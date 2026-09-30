@@ -423,17 +423,23 @@ pub(super) fn decode_exclusive(raw: u32, ext: &Extensions) -> Insn {
     };
     let rn = reg(raw, 19);
     if bit(raw, 20) {
+        let rt = reg(raw, 15);
         Insn::LoadExclusive {
             size,
-            rt: reg(raw, 15),
+            rt,
+            rt2: rt.wrapping_add(1) & 0xf,
             rn,
+            imm: 0,
         }
     } else {
+        let rt = reg(raw, 3);
         Insn::StoreExclusive {
             size,
             rd: reg(raw, 15),
-            rt: reg(raw, 3),
+            rt,
+            rt2: rt.wrapping_add(1) & 0xf,
             rn,
+            imm: 0,
         }
     }
 }
@@ -593,6 +599,15 @@ const fn block_mode(before: bool, up: bool) -> &'static str {
         (true, true) => "IB",
         (false, false) => "DA",
         (true, false) => "DB",
+    }
+}
+
+/// `[Rn]` or `[Rn, #imm]`, an exclusive's address.
+fn exclusive_address(f: &mut fmt::Formatter<'_>, rn: u8, imm: u16) -> fmt::Result {
+    if imm == 0 {
+        write!(f, "[{}]", RegName(rn))
+    } else {
+        write!(f, "[{}, #{imm}]", RegName(rn))
     }
 }
 
@@ -816,19 +831,62 @@ pub(super) fn fmt_insn(d: &Decoded, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let w = if writeback { "!" } else { "" };
             write!(f, "RFE{} {}{w}", block_mode(before, up), r(rn))
         }
-        Insn::LoadExclusive { size, rt, rn } => {
+        Insn::LoadExclusive {
+            size,
+            rt,
+            rt2,
+            rn,
+            imm,
+        } => {
             write!(f, "LDREX{}{c} {}, ", size.suffix(), r(rt))?;
             if size == ExSize::Double {
-                write!(f, "{}, ", r(rt.wrapping_add(1)))?;
+                write!(f, "{}, ", r(rt2))?;
             }
-            write!(f, "[{}]", r(rn))
+            exclusive_address(f, rn, imm)
         }
-        Insn::StoreExclusive { size, rd, rt, rn } => {
+        Insn::StoreExclusive {
+            size,
+            rd,
+            rt,
+            rt2,
+            rn,
+            imm,
+        } => {
             write!(f, "STREX{}{c} {}, {}, ", size.suffix(), r(rd), r(rt))?;
             if size == ExSize::Double {
-                write!(f, "{}, ", r(rt.wrapping_add(1)))?;
+                write!(f, "{}, ", r(rt2))?;
             }
-            write!(f, "[{}]", r(rn))
+            exclusive_address(f, rn, imm)
+        }
+        Insn::TableBranch { half, rn, rm } => {
+            if half {
+                write!(f, "TBH{c} [{}, {}, LSL #1]", r(rn), r(rm))
+            } else {
+                write!(f, "TBB{c} [{}, {}]", r(rn), r(rm))
+            }
+        }
+        Insn::LoadStoreDual {
+            load,
+            rt,
+            rt2,
+            rn,
+            up,
+            index,
+            imm,
+        } => {
+            let name = if load { "LDRD" } else { "STRD" };
+            write!(
+                f,
+                "{name}{c} {}, {}, {}",
+                r(rt),
+                r(rt2),
+                Addressing {
+                    rn,
+                    up,
+                    index,
+                    offset: super::isa::Offset::Imm(imm),
+                }
+            )
         }
         Insn::Clrex => f.write_str("CLREX"),
         Insn::Hint { op } => match op {

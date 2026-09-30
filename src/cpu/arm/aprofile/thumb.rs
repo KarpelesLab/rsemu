@@ -16,16 +16,32 @@
 //! the same barrel shifter, ALU and memory helpers the ARM path uses, so there
 //! is one implementation of `ADC`, one of `LDR`, and one shifter.
 //!
+//! # Later architectures
+//!
+//! [`decode_for`] takes the part's [`Arch`]. ARMv6 adds eight 16-bit
+//! encodings to the `1011` block — `REV`, `REV16`, `REVSH`, the four plain
+//! extends, `CPS` and `SETEND` — and v6T2 adds `CBZ`/`CBNZ`, `IT` and the
+//! 16-bit hints (DDI 0406C A6.2.5). All of those were UNDEFINED before, so an
+//! ARMv5TE part decodes exactly as it always did: [`decode`] *is*
+//! `decode_for(&Arch::V5TE, _)`. The ones whose operation an A32 instruction
+//! already describes decode to [`Thumb::Common`] carrying that
+//! [`Insn`], so there is one `REV` and one `CPS` in the
+//! interpreter, not two. The 32-bit Thumb-2 encodings are
+//! [`super::thumb2`]'s.
+//!
 //! # Sources
 //!
 //! ARM ARM (DDI 0100) A6, "The Thumb Instruction Set": A6.1's encoding
 //! summary, and A7.1's alphabetical list for each instruction's operands and
 //! flag effects. `BLX` in both its forms is A7.1.11 and A7.1.12 — ARMv5T
-//! additions, as is `BKPT` (A7.1.10).
+//! additions, as is `BKPT` (A7.1.10). ARM DDI 0406C A6.2 for the 16-bit table
+//! as ARMv7 has it, and A8.8's pages for `CBZ`, `IT`, `REV`, `SXTB` and the
+//! rest.
 
 use core::fmt;
 
-use super::isa::{Cond, RegName, ShiftType, bit, field};
+use super::arch::{Arch, Extensions};
+use super::isa::{Cond, Decoded, ExtendSize, HintOp, Insn, RegName, RevOp, ShiftType, bit, field};
 
 /// Extract bits `hi..=lo` of a Thumb halfword.
 #[inline]
@@ -457,6 +473,32 @@ pub enum Thumb {
     },
     /// An encoding this architecture does not define.
     Undefined,
+    /// `CBZ` and `CBNZ` (v6T2; DDI 0406C A8.8.29): compare a low register
+    /// with zero and branch forward. Never conditional, and not permitted
+    /// inside an `IT` block.
+    CompareBranch {
+        /// `CBNZ` rather than `CBZ`.
+        nonzero: bool,
+        /// The register tested.
+        rn: u8,
+        /// Byte offset forward from `PC + 4`, `0..=126`.
+        offset: u8,
+    },
+    /// `IT` (v6T2; DDI 0406C A8.8.54): make the next one to four
+    /// instructions conditional.
+    It {
+        /// The first instruction's condition.
+        firstcond: u8,
+        /// The then/else pattern and its terminating bit; never zero (a zero
+        /// mask is the hint space).
+        mask: u8,
+    },
+    /// A 16-bit encoding whose operation an A32 instruction already
+    /// describes: `REV`/`REV16`/`REVSH`, `SXTB`/`SXTH`/`UXTB`/`UXTH`, `CPS`,
+    /// `SETEND` (ARMv6) and the `NOP`/`YIELD`/`WFE`/`WFI`/`SEV` hints (v6T2).
+    /// The interpreter executes the carried [`Insn`] exactly as it does in ARM
+    /// state.
+    Common(Insn),
 }
 
 /// The second operand of the format-2 `ADD`/`SUB`.
@@ -477,10 +519,22 @@ impl fmt::Display for SmallOperand {
     }
 }
 
-/// Decode one Thumb halfword.
+/// Decode one Thumb halfword as an ARMv5TE part — an ARM926EJ-S — sees it.
 ///
 /// Never fails: an undefined encoding decodes to [`Thumb::Undefined`], which
 /// the interpreter turns into an Undefined Instruction exception.
+#[must_use]
+pub fn decode(raw: u16) -> Thumb {
+    decode_for(&Arch::V5TE, raw)
+}
+
+/// Decode one Thumb halfword for the part `arch` describes.
+///
+/// On a part with Thumb-2 a halfword that starts a 32-bit instruction
+/// ([`crate::cpu::arm::t32::is_32bit`]) is not a whole instruction, and the
+/// interpreter never asks this function about it; asked anyway, it answers
+/// with the ARMv5T `BL`/`BLX` half the bits spell, as a listing of raw
+/// halfwords would.
 ///
 /// The order of the arms follows ARM ARM A6.1's encoding table top to bottom;
 /// the narrower patterns (`BKPT` inside the `1011` block, `SWI` and the
@@ -488,7 +542,8 @@ impl fmt::Display for SmallOperand {
 /// tested before the block they sit in.
 #[must_use]
 #[allow(clippy::too_many_lines)] // One arm per format; splitting it hides the table.
-pub fn decode(raw: u16) -> Thumb {
+pub fn decode_for(arch: &Arch, raw: u16) -> Thumb {
+    let ext = &arch.ext;
     let rd = hfield(raw, 2, 0) as u8;
     let rn = hfield(raw, 5, 3) as u8;
     match hfield(raw, 15, 13) {
@@ -564,7 +619,7 @@ pub fn decode(raw: u16) -> Thumb {
                     imm: hfield(raw, 7, 0) as u8,
                 }
             } else {
-                decode_misc(raw)
+                decode_misc(raw, ext)
             }
         }
         0b110 => {
@@ -648,21 +703,100 @@ fn decode_group_010(raw: u16) -> Thumb {
     }
 }
 
-/// The `1011` block: stack adjustment, `PUSH`/`POP` and `BKPT`.
-fn decode_misc(raw: u16) -> Thumb {
+/// The `1011` block: stack adjustment, `PUSH`/`POP` and `BKPT`, and on later
+/// parts the miscellaneous 16-bit instructions (DDI 0406C A6.2.5).
+fn decode_misc(raw: u16, ext: &Extensions) -> Thumb {
+    let w = u32::from(raw);
+    let rd = hfield(raw, 2, 0) as u8;
+    let rm = hfield(raw, 5, 3) as u8;
     match hfield(raw, 11, 8) {
         0b0000 => Thumb::AdjustStack {
-            sub: bit(u32::from(raw), 7),
+            sub: bit(w, 7),
             imm: hfield(raw, 6, 0) as u8,
         },
         0b0100 | 0b0101 | 0b1100 | 0b1101 => Thumb::PushPop {
-            load: bit(u32::from(raw), 11),
-            extra: bit(u32::from(raw), 8),
+            load: bit(w, 11),
+            extra: bit(w, 8),
             list: hfield(raw, 7, 0) as u8,
         },
         0b1110 => Thumb::Bkpt {
             imm: hfield(raw, 7, 0) as u8,
         },
+        // CBZ/CBNZ: `1011 o0i1 imm5 Rn`; the offset is `i:imm5:'0'`.
+        0b0001 | 0b0011 | 0b1001 | 0b1011 if ext.thumb2 => Thumb::CompareBranch {
+            nonzero: bit(w, 11),
+            rn: rd,
+            offset: ((hfield(raw, 9, 9) << 6) | (hfield(raw, 7, 3) << 1)) as u8,
+        },
+        // SXTH, SXTB, UXTH, UXTB: `1011 0010 op Rm Rd`.
+        0b0010 if ext.v6 => {
+            let (signed, size) = match hfield(raw, 7, 6) {
+                0b00 => (true, ExtendSize::Half),
+                0b01 => (true, ExtendSize::Byte),
+                0b10 => (false, ExtendSize::Half),
+                _ => (false, ExtendSize::Byte),
+            };
+            Thumb::Common(Insn::Extend {
+                signed,
+                size,
+                rd,
+                rn: None,
+                rm,
+                rotate: 0,
+            })
+        }
+        // SETEND `1011 0110 0101 E000` and CPS `1011 0110 011 im 0 A I F`.
+        0b0110 if ext.v6 => match hfield(raw, 7, 5) {
+            0b010 if bit(w, 4) && hfield(raw, 2, 0) == 0 => {
+                Thumb::Common(Insn::Setend { big: bit(w, 3) })
+            }
+            // `A`, `I` and `F` all clear changes nothing and is
+            // UNPREDICTABLE (A8.8.31's T1 note); the reading that cannot
+            // compute something is UNDEFINED, as in A32.
+            0b011 if !bit(w, 3) && hfield(raw, 2, 0) != 0 => Thumb::Common(Insn::Cps {
+                enable: Some(!bit(w, 4)),
+                a: bit(w, 2),
+                i: bit(w, 1),
+                f: bit(w, 0),
+                mode: None,
+            }),
+            _ => Thumb::Undefined,
+        },
+        // REV, REV16, REVSH: `1011 1010 op Rm Rd`. `op == 10` is unallocated.
+        0b1010 if ext.v6 => {
+            let op = match hfield(raw, 7, 6) {
+                0b00 => RevOp::Rev,
+                0b01 => RevOp::Rev16,
+                0b11 => RevOp::Revsh,
+                _ => return Thumb::Undefined,
+            };
+            Thumb::Common(Insn::Reverse { op, rd, rm })
+        }
+        // IT, and the hints where its mask would be zero.
+        0b1111 if ext.thumb2 => {
+            let firstcond = hfield(raw, 7, 4) as u8;
+            let mask = hfield(raw, 3, 0) as u8;
+            if mask != 0 {
+                // `firstcond == 1111` is UNPREDICTABLE, and so is `AL` with
+                // anything but one instruction in the block, since the else
+                // condition would be `NV` (A8.8.54).
+                if firstcond == 0xf || (firstcond == 0xe && mask != 0b1000) {
+                    return Thumb::Undefined;
+                }
+                return Thumb::It { firstcond, mask };
+            }
+            // A v6T2 part without the v6K hints executes them as `NOP`
+            // (A8.8.426 and its neighbours: "executes as NOP in ARMv6T2").
+            let op = match firstcond {
+                0 => HintOp::Nop,
+                1 if ext.v6k => HintOp::Yield,
+                2 if ext.v6k => HintOp::Wfe,
+                3 if ext.v6k => HintOp::Wfi,
+                4 if ext.v6k => HintOp::Sev,
+                n => HintOp::Other(n),
+            };
+            Thumb::Common(Insn::Hint { op })
+        }
         _ => Thumb::Undefined,
     }
 }
@@ -838,6 +972,32 @@ impl fmt::Display for Thumb {
                 write!(f, "{name}(suffix) +{offset}")
             }
             Thumb::Undefined => f.write_str("UNDEFINED"),
+            Thumb::CompareBranch {
+                nonzero,
+                rn,
+                offset,
+            } => {
+                let name = if nonzero { "CBNZ" } else { "CBZ" };
+                write!(f, "{name} {}, +{offset}", RegName(rn))
+            }
+            Thumb::It { firstcond, mask } => {
+                let name = crate::cpu::arm::t32::ItState::mnemonic(firstcond, mask);
+                // `Cond`'s own spelling of `AL` is the empty suffix; an `IT`
+                // operand has to say it.
+                match Cond(firstcond) {
+                    Cond::AL => write!(f, "{name} AL"),
+                    c => write!(f, "{name} {c}"),
+                }
+            }
+            Thumb::Common(insn) => write!(
+                f,
+                "{}",
+                Decoded {
+                    raw: 0,
+                    cond: Cond::AL,
+                    insn,
+                }
+            ),
         }
     }
 }

@@ -306,6 +306,18 @@ pub enum Operand {
         /// How it is shifted.
         shift: Shift,
     },
+    /// An immediate already expanded, with the carry it produces.
+    ///
+    /// T32's forms: a modified immediate after `ThumbExpandImm_C` (DDI 0406C
+    /// A6.3.2), whose rotation may be odd and whose replicated-byte patterns
+    /// have no A32 spelling at all, and the plain twelve- and eight-bit
+    /// immediates of `ADDW`, `SUBW` and `SUBS PC, LR`. A32 never produces it.
+    Const {
+        /// The 32-bit value.
+        value: u32,
+        /// The shifter carry-out, or `None` where the flag is left alone.
+        carry: Option<bool>,
+    },
 }
 
 impl Operand {
@@ -314,6 +326,7 @@ impl Operand {
     pub const fn immediate(self) -> Option<u32> {
         match self {
             Operand::Imm { imm8, rotate } => Some((imm8 as u32).rotate_right((rotate as u32) * 2)),
+            Operand::Const { value, .. } => Some(value),
             Operand::Reg { .. } => None,
         }
     }
@@ -334,7 +347,7 @@ impl Operand {
 impl fmt::Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Operand::Imm { .. } => {
+            Operand::Imm { .. } | Operand::Const { .. } => {
                 let v = self.immediate().unwrap_or(0);
                 write!(f, "#{v}")
             }
@@ -398,6 +411,10 @@ pub enum DpOp {
     Bic,
     /// Move not.
     Mvn,
+    /// Bitwise or not: `Rn OR NOT operand`. T32 only (DDI 0406C A8.8.111,
+    /// A8.8.112) — the A32 `opcode` field has no room for it, so
+    /// [`DpOp::from_bits`] never produces it.
+    Orn,
 }
 
 impl DpOp {
@@ -444,6 +461,7 @@ impl DpOp {
             DpOp::Mov => "MOV",
             DpOp::Bic => "BIC",
             DpOp::Mvn => "MVN",
+            DpOp::Orn => "ORN",
         }
     }
 
@@ -481,6 +499,7 @@ impl DpOp {
                 | DpOp::Mov
                 | DpOp::Bic
                 | DpOp::Mvn
+                | DpOp::Orn
         )
     }
 }
@@ -511,15 +530,32 @@ pub enum Index {
         /// `STRBT` (ARM ARM A4.1.24). Never set for addressing mode 3.
         unprivileged: bool,
     },
+    /// `[Rn, #imm]` with no writeback, accessed as if unprivileged.
+    ///
+    /// The T32 `LDRT`/`STRT` family (DDI 0406C A8.8.92 and its neighbours):
+    /// unlike A32's, which is post-indexed and always writes the base back,
+    /// the T32 form adds a positive eight-bit offset and leaves the base
+    /// alone. A32 never produces it.
+    Unprivileged,
 }
 
 impl Index {
+    /// Whether the access is made as if from User mode: the `T` forms.
+    #[must_use]
+    pub const fn is_unprivileged(self) -> bool {
+        matches!(
+            self,
+            Index::Post { unprivileged: true } | Index::Unprivileged
+        )
+    }
+
     /// Whether the base register is updated by this access.
     #[must_use]
     pub const fn writes_base(self) -> bool {
         match self {
             Index::Pre { writeback } => writeback,
             Index::Post { .. } => true,
+            Index::Unprivileged => false,
         }
     }
 }
@@ -563,6 +599,12 @@ impl fmt::Display for Addressing {
             // is what an assembler writes and what a reader expects.
             Index::Pre { writeback } if self.offset.is_zero() && !writeback => {
                 write!(f, "[{base}]")
+            }
+            Index::Unprivileged if self.offset.is_zero() => write!(f, "[{base}]"),
+            Index::Unprivileged => {
+                write!(f, "[{base}, ")?;
+                write_offset(f, self.offset, sign)?;
+                f.write_str("]")
             }
             Index::Pre { writeback } => {
                 write!(f, "[{base}, ")?;
@@ -1232,10 +1274,16 @@ pub enum Insn {
     LoadExclusive {
         /// Access size.
         size: ExSize,
-        /// Destination; `LDREXD` also writes `Rt + 1`.
+        /// Destination.
         rt: u8,
+        /// `LDREXD`'s second destination: `Rt + 1` in A32, any register in
+        /// T32. Unused for the other sizes.
+        rt2: u8,
         /// Address register.
         rn: u8,
+        /// Byte offset added to `Rn`: always zero in A32, and T32's
+        /// word-scaled eight-bit offset for `LDREX` (DDI 0406C A8.8.75).
+        imm: u16,
     },
     /// `STREX` (ARMv6) and `STREXB`/`STREXH`/`STREXD` (ARMv6K).
     StoreExclusive {
@@ -1243,10 +1291,14 @@ pub enum Insn {
         size: ExSize,
         /// Status: 0 if the store happened, 1 if not.
         rd: u8,
-        /// Value; `STREXD` also stores `Rt + 1`.
+        /// Value.
         rt: u8,
+        /// `STREXD`'s second value: `Rt + 1` in A32, any register in T32.
+        rt2: u8,
         /// Address register.
         rn: u8,
+        /// Byte offset added to `Rn`, as for [`Insn::LoadExclusive`].
+        imm: u16,
     },
     /// `CLREX` (ARMv6K).
     Clrex,
@@ -1289,6 +1341,39 @@ pub enum Insn {
     Bxj {
         /// Register holding the target.
         rm: u8,
+    },
+
+    // -----------------------------------------------------------------
+    // T32 only. Decoded by `thumb2`, never from an A32 word.
+    // -----------------------------------------------------------------
+    /// `TBB` and `TBH` (DDI 0406C A8.8.411): branch forward by twice a byte
+    /// or halfword read from a table at `Rn + Rm` (`Rn + 2*Rm` for `TBH`).
+    TableBranch {
+        /// Halfword entries (`TBH`) rather than bytes.
+        half: bool,
+        /// The table base; the PC reads as the instruction plus four.
+        rn: u8,
+        /// The index.
+        rm: u8,
+    },
+    /// T32 `LDRD` and `STRD` (DDI 0406C A8.8.72–A8.8.74, A8.8.210): unlike
+    /// A32's, the two registers are independent and the offset is a
+    /// word-scaled eight-bit immediate.
+    LoadStoreDual {
+        /// Whether this reads memory.
+        load: bool,
+        /// First register, at the lower address.
+        rt: u8,
+        /// Second register.
+        rt2: u8,
+        /// Base register; the literal form reads `Align(PC, 4)`.
+        rn: u8,
+        /// Add the offset rather than subtract it.
+        up: bool,
+        /// Pre- or post-indexed.
+        index: Index,
+        /// Byte offset, already scaled.
+        imm: u16,
     },
 }
 
@@ -2050,12 +2135,7 @@ impl fmt::Display for Decoded {
             } => {
                 let name = if load { "LDR" } else { "STR" };
                 let b = if byte { "B" } else { "" };
-                let t = match index {
-                    Index::Post {
-                        unprivileged: true, ..
-                    } => "T",
-                    _ => "",
-                };
+                let t = if index.is_unprivileged() { "T" } else { "" };
                 write!(
                     f,
                     "{name}{c}{b}{t} {}, {}",
@@ -2079,11 +2159,7 @@ impl fmt::Display for Decoded {
                 f,
                 "{}{}{c} {}, {}",
                 op.mnemonic(),
-                if matches!(index, Index::Post { unprivileged: true }) {
-                    "T"
-                } else {
-                    ""
-                },
+                if index.is_unprivileged() { "T" } else { "" },
                 RegName(rd),
                 Addressing {
                     rn,

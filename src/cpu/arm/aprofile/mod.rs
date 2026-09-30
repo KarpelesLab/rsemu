@@ -1,5 +1,6 @@
 //! The A-profile 32-bit core — an ARM926EJ-S-class ARMv5TE interpreter that
-//! also executes the ARMv7-A **A32** instruction set when its part says so.
+//! also executes the ARMv7-A **A32** and **T32** (Thumb-2) instruction sets
+//! when its part says so.
 //!
 //! As an ARMv5TE part it covers what an ARM9 SoC needs and nothing it does
 //! not: the full 32-bit ARM instruction set including `CLZ`, both forms of
@@ -23,11 +24,20 @@
 //! `LDRHT` and friends), and ARMv7's barriers, `PLI`, `PLDW`, `DBG`,
 //! interworking data-processing writes to the PC and true unaligned access.
 //! The PSR gains `GE`, `E`, `A`, `J` and the IT state, with ARMv6's `MSR`
-//! write rules and exception entry. Decode is gated on the part, so an
-//! ARM926EJ-S is bit-for-bit what it was and a feature probe on it still traps.
-//! `tests/conformance/ledgers/cpu-arm-aprofile-a32.txt` lists what is
+//! write rules and exception entry.
+//!
+//! Thumb state grows with it: the ARMv6 16-bit additions (`REV`, the
+//! extends, `CPS`, `SETEND`), and on a part with Thumb-2 the whole 32-bit
+//! T32 encoding space, `IT` blocks, `CBZ`/`CBNZ` and the 16-bit hints
+//! ([`thumb2`]). A 32-bit Thumb instruction decodes to the same
+//! [`isa::Insn`] an A32 word does and runs through the same executor — one
+//! `ADD`, one `LDREX`, one `SMLAD` — with the Thumb-specific rules (the
+//! `IT` state, flag-setting inside a block, `Align(PC, 4)`, the link values)
+//! kept where the architecture puts them. Decode is gated on the part, so an
+//! ARM926EJ-S is bit-for-bit what it was and a feature probe on it still
+//! traps. `tests/conformance/ledgers/cpu-arm-aprofile-a32.txt` lists what is
 //! deliberately absent (`SMC` executes as Undefined; Monitor mode, a global
-//! exclusive monitor and Thumb-2 are elsewhere or later).
+//! exclusive monitor, ThumbEE and Advanced SIMD are elsewhere or later).
 //!
 //! # Using it from another crate
 //!
@@ -84,7 +94,8 @@
 //! | [`isa_v6`] | the same decoder's ARMv6-and-later half, gated on the part's [`Extensions`] |
 //! | [`media`] | the ARMv6 media arithmetic as pure functions |
 //! | [`monitor`] | the local exclusive monitor, and the seam for a global one |
-//! | [`thumb`] | the same for Thumb |
+//! | [`thumb`] | the same for 16-bit Thumb, gated on the part as [`isa`] is |
+//! | [`thumb2`] | the 32-bit T32 decoder, producing [`isa::Insn`] values, and the UAL printer for either Thumb width |
 //! | [`disasm`] | the disassembler built on those two |
 //! | [`cp`] | the coprocessor and MMU traits, the software TLB, `FlatMmu`, and a CP15 stub |
 //! | [`cp15`] | the ARMv5 system control coprocessor and the VMSAv5 table walk |
@@ -100,7 +111,8 @@
 //! instructions), A5 (addressing modes), A6/A7 (Thumb), A10 (the DSP
 //! extensions), B2 (the system control coprocessor) and B4 (fault status);
 //! and ARM DDI 0406C (ARMv7-A and ARMv7-R) — A2–A5 and A8 for the A32
-//! additions, B1 for the PSRs, the exception model and the event register.
+//! additions, A6 and A8 for T32, A2.5.2 for `ITSTATE`, B1 for the PSRs, the
+//! exception model and the event register.
 //! Cycle counts from ARM's own instruction-cycle timing summaries. No emulator
 //! source of any licence was consulted (`ROADMAP.md` §1).
 
@@ -115,6 +127,7 @@ pub mod isa_v6;
 pub mod media;
 pub mod monitor;
 pub mod thumb;
+pub mod thumb2;
 #[cfg(feature = "cpu-arm-aprofile-vfp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile-vfp")))]
 pub mod vfp;
@@ -124,10 +137,12 @@ pub mod vfpisa;
 
 #[cfg(test)]
 mod tests;
-#[cfg(all(test, feature = "cpu-arm-aprofile-vfp"))]
-mod vfptests;
+#[cfg(test)]
+mod tests_t32;
 #[cfg(test)]
 mod tests_v7;
+#[cfg(all(test, feature = "cpu-arm-aprofile-vfp"))]
+mod vfptests;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).
@@ -1645,7 +1660,7 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    unchanged, and a v5 chunk without the trailer means the reset values:
     //    see `migrations`.
     version: 6,
-    summary: "A-profile 32-bit ARM CPU core: ARMv5TE (ARM926EJ-S) or the ARMv7-A A32 instruction set (Cortex-A9), with Thumb",
+    summary: "A-profile 32-bit ARM CPU core: ARMv5TE (ARM926EJ-S) with Thumb, or ARMv7-A (Cortex-A9) with A32 and Thumb-2",
     properties: &[
         PropertySpec {
             name: "big-endian",

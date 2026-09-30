@@ -2,8 +2,15 @@
 //!
 //! Not a side project: gdb's `disassemble`, the monitor's single-step display
 //! and any trace log need it, and CLAUDE.md forbids describing the instruction
-//! set twice. Everything here calls [`isa::decode`](super::isa::decode) or
-//! [`thumb::decode`](super::thumb::decode); there is no second table.
+//! set twice. Everything here calls [`isa::decode`](super::isa::decode),
+//! [`thumb::decode`](super::thumb::decode) or, on a part with Thumb-2,
+//! [`thumb2::T32::decode_for`]; there is no second table.
+//!
+//! A Thumb listing for a Thumb-2 part is [`Listed::Thumb2`]: instructions of
+//! either width, printed in UAL, with each instruction inside an `IT` block
+//! carrying the block's condition. The listing follows `ITSTATE` from the
+//! `IT` instructions it passes, the way `objdump` does; one that starts in
+//! the middle of a block cannot know it is there.
 //!
 //! What this layer adds over those two is *address context*: a bare
 //! [`Decoded`] prints a branch as `B +40` because it does not know where it
@@ -22,8 +29,10 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use super::arch::Arch;
-use super::isa::{Decoded, Insn};
+use super::isa::{Cond, Decoded, Insn};
 use super::thumb::Thumb;
+use super::thumb2::{self, T32};
+use crate::cpu::arm::t32::ItState;
 
 /// Why a listing has a hole in it.
 ///
@@ -74,6 +83,16 @@ pub enum Listed {
         /// The decoded form.
         insn: Thumb,
     },
+    /// A Thumb instruction of either width, on a part with Thumb-2.
+    Thumb2 {
+        /// Where it lives.
+        addr: u32,
+        /// The decoded form, 16- or 32-bit.
+        insn: T32,
+        /// The `IT` block condition it executes under, if the listing
+        /// placed it inside one.
+        it: Option<Cond>,
+    },
     /// Not every byte was readable — an unmapped page, or the end of a buffer.
     ///
     /// A monitor disassembling to the end of a region gets this rather than a
@@ -95,6 +114,7 @@ impl Listed {
         match *self {
             Listed::Arm { addr, .. }
             | Listed::Thumb { addr, .. }
+            | Listed::Thumb2 { addr, .. }
             | Listed::Unreadable { addr, .. } => addr,
         }
     }
@@ -105,6 +125,7 @@ impl Listed {
         match *self {
             Listed::Arm { .. } => 4,
             Listed::Thumb { .. } => 2,
+            Listed::Thumb2 { insn, .. } => insn.byte_len(),
             // Advance by the width that was being attempted, so a listing
             // walks past a hole rather than sitting on it.
             Listed::Unreadable { thumb, .. } => {
@@ -122,7 +143,7 @@ impl Listed {
     pub const fn is_thumb(&self) -> bool {
         matches!(
             self,
-            Listed::Thumb { .. } | Listed::Unreadable { thumb: true, .. }
+            Listed::Thumb { .. } | Listed::Thumb2 { .. } | Listed::Unreadable { thumb: true, .. }
         )
     }
 
@@ -147,6 +168,7 @@ impl Listed {
                 }
                 _ => None,
             },
+            Listed::Thumb2 { addr, insn, .. } => insn.branch_target(addr),
             Listed::Unreadable { .. } => None,
         }
     }
@@ -191,6 +213,15 @@ impl fmt::Display for Listed {
                     (None, _) => write!(f, "{insn}"),
                 }
             }
+            Listed::Thumb2 { addr, insn, it } => {
+                match insn {
+                    T32::Narrow { raw, .. } => write!(f, "{addr:08x}: {raw:04x}      ")?,
+                    T32::Wide(d) => {
+                        write!(f, "{addr:08x}: {:04x} {:04x} ", d.raw >> 16, d.raw & 0xffff)?
+                    }
+                }
+                write!(f, "{}", insn.ual(Some(addr), it))
+            }
             Listed::Unreadable { addr, why, .. } => write!(f, "{addr:08x}: ??        <{why}>"),
         }
     }
@@ -220,6 +251,24 @@ pub fn disassemble_thumb(addr: u32, half: u16) -> Listed {
         addr,
         raw: half,
         insn: super::thumb::decode(half),
+    }
+}
+
+/// Disassemble one Thumb instruction for the part `arch` describes, given
+/// its first halfword and the one after it (ignored unless the first starts
+/// a 32-bit instruction on a Thumb-2 part), outside any `IT` block.
+///
+/// On a part without Thumb-2 this is [`disassemble_thumb`].
+#[must_use]
+pub fn disassemble_thumb_for(arch: &Arch, addr: u32, hw1: u16, hw2: u16) -> Listed {
+    if arch.ext.thumb2 {
+        Listed::Thumb2 {
+            addr,
+            insn: T32::decode_for(arch, hw1, hw2),
+            it: None,
+        }
+    } else {
+        disassemble_thumb(addr, hw1)
     }
 }
 
@@ -255,7 +304,14 @@ pub fn disassemble_run_for(
 ) -> Vec<Listed> {
     let mut out = Vec::with_capacity(count);
     let mut at = addr;
+    let mut it = ItState::NONE;
     for _ in 0..count {
+        if thumb && arch.ext.thumb2 {
+            let listed = thumb2_one(arch, at, &mut read, &mut it);
+            at = at.wrapping_add(listed.byte_len());
+            out.push(listed);
+            continue;
+        }
         let width = if thumb { 2 } else { 4 };
         let mut word = 0u32;
         // The first reason wins: an instruction straddling the end of a mapped
@@ -282,4 +338,53 @@ pub fn disassemble_run_for(
         out.push(listed);
     }
     out
+}
+
+/// One Thumb-2 listing entry: read a halfword, and a second when the first
+/// starts a 32-bit instruction, then walk `ITSTATE` past it.
+fn thumb2_one(
+    arch: &Arch,
+    at: u32,
+    read: &mut impl FnMut(u32) -> Result<u8, Missing>,
+    it: &mut ItState,
+) -> Listed {
+    let mut half = |a: u32| -> Result<u16, Missing> {
+        Ok(u16::from(read(a)?) | (u16::from(read(a.wrapping_add(1))?) << 8))
+    };
+    let hw1 = match half(at) {
+        Ok(h) => h,
+        Err(why) => {
+            return Listed::Unreadable {
+                addr: at,
+                thumb: true,
+                why,
+            };
+        }
+    };
+    let hw2 = if thumb2::is_32bit(hw1) {
+        match half(at.wrapping_add(2)) {
+            Ok(h) => h,
+            Err(why) => {
+                return Listed::Unreadable {
+                    addr: at,
+                    thumb: true,
+                    why,
+                };
+            }
+        }
+    } else {
+        0
+    };
+    let insn = T32::decode_for(arch, hw1, hw2);
+    let cond = it.in_block().then(|| Cond(it.cond()));
+    *it = match insn.it_state() {
+        Some(next) => next,
+        None if it.in_block() => it.advance(),
+        None => ItState::NONE,
+    };
+    Listed::Thumb2 {
+        addr: at,
+        insn,
+        it: cond,
+    }
 }

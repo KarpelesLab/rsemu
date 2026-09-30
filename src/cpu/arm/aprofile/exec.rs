@@ -49,14 +49,44 @@
 //! architecture calls that case UNPREDICTABLE, and this is the ARM7TDMI
 //! behaviour every assembler that relies on it expects.
 //!
+//! # Thumb-2
+//!
+//! On a part with Thumb-2, Thumb state fetches a second halfword whenever
+//! the first starts a 32-bit instruction, decodes the pair with
+//! [`super::thumb2`] into the same [`Decoded`] an A32 word produces, and
+//! executes it through the same arms — the ALU, the shifter, the load/store
+//! helpers with their alignment, exclusive-monitor and `CPSR.E` handling, the
+//! coprocessor and VFP seams. Three things are Thumb's own:
+//!
+//! - **`ITSTATE`** (DDI 0406C A2.5.2), kept where the architecture keeps it,
+//!   in `CPSR[26:25]` and `CPSR[15:10]`. Inside a block every instruction of
+//!   either width executes under the block's condition, a failed one is
+//!   skipped without side effects, and afterwards the state advances
+//!   (`ITAdvance`) — unless the instruction replaced the `CPSR` wholesale
+//!   (an exception entry, which saves the *unadvanced* state for a restart,
+//!   or an exception return, which restores the one it saved) or was `IT`
+//!   itself. `SVC` advances first, because its return address is the next
+//!   instruction (`TakeSVCException`, B1.9.9).
+//! - **16-bit flag setting**: the data-processing encodings that always set
+//!   the flags outside an `IT` block set none inside one (`setflags =
+//!   !InITBlock()` throughout A8.8's 16-bit encodings).
+//! - **the PC**: it reads as the instruction plus four; the literal loads,
+//!   `ADR`, `LDRD` (literal) and `LDC` (literal) use `Align(PC, 4)`
+//!   ([`Exec::base_reg`]); `BL` leaves the next instruction's address with
+//!   bit 0 set; and `BLX` (immediate) switches to ARM state at
+//!   `Align(PC, 4) + imm` (A8.8.25).
+//!
 //! # Sources
 //!
 //! ARM ARM (DDI 0100): A2.5 (registers and modes), A2.6 (exceptions, their
 //! priority, and the `R14` values each one saves), A2.8 (endianness), A3
 //! (the encoding tables), A4.1 (per-instruction operation pseudocode), A5
-//! (addressing modes), A6/A7 (Thumb), A10 (the DSP extensions). Cycle counts
-//! from the instruction-cycle-timing summaries in ARM's ARM7TDMI and
-//! ARM9 datasheets. No emulator source of any licence was consulted.
+//! (addressing modes), A6/A7 (Thumb), A10 (the DSP extensions). ARM DDI 0406C
+//! A2.3.1 (the PC in Thumb state), A2.3.2 (`BXWritePC`, `LoadWritePC`,
+//! `ALUWritePC`), A2.5.2 (`ITSTATE`) and B1.9 (exception entry and the link
+//! values in each state) for Thumb-2. Cycle counts from the
+//! instruction-cycle-timing summaries in ARM's ARM7TDMI and ARM9
+//! datasheets. No emulator source of any licence was consulted.
 
 use alloc::sync::Arc;
 use core::cell::Cell;
@@ -69,11 +99,13 @@ use super::cp::{
     Tlb, Va,
 };
 use super::isa::{
-    Decoded, DpOp, ExtraOp, Half, HalfMulOp, Index, Insn, Offset, Operand, SatOp, Shift, ShiftType,
+    Cond, Decoded, DpOp, ExtraOp, Half, HalfMulOp, Index, Insn, Offset, Operand, SatOp, Shift,
+    ShiftType,
 };
 use super::monitor::{GlobalMonitor, LocalMonitor};
 use super::thumb::{AluOp, HiOp, ImmOp, MemRegOp, MemSize, SmallOperand, Thumb};
 use super::{Config, Mode, Regs, psr};
+use crate::cpu::arm::t32::ItState;
 
 /// The VFP executor: a child module, so it can reach this one's load/store
 /// path rather than growing a second one.
@@ -336,6 +368,10 @@ pub(super) struct Exec<'a> {
     /// Set when the instruction wrote `R15`, so the fall-through advance is
     /// skipped.
     branched: bool,
+    /// Set when the instruction has already settled `ITSTATE` — an `IT`, an
+    /// exception entry, an exception return — so the end-of-instruction
+    /// `ITAdvance` must not run.
+    it_done: bool,
     /// Cycles this step has charged.
     used: u64,
 }
@@ -370,6 +406,7 @@ impl<'a> Exec<'a> {
             attrs,
             insn_addr: 0,
             branched: false,
+            it_done: false,
             used: 0,
         }
     }
@@ -483,6 +520,24 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// The base of an address, or the first operand of `ADR`: a register, or
+    /// — for the PC in Thumb state — `Align(PC, 4)`.
+    ///
+    /// Every T32 instruction that addresses relative to the PC does so from
+    /// the word-aligned value (the literal `LDR`s, `LDRD`, `LDC`, `PLD`, and
+    /// `ADR`; DDI 0406C A8.8's pages for each), because a Thumb instruction
+    /// may sit at an odd halfword. ARM state keeps reading `R15` exactly as
+    /// it always did.
+    #[inline]
+    fn base_reg(&self, index: u8) -> u32 {
+        let v = self.reg(index);
+        if index & 0xf == 15 && self.flag(psr::T) {
+            v & !3
+        } else {
+            v
+        }
+    }
+
     /// Write a register, treating `R15` as a branch.
     ///
     /// Writing `R15` from an instruction that is not a branch is
@@ -587,6 +642,9 @@ impl<'a> Exec<'a> {
             // `CPSRWriteByInstr(…, TRUE)` asks for (DDI 0406C B1.3).
             self.state.regs.write_cpsr(spsr);
         }
+        // The IT state just came back from the SPSR; advancing it now would
+        // skip an instruction of the block the exception interrupted.
+        self.it_done = true;
         if self.cfg.arch.ext.v6 {
             self.exception_returned();
         }
@@ -597,6 +655,38 @@ impl<'a> Exec<'a> {
         };
         self.branched = true;
         self.cycle(2);
+    }
+
+    // -----------------------------------------------------------------
+    // ITSTATE
+    // -----------------------------------------------------------------
+
+    /// `ITSTATE`, gathered from the two places `CPSR` keeps it: `IT[7:2]`
+    /// in bits 15..10 and `IT[1:0]` in bits 26..25 (DDI 0406C A2.5.2).
+    ///
+    /// Always empty on a part without Thumb-2, whatever those bits hold: an
+    /// ARMv5 `MSR` may write them as ordinary reserved bits, and on that
+    /// part they mean nothing.
+    fn itstate(&self) -> ItState {
+        if !self.cfg.arch.ext.thumb2 {
+            return ItState::NONE;
+        }
+        let c = self.state.regs.cpsr;
+        ItState((((c >> 10) & 0x3f) << 2 | ((c >> 25) & 0b11)) as u8)
+    }
+
+    /// Write `ITSTATE` back into `CPSR`.
+    fn set_itstate(&mut self, it: ItState) {
+        let it = u32::from(it.0);
+        self.state.regs.cpsr =
+            (self.state.regs.cpsr & !psr::IT) | ((it >> 2) << 10) | ((it & 0b11) << 25);
+    }
+
+    /// `ConditionPassed()` for a condition taken from `ITSTATE`, where
+    /// `0b1111` is "always" rather than "never" (DDI 0406C A8.3.1: a
+    /// `cond<3:1>` of `111` always passes).
+    fn it_condition_passes(&self, cond: u8) -> bool {
+        cond & 0b1110 == 0b1110 || Cond(cond).passes(self.state.regs.cpsr)
     }
 
     // -----------------------------------------------------------------
@@ -624,6 +714,9 @@ impl<'a> Exec<'a> {
 
     /// Enter an exception: bank `CPSR`, set `R14`, mask, and vector.
     fn take_exception(&mut self, kind: Exception, return_address: u32) {
+        // The SPSR keeps the IT state this instruction ran under, so the
+        // handler's return restarts it in the right place of its block.
+        self.it_done = true;
         let old_cpsr = self.state.regs.cpsr;
         self.state.regs.set_mode(kind.mode());
         self.state.regs.set_spsr(old_cpsr);
@@ -1101,6 +1194,8 @@ impl<'a> Exec<'a> {
                     (value, value & 0x8000_0000 != 0)
                 }
             }
+            // T32's expanded immediate carries its own carry-out, or none.
+            Operand::Const { value, carry } => (value, carry.unwrap_or(carry_in)),
             Operand::Reg { rm, shift } => {
                 let value = self.reg_plus(rm, extra);
                 match shift {
@@ -1180,6 +1275,9 @@ impl<'a> Exec<'a> {
             DpOp::Mov => (b, shifter_carry, v_in),
             DpOp::Bic => (a & !b, shifter_carry, v_in),
             DpOp::Mvn => (!b, shifter_carry, v_in),
+            // T32's `ORN`: `Rn OR NOT operand`, a logical operation with the
+            // shifter's carry (A8.8.111).
+            DpOp::Orn => (a | !b, shifter_carry, v_in),
         }
     }
 
@@ -1254,11 +1352,18 @@ impl<'a> Exec<'a> {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // One arm per encoding; splitting it hides the table.
+    /// Execute an A32 word — or a T32 one, which decodes to the same
+    /// [`Decoded`] with `hw1:hw2` as its `raw`.
+    ///
+    /// VFP owns coprocessors 10 and 11 on a part that has it; the
+    /// unconditional (`cond == 0b1111`) space there is not VFP and stays
+    /// with the ordinary coprocessor path, which leaves it UNDEFINED. The
+    /// same test is right for T32: its coprocessor instructions start
+    /// `0xEC`–`0xEE` (the A32 condition `AL`, bits 27..0 the A32 encoding)
+    /// or `0xFC`–`0xFE` (the `2` forms, A32's `1111` space), and no other T32
+    /// word has bits 27..25 of `110` or bits 27..24 of `1110` with a top
+    /// nibble of `0xE` (DDI 0406C A6.3.18).
     fn execute_arm(&mut self, decoded: Decoded) -> Ex {
-        // VFP owns coprocessors 10 and 11 on a part that has it; the
-        // unconditional (`cond == 0b1111`) space there is not VFP and stays
-        // with the ordinary coprocessor path, which leaves it UNDEFINED.
         #[cfg(feature = "cpu-arm-aprofile-vfp")]
         if self.cfg.arch.ext.vfp.is_some()
             && decoded.raw >> 28 != 0xf
@@ -1266,6 +1371,12 @@ impl<'a> Exec<'a> {
         {
             return self.execute_vfp(decoded.raw);
         }
+        self.execute_insn(decoded)
+    }
+
+    /// Execute one decoded instruction, whichever encoding it came from.
+    #[allow(clippy::too_many_lines)] // One arm per encoding; splitting it hides the table.
+    fn execute_insn(&mut self, decoded: Decoded) -> Ex {
         match decoded.insn {
             Insn::DataProc {
                 op,
@@ -1281,10 +1392,14 @@ impl<'a> Exec<'a> {
                 let extra = if register_shift { 4 } else { 0 };
                 let carry_in = self.flag(psr::C);
                 let (b, shifter_carry) = self.eval_operand(operand, extra, carry_in);
-                let a = if op.reads_rn() {
-                    self.reg_plus(rn, extra)
-                } else {
+                let a = if !op.reads_rn() {
                     0
+                } else if rn & 0xf == 15 && self.flag(psr::T) {
+                    // T32's `ADR` (`ADDW`/`SUBW` from the PC): the only Thumb
+                    // data-processing read of the PC, and it is aligned.
+                    self.base_reg(rn)
+                } else {
+                    self.reg_plus(rn, extra)
                 };
                 let (result, c, v) =
                     Exec::alu(op, a, b, carry_in, shifter_carry, self.flag(psr::V));
@@ -1341,8 +1456,8 @@ impl<'a> Exec<'a> {
                 operand,
             } => {
                 let value = match operand {
-                    Operand::Imm { .. } => operand.immediate().unwrap_or(0),
                     Operand::Reg { rm, .. } => self.reg(rm),
+                    _ => operand.immediate().unwrap_or(0),
                 };
                 self.write_psr(spsr, mask, value);
                 Ok(())
@@ -1372,20 +1487,31 @@ impl<'a> Exec<'a> {
                 Ok(())
             }
             Insn::Branch { link, offset } => {
+                // The offset is from the PC as read — the instruction plus
+                // eight in ARM state, plus four in Thumb — in both encodings.
                 let target = self.state.regs.r[15].wrapping_add(offset as u32);
                 if link {
-                    self.state.regs.r[14] = self.insn_addr.wrapping_add(4);
+                    self.state.regs.r[14] = self.link_value();
                 }
                 self.branch_to(target);
                 Ok(())
             }
             Insn::BlxImm { offset } => {
-                let target = self.state.regs.r[15].wrapping_add(offset as u32);
-                self.state.regs.r[14] = self.insn_addr.wrapping_add(4);
-                // The immediate form always lands in Thumb state, whatever the
-                // low bit of the computed address says (ARM ARM A4.1.11).
-                self.set_flag(psr::T, true);
-                self.state.regs.r[15] = target & !1;
+                self.state.regs.r[14] = self.link_value();
+                if self.flag(psr::T) {
+                    // T32's `BLX` (immediate) goes the other way: to ARM state,
+                    // from `Align(PC, 4)`, landing on a word (A8.8.25).
+                    let target = (self.state.regs.r[15] & !3).wrapping_add(offset as u32);
+                    self.set_flag(psr::T, false);
+                    self.state.regs.r[15] = target & !3;
+                } else {
+                    let target = self.state.regs.r[15].wrapping_add(offset as u32);
+                    // The immediate form always lands in Thumb state, whatever
+                    // the low bit of the computed address says (ARM ARM
+                    // A4.1.11).
+                    self.set_flag(psr::T, true);
+                    self.state.regs.r[15] = target & !1;
+                }
                 self.branched = true;
                 self.cycle(2);
                 Ok(())
@@ -1641,6 +1767,17 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// What `BL` and `BLX` leave in `LR`: the next instruction's address,
+    /// with bit 0 set in Thumb state so a `BX lr` returns there (A8.8.25).
+    ///
+    /// Only 32-bit instructions reach here in Thumb state — the 16-bit
+    /// `BLX Rm` and the ARMv5T `BL` halves compute their own — so the next
+    /// instruction is four bytes on in either state.
+    fn link_value(&self) -> u32 {
+        let next = self.insn_addr.wrapping_add(4);
+        if self.flag(psr::T) { next | 1 } else { next }
+    }
+
     /// Write `CPSR` or the current `SPSR` through an `MSR` field mask.
     fn write_psr(&mut self, spsr: bool, mask: u8, value: u32) {
         if self.cfg.arch.ext.v6 {
@@ -1825,7 +1962,7 @@ impl<'a> Exec<'a> {
         rd: u8,
         offset: Offset,
     ) -> Ex {
-        let base = self.reg(rn);
+        let base = self.base_reg(rn);
         let delta = self.eval_offset(offset);
         let adjusted = if up {
             base.wrapping_add(delta)
@@ -1833,15 +1970,12 @@ impl<'a> Exec<'a> {
             base.wrapping_sub(delta)
         };
         let address = match index {
-            Index::Pre { .. } => adjusted,
+            Index::Pre { .. } | Index::Unprivileged => adjusted,
             Index::Post { .. } => base,
         };
         // The `T` forms make a privileged access behave as an unprivileged
         // one, which is how a kernel copies from user space safely.
-        let privileged = match index {
-            Index::Post { unprivileged: true } => false,
-            _ => self.privileged(),
-        };
+        let privileged = !index.is_unprivileged() && self.privileged();
 
         if load {
             let value = if byte {
@@ -1885,7 +2019,7 @@ impl<'a> Exec<'a> {
         rd: u8,
         offset: Offset,
     ) -> Ex {
-        let base = self.reg(rn);
+        let base = self.base_reg(rn);
         let delta = self.eval_offset(offset);
         let adjusted = if up {
             base.wrapping_add(delta)
@@ -1893,26 +2027,12 @@ impl<'a> Exec<'a> {
             base.wrapping_sub(delta)
         };
         let address = match index {
-            Index::Pre { .. } => adjusted,
+            Index::Pre { .. } | Index::Unprivileged => adjusted,
             Index::Post { .. } => base,
         };
         // `LDRHT` and friends (v6T2): as for `LDRT`, an unprivileged access
         // from privileged code.
-        let privileged = match index {
-            Index::Post { unprivileged: true } => false,
-            _ => self.privileged(),
-        };
-        // LDRD and STRD need only word alignment on ARMv7, but they do need
-        // it, whatever `SCTLR.A` says (DDI 0406C A3.2.1).
-        if matches!(op, ExtraOp::Ldrd | ExtraOp::Strd) && self.unaligned_mode() {
-            let kind = if op.is_load() {
-                AccessKind::Read
-            } else {
-                AccessKind::Write
-            };
-            Exec::require_alignment(address, 4, kind)?;
-        }
-
+        let privileged = !index.is_unprivileged() && self.privileged();
         match op {
             ExtraOp::Strh => {
                 let value = self.store_value(rd);
@@ -1945,9 +2065,7 @@ impl<'a> Exec<'a> {
                     self.undefined_instruction();
                     return Ok(());
                 }
-                let low = self.load(address & !3, Width::U32, privileged)?;
-                let high = self.load((address & !3).wrapping_add(4), Width::U32, privileged)?;
-                self.cycle(1);
+                let (low, high) = self.load_dual(address, privileged)?;
                 if index.writes_base() {
                     self.set_reg(rn, adjusted);
                 }
@@ -1962,14 +2080,38 @@ impl<'a> Exec<'a> {
                 }
                 let low = self.reg(rd);
                 let high = self.reg(rd + 1);
-                self.store(address & !3, Width::U32, low, privileged)?;
-                self.store((address & !3).wrapping_add(4), Width::U32, high, privileged)?;
+                self.store_dual(address, low, high, privileged)?;
             }
         }
         if index.writes_base() {
             self.set_reg(rn, adjusted);
         }
         Ok(())
+    }
+
+    /// The two word reads of a doubleword load, `LDRD` in either encoding.
+    ///
+    /// `LDRD` and `STRD` need only word alignment on ARMv7, but they do need
+    /// it, whatever `SCTLR.A` says (DDI 0406C A3.2.1): with unaligned support
+    /// on, a misaligned address faults here. Without it — ARMv5 — the low
+    /// bits are simply not presented to the bus.
+    fn load_dual(&mut self, address: u32, privileged: bool) -> Ex<(u32, u32)> {
+        if self.unaligned_mode() {
+            Exec::require_alignment(address, 4, AccessKind::Read)?;
+        }
+        let low = self.load(address & !3, Width::U32, privileged)?;
+        let high = self.load((address & !3).wrapping_add(4), Width::U32, privileged)?;
+        self.cycle(1);
+        Ok((low, high))
+    }
+
+    /// The store half of [`load_dual`](Exec::load_dual).
+    fn store_dual(&mut self, address: u32, low: u32, high: u32, privileged: bool) -> Ex {
+        if self.unaligned_mode() {
+            Exec::require_alignment(address, 4, AccessKind::Write)?;
+        }
+        self.store(address & !3, Width::U32, low, privileged)?;
+        self.store((address & !3).wrapping_add(4), Width::U32, high, privileged)
     }
 
     /// The tail every addressing-mode-3 load shares.
@@ -2235,7 +2377,7 @@ impl<'a> Exec<'a> {
             self.undefined_instruction();
             return Ok(());
         };
-        let base = self.reg(rn);
+        let base = self.base_reg(rn);
         let delta = u32::from(offset) * 4;
         let adjusted = if up {
             base.wrapping_add(delta)
@@ -2243,7 +2385,7 @@ impl<'a> Exec<'a> {
             base.wrapping_sub(delta)
         };
         let mut address = match index {
-            Index::Pre { .. } => adjusted,
+            Index::Pre { .. } | Index::Unprivileged => adjusted,
             Index::Post { .. } => base,
         };
         let privileged = self.privileged();
@@ -2277,7 +2419,9 @@ impl<'a> Exec<'a> {
         let pc = self.state.regs.r[15];
         self.insn_addr = pc;
         self.branched = false;
-        // In Thumb state R15 reads as the instruction's address plus four.
+        self.it_done = false;
+        // In Thumb state R15 reads as the instruction's address plus four,
+        // for either width (DDI 0406C A2.3.1).
         self.state.regs.r[15] = pc.wrapping_add(4);
 
         let half = match self.fetch(pc, Width::U16) {
@@ -2287,29 +2431,82 @@ impl<'a> Exec<'a> {
                 return;
             }
         };
-        let decoded = super::thumb::decode(half);
+        let arch = self.cfg.arch;
+        // Empty on a part without Thumb-2, so everything below is the ARMv5T
+        // path there.
+        let it = self.itstate();
         let saved = self.state.regs.r;
-        if let Err(abort) = self.execute_thumb(decoded) {
+        let (outcome, len) = if arch.ext.thumb2 && super::thumb2::is_32bit(half) {
+            // The second halfword is fetched as part of the same
+            // instruction: a fault on it is a Prefetch Abort on this one,
+            // with the faulting address in `IFAR` (DDI 0406C B3.12.3).
+            let second = match self.fetch(pc.wrapping_add(2), Width::U16) {
+                Ok(w) => w as u16,
+                Err(abort) => {
+                    self.take_abort(abort);
+                    return;
+                }
+            };
+            let decoded = super::thumb2::decode_for(&arch, half, second);
+            let passes = if it.in_block() {
+                self.it_condition_passes(it.cond())
+            } else {
+                decoded.passes(self.state.regs.cpsr)
+            };
+            let outcome = if passes {
+                self.execute_arm(decoded)
+            } else {
+                Ok(())
+            };
+            (outcome, 4)
+        } else {
+            let insn = super::thumb::decode_for(&arch, half);
+            // `BKPT` executes whatever the block's condition (A8.8.24).
+            let passes = !it.in_block()
+                || matches!(insn, Thumb::Bkpt { .. })
+                || self.it_condition_passes(it.cond());
+            let outcome = if passes {
+                self.execute_thumb(insn, it.in_block())
+            } else {
+                Ok(())
+            };
+            (outcome, 2)
+        };
+        if let Err(abort) = outcome {
             self.state.regs.r = saved;
             self.state.regs.r[15] = pc;
             self.take_abort(abort);
             return;
         }
+        // `ITAdvance()` after every instruction of a block, executed or
+        // skipped, unless this one settled the state itself.
+        if it.in_block() && !self.it_done {
+            self.set_itstate(it.advance());
+        }
         if !self.branched {
-            self.state.regs.r[15] = pc.wrapping_add(2);
+            self.state.regs.r[15] = pc.wrapping_add(len);
         }
     }
 
+    /// Execute one 16-bit Thumb instruction whose condition has passed.
+    ///
+    /// `in_it` is `InITBlock()`: inside a block the encodings that set the
+    /// flags outside one do not (A8.8's 16-bit encodings, `setflags =
+    /// !InITBlock()`). `CMP`, `CMN` and `TST` exist only for their flags and
+    /// set them regardless.
     #[allow(clippy::too_many_lines)] // One arm per format; splitting it hides the table.
-    fn execute_thumb(&mut self, insn: Thumb) -> Ex {
+    fn execute_thumb(&mut self, insn: Thumb, in_it: bool) -> Ex {
         let carry_in = self.flag(psr::C);
+        let setflags = !in_it;
         match insn {
             Thumb::ShiftImm { ty, rd, rm, imm } => {
                 let value = self.reg(rm);
                 let (result, c) = Exec::shift_immediate(ty, value, imm, carry_in);
                 self.set_reg(rd, result);
-                self.set_nz(result);
-                self.set_flag(psr::C, c);
+                if setflags {
+                    self.set_nz(result);
+                    self.set_flag(psr::C, c);
+                }
                 Ok(())
             }
             Thumb::AddSub {
@@ -2326,7 +2523,9 @@ impl<'a> Exec<'a> {
                 let op = if sub { DpOp::Sub } else { DpOp::Add };
                 let (result, c, v) = Exec::alu(op, a, b, carry_in, carry_in, self.flag(psr::V));
                 self.set_reg(rd, result);
-                self.commit_flags(result, c, v);
+                if setflags {
+                    self.commit_flags(result, c, v);
+                }
                 Ok(())
             }
             Thumb::AluImm { op, rd, imm } => {
@@ -2345,14 +2544,16 @@ impl<'a> Exec<'a> {
                 if op == ImmOp::Mov {
                     // `MOV Rd, #imm8` sets only N and Z; there is no shifter
                     // in this encoding to produce a carry.
-                    self.set_nz(result);
-                } else {
+                    if setflags {
+                        self.set_nz(result);
+                    }
+                } else if setflags || op == ImmOp::Cmp {
                     self.commit_flags(result, c, v);
                 }
                 Ok(())
             }
             Thumb::Alu { op, rd, rm } => {
-                self.thumb_alu(op, rd, rm, carry_in);
+                self.thumb_alu(op, rd, rm, carry_in, setflags);
                 Ok(())
             }
             Thumb::HiReg { op, rd, rm } => {
@@ -2462,6 +2663,13 @@ impl<'a> Exec<'a> {
             }
             Thumb::Swi { imm } => {
                 self.state.last_swi = u32::from(imm);
+                // `TakeSVCException` advances the IT state *before* saving
+                // it: the return is to the next instruction, which must run
+                // under its own condition (DDI 0406C B1.9.9).
+                if in_it {
+                    let it = self.itstate().advance();
+                    self.set_itstate(it);
+                }
                 let lr = self.insn_addr.wrapping_add(2);
                 self.take_exception(Exception::Swi, lr);
                 Ok(())
@@ -2498,11 +2706,36 @@ impl<'a> Exec<'a> {
                 self.undefined_instruction();
                 Ok(())
             }
+            Thumb::CompareBranch {
+                nonzero,
+                rn,
+                offset,
+            } => {
+                if (self.reg(rn) == 0) != nonzero {
+                    let target = self.state.regs.r[15].wrapping_add(u32::from(offset));
+                    self.branch_to(target);
+                }
+                Ok(())
+            }
+            Thumb::It { firstcond, mask } => {
+                // `ITSTATE.IT<7:0> = firstcond:mask` (A8.8.54). The next
+                // instruction is the block's first, so this one does not
+                // advance it.
+                self.set_itstate(ItState::from_it(firstcond, mask));
+                self.it_done = true;
+                Ok(())
+            }
+            Thumb::Common(insn) => self.execute_insn(Decoded {
+                raw: 0,
+                cond: Cond::AL,
+                insn,
+            }),
         }
     }
 
-    /// Format 4, the register-to-register ALU. Every operation sets the flags.
-    fn thumb_alu(&mut self, op: AluOp, rd: u8, rm: u8, carry_in: bool) {
+    /// Format 4, the register-to-register ALU. Every operation sets the flags
+    /// outside an `IT` block; inside one only the three compares do.
+    fn thumb_alu(&mut self, op: AluOp, rd: u8, rm: u8, carry_in: bool, setflags: bool) {
         let a = self.reg(rd);
         let b = self.reg(rm);
         let v_in = self.flag(psr::V);
@@ -2554,7 +2787,9 @@ impl<'a> Exec<'a> {
         if writes {
             self.set_reg(rd, result);
         }
-        self.commit_flags(result, c, v);
+        if setflags || !writes {
+            self.commit_flags(result, c, v);
+        }
     }
 
     /// Thumb formats 7 and 8: the eight register-offset accesses.

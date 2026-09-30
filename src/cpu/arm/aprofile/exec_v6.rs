@@ -17,7 +17,7 @@
 use crate::core::value::Width;
 
 use super::super::cp::AccessKind;
-use super::super::isa::{BitfieldOp, Decoded, ExSize, HintOp, Insn};
+use super::super::isa::{BitfieldOp, Decoded, ExSize, HintOp, Index, Insn};
 use super::super::media;
 use super::super::{Mode, psr};
 use super::{Ex, Exec};
@@ -266,10 +266,33 @@ impl Exec<'_> {
                 writeback,
                 rn,
             } => return self.return_from_exception_rfe(before, up, writeback, rn),
-            Insn::LoadExclusive { size, rt, rn } => return self.load_exclusive(size, rt, rn),
-            Insn::StoreExclusive { size, rd, rt, rn } => {
-                return self.store_exclusive(size, rd, rt, rn);
+            Insn::LoadExclusive {
+                size,
+                rt,
+                rt2,
+                rn,
+                imm,
+            } => return self.load_exclusive(size, rt, rt2, rn, imm),
+            Insn::StoreExclusive {
+                size,
+                rd,
+                rt,
+                rt2,
+                rn,
+                imm,
+            } => {
+                return self.store_exclusive(size, rd, rt, rt2, rn, imm);
             }
+            Insn::TableBranch { half, rn, rm } => return self.table_branch(half, rn, rm),
+            Insn::LoadStoreDual {
+                load,
+                rt,
+                rt2,
+                rn,
+                up,
+                index,
+                imm,
+            } => return self.load_store_dual(load, rt, rt2, rn, up, index, imm),
             Insn::Clrex => self.state.monitor.clear(),
             Insn::Hint { op } => self.hint(op),
             // Barriers order memory against other observers and against the
@@ -405,6 +428,7 @@ impl Exec<'_> {
         // `CPSRWriteByInstr(value, '1111', TRUE)`: every field, including the
         // execution state, then `BranchWritePC` in the state just restored.
         self.state.regs.write_cpsr(cpsr);
+        self.it_done = true;
         self.exception_returned();
         self.state.regs.r[15] = if self.flag(psr::T) { pc & !1 } else { pc & !3 };
         self.branched = true;
@@ -431,14 +455,20 @@ impl Exec<'_> {
         self.translate(va, kind, privileged)
     }
 
+    /// Whether a doubleword exclusive's register pair is one A32 cannot
+    /// encode sensibly: an odd or `R14` first register is UNPREDICTABLE there,
+    /// as for `LDRD`. T32 names both registers and has no such rule.
+    fn bad_a32_pair(&self, size: ExSize, rt: u8) -> bool {
+        size == ExSize::Double && !self.flag(psr::T) && (rt & 1 != 0 || rt == 14)
+    }
+
     /// `LDREX`, `LDREXB`, `LDREXH`, `LDREXD` (A8.8's `LDREX*` pages).
-    fn load_exclusive(&mut self, size: ExSize, rt: u8, rn: u8) -> Ex {
-        if size == ExSize::Double && (rt & 1 != 0 || rt == 14) {
-            // An odd or `R14` first register is UNPREDICTABLE, as for LDRD.
+    fn load_exclusive(&mut self, size: ExSize, rt: u8, rt2: u8, rn: u8, imm: u16) -> Ex {
+        if self.bad_a32_pair(size, rt) {
             self.undefined_instruction();
             return Ok(());
         }
-        let address = self.reg(rn);
+        let address = self.reg(rn).wrapping_add(u32::from(imm));
         let pa = self.exclusive_pa(address, size.bytes(), AccessKind::Read)?;
         let privileged = self.privileged();
         let (low, high) = match size {
@@ -457,18 +487,18 @@ impl Exec<'_> {
         }
         self.set_reg(rt, low);
         if size == ExSize::Double {
-            self.set_reg(rt + 1, high);
+            self.set_reg(rt2, high);
         }
         Ok(())
     }
 
     /// `STREX`, `STREXB`, `STREXH`, `STREXD` (A8.8's `STREX*` pages).
-    fn store_exclusive(&mut self, size: ExSize, rd: u8, rt: u8, rn: u8) -> Ex {
-        if size == ExSize::Double && (rt & 1 != 0 || rt == 14) {
+    fn store_exclusive(&mut self, size: ExSize, rd: u8, rt: u8, rt2: u8, rn: u8, imm: u16) -> Ex {
+        if self.bad_a32_pair(size, rt) {
             self.undefined_instruction();
             return Ok(());
         }
-        let address = self.reg(rn);
+        let address = self.reg(rn).wrapping_add(u32::from(imm));
         // Translation and its faults come first, pass or fail: the
         // pseudocode's `ExclusiveMonitorsPass` translates before it looks at
         // either monitor.
@@ -487,13 +517,75 @@ impl Exec<'_> {
                 ExSize::Half => self.store(address, Width::U16, value & 0xffff, privileged)?,
                 ExSize::Word => self.store(address, Width::U32, value, privileged)?,
                 ExSize::Double => {
-                    let high = self.reg(rt + 1);
+                    let high = self.reg(rt2);
                     self.store(address, Width::U32, value, privileged)?;
                     self.store(address.wrapping_add(4), Width::U32, high, privileged)?;
                 }
             }
         }
         self.set_reg(rd, u32::from(!passed));
+        Ok(())
+    }
+
+    /// `TBB` and `TBH` (A8.8.411): a forward branch by twice a table entry.
+    ///
+    /// The PC reads as the instruction plus four, which is also where the
+    /// branch is measured from — so a table placed straight after the
+    /// instruction is indexed from its own start.
+    fn table_branch(&mut self, half: bool, rn: u8, rm: u8) -> Ex {
+        let base = self.reg(rn);
+        let index = self.reg(rm);
+        let privileged = self.privileged();
+        let entry = if half {
+            self.load_half_rotated(base.wrapping_add(index << 1), privileged)?
+        } else {
+            self.load(base.wrapping_add(index), Width::U8, privileged)?
+        };
+        self.cycle(1);
+        let target = self.reg(15).wrapping_add(entry << 1);
+        self.branch_to(target);
+        Ok(())
+    }
+
+    /// T32 `LDRD`/`STRD` (A8.8.72–A8.8.74, A8.8.210): the A32 doubleword
+    /// accesses with two independent registers.
+    #[allow(clippy::too_many_arguments)] // The encoding has this many fields.
+    fn load_store_dual(
+        &mut self,
+        load: bool,
+        rt: u8,
+        rt2: u8,
+        rn: u8,
+        up: bool,
+        index: Index,
+        imm: u16,
+    ) -> Ex {
+        let base = self.base_reg(rn);
+        let delta = u32::from(imm);
+        let adjusted = if up {
+            base.wrapping_add(delta)
+        } else {
+            base.wrapping_sub(delta)
+        };
+        let address = match index {
+            Index::Post { .. } => base,
+            Index::Pre { .. } | Index::Unprivileged => adjusted,
+        };
+        let privileged = self.privileged();
+        if load {
+            let (low, high) = self.load_dual(address, privileged)?;
+            if index.writes_base() {
+                self.set_reg(rn, adjusted);
+            }
+            self.set_reg(rt, low);
+            self.set_reg(rt2, high);
+        } else {
+            let (low, high) = (self.reg(rt), self.reg(rt2));
+            self.store_dual(address, low, high, privileged)?;
+            if index.writes_base() {
+                self.set_reg(rn, adjusted);
+            }
+        }
         Ok(())
     }
 
