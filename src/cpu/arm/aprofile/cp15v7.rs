@@ -190,7 +190,8 @@ mod reg {
     pub(super) const TPIDRURO: usize = 44;
     pub(super) const TPIDRPRW: usize = 45;
     pub(super) const POWER: usize = 46;
-    pub(super) const COUNT: usize = 47;
+    pub(super) const DIAGNOSTIC: usize = 47;
+    pub(super) const COUNT: usize = 48;
 }
 
 /// How many event counters the A9's performance monitor has (`PMCR.N`).
@@ -798,6 +799,14 @@ impl Cp15v7 {
 
             // ---- c15: the A9's own (DDI 0388 4.3.x) ----
             (0, 15, 0, 0) => Stored(reg::POWER, 0x0000_ff01),
+            // The Diagnostic Register: implementation-defined and documented
+            // only as "reserved for ARM use", but it is where the published
+            // Cortex-A9 errata workarounds set their chicken bits, so boot
+            // code does a read-modify-write of it in Secure state. The Alphard
+            // navi U-Boot sets bit 6 as its very first instruction after
+            // reset. No bit changes anything this model does; stored so the
+            // read back matches.
+            (0, 15, 0, 1) => Stored(reg::DIAGNOSTIC, u32::MAX),
             // NEON busy: never, with no NEON.
             (0, 15, 1, 0) => Const(0),
             (4, 15, 0, 0) => Target::Special(S::Cbar),
