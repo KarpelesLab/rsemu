@@ -1579,9 +1579,9 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// instance, so the pins are declared up to a number comfortably past what a
 /// board of this shape uses. A `wire … -> gic.spi999` on a 96-source block is
 /// still refused — by [`Device::sink`], at realize time, with the count in
-/// hand. 224 covers interrupt IDs up to 255, which is where an R-Car Gen1's
-/// peripherals end (its SD hosts are at 136–139).
-pub const SCHEMA_SPIS: u32 = 224;
+/// hand. 288 covers interrupt IDs up to 319, which is where an R-Car Gen1's
+/// peripherals end (its HPB-DMAC channels are at 260–303).
+pub const SCHEMA_SPIS: u32 = 288;
 
 /// What the validator should know about `arm.gic`.
 #[must_use]
