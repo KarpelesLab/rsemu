@@ -216,6 +216,10 @@ pub mod stm32;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-q35")))]
 pub mod q35;
 
+#[cfg(feature = "dev-navi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-navi")))]
+pub mod navi;
+
 #[cfg(feature = "dev-rcar")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-rcar")))]
 pub mod rcar;

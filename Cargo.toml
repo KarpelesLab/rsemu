@@ -1289,6 +1289,13 @@ dev-rcar = ["dev-sd-card", "bus-uart"]
 # `no_std + alloc`, no dependencies.
 dev-watchdog-pin = []
 
+# The Toyota Alphard navigation unit's board-level peers (src/dev/navi): today
+# `navi.psc`, the base board MCU's power-supply-control protocol peer on a UART
+# link -- the ACK/NAK packet protocol the kernel uses to switch the SD slot's
+# supply, among much else. Learnt from the unit's own kernel image, read as
+# data. `no_std + alloc`, no dependencies beyond the UART link.
+dev-navi = ["bus-uart"]
+
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a system
 # controller, virtio-MMIO with block and entropy devices, and a **device tree
 # generator** that emits the DTB from the realized machine graph rather than
