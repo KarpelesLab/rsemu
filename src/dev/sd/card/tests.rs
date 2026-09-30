@@ -980,7 +980,7 @@ fn a_drive_card_writes_through_to_its_medium() {
     bring_up(&card);
     short(card.command(cmd::WRITE_BLOCK, 1));
     let block = [0x5au8; BLOCK as usize];
-    card.write_data(&block);
+    let _ = card.write_data(&block);
     let mut back = [0u8; 4];
     store.read_at(BLOCK, &mut back).unwrap();
     assert_eq!(back, [0x5a; 4]);

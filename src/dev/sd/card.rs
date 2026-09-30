@@ -2073,8 +2073,47 @@ impl CardDevice {
             .and_then(crate::core::props::Value::as_str)
             .unwrap_or(super::DEFAULT_SLOT)
             .to_string();
-        let card = Arc::new(SdCard::new(props)?);
+        // A `drive` the run left empty, with no `size` to fall back on, is an
+        // empty socket: the board has the slot and nobody put a card in it.
+        // A small blank card stands behind the socket so the removable-media
+        // door still has something to load an image into later.
+        let drive = props.get("drive").and_then(crate::core::props::Value::as_str);
+        let supplied = match (drive, props.hosts()) {
+            (Some(name), Some(hosts)) => {
+                medium::get(hosts, name)?.is_some_and(|slot| slot.is_occupied())
+            }
+            _ => false,
+        };
+        let empty = drive.is_some() && !supplied && props.get("size").is_none();
+        let card = if empty {
+            let id = Identity::new(
+                HIGH_CAPACITY_UNIT,
+                true,
+                false,
+                IdentityText {
+                    manufacturer: 0x03,
+                    oem: "RE",
+                    product: "RSEMU",
+                    revision: 0x10,
+                    serial: 1,
+                    year: 2024,
+                    month: 1,
+                },
+            )?;
+            Arc::new(SdCard::with_identity(id, BusMode::Sd, 1)?)
+        } else {
+            Arc::new(SdCard::new(props)?)
+        };
         let holder = super::slots::attach(props, &slot)?;
+        if empty {
+            return Ok(CardDevice {
+                socket: Arc::new(Socket {
+                    card,
+                    holder,
+                    name: slot,
+                }),
+            });
+        }
         holder.insert(Arc::clone(&card)).map_err(|_| {
             config(format!(
                 "two cards were put in the slot called `{slot}`; give one of them another `slot`"
