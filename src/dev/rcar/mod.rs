@@ -10,6 +10,7 @@
 //! | --- | --- | --- |
 //! | [`scif`] | `rcar.scif` | the SCIF (16-byte FIFOs) and, by `variant`, the HSCIF (128-byte FIFOs), on the character-device seam |
 //! | [`tmu`] | `rcar.tmu` | one TMU: three 32-bit down-counters on the prescaled peripheral clock, lazily advanced |
+//! | [`gpio`] | `rcar.gpio` | one GPIO bank: 32 pins as wires both ways, the output latch, edge and level interrupts |
 //! | [`sdhi`] | `rcar.sdhi` | the SD host interface: command engine, one-block buffer, DMA requests, driving a `sd.card` through a socket |
 //! | [`du`] | `rcar.du` | the R-Car Display Unit: timing registers, up to eight planes composed from guest memory, a frame counter on the dot clock |
 //!
@@ -25,11 +26,13 @@ use crate::core::error::Result;
 use crate::machine::validate::ClassSchema;
 
 pub mod du;
+pub mod gpio;
 pub mod scif;
 pub mod sdhi;
 pub mod tmu;
 
 pub use du::Du;
+pub use gpio::Gpio;
 pub use scif::Scif;
 pub use sdhi::Sdhi;
 pub use tmu::Tmu;
@@ -40,6 +43,7 @@ pub use tmu::Tmu;
 ///
 /// If something already claimed one of the names.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
+    gpio::register(registry)?;
     scif::register(registry)?;
     sdhi::register(registry)?;
     tmu::register(registry)?;
@@ -52,6 +56,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// If one of the names is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    gpio::bind(bindings)?;
     scif::bind(bindings)?;
     sdhi::bind(bindings)?;
     tmu::bind(bindings)?;
@@ -61,5 +66,5 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// Every class's validator schema.
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
-    alloc::vec![scif::schema(), sdhi::schema(), tmu::schema(), du::schema()]
+    alloc::vec![gpio::schema(), scif::schema(), sdhi::schema(), tmu::schema(), du::schema()]
 }
