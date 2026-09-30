@@ -1,4 +1,5 @@
-//! The ARMv5TE interpreter.
+//! The interpreter: ARMv5TE, and — through `exec_v6.rs` and the `ext.v6`
+//! branches here — the ARMv6/ARMv7 A32 additions and PSR model.
 //!
 //! # The timing model, and why it is not a cycle table
 //!
@@ -70,6 +71,7 @@ use super::cp::{
 use super::isa::{
     Decoded, DpOp, ExtraOp, Half, HalfMulOp, Index, Insn, Offset, Operand, SatOp, Shift, ShiftType,
 };
+use super::monitor::{GlobalMonitor, LocalMonitor};
 use super::thumb::{AluOp, HiOp, ImmOp, MemRegOp, MemSize, SmallOperand, Thumb};
 use super::{Config, Mode, Regs, psr};
 
@@ -77,6 +79,10 @@ use super::{Config, Mode, Regs, psr};
 /// path rather than growing a second one.
 #[cfg(feature = "cpu-arm-aprofile-vfp")]
 mod vfp;
+// The ARMv6-and-later instructions, split out for length. A child module so
+// it can reach `Exec`'s private fields.
+#[path = "exec_v6.rs"]
+mod v6;
 
 /// The seven ARM exceptions, in the order their vectors appear.
 ///
@@ -137,6 +143,17 @@ impl Exception {
     #[must_use]
     pub const fn masks_fiq(self) -> bool {
         matches!(self, Exception::Reset | Exception::Fiq)
+    }
+
+    /// Whether entry on ARMv6 and later masks asynchronous aborts too.
+    ///
+    /// Every exception that could itself be interrupted by an imprecise
+    /// abort before its handler has saved state does: Reset, both aborts,
+    /// IRQ and FIQ. Undefined Instruction and SVC leave `CPSR.A` alone
+    /// (DDI 0406C B1.8.3–B1.8.8, each exception's `CPSR.A` assignment).
+    #[must_use]
+    pub const fn masks_async_abort(self) -> bool {
+        !matches!(self, Exception::Undefined | Exception::Swi)
     }
 
     /// A short name, for tracing.
@@ -203,6 +220,14 @@ pub(super) struct State {
     /// `arch.ext.vfp` is set can reach it.
     #[cfg(feature = "cpu-arm-aprofile-vfp")]
     pub vfp: super::vfp::VfpRegs,
+    /// The local exclusive monitor (ARMv6; see [`super::monitor`]).
+    pub monitor: LocalMonitor,
+    /// The event register `SEV` sets and `WFE` consumes (ARMv6K; DDI 0406C
+    /// B1.8, "Wait For Event and Send Event").
+    pub event: bool,
+    /// The halt in progress is a `WFE`, which an event also ends, rather
+    /// than a `WFI`, which only an interrupt does.
+    pub waiting_for_event: bool,
 }
 
 impl State {
@@ -220,6 +245,9 @@ impl State {
             debt: 0,
             #[cfg(feature = "cpu-arm-aprofile-vfp")]
             vfp: super::vfp::VfpRegs::new(),
+            monitor: LocalMonitor::OPEN,
+            event: false,
+            waiting_for_event: false,
         }
     }
 }
@@ -297,6 +325,9 @@ pub(super) struct Exec<'a> {
     tlb: &'a mut Tlb,
     coprocessors: &'a [Option<Arc<dyn Coprocessor>>; 16],
     cfg: &'a Config,
+    /// The shared exclusive monitor, when a machine with several cores has
+    /// attached one. `None` is one core and the local monitor alone.
+    global: Option<&'a dyn GlobalMonitor>,
     /// The MMU's control bits, sampled once for this instruction.
     regime: Regime,
     attrs: MemAttrs,
@@ -322,6 +353,7 @@ impl<'a> Exec<'a> {
         tlb: &'a mut Tlb,
         coprocessors: &'a [Option<Arc<dyn Coprocessor>>; 16],
         cfg: &'a Config,
+        global: Option<&'a dyn GlobalMonitor>,
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         let regime = mmu.regime();
@@ -333,6 +365,7 @@ impl<'a> Exec<'a> {
             tlb,
             coprocessors,
             cfg,
+            global,
             regime,
             attrs,
             insn_addr: 0,
@@ -353,6 +386,7 @@ impl<'a> Exec<'a> {
             // Reset disables the FPU (`FPEXC.EN` is 0 out of any reset).
             #[cfg(feature = "cpu-arm-aprofile-vfp")]
             self.state.vfp.reset_control();
+            self.state.waiting_for_event = false;
             self.take_exception(Exception::Reset, 0);
             return self.used;
         }
@@ -360,12 +394,24 @@ impl<'a> Exec<'a> {
         // An interrupt wakes a halted core whether or not it is masked — the
         // wake-up and the exception are separate things, and `WFI` returns on
         // the line, not on the handler (ARM926EJ-S TRM, "Wait for interrupt").
+        //
+        // A `WFE` also ends on an event, and consumes it (DDI 0406C B1.8).
+        // It ends on an interrupt whether or not that is masked, too: the
+        // architecture lets a `WFE` complete spuriously, and a masked
+        // interrupt is the event a single core would otherwise never see.
         if self.state.halted {
-            if !(irq || fiq) {
+            let event = self.state.waiting_for_event && self.state.event;
+            if !(irq || fiq || event) {
                 self.cycle(1);
                 return self.used;
             }
             self.state.halted = false;
+            if self.state.waiting_for_event {
+                self.state.waiting_for_event = false;
+                if event {
+                    self.state.event = false;
+                }
+            }
         }
 
         if fiq && !self.flag(psr::F) {
@@ -536,7 +582,13 @@ impl<'a> Exec<'a> {
     /// is what the ARM7TDMI does.
     fn return_from_exception(&mut self, target: u32) {
         if let Some(spsr) = self.state.regs.spsr() {
+            // The whole `SPSR` comes back, including the ARMv6 fields — `GE`,
+            // `E`, `A`, `J` and the IT state — which is what
+            // `CPSRWriteByInstr(…, TRUE)` asks for (DDI 0406C B1.3).
             self.state.regs.write_cpsr(spsr);
+        }
+        if self.cfg.arch.ext.v6 {
+            self.exception_returned();
         }
         self.state.regs.r[15] = if self.flag(psr::T) {
             target & !1
@@ -558,11 +610,15 @@ impl<'a> Exec<'a> {
     /// and with one it is CP15's `V` bit, which that strap set the reset value
     /// of. Guest code that clears the bit moves the vectors back down, which
     /// hardware permits and an ORed-in strap would not (ARM ARM A2.6.11).
+    ///
+    /// Low vectors are at `Regime::vector_base`: zero on everything before
+    /// the Security Extensions, `VBAR` on a part that has them (DDI 0406C
+    /// B1.8.1).
     fn vector_base(&self) -> u32 {
         if self.regime.high_vectors {
             0xffff_0000
         } else {
-            0
+            self.regime.vector_base
         }
     }
 
@@ -578,8 +634,28 @@ impl<'a> Exec<'a> {
         if kind.masks_fiq() {
             self.state.regs.cpsr |= psr::F;
         }
-        // Exceptions are always entered in ARM state.
-        self.state.regs.cpsr &= !psr::T;
+        if self.cfg.arch.ext.v6 {
+            // DDI 0406C B1.8.3–B1.8.8: the IT state and `J` are cleared, the
+            // instruction set is `SCTLR.TE`'s and the data endianness
+            // `SCTLR.EE`'s, and all but Undefined and SVC mask asynchronous
+            // aborts. The `SPSR` already holds every one of them as they were.
+            let mut cpsr = self.state.regs.cpsr & !(psr::IT | psr::J | psr::T | psr::E);
+            if kind.masks_async_abort() {
+                cpsr |= psr::A;
+            }
+            if self.regime.thumb_exceptions {
+                cpsr |= psr::T;
+            }
+            if self.regime.big_endian_exceptions {
+                cpsr |= psr::E;
+            }
+            self.state.regs.cpsr = cpsr;
+            // See `monitor`: an interrupted exclusive pair retries.
+            self.state.monitor.clear();
+        } else {
+            // Exceptions are always entered in ARM state before ARMv6.
+            self.state.regs.cpsr &= !psr::T;
+        }
         self.state.regs.r[15] = self.vector_base().wrapping_add(kind.vector());
         self.branched = true;
         // 2S + 1N in ARM's accounting: the refill, plus the cycle the core
@@ -698,7 +774,7 @@ impl<'a> Exec<'a> {
         self.cycle(1);
         let attrs = self.attrs.with_privileged(privileged);
         match self.space.read(u64::from(pa), width, attrs) {
-            Ok(v) => Ok(self.to_cpu_order(pa, width, v as u32)),
+            Ok(v) => Ok(self.data_order(width, self.to_cpu_order(pa, width, v as u32))),
             Err(_) => {
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = va;
@@ -716,12 +792,17 @@ impl<'a> Exec<'a> {
         let pa = self.translate(va, AccessKind::Write, privileged)?;
         self.cycle(1);
         let attrs = self.attrs.with_privileged(privileged);
-        let value = self.to_cpu_order(pa, width, value);
+        let value = self.to_cpu_order(pa, width, self.data_order(width, value));
         match self
             .space
             .write(u64::from(pa), width, u64::from(value), attrs)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(global) = self.global {
+                    global.observe_store(self.cfg.requester, u64::from(pa), width.bytes() as u32);
+                }
+                Ok(())
+            }
             Err(_) => {
                 self.state.faults = self.state.faults.wrapping_add(1);
                 self.state.last_fault = va;
@@ -734,12 +815,126 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Whether data accesses are big-endian because `CPSR.E` says so.
+    ///
+    /// ARMv6's mixed-endian support (BE-8): `SETEND` or an exception entry
+    /// with `SCTLR.EE` flips the byte order of *data* accesses only;
+    /// instruction fetches and translation-table walks keep their own
+    /// (DDI 0406C A3.3). Only a v6 part can set the bit, but an ARMv5 `MSR`
+    /// can write bit 9 as an ordinary reserved bit, so the version gates it.
+    #[inline]
+    fn data_big_endian(&self) -> bool {
+        self.cfg.arch.ext.v6 && self.flag(psr::E)
+    }
+
+    /// Apply `CPSR.E` to a data value of `width`.
+    #[inline]
+    fn data_order(&self, width: Width, value: u32) -> u32 {
+        if self.data_big_endian() {
+            swap_width(width, value)
+        } else {
+            value
+        }
+    }
+
+    /// Whether an unaligned word or halfword access is performed as one
+    /// rather than rotated: ARMv6 with `SCTLR.U`, and every ARMv7, which
+    /// dropped the rotation entirely (DDI 0406C A3.2.1, and appendix D on the differences from ARMv6).
+    #[inline]
+    fn unaligned_mode(&self) -> bool {
+        self.cfg.arch.has_unaligned() && (self.regime.unaligned || self.cfg.arch.ext.v7)
+    }
+
+    /// Reject an access that is not naturally aligned, whatever `SCTLR.A`
+    /// says — the rule for the instructions A3.2.1 lists as always
+    /// requiring alignment once unaligned support is on (`LDM`, `LDRD`,
+    /// `SWP`, the exclusives, `SRS`/`RFE`).
+    fn require_alignment(va: u32, bytes: u32, kind: AccessKind) -> Ex {
+        if va & (bytes - 1) != 0 {
+            return Err(Abort {
+                kind,
+                va,
+                fault: Fault::ALIGNMENT,
+            });
+        }
+        Ok(())
+    }
+
+    /// Byte-order a value assembled from single bytes in address order.
+    fn composed_order(&self, width: Width, value: u32) -> u32 {
+        if (self.cfg.endian == Endian::Big) != self.data_big_endian() {
+            swap_width(width, value)
+        } else {
+            value
+        }
+    }
+
+    /// A word or halfword load that may be unaligned (ARMv6 `U` / ARMv7).
+    ///
+    /// An aligned one is a single access, exactly as before; only an
+    /// unaligned one is composed from byte reads. That keeps a device
+    /// register — which is always aligned — seeing the one access of the
+    /// width it was written for, and it lets each byte translate on its own
+    /// so a load straddling a page boundary faults on whichever page is
+    /// missing, as the architecture requires.
+    fn load_unaligned(&mut self, va: u32, width: Width, privileged: bool) -> Ex<u32> {
+        self.check_alignment(va, width, AccessKind::Read)?;
+        if width.is_aligned(u64::from(va)) {
+            return self.load(va, width, privileged);
+        }
+        let mut value = 0u32;
+        for i in 0..width.bytes() as u32 {
+            value |= self.load(va.wrapping_add(i), Width::U8, privileged)? << (8 * i);
+        }
+        Ok(self.composed_order(width, value))
+    }
+
+    /// The store half of [`load_unaligned`](Exec::load_unaligned).
+    fn store_unaligned(&mut self, va: u32, width: Width, value: u32, privileged: bool) -> Ex {
+        self.check_alignment(va, width, AccessKind::Write)?;
+        if width.is_aligned(u64::from(va)) {
+            return self.store(va, width, value, privileged);
+        }
+        let value = self.composed_order(width, value);
+        for i in 0..width.bytes() as u32 {
+            self.store(
+                va.wrapping_add(i),
+                Width::U8,
+                (value >> (8 * i)) & 0xff,
+                privileged,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A word store: aligned down on ARMv5, performed unaligned on ARMv7.
+    fn store_word(&mut self, va: u32, value: u32, privileged: bool) -> Ex {
+        if self.unaligned_mode() {
+            self.store_unaligned(va, Width::U32, value, privileged)
+        } else {
+            self.store(va & !3, Width::U32, value, privileged)
+        }
+    }
+
+    /// A halfword store: aligned down on ARMv5, performed unaligned on ARMv7.
+    fn store_half(&mut self, va: u32, value: u32, privileged: bool) -> Ex {
+        if self.unaligned_mode() {
+            self.store_unaligned(va, Width::U16, value & 0xffff, privileged)
+        } else {
+            self.store(va & !1, Width::U16, value & 0xffff, privileged)
+        }
+    }
+
     /// A word load, with the unaligned rotate ARMv5 performs.
     ///
     /// The bus access is always word-aligned; the loaded value is rotated
     /// right by eight times the address's low two bits, which puts the
-    /// addressed byte in the low lane (ARM ARM A4.1.23).
+    /// addressed byte in the low lane (ARM ARM A4.1.23). On a part doing
+    /// real unaligned accesses there is no rotate.
     fn load_word_rotated(&mut self, va: u32, privileged: bool) -> Ex<u32> {
+        if self.unaligned_mode() {
+            return self.load_unaligned(va, Width::U32, privileged);
+        }
         if self.regime.alignment_faults {
             self.check_alignment(va, Width::U32, AccessKind::Read)?;
         }
@@ -754,6 +949,9 @@ impl<'a> Exec<'a> {
     /// access is aligned and the value comes back rotated so the addressed
     /// byte lands in the low lane. Measured against the corpus.
     fn load_half_rotated(&mut self, va: u32, privileged: bool) -> Ex<u32> {
+        if self.unaligned_mode() {
+            return self.load_unaligned(va, Width::U16, privileged);
+        }
         if self.regime.alignment_faults {
             self.check_alignment(va, Width::U16, AccessKind::Read)?;
         }
@@ -768,6 +966,10 @@ impl<'a> Exec<'a> {
     /// better known consequences of ARMv5 leaving the case UNPREDICTABLE
     /// (ARM ARM A4.1.22). The access on the bus is still a halfword.
     fn load_signed_half(&mut self, va: u32, privileged: bool) -> Ex<u32> {
+        if self.unaligned_mode() {
+            let value = self.load_unaligned(va, Width::U16, privileged)?;
+            return Ok(i32::from(value as u16 as i16) as u32);
+        }
         if self.regime.alignment_faults {
             self.check_alignment(va, Width::U16, AccessKind::Read)?;
         }
@@ -1029,7 +1231,7 @@ impl<'a> Exec<'a> {
                 return;
             }
         };
-        let decoded = super::isa::decode(word);
+        let decoded = super::isa::decode_for(&self.cfg.arch, word);
         let saved = self.state.regs.r;
         let outcome = if decoded.passes(self.state.regs.cpsr) {
             self.execute_arm(decoded)
@@ -1104,7 +1306,13 @@ impl<'a> Exec<'a> {
                         if s {
                             self.commit_flags(result, c, v);
                         }
-                        self.branch_to(result);
+                        // `ALUWritePC` (DDI 0406C A2.3.2): on ARMv7 an ARM
+                        // data-processing write to the PC interworks.
+                        if self.cfg.arch.alu_write_pc_interworks() && !self.flag(psr::T) {
+                            self.branch_exchange(result);
+                        } else {
+                            self.branch_to(result);
+                        }
                     }
                 } else {
                     self.set_reg(rd, result);
@@ -1321,6 +1529,9 @@ impl<'a> Exec<'a> {
                 // shift. Using `R15` at all is UNPREDICTABLE.
                 let addr = self.reg_plus(rn, 4);
                 let privileged = self.privileged();
+                if !byte && self.unaligned_mode() {
+                    Exec::require_alignment(addr, 4, AccessKind::Read)?;
+                }
                 let value = if byte {
                     self.load(addr, Width::U8, privileged)?
                 } else {
@@ -1426,11 +1637,16 @@ impl<'a> Exec<'a> {
                 self.undefined_instruction();
                 Ok(())
             }
+            _ => self.execute_v6(decoded),
         }
     }
 
     /// Write `CPSR` or the current `SPSR` through an `MSR` field mask.
     fn write_psr(&mut self, spsr: bool, mask: u8, value: u32) {
+        if self.cfg.arch.ext.v6 {
+            self.write_psr_v6(spsr, mask, value);
+            return;
+        }
         let mut byte_mask = 0u32;
         if mask & 0b0001 != 0 {
             byte_mask |= 0x0000_00ff;
@@ -1464,6 +1680,61 @@ impl<'a> Exec<'a> {
         // Filtering it out would be the emulator silently overriding what the
         // guest asked for, which is the worse failure of the two.
         let new = (self.state.regs.cpsr & !byte_mask) | (value & byte_mask);
+        self.state.regs.write_cpsr(new);
+    }
+
+    /// `MSR` on ARMv6 and later: `CPSRWriteByInstr` and `SPSRWriteByInstr`
+    /// with `is_excp_return` false (DDI 0406C B1.3).
+    ///
+    /// Unlike ARMv5, the mask is no longer whole bytes: the execution-state
+    /// bits (`IT`, `J`, `T`) are writable only by an exception return, the
+    /// reserved bits 23:20 not at all, and User mode may write `NZCVQ`, `GE`
+    /// and `E` and nothing else. The Security Extensions' `SCR.AW`/`SCR.FW`
+    /// gates are always open, because this core runs everything Secure.
+    fn write_psr_v6(&mut self, spsr: bool, mask: u8, value: u32) {
+        if spsr {
+            let mut bits = 0u32;
+            if mask & 0b1000 != 0 {
+                bits |= 0xff00_0000;
+            }
+            if mask & 0b0100 != 0 {
+                bits |= psr::GE;
+            }
+            if mask & 0b0010 != 0 {
+                bits |= 0x0000_ff00;
+            }
+            if mask & 0b0001 != 0 {
+                bits |= 0x0000_00ff;
+            }
+            if let Some(current) = self.state.regs.spsr() {
+                self.state.regs.set_spsr((current & !bits) | (value & bits));
+            }
+            return;
+        }
+        let privileged = self.privileged();
+        let mut bits = 0u32;
+        if mask & 0b1000 != 0 {
+            bits |= psr::N | psr::Z | psr::C | psr::V | psr::Q;
+        }
+        if mask & 0b0100 != 0 {
+            bits |= psr::GE;
+        }
+        if mask & 0b0010 != 0 {
+            bits |= psr::E;
+            if privileged {
+                bits |= psr::A;
+            }
+        }
+        if mask & 0b0001 != 0 && privileged {
+            bits |= psr::I | psr::F;
+            // A mode the part does not have — including Monitor, which this
+            // core does not model — is UNPREDICTABLE; the mode is left as it
+            // was rather than banking into nothing.
+            if Mode((value & psr::MODE) as u8).is_defined() {
+                bits |= psr::MODE;
+            }
+        }
+        let new = (self.state.regs.cpsr & !bits) | (value & bits);
         self.state.regs.write_cpsr(new);
     }
 
@@ -1594,7 +1865,7 @@ impl<'a> Exec<'a> {
             if byte {
                 self.store(address, Width::U8, value & 0xff, privileged)?;
             } else {
-                self.store(address & !3, Width::U32, value, privileged)?;
+                self.store_word(address, value, privileged)?;
             }
             if index.writes_base() {
                 self.set_reg(rn, adjusted);
@@ -1625,12 +1896,27 @@ impl<'a> Exec<'a> {
             Index::Pre { .. } => adjusted,
             Index::Post { .. } => base,
         };
-        let privileged = self.privileged();
+        // `LDRHT` and friends (v6T2): as for `LDRT`, an unprivileged access
+        // from privileged code.
+        let privileged = match index {
+            Index::Post { unprivileged: true } => false,
+            _ => self.privileged(),
+        };
+        // LDRD and STRD need only word alignment on ARMv7, but they do need
+        // it, whatever `SCTLR.A` says (DDI 0406C A3.2.1).
+        if matches!(op, ExtraOp::Ldrd | ExtraOp::Strd) && self.unaligned_mode() {
+            let kind = if op.is_load() {
+                AccessKind::Read
+            } else {
+                AccessKind::Write
+            };
+            Exec::require_alignment(address, 4, kind)?;
+        }
 
         match op {
             ExtraOp::Strh => {
                 let value = self.store_value(rd);
-                self.store(address & !1, Width::U16, value & 0xffff, privileged)?;
+                self.store_half(address, value, privileged)?;
             }
             ExtraOp::Ldrh => {
                 let value = self.load_half_rotated(address, privileged)?;
@@ -1734,6 +2020,18 @@ impl<'a> Exec<'a> {
             ),
             (true, false) => (base.wrapping_sub(span), base.wrapping_sub(span)),
         };
+
+        // With unaligned support on, a block transfer still needs a word
+        // address, and says so with an alignment fault rather than ignoring
+        // the low bits as ARMv5 did (DDI 0406C A3.2.1).
+        if self.unaligned_mode() {
+            let kind = if load {
+                AccessKind::Read
+            } else {
+                AccessKind::Write
+            };
+            Exec::require_alignment(start, 4, kind)?;
+        }
 
         let loads_pc = load && effective_list & 0x8000 != 0;
         // The S bit means "the user-mode bank" unless this is an LDM that
@@ -2279,10 +2577,8 @@ impl<'a> Exec<'a> {
             let value = self.reg(rd);
             match op {
                 MemRegOp::Strb => self.store(address, Width::U8, value & 0xff, privileged)?,
-                MemRegOp::Strh => {
-                    self.store(address & !1, Width::U16, value & 0xffff, privileged)?;
-                }
-                _ => self.store(address & !3, Width::U32, value, privileged)?,
+                MemRegOp::Strh => self.store_half(address, value, privileged)?,
+                _ => self.store_word(address, value, privileged)?,
             }
         }
         Ok(())
@@ -2303,12 +2599,20 @@ impl<'a> Exec<'a> {
             let value = self.reg(rd);
             match size {
                 MemSize::Byte => self.store(address, Width::U8, value & 0xff, privileged)?,
-                MemSize::Half => {
-                    self.store(address & !1, Width::U16, value & 0xffff, privileged)?;
-                }
-                MemSize::Word => self.store(address & !3, Width::U32, value, privileged)?,
+                MemSize::Half => self.store_half(address, value, privileged)?,
+                MemSize::Word => self.store_word(address, value, privileged)?,
             }
         }
         Ok(())
+    }
+}
+
+/// Reverse the bytes of the low `width` of `value`.
+#[inline]
+const fn swap_width(width: Width, value: u32) -> u32 {
+    match width {
+        Width::U8 => value,
+        Width::U16 => (value as u16).swap_bytes() as u32,
+        _ => value.swap_bytes(),
     }
 }

@@ -1,15 +1,33 @@
-//! The ARMv5TE core — an ARM926EJ-S-class interpreter with Thumb, the DSP
-//! extensions, and a coprocessor seam where CP15 goes.
+//! The A-profile 32-bit core — an ARM926EJ-S-class ARMv5TE interpreter that
+//! also executes the ARMv7-A **A32** instruction set when its part says so.
 //!
-//! Covers what an ARM9 SoC needs and nothing it does not: the full 32-bit ARM
-//! instruction set including `CLZ`, both forms of `BLX`, `BKPT` and the E
-//! extensions (`QADD`, `SMLA<x><y>`, `LDRD`/`STRD`, `PLD`); the full 16-bit
-//! Thumb set with interworking; all seven processor modes with their banked
-//! registers; the complete exception model; and, when a machine asks for one,
-//! a real [`cp15::Cp15`] with the VMSAv5 MMU behind it — or, on a Cortex-A9,
-//! a [`cp15v7::Cp15v7`] with the VMSAv7 short-descriptor MMU. The caches and the
-//! TCMs are **not** here — those are the SoC's, and anything else it wants to
-//! add attaches through [`cp::Coprocessor`] and [`cp::Mmu`].
+//! As an ARMv5TE part it covers what an ARM9 SoC needs and nothing it does
+//! not: the full 32-bit ARM instruction set including `CLZ`, both forms of
+//! `BLX`, `BKPT` and the E extensions (`QADD`, `SMLA<x><y>`, `LDRD`/`STRD`,
+//! `PLD`); the full 16-bit Thumb set with interworking; all seven processor
+//! modes with their banked registers; the complete exception model; and, when
+//! a machine asks for one, a real [`cp15::Cp15`] with the VMSAv5 MMU behind
+//! it — or, on a Cortex-A9, a [`cp15v7::Cp15v7`] with the VMSAv7
+//! short-descriptor MMU and, with `cpu-arm-aprofile-vfp`, VFPv3-D32. The caches and the TCMs are **not** here — those are the SoC's, and
+//! anything else it wants to add attaches through [`cp::Coprocessor`] and
+//! [`cp::Mmu`].
+//!
+//! Configured as a later part ([`Config::arch`], `cpu = "cortex-a9"`), the
+//! ARM-state instruction set grows to ARMv7-A's: the ARMv6 media instructions
+//! (`REV`, the extends, `SEL`, the parallel add/subtract family with `GE`,
+//! `SSAT`/`USAT`, `PKH`, the dual and most-significant-word multiplies,
+//! `USAD8`, `UMAAL`), `CPS`, `SRS`/`RFE`, `SETEND` with big-endian data
+//! accesses, the load/store exclusives with a local monitor ([`monitor`]),
+//! the ARMv6K hints (`WFI`, `WFE`/`SEV` with an event register, `YIELD`), the
+//! v6T2 additions (`MOVW`/`MOVT`, the bitfield instructions, `RBIT`, `MLS`,
+//! `LDRHT` and friends), and ARMv7's barriers, `PLI`, `PLDW`, `DBG`,
+//! interworking data-processing writes to the PC and true unaligned access.
+//! The PSR gains `GE`, `E`, `A`, `J` and the IT state, with ARMv6's `MSR`
+//! write rules and exception entry. Decode is gated on the part, so an
+//! ARM926EJ-S is bit-for-bit what it was and a feature probe on it still traps.
+//! `tests/conformance/ledgers/cpu-arm-aprofile-a32.txt` lists what is
+//! deliberately absent (`SMC` executes as Undefined; Monitor mode, a global
+//! exclusive monitor and Thumb-2 are elsewhere or later).
 //!
 //! # Using it from another crate
 //!
@@ -63,12 +81,15 @@
 //! | Module | Holds |
 //! | --- | --- |
 //! | [`isa`] | the ARM decoder, producing one semantic value that both the interpreter and the disassembler read |
+//! | [`isa_v6`] | the same decoder's ARMv6-and-later half, gated on the part's [`Extensions`] |
+//! | [`media`] | the ARMv6 media arithmetic as pure functions |
+//! | [`monitor`] | the local exclusive monitor, and the seam for a global one |
 //! | [`thumb`] | the same for Thumb |
 //! | [`disasm`] | the disassembler built on those two |
 //! | [`cp`] | the coprocessor and MMU traits, the software TLB, `FlatMmu`, and a CP15 stub |
 //! | [`cp15`] | the ARMv5 system control coprocessor and the VMSAv5 table walk |
+//! | `exec` (private) | the interpreter, and the timing model it implements; `exec_v6.rs` is its ARMv6-and-later half |
 //! | [`cp15v7`] | the Cortex-A9 system control coprocessor and the VMSAv7 short-descriptor walk |
-//! | `exec` (private) | the interpreter, and the timing model it implements |
 //! | `vfp` (feature `cpu-arm-aprofile-vfp`) | the VFP register file, `FPSCR`/`FPEXC`/`FPSID`/`MVFR`, and the ARMv7 rules around [`crate::float`] |
 //! | `vfpisa` (same feature) | the VFP A32 decoder and its disassembly |
 //!
@@ -77,7 +98,9 @@
 //! *ARM Architecture Reference Manual*, ARM DDI 0100, ARMv5 revisions —
 //! chapters A2 (programmer's model), A3 (ARM encodings), A4 (ARM
 //! instructions), A5 (addressing modes), A6/A7 (Thumb), A10 (the DSP
-//! extensions), B2 (the system control coprocessor) and B4 (fault status).
+//! extensions), B2 (the system control coprocessor) and B4 (fault status);
+//! and ARM DDI 0406C (ARMv7-A and ARMv7-R) — A2–A5 and A8 for the A32
+//! additions, B1 for the PSRs, the exception model and the event register.
 //! Cycle counts from ARM's own instruction-cycle timing summaries. No emulator
 //! source of any licence was consulted (`ROADMAP.md` §1).
 
@@ -88,6 +111,9 @@ pub mod cp15v7;
 pub mod disasm;
 mod exec;
 pub mod isa;
+pub mod isa_v6;
+pub mod media;
+pub mod monitor;
 pub mod thumb;
 #[cfg(feature = "cpu-arm-aprofile-vfp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-aprofile-vfp")))]
@@ -100,6 +126,8 @@ pub mod vfpisa;
 mod tests;
 #[cfg(all(test, feature = "cpu-arm-aprofile-vfp"))]
 mod vfptests;
+#[cfg(test)]
+mod tests_v7;
 
 // The conformance runner reads a downloaded corpus off the filesystem, so it
 // exists only where there is one (`ROADMAP.md` §12).
@@ -130,6 +158,7 @@ use cp::{Coprocessor, FlatMmu, Mmu, Tlb};
 use cp15::Cp15;
 use cp15v7::Cp15v7;
 use exec::{Exec, State};
+use monitor::{GlobalMonitor, LocalMonitor};
 
 pub use exec::Exception;
 
@@ -146,6 +175,19 @@ pub mod psr {
     /// Sticky saturation, set by the DSP extensions and cleared only by an
     /// explicit `MSR` — bit 27.
     pub const Q: u32 = 1 << 27;
+    /// Jazelle state — bit 24 (ARMv5TEJ and later; always clear here, since
+    /// Jazelle is trivial).
+    pub const J: u32 = 1 << 24;
+    /// The four greater-than-or-equal flags the ARMv6 parallel add/subtract
+    /// instructions set and `SEL` reads — bits 19..16.
+    pub const GE: u32 = 0xf << 16;
+    /// Big-endian data accesses (ARMv6, `SETEND`) — bit 9.
+    pub const E: u32 = 1 << 9;
+    /// Asynchronous (imprecise) abort mask (ARMv6) — bit 8.
+    pub const A: u32 = 1 << 8;
+    /// The Thumb-2 `IT` block state, split across bits 26..25 (`IT[1:0]`) and
+    /// 15..10 (`IT[7:2]`) (DDI 0406C A2.5.2).
+    pub const IT: u32 = 0x0600_fc00;
     /// IRQ disable — bit 7.
     pub const I: u32 = 1 << 7;
     /// FIQ disable — bit 6.
@@ -675,6 +717,10 @@ pub(crate) struct Lines {
     /// lock there would re-enter the core's own critical section
     /// (`ROADMAP.md` §4.7).
     reset: AtomicBool,
+    /// An event another core's `SEV` sent, latched the same way and for the
+    /// same reason as `reset`: whoever sends it must not need this core's
+    /// execution lock.
+    event: AtomicBool,
 }
 
 impl Lines {
@@ -698,6 +744,11 @@ impl Lines {
     /// Consume the latch, reporting whether one was owed.
     fn take_reset_request(&self) -> bool {
         self.reset.swap(false, Ordering::AcqRel)
+    }
+
+    /// Consume a pending event, reporting whether one was sent.
+    fn take_event(&self) -> bool {
+        self.event.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -787,6 +838,8 @@ struct Session {
     /// The software TLB. Derived state: never serialized, emptied by reset, by
     /// a snapshot restore, and by either generation counter moving.
     tlb: Tlb,
+    /// The global exclusive monitor, when the machine has several cores.
+    global_monitor: Option<Arc<dyn GlobalMonitor>>,
 }
 
 impl fmt::Debug for Session {
@@ -800,11 +853,13 @@ impl fmt::Debug for Session {
                 &self.coprocessors.iter().filter(|c| c.is_some()).count(),
             )
             .field("tlb", &self.tlb.stats())
+            .field("global_monitor", &self.global_monitor.is_some())
             .finish()
     }
 }
 
-/// An ARMv5TE core.
+/// An A-profile ARM core: ARMv5TE, or the A32 half of ARMv7-A, as its
+/// [`Config::arch`] says.
 ///
 /// # Locking
 ///
@@ -931,6 +986,7 @@ impl Arm {
                     mmu,
                     coprocessors,
                     tlb: Tlb::new(),
+                    global_monitor: None,
                 },
             ),
             pins: sync::Mutex::new(Pins::default()),
@@ -1167,6 +1223,38 @@ impl Arm {
         self.session.lock().coprocessors[(cp & 0xf) as usize] = Some(coprocessor);
     }
 
+    /// Share a global exclusive monitor with the other cores of a machine.
+    ///
+    /// Only meaningful for a part with `LDREX`/`STREX` and a machine with
+    /// more than one core; see [`monitor`] for what it is consulted about.
+    /// Without one, a store-exclusive answers to this core's local monitor
+    /// alone, which is exactly right for a single core.
+    pub fn attach_global_monitor(&self, monitor: Arc<dyn GlobalMonitor>) {
+        self.session.lock().global_monitor = Some(monitor);
+    }
+
+    /// Deliver an event, as another core's `SEV` does (ARMv6K).
+    ///
+    /// Sets the event register at the next step, which wakes a `WFE` in
+    /// progress or lets the next one fall straight through. Lock-free, so a
+    /// core executing `SEV` can call it on its siblings from inside its own
+    /// step.
+    pub fn send_event(&self) {
+        self.lines.event.store(true, Ordering::Release);
+    }
+
+    /// Whether the event register is set.
+    #[must_use]
+    pub fn event_pending(&self) -> bool {
+        self.lines.event.load(Ordering::Acquire) || self.session.lock().state.event
+    }
+
+    /// The granule the local exclusive monitor has marked, if any.
+    #[must_use]
+    pub fn exclusive_tag(&self) -> Option<u32> {
+        self.session.lock().state.monitor.tag()
+    }
+
     /// Remove the coprocessor at number `cp`, so its instructions become
     /// Undefined again.
     pub fn detach_coprocessor(&self, cp: u8) {
@@ -1242,7 +1330,9 @@ impl Arm {
     /// Whether the core is waiting for an interrupt.
     ///
     /// Set by a coprocessor returning [`cp::CpEffect::HALT`], which is how
-    /// CP15's "wait for interrupt" register is implemented. A halted core
+    /// CP15's "wait for interrupt" register is implemented, and on ARMv6K
+    /// and later by `WFI` and by a `WFE` with no event pending (which an
+    /// event, from [`Arm::send_event`] or `SEV`, also ends). A halted core
     /// still consumes budget — it is idling, not stopped — and wakes on either
     /// interrupt input whether or not that interrupt is masked.
     #[must_use]
@@ -1331,6 +1421,7 @@ impl Arm {
     pub fn step(&self) -> u64 {
         let (irq, fiq) = self.lines.snapshot();
         let reset = self.lines.take_reset_request();
+        let event = self.lines.take_event();
         let cfg = self.config();
         let mut session = self.session.lock();
         let Session {
@@ -1339,16 +1430,29 @@ impl Arm {
             mmu,
             coprocessors,
             tlb,
+            global_monitor,
         } = &mut *session;
         // The `reset` pin latches outside the lock; this is where the latch
         // becomes execution state, and it must happen before the step so an
-        // assertion is honoured by the very next instruction boundary.
+        // assertion is honoured by the very next instruction boundary. An
+        // event from another core's `SEV` is folded in the same way.
         state.reset_pending |= reset;
+        state.event |= event;
         let Some(space) = space.clone() else {
             return 0;
         };
         let mmu = Arc::clone(mmu);
-        Exec::new(state, &space, mmu.as_ref(), tlb, coprocessors, &cfg).step(irq, fiq)
+        let global = global_monitor.clone();
+        Exec::new(
+            state,
+            &space,
+            mmu.as_ref(),
+            tlb,
+            coprocessors,
+            &cfg,
+            global.as_deref(),
+        )
+        .step(irq, fiq)
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -1464,7 +1568,7 @@ impl Arm {
         let mmu = Arc::clone(&session.mmu);
         drop(session);
         let attrs = MemAttrs::DEBUG.with_requester(cfg.requester);
-        disasm::disassemble_run(addr, count, thumb, |a| {
+        disasm::disassemble_run_for(&cfg.arch, addr, count, thumb, |a| {
             let pa = exec::debug_translate(&space, mmu.as_ref(), &cfg, a)
                 .ok_or(disasm::Missing::Untranslated)?;
             space
@@ -1498,7 +1602,7 @@ impl Arm {
             return Vec::new();
         };
         let attrs = MemAttrs::DEBUG.with_requester(self.config().requester);
-        disasm::disassemble_run(addr, count, thumb, |a| {
+        disasm::disassemble_run_for(&self.cfg.arch, addr, count, thumb, |a| {
             space
                 .read(u64::from(a), crate::core::value::Width::U8, attrs)
                 .map(|v| v as u8)
@@ -1536,8 +1640,12 @@ pub static CLASS: DeviceClass = DeviceClass {
     // 5: a core whose part has VFP appends the register file, FPSCR and
     //    FPEXC after CP15. Same reasoning as 3: a core without writes the v4
     //    bytes, but the class's chunk is no longer one shape.
-    version: 5,
-    summary: "ARMv5TE (ARM926EJ-S class) 32-bit CPU core with Thumb and the DSP extensions",
+    // 6: a core whose part has ARMv6 appends the local exclusive monitor and
+    //    the event register after everything else. An ARMv5 core's bytes are
+    //    unchanged, and a v5 chunk without the trailer means the reset values:
+    //    see `migrations`.
+    version: 6,
+    summary: "A-profile 32-bit ARM CPU core: ARMv5TE (ARM926EJ-S) or the ARMv7-A A32 instruction set (Cortex-A9), with Thumb",
     properties: &[
         PropertySpec {
             name: "big-endian",
@@ -1613,6 +1721,11 @@ pub static CLASS: DeviceClass = DeviceClass {
 ///
 /// # Errors
 ///
+/// v5 to v6 is the identity too: v6 added a trailer that only an
+/// ARMv6-or-later core writes, and `load` reads it only if it is there.
+///
+/// # Errors
+///
 /// If a step is already registered for this class.
 pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
     migrations.register(CLASS.name, 3, |r, out| {
@@ -1623,6 +1736,11 @@ pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()>
     // v4 -> v5 is the identity for the same reason: only a VFP part appends
     // anything, and no configuration that could be saved at v4 had VFP state.
     migrations.register(CLASS.name, 4, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        Ok(())
+    })?;
+    migrations.register(CLASS.name, 5, |r, out| {
         let body = r.take(r.remaining())?;
         out.extend_from_slice(body);
         Ok(())
@@ -1693,12 +1811,15 @@ impl Device for Arm {
                 // sequence runs, and nothing else is forced.
                 session.state.reset_pending = true;
                 session.state.halted = false;
+                session.state.waiting_for_event = false;
             }
         }
         if kind == ResetKind::Cold {
             // The input levels belong to whatever drives them; only a cold
             // start may assume they are idle.
             self.lines.restore((false, false));
+            // An event sent to the machine that was is not owed to this one.
+            self.lines.take_event();
         }
         // The latch is internal bookkeeping either way: the sequence the
         // machine just asked for is the one it owed.
@@ -1759,6 +1880,23 @@ impl Device for Arm {
         if self.cfg.arch.ext.vfp.is_some() {
             state.vfp.save(w)?;
         }
+        // v4: the ARMv6 execution state, only for a part that has it — so an
+        // ARMv5 core's chunk is byte-for-byte what it was.
+        if self.cfg.arch.ext.v6 {
+            let event = state.event || self.lines.event.load(Ordering::Acquire);
+            match state.monitor.tag() {
+                Some(tag) => {
+                    w.write_bool(true)?;
+                    w.write_u32(tag)?;
+                }
+                None => {
+                    w.write_bool(false)?;
+                    w.write_u32(0)?;
+                }
+            }
+            w.write_bool(event)?;
+            w.write_bool(state.waiting_for_event)?;
+        }
         Ok(())
     }
 
@@ -1799,6 +1937,18 @@ impl Device for Arm {
         if self.cfg.arch.ext.vfp.is_some() {
             state.vfp = vfp::VfpRegs::load(r)?;
         }
+        // The v4 trailer. A v3 chunk (carried forward unchanged by
+        // `migrations`) has none, and a v3 build never executed an `LDREX` or
+        // a `WFE` — it decoded both as Undefined — so the state it implies is
+        // exactly the default: monitor open, no event, not waiting.
+        if self.cfg.arch.ext.v6 && r.remaining() > 0 {
+            let armed = r.read_bool()?;
+            let tag = r.read_u32()?;
+            state.monitor = LocalMonitor::from_tag(armed.then_some(tag));
+            state.event = r.read_bool()?;
+            state.waiting_for_event = r.read_bool()?;
+        }
+        self.lines.take_event();
         {
             let mut session = self.session.lock();
             session.state = state;

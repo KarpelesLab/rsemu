@@ -21,6 +21,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use super::arch::Arch;
 use super::isa::{Decoded, Insn};
 use super::thumb::Thumb;
 
@@ -195,12 +196,20 @@ impl fmt::Display for Listed {
     }
 }
 
-/// Disassemble one ARM word at a known address.
+/// Disassemble one ARM word at a known address, as an ARMv5TE part reads it.
 #[must_use]
 pub fn disassemble_arm(addr: u32, word: u32) -> Listed {
+    disassemble_arm_for(&Arch::V5TE, addr, word)
+}
+
+/// Disassemble one ARM word at a known address, as the part `arch`
+/// describes reads it — so a word that part would take as Undefined lists as
+/// `UNDEFINED`, and the listing tells the truth about what will execute.
+#[must_use]
+pub fn disassemble_arm_for(arch: &Arch, addr: u32, word: u32) -> Listed {
     Listed::Arm {
         addr,
-        insn: super::isa::decode(word),
+        insn: super::isa::decode_for(arch, word),
     }
 }
 
@@ -231,6 +240,17 @@ pub fn disassemble_run(
     addr: u32,
     count: usize,
     thumb: bool,
+    read: impl FnMut(u32) -> Result<u8, Missing>,
+) -> Vec<Listed> {
+    disassemble_run_for(&Arch::V5TE, addr, count, thumb, read)
+}
+
+/// [`disassemble_run`] for the part `arch` describes.
+pub fn disassemble_run_for(
+    arch: &Arch,
+    addr: u32,
+    count: usize,
+    thumb: bool,
     mut read: impl FnMut(u32) -> Result<u8, Missing>,
 ) -> Vec<Listed> {
     let mut out = Vec::with_capacity(count);
@@ -256,7 +276,7 @@ pub fn disassemble_run(
         } else if thumb {
             disassemble_thumb(at, word as u16)
         } else {
-            disassemble_arm(at, word)
+            disassemble_arm_for(arch, at, word)
         };
         at = at.wrapping_add(listed.byte_len());
         out.push(listed);

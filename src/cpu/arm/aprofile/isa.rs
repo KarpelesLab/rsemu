@@ -42,6 +42,10 @@
 
 use core::fmt;
 
+use super::arch::{Arch, Extensions};
+pub use super::isa_v6::{BarrierKind, BitfieldOp, ExSize, HintOp};
+pub use super::media::{ExtendSize, ParKind, ParOp, ParShape, RevOp};
+
 /// Extract bits `hi..=lo` of `word`.
 ///
 /// Written to stay correct at `hi == 31, lo == 0`, where the obvious
@@ -543,11 +547,11 @@ impl Offset {
 }
 
 /// Formats one addressing-mode-2/3 operand: `[r1, #-4]!`, `[r1], r2, LSL #2`.
-struct Addressing {
-    rn: u8,
-    up: bool,
-    index: Index,
-    offset: Offset,
+pub(super) struct Addressing {
+    pub(super) rn: u8,
+    pub(super) up: bool,
+    pub(super) index: Index,
+    pub(super) offset: Offset,
 }
 
 impl fmt::Display for Addressing {
@@ -985,6 +989,307 @@ pub enum Insn {
     /// Taken as an Undefined Instruction exception, which is what the
     /// architecture requires — never silently skipped.
     Undefined,
+
+    // -----------------------------------------------------------------
+    // ARMv6 and later. Decoded by `isa_v6`, only for a part that has them.
+    // -----------------------------------------------------------------
+    /// The parallel add/subtract family (ARMv6): `SADD16` … `UHSUB8`.
+    Parallel {
+        /// Which of the thirty-six.
+        op: ParOp,
+        /// Destination.
+        rd: u8,
+        /// First operand.
+        rn: u8,
+        /// Second operand.
+        rm: u8,
+    },
+    /// `SXTB`/`UXTH`/… and the accumulating `SXTAB`/`UXTAH`/… (ARMv6).
+    Extend {
+        /// Sign- rather than zero-extend.
+        signed: bool,
+        /// Byte, halfword, or the two-byte `B16` form.
+        size: ExtendSize,
+        /// Destination.
+        rd: u8,
+        /// The addend, or `None` for the plain extend (`Rn == 0b1111`).
+        rn: Option<u8>,
+        /// The register extended.
+        rm: u8,
+        /// Rotate `Rm` right by eight times this first, `0..=3`.
+        rotate: u8,
+    },
+    /// `SEL` (ARMv6): bytes from `Rn` or `Rm` by the `GE` flags.
+    Sel {
+        /// Destination.
+        rd: u8,
+        /// Selected where `GE` is set.
+        rn: u8,
+        /// Selected where it is clear.
+        rm: u8,
+    },
+    /// `SSAT` and `USAT` (ARMv6).
+    Saturate {
+        /// `USAT` rather than `SSAT`.
+        unsigned: bool,
+        /// The saturation width: `1..=32` signed, `0..=31` unsigned.
+        bits: u8,
+        /// Destination.
+        rd: u8,
+        /// Source, shifted first.
+        rn: u8,
+        /// `ASR` rather than `LSL`; an `ASR` of zero means thirty-two.
+        asr: bool,
+        /// The shift amount's raw `imm5`.
+        amount: u8,
+    },
+    /// `SSAT16` and `USAT16` (ARMv6).
+    Saturate16 {
+        /// `USAT16` rather than `SSAT16`.
+        unsigned: bool,
+        /// The width: `1..=16` signed, `0..=15` unsigned.
+        bits: u8,
+        /// Destination.
+        rd: u8,
+        /// Source.
+        rn: u8,
+    },
+    /// `PKHBT` and `PKHTB` (ARMv6).
+    Pack {
+        /// `PKHTB`: top from `Rn`, bottom from `Rm ASR`.
+        tb: bool,
+        /// Destination.
+        rd: u8,
+        /// First operand, unshifted.
+        rn: u8,
+        /// Second operand, shifted.
+        rm: u8,
+        /// The raw `imm5`; zero means thirty-two for `PKHTB`.
+        amount: u8,
+    },
+    /// `REV`, `REV16`, `REVSH` (ARMv6) and `RBIT` (v6T2).
+    Reverse {
+        /// Which reversal.
+        op: RevOp,
+        /// Destination.
+        rd: u8,
+        /// Source.
+        rm: u8,
+    },
+    /// `SMUAD`/`SMUSD`/`SMLAD`/`SMLSD` and their `X` forms (ARMv6).
+    DualMul {
+        /// Subtract the high product from the low rather than add.
+        sub: bool,
+        /// Swap `Rm`'s halves first.
+        exchange: bool,
+        /// Destination.
+        rd: u8,
+        /// First operand.
+        rn: u8,
+        /// Second operand.
+        rm: u8,
+        /// Accumulator, or `None` for the `SMU` forms.
+        ra: Option<u8>,
+    },
+    /// `SMLALD`/`SMLSLD` and their `X` forms (ARMv6).
+    DualMulLong {
+        /// Subtract the high product rather than add.
+        sub: bool,
+        /// Swap `Rm`'s halves first.
+        exchange: bool,
+        /// High half of the accumulator pair.
+        rdhi: u8,
+        /// Low half of the accumulator pair.
+        rdlo: u8,
+        /// First operand.
+        rn: u8,
+        /// Second operand.
+        rm: u8,
+    },
+    /// `SMMUL`/`SMMLA`/`SMMLS` and their `R` forms (ARMv6): the top word of
+    /// a 64-bit product.
+    MulHigh {
+        /// `SMMLS`: subtract the product from `Ra:0`.
+        sub: bool,
+        /// Round rather than truncate.
+        round: bool,
+        /// Destination.
+        rd: u8,
+        /// First operand.
+        rn: u8,
+        /// Second operand.
+        rm: u8,
+        /// Accumulator; `None` for `SMMUL`.
+        ra: Option<u8>,
+    },
+    /// `USAD8` and `USADA8` (ARMv6).
+    Usad8 {
+        /// Destination.
+        rd: u8,
+        /// First operand.
+        rn: u8,
+        /// Second operand.
+        rm: u8,
+        /// Accumulator; `None` for `USAD8`.
+        ra: Option<u8>,
+    },
+    /// `UMAAL` (ARMv6): `RdHi:RdLo = Rn * Rm + RdHi + RdLo`.
+    Umaal {
+        /// High half.
+        rdhi: u8,
+        /// Low half.
+        rdlo: u8,
+        /// First operand.
+        rn: u8,
+        /// Second operand.
+        rm: u8,
+    },
+    /// `MLS` (v6T2): `Rd = Ra - Rn * Rm`.
+    Mls {
+        /// Destination.
+        rd: u8,
+        /// First multiplicand.
+        rn: u8,
+        /// Second multiplicand.
+        rm: u8,
+        /// Minuend.
+        ra: u8,
+    },
+    /// `SDIV` and `UDIV` (when the part has the A32 divider).
+    Divide {
+        /// Signed.
+        signed: bool,
+        /// Destination.
+        rd: u8,
+        /// Dividend.
+        rn: u8,
+        /// Divisor.
+        rm: u8,
+    },
+    /// `MOVW` and `MOVT` (v6T2).
+    MovWide {
+        /// `MOVT`: write the top half and keep the bottom.
+        top: bool,
+        /// Destination.
+        rd: u8,
+        /// The sixteen-bit immediate.
+        imm: u16,
+    },
+    /// `BFC`, `BFI`, `SBFX`, `UBFX` (v6T2).
+    Bitfield {
+        /// Which.
+        op: BitfieldOp,
+        /// Destination.
+        rd: u8,
+        /// Source; `0b1111` for `BFC`.
+        rn: u8,
+        /// Lowest bit of the field.
+        lsb: u8,
+        /// Width of the field, `1..=32`; decode has checked it fits.
+        width: u8,
+    },
+    /// `CPS`, `CPSIE`, `CPSID` (ARMv6).
+    Cps {
+        /// `Some(true)` clears the named masks, `Some(false)` sets them.
+        enable: Option<bool>,
+        /// The asynchronous abort mask.
+        a: bool,
+        /// The IRQ mask.
+        i: bool,
+        /// The FIQ mask.
+        f: bool,
+        /// A mode to change to.
+        mode: Option<u8>,
+    },
+    /// `SETEND` (ARMv6): the data endianness bit.
+    Setend {
+        /// `SETEND BE`.
+        big: bool,
+    },
+    /// `SRS` (ARMv6): store `LR` and `SPSR` to another mode's stack.
+    Srs {
+        /// `IB`/`DB`.
+        before: bool,
+        /// `IA`/`IB`.
+        up: bool,
+        /// Update that mode's `SP`.
+        writeback: bool,
+        /// The mode whose `SP` is the base.
+        mode: u8,
+    },
+    /// `RFE` (ARMv6): load `PC` and `CPSR` from memory.
+    Rfe {
+        /// `IB`/`DB`.
+        before: bool,
+        /// `IA`/`IB`.
+        up: bool,
+        /// Update the base.
+        writeback: bool,
+        /// Base register.
+        rn: u8,
+    },
+    /// `LDREX` (ARMv6) and `LDREXB`/`LDREXH`/`LDREXD` (ARMv6K).
+    LoadExclusive {
+        /// Access size.
+        size: ExSize,
+        /// Destination; `LDREXD` also writes `Rt + 1`.
+        rt: u8,
+        /// Address register.
+        rn: u8,
+    },
+    /// `STREX` (ARMv6) and `STREXB`/`STREXH`/`STREXD` (ARMv6K).
+    StoreExclusive {
+        /// Access size.
+        size: ExSize,
+        /// Status: 0 if the store happened, 1 if not.
+        rd: u8,
+        /// Value; `STREXD` also stores `Rt + 1`.
+        rt: u8,
+        /// Address register.
+        rn: u8,
+    },
+    /// `CLREX` (ARMv6K).
+    Clrex,
+    /// `NOP`, `YIELD`, `WFE`, `WFI`, `SEV`, `DBG` (ARMv6K / ARMv7).
+    Hint {
+        /// Which.
+        op: HintOp,
+    },
+    /// `DMB`, `DSB`, `ISB` (ARMv7).
+    Barrier {
+        /// Which.
+        kind: BarrierKind,
+        /// The four-bit option (`SY` is `0b1111`).
+        option: u8,
+    },
+    /// `PLI` (ARMv7): preload for execution.
+    Pli {
+        /// Base register.
+        rn: u8,
+        /// Add the offset.
+        up: bool,
+        /// The offset.
+        offset: Offset,
+    },
+    /// `PLDW` (Multiprocessing Extensions): preload for a write.
+    Pldw {
+        /// Base register.
+        rn: u8,
+        /// Add the offset.
+        up: bool,
+        /// The offset.
+        offset: Offset,
+    },
+    /// `SMC` (Security Extensions).
+    Smc {
+        /// The four-bit immediate.
+        imm: u8,
+    },
+    /// `BXJ` (ARMv6 and later here): `BX`, on a part with a trivial Jazelle.
+    Bxj {
+        /// Register holding the target.
+        rm: u8,
+    },
 }
 
 /// A decoded instruction together with its condition and its raw encoding.
@@ -1017,36 +1322,56 @@ impl Decoded {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Decode one ARM instruction word.
+/// Decode one ARM instruction word as an ARMv5TE part — an ARM926EJ-S —
+/// sees it.
 ///
 /// Never fails: an encoding with no meaning decodes to [`Insn::Undefined`],
 /// which the interpreter turns into an Undefined Instruction exception.
+/// [`decode_for`] is the same decoder for a named architecture.
+#[must_use]
+pub fn decode(raw: u32) -> Decoded {
+    decode_for(&Arch::V5TE, raw)
+}
+
+/// Decode one ARM instruction word for the part `arch` describes.
+///
+/// An encoding the part lacks decodes exactly as it does on ARMv5TE, which
+/// for almost every new instruction is [`Insn::Undefined`] — the answer a
+/// guest probing for a feature must get (`ROADMAP.md` §6.1.1). The gate is
+/// here rather than in the interpreter because three encodings are *not*
+/// undefined on the older parts but mean something else there; see
+/// [`super::isa_v6`]'s module docs.
 ///
 /// The discriminators follow ARM ARM A3.1's top-level table and the two
 /// sub-tables it refers to, A3.4 ("Miscellaneous instructions") and A3.5
 /// ("Multiplies and extra load/store instructions"), in that order — the order
 /// matters, because the misc and multiply spaces are carved *out of* the
-/// data-processing space rather than sitting beside it.
+/// data-processing space rather than sitting beside it. DDI 0406C A5.1–A5.7
+/// is the same table grown for ARMv7.
 #[must_use]
-pub fn decode(raw: u32) -> Decoded {
+pub fn decode_for(arch: &Arch, raw: u32) -> Decoded {
+    let ext = &arch.ext;
     let cond = Cond(field(raw, 31, 28) as u8);
     if cond == Cond::NV {
         // ARMv5 reclaimed `0b1111` as a separate, unconditional space.
         return Decoded {
             raw,
             cond: Cond::AL,
-            insn: decode_unconditional(raw),
+            insn: decode_unconditional(raw, ext),
         };
     }
     Decoded {
         raw,
         cond,
-        insn: decode_conditional(raw),
+        insn: decode_conditional(raw, ext),
     }
 }
 
 /// The `cond == 0b1111` space (ARM ARM A3.1, "Unconditional instructions").
-fn decode_unconditional(raw: u32) -> Insn {
+fn decode_unconditional(raw: u32, ext: &Extensions) -> Insn {
+    if let Some(insn) = super::isa_v6::decode_unconditional_v6(raw, ext) {
+        return insn;
+    }
     match field(raw, 27, 25) {
         // 1111 101H <offset24>: BLX to a Thumb routine. H supplies bit 1 of
         // the target, so the reachable granularity is a halfword.
@@ -1072,7 +1397,17 @@ fn decode_unconditional(raw: u32) -> Insn {
 
 /// `PLD [Rn, offset]` — addressing mode 2 with `P == 1`, `U` free, `W == 0`.
 fn decode_pld(raw: u32) -> Insn {
-    let offset = if bit(raw, 25) {
+    Insn::Pld {
+        rn: field(raw, 19, 16) as u8,
+        up: bit(raw, 23),
+        offset: mode2_offset(raw),
+    }
+}
+
+/// The offset of a preload hint: a twelve-bit immediate, or a register
+/// shifted by an immediate when bit 25 is set (addressing mode 2).
+pub(super) fn mode2_offset(raw: u32) -> Offset {
+    if bit(raw, 25) {
         Offset::Reg {
             rm: field(raw, 3, 0) as u8,
             shift: Shift::Imm {
@@ -1082,25 +1417,20 @@ fn decode_pld(raw: u32) -> Insn {
         }
     } else {
         Offset::Imm(field(raw, 11, 0) as u16)
-    };
-    Insn::Pld {
-        rn: field(raw, 19, 16) as u8,
-        up: bit(raw, 23),
-        offset,
     }
 }
 
 /// Everything with a real condition field.
-fn decode_conditional(raw: u32) -> Insn {
+fn decode_conditional(raw: u32, ext: &Extensions) -> Insn {
     match field(raw, 27, 25) {
-        0b000 => decode_group_000(raw),
-        0b001 => decode_group_001(raw),
+        0b000 => decode_group_000(raw, ext),
+        0b001 => decode_group_001(raw, ext),
         0b010 => decode_load_store(raw, false),
         0b011 => {
             // A3.1: a set bit 4 in this group is the "media" space, which
             // ARMv6 defines and ARMv5 leaves undefined.
             if bit(raw, 4) {
-                Insn::Undefined
+                super::isa_v6::decode_media(raw, ext)
             } else {
                 decode_load_store(raw, true)
             }
@@ -1129,26 +1459,31 @@ fn decode_conditional(raw: u32) -> Insn {
 
 /// `0b000`: data processing with a register operand, plus the multiply, misc
 /// and extra load/store spaces carved out of it (ARM ARM A3.4, A3.5).
-fn decode_group_000(raw: u32) -> Insn {
+fn decode_group_000(raw: u32, ext: &Extensions) -> Insn {
     if bit(raw, 7) && bit(raw, 4) {
         // A3.5: bits 7 and 4 both set is the multiply / extra load-store
         // space, never a data-processing instruction.
         return if field(raw, 7, 4) == 0b1001 {
-            decode_multiply_or_swap(raw)
+            decode_multiply_or_swap(raw, ext)
         } else {
-            decode_extra_load_store(raw)
+            decode_extra_load_store(raw, ext)
         };
     }
     if field(raw, 24, 23) == 0b10 && !bit(raw, 20) {
         // A3.4: opcode `10xx` with S clear is not a compare — it is the
         // miscellaneous space.
-        return decode_misc(raw);
+        return decode_misc(raw, ext);
     }
     decode_data_proc_reg(raw)
 }
 
 /// `MUL`, `MLA`, the long multiplies, and `SWP` (ARM ARM A3.5).
-fn decode_multiply_or_swap(raw: u32) -> Insn {
+fn decode_multiply_or_swap(raw: u32, ext: &Extensions) -> Insn {
+    if field(raw, 27, 23) == 0b00000
+        && let Some(insn) = super::isa_v6::decode_multiply_v6(raw, ext)
+    {
+        return insn;
+    }
     match field(raw, 27, 23) {
         0b00000 => Insn::Mul {
             accumulate: bit(raw, 21),
@@ -1173,12 +1508,14 @@ fn decode_multiply_or_swap(raw: u32) -> Insn {
             rn: field(raw, 19, 16) as u8,
             rm: field(raw, 3, 0) as u8,
         },
+        // DDI 0406C A5.2.10: the load/store exclusives.
+        0b00011 => super::isa_v6::decode_exclusive(raw, ext),
         _ => Insn::Undefined,
     }
 }
 
 /// Addressing mode 3 (ARM ARM A5.3): halfword, signed byte, doubleword.
-fn decode_extra_load_store(raw: u32) -> Insn {
+fn decode_extra_load_store(raw: u32, ext: &Extensions) -> Insn {
     let load = bit(raw, 20);
     let op = match (load, field(raw, 6, 5)) {
         (false, 0b01) => ExtraOp::Strh,
@@ -1205,6 +1542,11 @@ fn decode_extra_load_store(raw: u32) -> Insn {
         Index::Pre {
             writeback: bit(raw, 21),
         }
+    } else if bit(raw, 21) && ext.thumb2 && !matches!(op, ExtraOp::Ldrd | ExtraOp::Strd) {
+        // v6T2 gave the redundant `W` a meaning: `LDRHT`, `LDRSBT`,
+        // `LDRSHT`, `STRHT` (DDI 0406C A5.2.9). The doubleword forms stay
+        // UNPREDICTABLE and keep the reading below.
+        Index::Post { unprivileged: true }
     } else {
         // `W` is redundant in a post-indexed access, which always writes the
         // base back, and ARMv5 has no `LDRHT` to give it a second meaning —
@@ -1228,7 +1570,7 @@ fn decode_extra_load_store(raw: u32) -> Insn {
 
 /// The miscellaneous space (ARM ARM A3.4): `MRS`, `MSR`, `BX`, `BLX`, `CLZ`,
 /// `BKPT`, the saturating arithmetic and the half-word multiplies.
-fn decode_misc(raw: u32) -> Insn {
+fn decode_misc(raw: u32, ext: &Extensions) -> Insn {
     let op = field(raw, 22, 21);
     if bit(raw, 7) {
         // Bit 7 set with bit 4 clear is the signed multiply family; both set
@@ -1300,6 +1642,14 @@ fn decode_misc(raw: u32) -> Insn {
         0b0111 if op == 0b01 => Insn::Bkpt {
             imm: ((field(raw, 19, 8) << 4) | field(raw, 3, 0)) as u16,
         },
+        // DDI 0406C A5.2.12: `BXJ` (a trivial Jazelle makes it `BX`) and
+        // `SMC`. ARMv5 leaves both undefined here.
+        0b0010 if op == 0b01 && ext.v6 => Insn::Bxj {
+            rm: field(raw, 3, 0) as u8,
+        },
+        0b0111 if op == 0b11 && ext.security => Insn::Smc {
+            imm: field(raw, 3, 0) as u8,
+        },
         _ => Insn::Undefined,
     }
 }
@@ -1331,7 +1681,7 @@ fn decode_data_proc_reg(raw: u32) -> Insn {
 }
 
 /// `0b001`: data processing with an immediate, and `MSR` immediate.
-fn decode_group_001(raw: u32) -> Insn {
+fn decode_group_001(raw: u32, ext: &Extensions) -> Insn {
     let operand = Operand::Imm {
         imm8: field(raw, 7, 0) as u8,
         rotate: field(raw, 11, 8) as u8,
@@ -1340,13 +1690,14 @@ fn decode_group_001(raw: u32) -> Insn {
         // Opcode `10xx` with S clear: `MSR` immediate if bit 21 is set,
         // architecturally undefined otherwise (ARM ARM A3.4's note).
         return if bit(raw, 21) {
-            Insn::Msr {
+            // An empty `CPSR` mask is the hint space on ARMv6K.
+            super::isa_v6::decode_hint(raw, ext).unwrap_or(Insn::Msr {
                 spsr: bit(raw, 22),
                 mask: field(raw, 19, 16) as u8,
                 operand,
-            }
+            })
         } else {
-            Insn::Undefined
+            super::isa_v6::decode_move_wide(raw, ext)
         };
     }
     Insn::DataProc {
@@ -1726,8 +2077,13 @@ impl fmt::Display for Decoded {
                 offset,
             } => write!(
                 f,
-                "{}{c} {}, {}",
+                "{}{}{c} {}, {}",
                 op.mnemonic(),
+                if matches!(index, Index::Post { unprivileged: true }) {
+                    "T"
+                } else {
+                    ""
+                },
                 RegName(rd),
                 Addressing {
                     rn,
@@ -1856,6 +2212,7 @@ impl fmt::Display for Decoded {
                 )
             }
             Insn::Undefined => write!(f, "UNDEFINED ; 0x{:08x}", self.raw),
+            _ => super::isa_v6::fmt_insn(self, f),
         }
     }
 }
