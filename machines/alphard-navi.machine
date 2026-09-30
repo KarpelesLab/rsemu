@@ -72,8 +72,10 @@ machine "alphard-navi" {
   }
 
   # On-chip SRAM: U-Boot copies its DDR initialisation here and runs it before
-  # DRAM exists, and the kernel keeps its warm-reboot flag at 0xfe794000.
-  object sram "ram" { size = 128K }
+  # DRAM exists, and the kernel keeps its warm-reboot flag at 0xfe794000. The
+  # 12 KiB below it, at 0xfe780000, are interrupt-controller registers, not
+  # memory: the kernel maps exactly that window for them.
+  object sram "ram" { size = 64K }
 
   # Two DDR3 channels, contiguous from 0x60000000. The kernel is told
   # mem=256M at 0x80000000; U-Boot relocates itself to the top of the second
@@ -82,7 +84,7 @@ machine "alphard-navi" {
 
   # -- the Cortex-A9 MPCore private region -----------------------------------
   object mpcore "arm.a9mpcore" { clock = cpuclk / 2, cpus = 1 }
-  object gic    "arm.gic"      { version = 1, cpus = 1, spis = 160 }
+  object gic    "arm.gic"      { version = 1, cpus = 1, spis = 288 }
   object l2     "arm.l2c310"   { size = 1M, ways = 16 }
 
   # -- SoC peripherals ---------------------------------------------------------
@@ -100,12 +102,23 @@ machine "alphard-navi" {
   # anything written there is visible on the `console` port.
   object scif0 "rcar.scif" { clock = pclk / 1024, port = "console" }
 
+  # The HPB-DMAC: the peripherals' DMA controller. The SCIFs and SD hosts move
+  # their data through it. Its channels reach the GIC through twelve group
+  # lines, IDs 142-153, with a status mirror at 0xfe782000 the kernel reads to
+  # tell the channels of a group apart (it numbers them 260 + n).
+  object hpbdmac "rcar.hpbdmac" { clock = pclk / 1024, space = mem }
+
   # SCIF1-5: the links to the sub-processors, driven by Aisin's scif_iif and
-  # its clients. SCIF5 is the PSC (power supply control) link, which the
-  # kernel runs in clock-synchronous mode; each is a host port of its own.
+  # its clients. SCIF3 is the PSC link to the base board's MN103 (power supply
+  # control, which switches the SD slot among much else), by DMA on channels
+  # 6 (transmit) and 7 (receive). SCIF n interrupts on GIC ID 120 + n.
   object scif1 "rcar.scif" { clock = pclk / 1024, port = "scif1" }
   object scif2 "rcar.scif" { clock = pclk / 1024, port = "scif2" }
-  object scif3 "rcar.scif" { clock = pclk / 1024, port = "scif3" }
+  object scif3 "rcar.scif" { clock = pclk / 1024, link = "psc", side = "a", dma = true }
+
+  # The base board's MCU on the other end of SCIF3, as its PSC protocol peer.
+  # One line per command it answers goes to the `psc` port.
+  object psc "navi.psc" { clock = wdclk, link = "psc", side = "b", log = "psc" }
   object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
   object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }
 
@@ -126,9 +139,12 @@ machine "alphard-navi" {
   # after leaving a boot flag in SRAM -- stops toggling and spins. What pulls
   # the SoC's reset then is the sub-processor, not modelled beyond this:
   # silence on the pin for `timeout` milliseconds. The real timeout is not
-  # known; two seconds is well clear of the kernel's kick period.
+  # known; two seconds is well clear of the kernel's kick period. It resets
+  # the whole SoC, warm -- every peripheral, not just the core -- and DRAM and
+  # SRAM keep their contents, which is what the warm reboot into a kernel
+  # loaded from the SD card depends on.
   osc wdclk = 1000 Hz
-  object subwdt "watchdog.pin" { clock = wdclk, timeout = 2000 }
+  object subwdt "watchdog.pin" { clock = wdclk, timeout = 2000, scope = "machine" }
 
   # The four SD host interfaces. The kernel's own resource tables give their
   # interrupts: SDHI0 is GIC ID 136, SDHI3 138, SDHI2 139 (SDHI1 is not used).
@@ -140,7 +156,7 @@ machine "alphard-navi" {
 
   # The map card: whatever the run supplies with `--drive sd=card.img`, and an
   # empty socket when it supplies nothing -- the unit's "no SD" case.
-  param map-slot = "sd0"
+  param map-slot = "sd3"
   object mapcard "sd.card" { drive = "sd", slot = map-slot }
 
   # The Display Unit: rcarfb drives plane 1 as 800x480 RGB565 from 0x9e000000.
@@ -149,10 +165,11 @@ machine "alphard-navi" {
   # -- placeholders: storage, not models (see the header) ---------------------
   object extcs  "ram" { size = 4K }    # 0x18100000: a device on an LBSC chip select U-Boot probes
   object intc   "ram" { size = 4K }    # 0xfe700000: interrupt mask registers
+  object intcs  "ram" { size = 8K }    # 0xfe780000: the interrupt controller's configuration
   object dbsc0  "ram" { size = 4K }    # 0xfe800000: DDR controller, channel 0
   object dbsc1  "ram" { size = 4K }    # 0xfec00000: DDR controller, channel 1
   object lbsc   "ram" { size = 4K }    # 0xff800000: local bus state controller
-  object misc0  "ram" { size = 64K }   # 0xffc00000: 0xffc00300/400, and the 0xffc08000/0xffc09000 blocks
+  object misc0  "ram" { size = 32K }   # 0xffc00000: 0xffc00300/400 (DMA request routing, among others)
   object darc   "ram" { size = 4K }    # 0xffc55000: the kernel's UIO_DARC block
   object i2c    "ram" { size = 12K }   # 0xffc70000: I2C 0-2
   object cpg    "ram" { size = 4K }    # 0xffc80000: clock pulse generator
@@ -172,11 +189,15 @@ machine "alphard-navi" {
   map mem 0xf0001000 size 0x1000 = gic.dist
   map mem 0xf0100000 size 0x1000 = l2
   map mem 0xfe700000 size 4K     = intc
-  map mem 0xfe780000 size 128K   = sram
+  map mem 0xfe780000 size 8K     = intcs
+  map mem 0xfe782000 size 4K     = hpbdmac.status
+  map mem 0xfe790000 size 64K    = sram
   map mem 0xfe800000 size 4K     = dbsc0
   map mem 0xfec00000 size 4K     = dbsc1
   map mem 0xff800000 size 4K     = lbsc
-  map mem 0xffc00000 size 64K    = misc0
+  map mem 0xffc00000 size 32K    = misc0
+  map mem 0xffc08000 size 0xb00  = hpbdmac.channels
+  map mem 0xffc09000 size 0x170  = hpbdmac.common
   map mem 0xffc40000 size 0x100  = gpio0
   map mem 0xffc41000 size 0x100  = gpio1
   map mem 0xffc42000 size 0x100  = gpio2
@@ -222,9 +243,28 @@ machine "alphard-navi" {
   wire gpio4.irq   -> gic.spi145      # ID 177
   wire gpio5.irq   -> gic.spi146      # ID 178
   wire gpio6.irq   -> gic.spi147      # ID 179
-  wire mapcard.cd  -> gpio3.in20      # GPIO 116: SDHI0's card-detect switch, low when a card is in
+  wire mapcard.cd  -> gpio2.in26      # GPIO 90: SDHI3's card-detect switch, low when a card is in
   wire mapcard.cd  -> gpio2.in28      # GPIO 92: the same switch as userspace watches it (falling edge)
   wire gpio4.out28 -> subwdt.kick     # GPIO 4.28: the watchdog kick
-  wire subwdt.reset -> cpu.reset
+  wire scif1.irq   -> gic.spi89       # ID 121
+  wire scif2.irq   -> gic.spi90       # ID 122
+  wire scif3.irq   -> gic.spi91       # ID 123
+  wire scif4.irq   -> gic.spi92       # ID 124
+  wire scif5.irq   -> gic.spi93       # ID 125
+  wire scif3.tx-dreq -> hpbdmac.dreq6
+  wire scif3.rx-dreq -> hpbdmac.dreq7
+  wire sdhi3.rx-dreq -> hpbdmac.dreq39   # traced: the SCR read runs on ch39
+  wire hpbdmac.grp0  -> gic.spi110   # ID 142: channels 0-10
+  wire hpbdmac.grp1  -> gic.spi111   # ID 143
+  wire hpbdmac.grp2  -> gic.spi112   # ID 144
+  wire hpbdmac.grp3  -> gic.spi113   # ID 145
+  wire hpbdmac.grp4  -> gic.spi114   # ID 146
+  wire hpbdmac.grp5  -> gic.spi115   # ID 147
+  wire hpbdmac.grp6  -> gic.spi116   # ID 148
+  wire hpbdmac.grp7  -> gic.spi117   # ID 149
+  wire hpbdmac.grp8  -> gic.spi118   # ID 150
+  wire hpbdmac.grp9  -> gic.spi119   # ID 151
+  wire hpbdmac.grp10 -> gic.spi120   # ID 152
+  wire hpbdmac.grp11 -> gic.spi121   # ID 153
   wire gic.irq0    -> cpu.irq
 }

@@ -1234,6 +1234,7 @@ machine-arm926 = ["cpu-arm-aprofile"]
 # what does not is in docs/platforms/alphard-navi.md. Adds no dependencies.
 machine-alphard-navi = [
     "cpu-arm-aprofile-vfp",
+    "dev-navi",
     "dev-watchdog-pin",
     "dev-arm-mpcore",
     "dev-arm-l2c310",
