@@ -1242,10 +1242,16 @@ dev-uart-ns16550 = []
 # back pressure and the manual's read-1-write-0 status flags; and `rcar.tmu`,
 # one TMU unit of three 32-bit down-counters on the prescaled peripheral clock,
 # lazily advanced on its own clock domain so TCNT is arithmetic and an
-# underflow interrupt lands on the tick it is due on. Reusable classes, not a
-# board: an R-Car H1 (R8A7779) machine file places them. Written from the
-# Renesas SH7780 Hardware Manual (SCIF §25, TMU §22) and the R-Car SCIF/HSCIF
-# chapters. `no_std + alloc`, no `unsafe`, no dependencies.
+# underflow interrupt lands on the tick it is due on; and `rcar.du`, the R-Car
+# Display Unit — its register file, the guest-programmed H/V timing, up to
+# eight planes (RGB565, ARGB1555, ARGB8888, XRGB8888) composed from guest
+# memory over a background colour, a frame counter and vblank interrupt on its
+# dot-clock domain, and a host adapter (`host::display::rcar`) so the picture
+# reaches `--screenshot` (with `display-png`) and `--vnc`. Reusable classes, not
+# a board: an R-Car H1 (R8A7779) machine file places them. Written from the
+# Renesas SH7780 Hardware Manual (SCIF §25, TMU §22), the R-Car SCIF/HSCIF and
+# DU chapters, and a black-box trace of a real DU driver's register writes.
+# `no_std + alloc`, no `unsafe`, no dependencies.
 dev-rcar = []
 
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a system

@@ -29,6 +29,39 @@ records what has been measured running both.
 | Game Boy PPU | [Pan Docs](https://gbdev.io/pandocs/) (CC0) |
 | SMS VDP | [SMS Power! documents](https://www.smspower.org/Development/Documents) |
 
+## SoC display controllers
+
+| Device | Source |
+| --- | --- |
+| Generic scanout engine (`lcd.scanout`) | **ours** — rsemu's own register block over a parallel-RGB scanout, see `src/dev/lcd/scanout.rs` |
+| Renesas R-Car Display Unit (`rcar.du`) | Renesas *R-Car Series User's Manual: Hardware*, Display Unit chapter (register names and offsets: `DSYSR`/`DSSR`/`DSRCR`/`DIER`/`DPPR`, the `HDSR`…`VSPR` timing block, plane *n* at `0x100 × n` with `PnMR`, `PnMWR`, `PnALPHAR`, `PnDSXR`/`PnDSYR`, `PnDPXR`/`PnDPYR`, `PnDSA0R`, `PnSPXR`/`PnSPYR`, `PnDDCR4`); and, as the primary source for what a guest does, a **black-box trace** of the register writes Renesas' Linux 2.6.35 `rcarfb` driver makes on an R-Car H1 head unit. No kernel source was read |
+
+`rcar.du` is deliberately minimal. Every offset in its 256 KiB window stores
+what is written; what it *interprets* is the display enable (`DSYSR.DEN`, with
+`DRES` clear), the active window (`HDER − HDSR` × `VDER − VDSR`), the frame
+(`(HCR + 1) × (VCR + 1)` dots of its `clock =` domain), the plane priority
+register, and each enabled plane's format, size, position, source offset and
+framebuffer address, which it reads from its `space =` when a frame is
+captured. `DSSR.FRM`/`VBK` latch at every frame boundary, `DSRCR` clears them,
+and `irq` is `DSSR & DIER`. Not modelled: the colour palette (8-bit planes
+show the index as grey), YCbCr (decoded as RGB565), colour keying, the
+automatic buffer-switching modes (`PnDSA0R` is always the one shown),
+`PnSWAPR`, `HBK` and the raster interrupt. The choices the manual left open to
+the author — which `DPPR` slot is on top, what `PnDPXR`/`PnDPYR` are relative
+to, `DSYSR`'s reset value — are listed in the module docs under *Uncertain*;
+the traced driver writes `PnDPXR = 16`, `PnDPYR = 9` for a full-screen plane,
+and the `plane-origin-x`/`-y` properties exist so a board can move the origin
+if the real panel shows the default reading is wrong.
+
+```text
+object du "rcar.du" {
+  clock = dotclk          # the DU dot clock; a frame is (HCR+1) x (VCR+1) ticks
+  space = mem             # where the framebuffers are: the DU is a bus master
+}
+map mem 0xfff80000 size 0x40000 = du
+wire du.irq -> gic.spiN   # optional (the board's DU SPI); the traced driver never enables it
+```
+
 ## Audio
 
 | Device | Source |

@@ -1314,6 +1314,8 @@ fn install_capture(
     rsemu::host::display::amiga::capture::install(options)?;
     #[cfg(feature = "dev-mac")]
     rsemu::host::display::mac::capture::install(options)?;
+    #[cfg(feature = "dev-rcar")]
+    rsemu::host::display::rcar::capture::install(options)?;
     // The pointer. Unconditional for the same reason a display is: the
     // interception constructs the same device from the same properties and
     // keeps an `Arc`, so whether a frontend is listening cannot change what was
@@ -1439,6 +1441,12 @@ fn take_scanout(
     // what knows what that is in nanoseconds.
     #[cfg(feature = "dev-mac")]
     if let Some(s) = rsemu::host::display::mac::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
+    // An R-Car's Display Unit needs the machine for its dot clock's rate: the
+    // frame is `(HCR + 1) x (VCR + 1)` dots of it.
+    #[cfg(feature = "dev-rcar")]
+    if let Some(s) = rsemu::host::display::rcar::capture::take(hosts, machine) {
         return Some(Box::new(s));
     }
     // Last, because it is the generic one: a board with a console's own video

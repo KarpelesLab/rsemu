@@ -38,7 +38,7 @@
 //! | [`linuxboot`] | `dev-linuxboot` | the Linux/x86 boot protocol: a bzImage into memory and a stub that enters it |
 //! | [`sitronix`] | `dev-st7272a`, `dev-st77xx` | the ST7272A TFT panel driver, which holds no picture, and the ST7789/ST7735, which hold theirs |
 //! | [`stm32`] | `dev-stm32` | STM32 peripherals: a GPIO port, a USART, and — under their own features — the reset/clock and power controllers |
-//! | [`rcar`] | `dev-rcar` | Renesas SH-4A/R-Car peripherals: the SCIF/HSCIF serial port and the TMU timer unit |
+//! | [`rcar`] | `dev-rcar` | Renesas SH-4A/R-Car peripherals: the SCIF/HSCIF serial port, the TMU timer unit and the R-Car Display Unit |
 //! | [`q35`] | `dev-q35` | the q35 chipset: an 82Q35 (G)MCH, an ICH9 LPC bridge, ECAM, and the ACPI table generator |
 //! | [`riscv`] | `dev-riscv` | the RISC-V `virt` board: CLINT, PLIC, and the device tree generator |
 //! | [`virtio`] | `dev-virtio` | virtio: split virtqueues, the MMIO transport, and block and entropy devices |

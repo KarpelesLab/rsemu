@@ -10,19 +10,24 @@
 //! | --- | --- | --- |
 //! | [`scif`] | `rcar.scif` | the SCIF (16-byte FIFOs) and, by `variant`, the HSCIF (128-byte FIFOs), on the character-device seam |
 //! | [`tmu`] | `rcar.tmu` | one TMU: three 32-bit down-counters on the prescaled peripheral clock, lazily advanced |
+//! | [`du`] | `rcar.du` | the R-Car Display Unit: timing registers, up to eight planes composed from guest memory, a frame counter on the dot clock |
 //!
-//! Both are written from the Renesas hardware manuals (the SH7780's SCIF and
-//! TMU chapters, and the R-Car SCIF/HSCIF chapters), cited by section in each
-//! file. No emulator, kernel or boot loader source was consulted.
+//! The SCIF and TMU are written from the Renesas hardware manuals (the
+//! SH7780's SCIF and TMU chapters, and the R-Car SCIF/HSCIF chapters), cited
+//! by section in each file; the DU from the R-Car manual's DU chapter and a
+//! black-box trace of a real driver's register writes, as [`du`] records. No
+//! emulator, kernel or boot loader source was consulted.
 
 use alloc::vec::Vec;
 
 use crate::core::error::Result;
 use crate::machine::validate::ClassSchema;
 
+pub mod du;
 pub mod scif;
 pub mod tmu;
 
+pub use du::Du;
 pub use scif::Scif;
 pub use tmu::Tmu;
 
@@ -33,7 +38,8 @@ pub use tmu::Tmu;
 /// If something already claimed one of the names.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     scif::register(registry)?;
-    tmu::register(registry)
+    tmu::register(registry)?;
+    du::register(registry)
 }
 
 /// Bind every class here into the machine graph.
@@ -43,11 +49,12 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 /// If one of the names is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     scif::bind(bindings)?;
-    tmu::bind(bindings)
+    tmu::bind(bindings)?;
+    du::bind(bindings)
 }
 
 /// Every class's validator schema.
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
-    alloc::vec![scif::schema(), tmu::schema()]
+    alloc::vec![scif::schema(), tmu::schema(), du::schema()]
 }

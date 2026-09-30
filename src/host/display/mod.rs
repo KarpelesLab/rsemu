@@ -22,7 +22,7 @@
 //!                             (Scanout)              → wasm exports → a canvas
 //! ```
 //!
-//! The device side is one small adapter per display device — [`nes`], [`lcd`], `amiga`,
+//! The device side is one small adapter per display device — [`nes`], [`lcd`], `rcar`, `amiga`,
 //! [`pc`], [`sms`] and [`gb`] — and the host side never learns which machine it
 //! is looking at. A virtio-gpu adds an adapter and nothing else changes.
 //!
@@ -105,6 +105,10 @@ pub mod panel;
 #[cfg(feature = "dev-pc-video")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-pc-video")))]
 pub mod pc;
+
+#[cfg(feature = "dev-rcar")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-rcar")))]
+pub mod rcar;
 
 #[cfg(feature = "dev-sms")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
