@@ -153,9 +153,9 @@ U-Boot variable.
 The vendor binaries under `/vns` (`pmng`, `osloader`, `smng`) are ARMv7
 **Thumb-2**; glibc and busybox are ARMv6 ARM/Thumb-1 with VFPv2.
 
-Twenty guest seconds take a little over three minutes of host time on an
-M-series Mac with the interpreter; the splash is up within the first ten, and
-the loaded kernel starts after roughly seventy.
+With a map card the loaded kernel starts about nine guest seconds in, a
+little under two minutes of host time on an M-series Mac with the
+interpreter.
 
 What would move it further: whatever the XIP kernel's faulting initcall wants
 (and the reset request on GPIO 0 bit 30 wired to the MCU, so it reboots rather
