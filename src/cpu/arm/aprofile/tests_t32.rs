@@ -985,7 +985,10 @@ fn t32_listing_matches_objdump() {
     let mut compared = 0;
     let mut wrong = Vec::new();
     for &(addr, expected) in T32_CORPUS {
-        if style_differs(expected) {
+        // Without the VFP feature there is no VFP decoder, and a VFP word
+        // lists as the coprocessor instruction it also is, as in A32.
+        let vfp = expected.starts_with('v');
+        if style_differs(expected) || (vfp && !cfg!(feature = "cpu-arm-aprofile-vfp")) {
             continue;
         }
         let Some(entry) = listing.iter().find(|l| l.addr() == addr) else {
@@ -1355,6 +1358,7 @@ const PROGRAM: &[u16] = &[
 /// c: ee11 2a10  vmov r2, s2
 /// 10: be00       bkpt 0x0000
 /// ```
+#[cfg_attr(not(feature = "cpu-arm-aprofile-vfp"), allow(dead_code))]
 const VFP: &[u16] = &[
     0xee00, 0x0a10, 0xee00, 0x1a90, 0xee30, 0x1a20, 0xee11, 0x2a10, 0xbe00,
 ];
