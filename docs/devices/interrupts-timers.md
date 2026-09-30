@@ -24,6 +24,7 @@ ordinary devices with wire sinks and sources — the core knows nothing about
 | STM32 TIM (`st.tim`) | ST RM0090 §16 (advanced-control TIM1/TIM8), §17 (general-purpose TIM2–TIM5), §18 (general-purpose TIM9–TIM14), §19 (basic TIM6/TIM7); RM0351 §31–§34 is the same block on an L4. `CK_INT` comes from §7.2, and on an F4 it is **twice** the APB clock whenever that bus has a prescaler — a board's `clock =` expression says which, never the device |
 | STM32 EXTI + SYSCFG | ST RM0090 §9 and §12 (F4), RM0351 §9 and §13 (L4) |
 | STM32 IWDG / WWDG | ST RM0090 §20 and §21, RM0351 §35 and §36 |
+| Renesas TMU (`rcar.tmu`) | Renesas *SH7780 Hardware Manual* §22 (Timer Unit); the SH7785/SH7786 manuals and the R-Car TMU chapters describe the same unit at the same offsets. The machine file's `clock =` is **Pφ itself** (one tick per peripheral-clock cycle); `TPSC` divides it by 4/16/64/256/1024, and the RTC/`TCLK` selections do not count. `irq0`–`irq2` are the `TUNI0`–`TUNI2` levels |
 | NES / Game Boy interrupt lines | The platform documentation — these machines have wires, not controllers |
 
 ## Implementation notes
