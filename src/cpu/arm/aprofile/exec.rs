@@ -1336,6 +1336,7 @@ impl<'a> Exec<'a> {
                     crn,
                     crm,
                     opc2,
+                    privileged: self.privileged(),
                 };
                 match self.coprocessor(cp).map(|c| c.cdp(op)) {
                     Some(Ok(effect)) => self.apply_effect(effect),
@@ -1845,6 +1846,7 @@ impl<'a> Exec<'a> {
             crn,
             crm,
             opc2,
+            privileged: self.privileged(),
         };
         let Some(coprocessor) = self.coprocessor(cp).cloned() else {
             self.undefined_instruction();
@@ -1866,7 +1868,18 @@ impl<'a> Exec<'a> {
             }
         } else {
             let value = self.reg(rd);
-            match coprocessor.mcr(op, value) {
+            // The coprocessor gets the table walker's view of memory, because
+            // an ARMv7 CP15's address-translation operations walk the tables
+            // from an `MCR`; the reads they make are charged like a walk's.
+            let walker = Walker {
+                space: self.space,
+                attrs: self.attrs.with_privileged(true),
+                endian: self.cfg.endian,
+                reads: Cell::new(0),
+            };
+            let result = coprocessor.mcr_with(op, value, &walker);
+            self.cycle(u64::from(walker.reads.get()));
+            match result {
                 Ok(effect) => self.apply_effect(effect),
                 Err(CpFault::Undefined) => self.undefined_instruction(),
             }

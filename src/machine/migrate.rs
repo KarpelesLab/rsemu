@@ -104,6 +104,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::dev::stm32::octospi::migrations(&mut migrations)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::migrations(&mut migrations)?;
+    #[cfg(feature = "cpu-arm-aprofile")]
+    crate::cpu::arm::aprofile::migrations(&mut migrations)?;
     Ok(migrations)
 }
 
@@ -121,6 +123,8 @@ mod tests {
         crate::dev::flash::spinor::CLASS_NAME,
         #[cfg(feature = "dev-stm32-octospi")]
         crate::dev::stm32::octospi::CLASS_NAME,
+        #[cfg(feature = "cpu-arm-aprofile")]
+        "cpu.arm",
     ];
 
     #[test]

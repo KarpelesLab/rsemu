@@ -2510,6 +2510,7 @@ fn enable_mmu(h: &Harness, domains: u32) {
         crn,
         crm,
         opc2,
+        privileged: true,
     };
     cp15.mcr(op(2, 0, 0), TABLE).unwrap();
     cp15.mcr(op(3, 0, 0), domains).unwrap();
@@ -2813,6 +2814,7 @@ fn a_tlb_invalidate_is_what_makes_a_remapped_page_visible() {
         crn,
         crm,
         opc2,
+        privileged: true,
     };
     h.poke(TABLE + 0x400, 0);
     h.cpu.set_pc(0x1000);

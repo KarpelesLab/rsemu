@@ -764,6 +764,7 @@ mod tests {
             crn,
             crm,
             opc2,
+            privileged: true,
         }
     }
 

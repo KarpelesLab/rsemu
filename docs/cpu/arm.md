@@ -8,7 +8,8 @@ Consumed by: `cpu/arm/aprofile` (ARMv5TE today, ARMv6/ARMv7-A later),
 | Source | Covers | Access |
 | --- | --- | --- |
 | Arm Architecture Reference Manual for A-profile (DDI 0487) | AArch64 and AArch32: instruction set, exception model, MMU/translation regimes, the memory model | `developer.arm.com/documentation/ddi0487/latest/` **[browser]** |
-| Arm ARM for ARMv7-A/R (DDI 0406) | The ARMv7 architecture, for the 32-bit cores | `developer.arm.com/documentation/ddi0406/latest/` **[browser]** |
+| Arm ARM for ARMv7-A/R (DDI 0406) | The ARMv7 architecture, for the 32-bit cores; part B3 (VMSA) and B4 (the CP15 registers) for `cp15v7.rs` |
+| Cortex-A9 TRM (DDI 0388), Cortex-A9 MPCore TRM (DDI 0407) | The A9's identification values, `SCTLR` reset value, cache geometry, `ACTLR`, the power control register, and `CBAR`/`PERIPHBASE` | `developer.arm.com/documentation/ddi0406/latest/` **[browser]** |
 | Arm ARM, ARMv5 and ARMv5TE (DDI 0100) | The **v5 architecture**: A32 and Thumb encodings, the seven modes, the exception model, and part B's CP15 register map, VMSAv5 translation table walk, domain model, access permissions and fault-status encodings | developer.arm.com **[browser]** |
 | ARM926EJ-S TRM (DDI 0198) | The implementation-defined half of the above: the main ID and cache type register values, the c7 `test and clean` behaviour, the TCM status register, and the instruction cycle timings | developer.arm.com **[browser]** |
 | GIC Architecture Specification (IHI 0069) | Generic Interrupt Controller v3/v4 — required by any modern ARM board | `developer.arm.com/documentation/ihi0069/latest/` **[browser]** |
@@ -37,6 +38,23 @@ secondary reference for the exception model.
   changes the descriptor format itself, which is why `cp15.rs` is written for
   v5 rather than "for ARM" — an `Arch` construction property selects the walk,
   and a second walk goes beside the first rather than inside it.
+- **That second walk is `cp15v7.rs`**, the Cortex-A9's CP15 (DDI 0406C B3.5
+  for the walk, B3.12/B3.13 for the check order and the five-bit fault
+  status, B4.1 for the registers; DDI 0388 chapter 4 for the part's values).
+  Four decisions in it are worth knowing before touching it. *No ASID tags:*
+  the core's TLB is flushed on every `CONTEXTIDR`, `TTBR`, `TTBCR`, `DACR`
+  and `SCTLR` write, which makes `nG` correct by construction at the cost of
+  a refill per context switch. *Inner-shareable TLB operations broadcast only
+  to cores joined with `Arm::join_cluster`:* `ID_MMFR3` advertises hardware
+  broadcast, so an OS will not send the IPI that would cover a missing join,
+  and every MPCore machine must join its cores pairwise. *The ID registers
+  tell the truth about this core, not the silicon,* where the two differ:
+  `ID_PFR0` reports no ThumbEE and `ID_DFR0` no CP14 debug, because
+  advertising either sends a kernel into CP14 accesses that trap. *User-mode
+  CP15 access is decided by the coprocessor* — `CpOp::privileged` carries the
+  mode — because only the coprocessor knows that `TPIDRURO` is readable and
+  `SCTLR` is not; the ARMv5 CP15 ignores the field, as it always allowed User
+  mode through.
 - **The M profile is a different architecture, not a subset.** There is no ARM
   state, so no A32 decoder; the exception model is hardware register stacking
   with `EXC_RETURN` rather than banked modes; the interrupt controller is *inside

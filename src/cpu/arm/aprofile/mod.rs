@@ -6,7 +6,8 @@
 //! extensions (`QADD`, `SMLA<x><y>`, `LDRD`/`STRD`, `PLD`); the full 16-bit
 //! Thumb set with interworking; all seven processor modes with their banked
 //! registers; the complete exception model; and, when a machine asks for one,
-//! a real [`cp15::Cp15`] with the VMSAv5 MMU behind it. The caches and the
+//! a real [`cp15::Cp15`] with the VMSAv5 MMU behind it — or, on a Cortex-A9,
+//! a [`cp15v7::Cp15v7`] with the VMSAv7 short-descriptor MMU. The caches and the
 //! TCMs are **not** here — those are the SoC's, and anything else it wants to
 //! add attaches through [`cp::Coprocessor`] and [`cp::Mmu`].
 //!
@@ -66,6 +67,7 @@
 //! | [`disasm`] | the disassembler built on those two |
 //! | [`cp`] | the coprocessor and MMU traits, the software TLB, `FlatMmu`, and a CP15 stub |
 //! | [`cp15`] | the ARMv5 system control coprocessor and the VMSAv5 table walk |
+//! | [`cp15v7`] | the Cortex-A9 system control coprocessor and the VMSAv7 short-descriptor walk |
 //! | `exec` (private) | the interpreter, and the timing model it implements |
 //!
 //! # Sources
@@ -80,6 +82,7 @@
 pub mod arch;
 pub mod cp;
 pub mod cp15;
+pub mod cp15v7;
 pub mod disasm;
 mod exec;
 pub mod isa;
@@ -115,6 +118,7 @@ use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 pub use arch::{Arch, Extensions, Version, Vfp};
 use cp::{Coprocessor, FlatMmu, Mmu, Tlb};
 use cp15::Cp15;
+use cp15v7::Cp15v7;
 use exec::{Exec, State};
 
 pub use exec::Exception;
@@ -528,6 +532,16 @@ pub struct Config {
     /// takes an Undefined Instruction exception rather than executing, because
     /// that is how guests probe for features (`ROADMAP.md` §6.1.1).
     pub arch: Arch,
+    /// This core's number within its cluster: `MPIDR.Aff0`, `0..=3` on a
+    /// Cortex-A9 MPCore. Read only by an ARMv7 CP15.
+    pub cpu_id: u8,
+    /// The cluster's number: `MPIDR.Aff1`, the `CLUSTERID` input.
+    pub cluster_id: u8,
+    /// The MPCore private peripheral base — the `PERIPHBASE` input, which
+    /// `CBAR` (`MRC p15, 4, Rd, c15, c0, 0`) reports so software can find the
+    /// SCU, the GIC and the private timers (DDI 0407 1.5). Bits 12..0 are not
+    /// part of the value.
+    pub periphbase: u32,
 }
 
 impl Config {
@@ -553,6 +567,9 @@ impl Config {
         // one existed and what every board that does not ask still gets.
         system: System::None,
         arch: Arch::V5TE,
+        cpu_id: 0,
+        cluster_id: 0,
+        periphbase: 0,
     };
 
     /// A whole ARM926EJ-S: the same core with its system control coprocessor,
@@ -563,6 +580,18 @@ impl Config {
     /// until guest code turns it on.
     pub const ARM926EJS_MMU: Config = Config {
         system: System::Arm926EjS,
+        ..Config::ARM926EJS
+    };
+
+    /// A Cortex-A9 MPCore core: ARMv7-A with its CP15 and the VMSAv7 MMU,
+    /// CPU 0 of cluster 0, private peripherals at zero until the board says
+    /// otherwise with [`periphbase`](Config::periphbase).
+    ///
+    /// The MMU is off out of reset, and so are the caches this model does not
+    /// have.
+    pub const CORTEX_A9: Config = Config {
+        system: System::CortexA9,
+        arch: Arch::CORTEX_A9,
         ..Config::ARM926EJS
     };
 
@@ -688,6 +717,12 @@ pub enum System {
     /// An ARM926EJ-S CP15: the VMSAv5 MMU, the domain model, the fault
     /// registers, and the part's identification values.
     Arm926EjS,
+    /// A Cortex-A9 CP15: the VMSAv7 short-descriptor MMU with `TTBR0`/`TTBR1`,
+    /// execute-never and the access flag, the ARMv7 fault registers, `VBAR`,
+    /// `CPACR`, the thread-ID registers, and the part's identification and
+    /// MPCore registers. What `cpu = "cortex-a9"` gets unless the machine
+    /// says otherwise. See [`cp15v7`].
+    CortexA9,
 }
 
 impl System {
@@ -697,11 +732,12 @@ impl System {
         match self {
             System::None => "none",
             System::Arm926EjS => "arm926ejs",
+            System::CortexA9 => "cortex-a9",
         }
     }
 
     /// Every name the `cp15` property accepts.
-    pub const NAMES: &'static [&'static str] = &["none", "arm926ejs"];
+    pub const NAMES: &'static [&'static str] = &["none", "arm926ejs", "cortex-a9"];
 
     /// Parse one of [`NAMES`](System::NAMES).
     ///
@@ -713,6 +749,7 @@ impl System {
         match name {
             "none" => Some(System::None),
             "arm926ejs" => Some(System::Arm926EjS),
+            "cortex-a9" => Some(System::CortexA9),
             _ => None,
         }
     }
@@ -779,7 +816,7 @@ pub struct Arm {
     /// guest state: it must survive a reset, it is answerable before the core
     /// has ever run, and a monitor or a test wants the concrete type rather
     /// than a `dyn Mmu`.
-    cp15: Option<Arc<Cp15>>,
+    cp15: Option<SystemCp>,
     lines: Arc<Lines>,
     /// This core's identity in `MemAttrs::requester`, assigned at bind time.
     ///
@@ -796,6 +833,20 @@ pub struct Arm {
     /// die on the way out of [`Device::sink`] and the wire would silently
     /// deliver to nothing.
     pins: sync::Mutex<Pins>,
+}
+
+/// The system control coprocessor a core was built with, by architecture.
+///
+/// An enum rather than a trait object because the two are genuinely different
+/// register files with different public surfaces — a monitor or a test wants
+/// `ttbr1()` on one and `fcse_pid()` on the other — and because the snapshot
+/// code must know which one it is writing.
+#[derive(Debug, Clone)]
+enum SystemCp {
+    /// ARMv5: [`Cp15`].
+    V5(Arc<Cp15>),
+    /// ARMv7: [`Cp15v7`].
+    V7(Arc<Cp15v7>),
 }
 
 /// The pins [`Device::sink`] has built, kept alive by the core that owns them.
@@ -816,15 +867,23 @@ impl Arm {
     /// the PC on the reset vector.
     #[must_use]
     pub fn new(cfg: Config) -> Arm {
+        let lines = Arc::new(Lines::default());
         let cp15 = match cfg.system {
             System::None => None,
-            System::Arm926EjS => Some(Arc::new(Cp15::arm926ejs(&cfg))),
+            System::Arm926EjS => Some(SystemCp::V5(Arc::new(Cp15::arm926ejs(&cfg)))),
+            System::CortexA9 => Some(SystemCp::V7(Arc::new(
+                Cp15v7::cortex_a9(&cfg).with_lines(Arc::clone(&lines)),
+            ))),
         };
         // `Option<Arc<_>>` is not `Copy`, so the array cannot be written
         // `[None; 16]`.
         let mut coprocessors: [Option<Arc<dyn Coprocessor>>; 16] = [const { None }; 16];
         let mmu: Arc<dyn Mmu> = match &cp15 {
-            Some(cp) => {
+            Some(SystemCp::V5(cp)) => {
+                coprocessors[15] = Some(Arc::clone(cp) as Arc<dyn Coprocessor>);
+                Arc::clone(cp) as Arc<dyn Mmu>
+            }
+            Some(SystemCp::V7(cp)) => {
                 coprocessors[15] = Some(Arc::clone(cp) as Arc<dyn Coprocessor>);
                 Arc::clone(cp) as Arc<dyn Mmu>
             }
@@ -838,7 +897,7 @@ impl Arm {
         Arm {
             cfg,
             cp15,
-            lines: Arc::new(Lines::default()),
+            lines,
             requester: AtomicU32::new(cfg.requester.0),
             session: sync::Mutex::with_rank(
                 LockRank::BUS,
@@ -860,8 +919,38 @@ impl Arm {
     /// a test asserting a fault status, and a SoC that wants to seed the
     /// translation table base all want to read named registers.
     #[must_use]
+    ///
+    /// `None` on a core built with an ARMv7 CP15, which answers
+    /// [`cp15v7`](Arm::cp15v7) instead.
     pub fn cp15(&self) -> Option<&Arc<Cp15>> {
-        self.cp15.as_ref()
+        match &self.cp15 {
+            Some(SystemCp::V5(cp)) => Some(cp),
+            _ => None,
+        }
+    }
+
+    /// This core's ARMv7 system control coprocessor, if it was built with
+    /// one ([`System::CortexA9`]).
+    #[must_use]
+    pub fn cp15v7(&self) -> Option<&Arc<Cp15v7>> {
+        match &self.cp15 {
+            Some(SystemCp::V7(cp)) => Some(cp),
+            _ => None,
+        }
+    }
+
+    /// Put this core and `other` in one inner-shareable domain, so a
+    /// broadcast TLB operation on either invalidates both TLBs.
+    ///
+    /// An MPCore machine calls this for every pair of its cores. Without it an
+    /// inner-shareable `TLBIALLIS` reaches only the core that executed it —
+    /// and a Cortex-A9's `ID_MMFR3` tells the OS that it reaches all of them,
+    /// so the OS will not send the IPI that would have covered the gap. A no-op
+    /// unless both cores have an ARMv7 CP15. See [`cp15v7`] "Several cores".
+    pub fn join_cluster(&self, other: &Arm) {
+        if let (Some(mine), Some(theirs)) = (self.cp15v7(), other.cp15v7()) {
+            mine.join(theirs);
+        }
     }
 
     /// Build one from machine-description properties.
@@ -877,8 +966,18 @@ impl Arm {
         let high_vectors = r.or("high-vectors", false)?;
         let alignment_faults = r.or("alignment-faults", false)?;
         let store_pc_offset = r.or_range("store-pc-offset", 8u64, 8..=12)?;
-        let system = r.or_enum("cp15", "none", System::NAMES)?;
         let part = r.or_enum("cpu", "arm926ejs", PARTS)?;
+        // A Cortex-A9 without its CP15 is not a part anyone built, so naming
+        // the part brings the coprocessor; `cp15 = "none"` still removes it.
+        let default_system = if part == "cortex-a9" {
+            "cortex-a9"
+        } else {
+            "none"
+        };
+        let system = r.or_enum("cp15", default_system, System::NAMES)?;
+        let cpu_id = r.or_range("cpu-id", 0u64, 0..=3)?;
+        let cluster_id = r.or_range("cluster-id", 0u64, 0..=15)?;
+        let periphbase = r.or_addr("periphbase", 0)?;
         // Accepted and ignored: there is one engine until phase 5, and a
         // machine file that names it should not have to be edited when the
         // second one lands.
@@ -888,6 +987,26 @@ impl Arm {
             return Err(Error::Property(
                 "store-pc-offset must be 8 (ARM926EJ-S) or 12 (ARM7TDMI)".into(),
             ));
+        }
+        let periphbase = u32::try_from(periphbase)
+            .map_err(|_| Error::Property("periphbase must fit in 32 bits".into()))?;
+        // `or_enum` already rejected anything not in `NAMES`.
+        let system = System::parse(system).unwrap_or(System::None);
+        // Each CP15 describes one architecture's MMU and one part's identity;
+        // an ARMv5 core reporting a Cortex-A9's ID registers, or the reverse,
+        // is a machine file mistake and not a configuration.
+        match (system, part) {
+            (System::CortexA9, "arm926ejs") => {
+                return Err(Error::Property(
+                    "cp15 = \"cortex-a9\" needs cpu = \"cortex-a9\"".into(),
+                ));
+            }
+            (System::Arm926EjS, "cortex-a9") => {
+                return Err(Error::Property(
+                    "cp15 = \"arm926ejs\" needs cpu = \"arm926ejs\"".into(),
+                ));
+            }
+            _ => {}
         }
         Ok(Arm::new(Config {
             requester: RequesterId::ANONYMOUS,
@@ -899,9 +1018,11 @@ impl Arm {
             high_vectors,
             alignment_faults,
             store_pc_offset: store_pc_offset as u8,
-            // `or_enum` already rejected anything not in `NAMES`.
-            system: System::parse(system).unwrap_or(System::None),
+            system,
             arch: part_arch(part),
+            cpu_id: cpu_id as u8,
+            cluster_id: cluster_id as u8,
+            periphbase,
         }))
     }
 
@@ -1336,7 +1457,11 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    core without one writes the same bytes it wrote at v2, but the chunk
     //    is no longer the same shape for every instance of the class, so the
     //    version moves for all of them rather than silently for some.
-    version: 3,
+    // 4: a core built with `cp15 = "cortex-a9"` appends its ARMv7 CP15
+    //    registers instead. Every configuration that existed at v3 writes the
+    //    same bytes it did, which is why the v3 step in `migrations` is the
+    //    identity.
+    version: 4,
     summary: "ARMv5TE (ARM926EJ-S class) 32-bit CPU core with Thumb and the DSP extensions",
     properties: &[
         PropertySpec {
@@ -1361,7 +1486,25 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "cp15",
             kind: ValueKind::Str,
             required: false,
-            summary: "the system control coprocessor: `none`, or `arm926ejs` for CP15 and the MMU",
+            summary: "the system control coprocessor: `none`, `arm926ejs` (VMSAv5) or `cortex-a9` (VMSAv7); defaults to the part's own",
+        },
+        PropertySpec {
+            name: "cpu-id",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "this core's number in its cluster, MPIDR.Aff0 (0-3; ARMv7 CP15 only)",
+        },
+        PropertySpec {
+            name: "cluster-id",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "the cluster's number, MPIDR.Aff1 (0-15; ARMv7 CP15 only)",
+        },
+        PropertySpec {
+            name: "periphbase",
+            kind: ValueKind::Addr,
+            required: false,
+            summary: "the MPCore private peripheral base CBAR reports (ARMv7 CP15 only)",
         },
         PropertySpec {
             name: "cpu",
@@ -1384,6 +1527,25 @@ pub static CLASS: DeviceClass = DeviceClass {
     ],
     construct: |props| Ok(Box::new(Arm::from_props(props)?)),
 };
+
+/// This class's snapshot upgrade steps.
+///
+/// v3 to v4 is the identity: v4 added a byte layout only for a CP15 that did
+/// not exist at v3, so every v3 chunk already is a valid v4 chunk. Registered
+/// in the commit that bumped the version, because that is `machine::migrate`'s
+/// rule — and because without it every v3 snapshot of an ARM926 board would be
+/// refused for a change that did not touch it.
+///
+/// # Errors
+///
+/// If a step is already registered for this class.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS.name, 3, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        Ok(())
+    })
+}
 
 /// Add this core's class to a registry.
 ///
@@ -1431,10 +1593,12 @@ impl Device for Arm {
         // CP15 is reset by the same signal the core is, so a cold start puts
         // its registers back too — including the MMU enable, which is what
         // makes a rebooted machine fetch its reset vector physically.
-        if kind == ResetKind::Cold
-            && let Some(cp15) = &self.cp15
-        {
-            cp15.reset();
+        if kind == ResetKind::Cold {
+            match &self.cp15 {
+                Some(SystemCp::V5(cp15)) => cp15.reset(),
+                Some(SystemCp::V7(cp15)) => cp15.reset(),
+                None => {}
+            }
         }
         {
             let mut session = self.session.lock();
@@ -1501,8 +1665,10 @@ impl Device for Arm {
         // bytes it always wrote. The TLB is not here and never will be: it is
         // derived state, and a snapshot that carried it would be asserting
         // something about the future rather than about the machine.
-        if let Some(cp15) = &self.cp15 {
-            cp15.save(w)?;
+        match &self.cp15 {
+            Some(SystemCp::V5(cp15)) => cp15.save(w)?,
+            Some(SystemCp::V7(cp15)) => cp15.save(w)?,
+            None => {}
         }
         Ok(())
     }
@@ -1535,8 +1701,10 @@ impl Device for Arm {
         state.debt = r.read_u64()?;
         let irq = r.read_bool()?;
         let fiq = r.read_bool()?;
-        if let Some(cp15) = &self.cp15 {
-            cp15.load(r)?;
+        match &self.cp15 {
+            Some(SystemCp::V5(cp15)) => cp15.load(r)?,
+            Some(SystemCp::V7(cp15)) => cp15.load(r)?,
+            None => {}
         }
         {
             let mut session = self.session.lock();
@@ -1649,6 +1817,9 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("store-pc-offset", ValueKind::Uint).range(8, 12))
         .prop(PropSchema::new("cp15", ValueKind::Str).values(System::NAMES))
         .prop(PropSchema::new("cpu", ValueKind::Str).values(PARTS))
+        .prop(PropSchema::new("cpu-id", ValueKind::Uint).range(0, 3))
+        .prop(PropSchema::new("cluster-id", ValueKind::Uint).range(0, 15))
+        .prop(PropSchema::new("periphbase", ValueKind::Addr))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
         // Inputs only: an ARM926EJ-S drives nothing this core models. The
         // bus-facing outputs a real part has -- `nMREQ`, `nRW`, `nWAIT` -- are

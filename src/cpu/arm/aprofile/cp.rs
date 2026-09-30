@@ -21,9 +21,10 @@
 //! [`Arm::attach_mmu`](super::Arm::attach_mmu).
 //!
 //! **The architecture's own CP15 now ships in the core**:
-//! [`Cp15`](super::cp15::Cp15) is a VMSAv5 system control coprocessor and is
-//! selected by a construction property ([`Config::system`](super::Config)), so
-//! a `.machine` file asks for one by name. The traits here remain the seam for
+//! [`Cp15`](super::cp15::Cp15) is a VMSAv5 system control coprocessor and
+//! [`Cp15v7`](super::cp15v7::Cp15v7) a Cortex-A9's VMSAv7 one, each selected by
+//! a construction property ([`Config::system`](super::Config)), so a `.machine`
+//! file asks for one by name. The traits here remain the seam for
 //! the parts that are genuinely the SoC's — a coprocessor 14 debug unit, a
 //! vendor MMU — and [`Cp15Stub`] remains for bring-up where even a real CP15
 //! is more than is wanted.
@@ -78,6 +79,15 @@ pub struct CpOp {
     pub crm: u8,
     /// The second opcode field.
     pub opc2: u8,
+    /// Whether the instruction was executed at PL1 — any mode but User.
+    ///
+    /// The seam carries it because the *coprocessor* is what decides: an
+    /// ARMv7 CP15 makes almost every register PL1-only and lets User mode at
+    /// exactly the thread-ID registers and the three CP15 barriers (DDI 0406C
+    /// B4.1.* "Access permissions", B3.18.1), and no core-side table could
+    /// know that without knowing every coprocessor. An ARMv5 CP15 ignores it,
+    /// which is what that model always did.
+    pub privileged: bool,
 }
 
 /// What an `LDC` or `STC` names.
@@ -149,6 +159,24 @@ pub trait Coprocessor: Send + Sync + fmt::Debug {
     fn mcr(&self, op: CpOp, value: u32) -> CpResult<CpEffect> {
         let _ = (op, value);
         Err(CpFault::Undefined)
+    }
+
+    /// `MCR`, for a coprocessor that may have to read physical memory to
+    /// answer.
+    ///
+    /// The core always calls this one, handing over the same read-only view of
+    /// physical memory a table walk gets. Only a system coprocessor with
+    /// address-translation *operations* needs it — ARMv7's `ATS1C**` writes
+    /// walk the tables and leave the result in `PAR` (DDI 0406C B4.2.6) — so
+    /// the default forgets `mem` and calls [`mcr`](Coprocessor::mcr), and every
+    /// other implementation is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// As [`mcr`](Coprocessor::mcr).
+    fn mcr_with(&self, op: CpOp, value: u32, mem: &dyn PhysMem) -> CpResult<CpEffect> {
+        let _ = mem;
+        self.mcr(op, value)
     }
 
     /// `MRC`: move a coprocessor register into an ARM register.
@@ -398,10 +426,16 @@ impl Default for Regime {
 ///
 /// The core never interprets these; it passes them to
 /// [`Mmu::report_abort`] and takes the corresponding exception. The constants
-/// are ARM ARM B4.6's table.
+/// are ARM ARM B4.6's table, which ARMv7's short-descriptor format keeps
+/// value-for-value and extends with a fifth bit (DDI 0406C B3.13.3, table
+/// B3-23): every constant here means the same thing to both, and the two that
+/// only VMSAv6/v7 raise — the access-flag faults — have values an ARMv5 CP15
+/// never produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fault {
-    /// The four-bit fault status.
+    /// The fault status: four bits on ARMv5, five (`FS[4:0]`) on ARMv7, where
+    /// `FS[4]` lives in bit 10 of the register rather than beside the rest —
+    /// see [`to_fsr_v7`](Fault::to_fsr_v7).
     pub status: u8,
     /// The four-bit domain, where the fault has one.
     pub domain: u8,
@@ -466,6 +500,21 @@ impl Fault {
         domain: 0,
     };
 
+    /// Access flag fault, section (`0b00011`, VMSAv6 and later).
+    ///
+    /// With `SCTLR.AFE` set, `AP[0]` becomes an access flag and a descriptor
+    /// with it clear faults on first use, so an OS can track which pages are
+    /// in use (DDI 0406C B3.7.3). ARMv5 has no such fault.
+    pub const ACCESS_FLAG_SECTION: Fault = Fault {
+        status: 0b0_0011,
+        domain: 0,
+    };
+    /// Access flag fault, page (`0b00110`).
+    pub const ACCESS_FLAG_PAGE: Fault = Fault {
+        status: 0b0_0110,
+        domain: 0,
+    };
+
     /// The same fault, attributed to a domain.
     #[must_use]
     pub const fn in_domain(mut self, domain: u8) -> Fault {
@@ -478,6 +527,21 @@ impl Fault {
     #[must_use]
     pub const fn to_fsr(self) -> u32 {
         (((self.domain & 0xf) as u32) << 4) | ((self.status & 0xf) as u32)
+    }
+
+    /// The value an ARMv7 short-descriptor `DFSR` holds, without `WnR`.
+    ///
+    /// `FS[3:0]` in bits 3..0, the domain in bits 7..4, and `FS[4]` in bit 10
+    /// (DDI 0406C B4.1.52). `ExT` (bit 12) is left clear: it classifies an
+    /// external abort in an IMPLEMENTATION DEFINED way, and this core has no
+    /// second kind of external abort to distinguish. `WnR` (bit 11) is the
+    /// caller's, because it is a property of the access rather than of the
+    /// fault. An `IFSR` has no domain field; mask bits 7..4 off for one.
+    #[must_use]
+    pub const fn to_fsr_v7(self) -> u32 {
+        (((self.status & 0x10) as u32) << 6)
+            | (((self.domain & 0xf) as u32) << 4)
+            | ((self.status & 0xf) as u32)
     }
 }
 
@@ -901,6 +965,7 @@ mod tests {
             crn: 0,
             crm: 0,
             opc2: 0,
+            privileged: true,
         };
         assert_eq!(cp.mrc(id), Ok(Cp15Stub::ARM926EJS_ID));
 
@@ -924,6 +989,7 @@ mod tests {
             crn: 7,
             crm: 0,
             opc2: 4,
+            privileged: true,
         };
         assert_eq!(cp.mcr(wfi, 0), Ok(CpEffect::HALT));
     }
@@ -938,6 +1004,7 @@ mod tests {
             crn: 0,
             crm: 0,
             opc2: 0,
+            privileged: true,
         };
         assert_eq!(cp.mrc(op), Err(CpFault::Undefined));
     }
@@ -979,6 +1046,26 @@ mod tests {
         assert_eq!(Fault::EXTERNAL.to_fsr(), 0b1000);
         assert_eq!(Fault::PERMISSION_PAGE.in_domain(3).to_fsr(), 0x3f);
         assert_eq!(Fault::DOMAIN_SECTION.in_domain(15).to_fsr(), 0xf9);
+    }
+
+    #[test]
+    fn the_v7_status_puts_fs4_in_bit_ten_and_keeps_the_v5_values() {
+        // Every v5 constant is below 0x10, so the v7 encoding of it is the v5
+        // one: the two formats agree wherever both define a value.
+        for fault in [
+            Fault::ALIGNMENT,
+            Fault::TRANSLATION_SECTION,
+            Fault::PERMISSION_PAGE.in_domain(3),
+            Fault::EXTERNAL_L2.in_domain(7),
+        ] {
+            assert_eq!(fault.to_fsr_v7(), fault.to_fsr());
+        }
+        assert_eq!(Fault::ACCESS_FLAG_PAGE.to_fsr_v7(), 0b0110);
+        let wide = Fault {
+            status: 0b1_0110,
+            domain: 0,
+        };
+        assert_eq!(wide.to_fsr_v7(), (1 << 10) | 0b0110);
     }
 
     #[test]

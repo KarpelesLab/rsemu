@@ -1013,9 +1013,15 @@ cpu-mos6502 = []
 # bits against c1's S and R, the fault status and address registers, and the c7
 # and c8 maintenance operations -- selected by the `cp15` construction property
 # and sitting behind a software TLB. Off by default, which is the bare
-# macrocell and is bit-for-bit what this core was before. Caches, the write
-# buffer and the TCMs are not modelled and remain the SoC's, behind the
-# `cp::Coprocessor` and `cp::Mmu` traits.
+# macrocell and is bit-for-bit what this core was before. `cpu = cortex-a9`
+# brings the Cortex-A9's **ARMv7 CP15 and the VMSAv7 short-descriptor MMU**
+# instead: TTBR0/TTBR1 split by TTBCR.N, sections, supersections, large and
+# small pages, APX and the access flag, execute-never, the ARMv7 fault status
+# and address registers (IFAR included), VBAR, CPACR, the thread-ID registers,
+# the ATS1C** VA-to-PA operations, MPIDR and CBAR from construction
+# properties, and inner-shareable TLB maintenance broadcast to joined cores.
+# Caches, the write buffer and the TCMs are not modelled and remain the SoC's,
+# behind the `cp::Coprocessor` and `cp::Mmu` traits.
 #
 # Named for the profile, not the version, because ARMv6 and ARMv7-A share this
 # core's whole shape -- A32 plus Thumb, banked modes, CP15, the exception model
