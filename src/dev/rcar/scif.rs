@@ -169,6 +169,13 @@ const DEFAULT_PORT: &str = "console";
 /// The one output pin.
 pub const IRQ_PIN: &str = "irq";
 
+/// The transmit DMA request: high while the transmitter is enabled and its
+/// FIFO has room.
+pub const TX_DREQ_PIN: &str = "tx-dreq";
+
+/// The receive DMA request: high while the receive FIFO holds data.
+pub const RX_DREQ_PIN: &str = "rx-dreq";
+
 // -- register offsets --------------------------------------------------------
 
 const SCSMR: u64 = 0x00;
@@ -207,7 +214,11 @@ const SCR_RE: u16 = 1 << 4;
 const SCR_REIE: u16 = 1 << 3;
 /// The bits of `SCSCR` that exist: the five above and CKE[1:0]. Bit 2 is
 /// reserved on the SH7780 SCIF.
-const SCR_MASK: u16 = 0x00fb;
+const SCR_MASK: u16 = 0x08fb;
+
+/// `SCSCR.TEIE` (bit 11): the transmit-end interrupt, on `TEND`. R-Car's
+/// SCIF has it; the SH7780's does not, which is why the mask above grew.
+const SCR_TEIE: u16 = 1 << 11;
 
 // -- SCFSR (§25.3.7) ---------------------------------------------------------
 
@@ -382,10 +393,16 @@ impl State {
 /// The register block, as something an address space can dispatch to.
 struct Registers {
     variant: Variant,
+    /// TXI and RXI go to the DMA controller rather than the interrupt
+    /// controller: the channel's data moves by DMA request, and the CPU hears
+    /// only the transmit end and the errors.
+    dma: crate::core::sync::AtomicBool,
     state: Mutex<State>,
     /// The interrupt output, at [`LockRank::LEAF`] so it can be taken with
     /// nothing else held.
     out: Mutex<Option<WireSource>>,
+    /// The DMA request outputs: transmit and receive.
+    dreq: Mutex<[Option<WireSource>; 2]>,
     port: Arc<dyn CharDevice>,
     /// The name the port was opened under, for `Debug` and diagnostics.
     port_name: String,
@@ -422,18 +439,35 @@ impl Scif {
     pub fn new(props: &Props) -> Result<Scif> {
         let mut r = props.reader();
         let port_name = r.or("port", String::from(DEFAULT_PORT))?;
+        let link = r.optional_str("link")?.map(ToString::to_string);
+        let side = r.or_enum("side", "a", &["a", "b"])?;
+        let dma = r.or("dma", false)?;
         let clock_hz = r.or_range("clock-hz", 0u64, 0..=u64::from(u32::MAX))?;
         let variant = match r.or_enum("variant", "scif", &["scif", "hscif"])? {
             "hscif" => Variant::Hscif,
             _ => Variant::Scif,
         };
         r.finish()?;
+        // A link to another device on the board wins over a host port: the
+        // line goes to a chip, not out of the machine.
+        if let Some(link) = link {
+            let side = crate::bus::uart::Side::parse(side).unwrap_or(crate::bus::uart::Side::A);
+            let end = crate::bus::uart::links::attach(props, &link)?.end(side);
+            return Ok(Scif::with_port(
+                end as Arc<dyn CharDevice>,
+                alloc::format!("link:{link}"),
+                variant,
+                clock_hz as u32,
+            )
+            .with_dma(dma));
+        }
         Ok(Scif::with_port(
             ports::attach(props, &port_name)?,
             port_name,
             variant,
             clock_hz as u32,
-        ))
+        )
+        .with_dma(dma))
     }
 
     /// Build one against a character device the caller already has.
@@ -446,8 +480,10 @@ impl Scif {
     ) -> Scif {
         let regs = Arc::new(Registers {
             variant,
+            dma: crate::core::sync::AtomicBool::new(false),
             state: Mutex::with_rank(LockRank::DEVICE, State::new()),
             out: Mutex::with_rank(LockRank::LEAF, None),
+            dreq: Mutex::with_rank(LockRank::LEAF, [None, None]),
             port,
             port_name,
             clock_hz,
@@ -458,6 +494,16 @@ impl Scif {
             Arc::clone(&regs) as Arc<dyn MemOps>,
         ));
         Scif { regs, region }
+    }
+
+    /// The same channel with TXI and RXI routed to the DMA controller instead
+    /// of the interrupt controller (the `dma` property).
+    #[must_use]
+    pub fn with_dma(self, dma: bool) -> Scif {
+        self.regs
+            .dma
+            .store(dma, crate::core::sync::Ordering::Relaxed);
+        self
     }
 
     /// Which member of the family this is.
@@ -508,19 +554,25 @@ impl Scif {
     /// Whether the interrupt output is currently asserted.
     #[must_use]
     pub fn irq_asserted(&self) -> bool {
-        Registers::interrupt(&self.regs.state.lock())
+        self.regs.interrupt(&self.regs.state.lock())
     }
 }
 
 impl Registers {
     /// The combined interrupt, from the latched flags and the enables.
-    fn interrupt(state: &State) -> bool {
+    ///
+    /// With `dma` set, TXI and RXI are the DMA controller's requests (see
+    /// [`dreqs`](Registers::dreqs)) and not interrupts.
+    fn interrupt(&self, state: &State) -> bool {
         let scr = state.scr;
         let fsr = state.fsr;
-        (scr & SCR_TIE != 0 && fsr & FSR_TDFE != 0)
-            || (scr & SCR_RIE != 0 && fsr & (FSR_RDF | FSR_DR) != 0)
-            || (scr & (SCR_RIE | SCR_REIE) != 0
-                && (fsr & (FSR_ER | FSR_BRK) != 0 || state.lsr & LSR_ORER != 0))
+        let dma = self.dma.load(crate::core::sync::Ordering::Relaxed);
+        let txi = !dma && scr & SCR_TIE != 0 && fsr & FSR_TDFE != 0;
+        let rxi = !dma && scr & SCR_RIE != 0 && fsr & (FSR_RDF | FSR_DR) != 0;
+        let tei = scr & SCR_TEIE != 0 && fsr & FSR_TEND != 0;
+        let eri = scr & (SCR_RIE | SCR_REIE) != 0
+            && (fsr & (FSR_ER | FSR_BRK) != 0 || state.lsr & LSR_ORER != 0);
+        txi || rxi || tei || eri
     }
 
     /// Drive the interrupt line. Never called with the state lock held.
@@ -531,10 +583,33 @@ impl Registers {
         }
     }
 
-    /// Recompute and drive the interrupt line from the current state.
+    /// The DMA request levels: transmit while the transmitter is on and the
+    /// FIFO has room, receive while it holds data. On the silicon these are
+    /// the TXI and RXI conditions routed to the DMA controller instead of the
+    /// interrupt controller; here they are two wires a DMA controller paces
+    /// itself by.
+    fn dreqs(&self, state: &State) -> [bool; 2] {
+        let tx = state.scr & SCR_TE != 0
+            && state.fcr & FCR_TFRST == 0
+            && state.tx.len() < self.variant.depth();
+        let rx = state.scr & SCR_RE != 0 && state.fcr & FCR_RFRST == 0 && !state.rx.is_empty();
+        [tx, rx]
+    }
+
+    /// Recompute and drive the interrupt line and the DMA requests from the
+    /// current state.
     fn refresh(&self) {
-        let asserted = Self::interrupt(&self.state.lock());
+        let (asserted, dreq) = {
+            let state = self.state.lock();
+            (self.interrupt(&state), self.dreqs(&state))
+        };
         self.drive(asserted);
+        let outs = self.dreq.lock().clone();
+        for (out, level) in outs.iter().zip(dreq) {
+            if let Some(out) = out {
+                out.set(Level::from_bool(level));
+            }
+        }
     }
 
     /// Set the level-conditioned flags whose conditions now hold.
@@ -826,6 +901,24 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "the character port to attach to, by name (default \"console\")",
         },
         PropertySpec {
+            name: "link",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "a serial link to another device on the board, by name; wins over `port`",
+        },
+        PropertySpec {
+            name: "side",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "which end of the `link` this is: \"a\" (the default) or \"b\"",
+        },
+        PropertySpec {
+            name: "dma",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "TXI/RXI request the DMA controller (tx-dreq/rx-dreq) instead of interrupting",
+        },
+        PropertySpec {
             name: "clock-hz",
             kind: ValueKind::Uint,
             required: false,
@@ -861,6 +954,15 @@ impl Device for Scif {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
+        let dreq = match port {
+            TX_DREQ_PIN => Some(0),
+            RX_DREQ_PIN => Some(1),
+            _ => None,
+        };
+        if let Some(n) = dreq {
+            self.regs.dreq.lock()[n] = Some(source);
+            return Ok(());
+        }
         if port != IRQ_PIN {
             return Err(Error::Config {
                 at: port.to_string(),
@@ -874,7 +976,7 @@ impl Device for Scif {
     }
 
     fn announce(&self, port: &str) {
-        if port == IRQ_PIN {
+        if matches!(port, IRQ_PIN | TX_DREQ_PIN | RX_DREQ_PIN) {
             self.regs.refresh();
         }
     }
@@ -989,11 +1091,16 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("port", ValueKind::Str))
+        .prop(PropSchema::new("link", ValueKind::Str))
+        .prop(PropSchema::new("dma", ValueKind::Bool))
+        .prop(PropSchema::new("side", ValueKind::Str).values(&["a", "b"]))
         .prop(PropSchema::new("clock-hz", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("variant", ValueKind::Str).values(&["scif", "hscif"]))
         .region("")
         .region("regs")
         .port(IRQ_PIN, PortDir::Out)
+        .port(TX_DREQ_PIN, PortDir::Out)
+        .port(RX_DREQ_PIN, PortDir::Out)
 }
 
 #[cfg(test)]

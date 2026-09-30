@@ -1280,7 +1280,7 @@ dev-uart-ns16550 = []
 # Renesas SH7780 Hardware Manual (SCIF §25, TMU §22), the R-Car SCIF/HSCIF and
 # DU chapters, and a black-box trace of a real DU driver's register writes.
 # `no_std + alloc`, no `unsafe`, no dependencies.
-dev-rcar = ["dev-sd-card"]
+dev-rcar = ["dev-sd-card", "bus-uart"]
 
 # An external watchdog kicked by a pin (src/dev/watchdog.rs, `watchdog.pin`):
 # the supervisor chip or companion MCU that pulls a SoC's reset when the GPIO
@@ -1509,6 +1509,13 @@ bus-i2c = []
 # ATSHA204A (DS40002025A) chapter 5, cited by section; CryptoAuthLib is not
 # permissively licensed and was not opened. `no_std + alloc`, no dependencies.
 bus-swi = []
+
+# A serial line between two devices of one machine (src/bus/uart): two ends of
+# a `UartLink`, each a `CharDevice`, meeting by name as a rendezvous so a UART
+# can talk to a sub-processor model on the same board instead of to a host
+# port -- which would record it as outside input and, unwatched, discard it.
+# `no_std + alloc`, no dependencies.
+bus-uart = []
 
 # The Atmel AT24C01D/02D I2C serial EEPROM (src/dev/atmel): 128 or 256 bytes on
 # two wires, and the smallest honest device that proves an I2C bus works. Byte

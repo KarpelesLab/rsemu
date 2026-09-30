@@ -61,6 +61,10 @@ pub mod spi;
 #[cfg_attr(docsrs, doc(cfg(feature = "bus-swi")))]
 pub mod swi;
 
+#[cfg(feature = "bus-uart")]
+#[cfg_attr(docsrs, doc(cfg(feature = "bus-uart")))]
+pub mod uart;
+
 #[cfg(feature = "bus-usb")]
 #[cfg_attr(docsrs, doc(cfg(feature = "bus-usb")))]
 pub mod usb;
