@@ -1311,6 +1311,14 @@ dev-fdt = []
 # `no_std` device for nothing. Written from JEDEC JESD68.01 and the Intel
 # StrataFlash P30 datasheet. `no_std + alloc`, no dependencies.
 #
+# `command-set = "amd"` makes the same part speak the AMD/Fujitsu standard set
+# (CFI id 0x0002) instead, as a Spansion S29JL064J does: unlock cycles,
+# autoselect with the three-word device ID, the AMD primary extended query,
+# program, unlock bypass, sector and chip erase, erase suspend/resume, the
+# Secured Silicon Region and `WP#` boot-sector protection, in word (x16) or byte
+# (x8) addressing. Written from the S29JL064J datasheet. Intel stays the
+# default, so no existing board changes.
+#
 # This is the device a UEFI build needs to *keep* a variable: the write path is
 # what installs `gEfiVariableWriteArchProtocolGuid`, and RAM cannot provide it.
 #

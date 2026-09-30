@@ -7,7 +7,7 @@
 //!
 //! | Module | Feature | Covers |
 //! | --- | --- | --- |
-//! | [`cfi`] | `dev-flash-cfi` | parallel NOR flash: the CFI query and the Intel/Sharp command set |
+//! | [`cfi`] | `dev-flash-cfi` | parallel NOR flash: the CFI query, and the Intel/Sharp or AMD/Fujitsu command set |
 //! | [`spinor`] | `dev-flash-spinor` | serial NOR flash: a Winbond W25Q on the SPI bus |
 //!
 //! The two share their *semantics* — a program clears bits, an erase costs a

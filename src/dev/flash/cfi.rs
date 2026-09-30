@@ -1,5 +1,5 @@
-//! CFI NOR flash: the query structure, and the Intel/Sharp extended command
-//! set.
+//! CFI NOR flash: the query structure, and the Intel/Sharp extended and
+//! AMD/Fujitsu standard command sets.
 //!
 //! A NOR flash part is not memory with a different name. Three properties make
 //! it a *device*, and a model that drops any one of them is a model that lets
@@ -26,14 +26,23 @@
 //! Intel/Sharp extended set (`0x0001`, a status register and single-cycle
 //! setup/confirm pairs).
 //!
-//! This device implements **Intel/Sharp extended, `0x0001`**, in the shape the
-//! Intel StrataFlash P30 family defines. The reason is the software: the UEFI
-//! firmware this device exists to serve — EDK II's `VirtNorFlashDxe`, which is
-//! BSD-2-Clause-Patent and so may be read — issues `0x70`/`0x50` status
-//! commands, `0x40` word programs, `0xe8`/`0xd0` buffered programs,
-//! `0x20`/`0xd0` block erases and `0x60`/`0xd0` block unlocks. Those are the
-//! Intel set. Implementing the AMD set instead would be a device nothing in
-//! this tree can talk to.
+//! By default this device implements **Intel/Sharp extended, `0x0001`**, in the
+//! shape the Intel StrataFlash P30 family defines. The reason is the software:
+//! the UEFI firmware this device was first built to serve — EDK II's
+//! `VirtNorFlashDxe`, which is BSD-2-Clause-Patent and so may be read — issues
+//! `0x70`/`0x50` status commands, `0x40` word programs, `0xe8`/`0xd0` buffered
+//! programs, `0x20`/`0xd0` block erases and `0x60`/`0xd0` block unlocks. Those
+//! are the Intel set.
+//!
+//! `command-set = "amd"` selects **AMD/Fujitsu standard, `0x0002`** instead,
+//! which is what a Spansion part on an embedded board speaks and what its boot
+//! loader and kernel expect: unlock cycles, autoselect, unlock bypass, sector
+//! and chip erase, the Secured Silicon Region, and a query table whose primary
+//! extended block is the AMD one. The state machine is in [`amd`], and the
+//! choice is one class with a property rather than two classes because
+//! everything else — the geometry, the lanes, the program-only-clears-bits
+//! array, the medium, the fast read path, the snapshot of the contents — is
+//! the same part.
 //!
 //! # Two chips make a bus
 //!
@@ -83,6 +92,8 @@
 //! * EDK II's `OvmfPkg/VirtNorFlashDxe` and `OvmfPkg/Library/VirtNorFlashDeviceLib`
 //!   (BSD-2-Clause-Patent, read under `ROADMAP.md` §1's permissive-source rule)
 //!   for which of those commands a real driver actually issues.
+//! * The **Infineon (Cypress/Spansion) S29JL064J** datasheet (002-00856 Rev.
+//!   \*J) for the AMD set: see [`amd`].
 //!
 //! No emulator source of any licence was consulted.
 
@@ -106,6 +117,10 @@ use crate::dev::medium::{self, Medium, Snapshot};
 use crate::machine::realize::Instance;
 use crate::machine::validate::{ClassSchema, PropSchema};
 
+pub mod amd;
+
+pub use amd::{AmdOptions, SecSiLock};
+
 /// The class name a machine description writes.
 pub const CLASS_NAME: &str = "flash.cfi";
 
@@ -124,6 +139,17 @@ pub const DEFAULT_INTERLEAVE: u64 = 2;
 
 /// Intel's JEDEC manufacturer identifier (JEP106, bank 1 code `0x89`).
 pub const DEFAULT_MANUFACTURER: u16 = 0x0089;
+
+/// Which command set the part speaks — the CFI query's primary command set
+/// field (JESD68.01 §4.3.1). A real enum: a part speaks exactly one, and every
+/// dispatch on it wants to be exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSet {
+    /// Intel/Sharp extended, `0x0001`.
+    Intel,
+    /// AMD/Fujitsu standard, `0x0002`.
+    Amd,
+}
 
 // ---------------------------------------------------------------------------
 // the command set (Intel/Sharp extended, 0x0001)
@@ -464,6 +490,27 @@ enum Pending {
     },
     /// The buffer is full; the next write must be the confirm.
     BufferConfirm,
+
+    // The AMD set's sequences (see [`amd`]).
+    /// `0xaa` at `0x555` was written; `0x55` at `0x2aa` must follow.
+    Unlock1,
+    /// Both unlock cycles are in; the next write at `0x555` is the command.
+    Unlock2,
+    /// A program setup (`0xa0`) was written; the next write is the data.
+    AmdProgram,
+    /// `0x80` was written; the second pair of unlock cycles must follow.
+    EraseSetup,
+    /// The first of that second pair is in.
+    EraseUnlock1,
+    /// Both are in; `0x10` erases the chip, `0x30` a sector.
+    EraseUnlock2,
+    /// A sector erase was accepted, and further `0x30` cycles within the
+    /// sector-erase time-out add sectors to it (S29JL064J §10.7).
+    EraseMore,
+    /// `0x90` was written, as the third cycle of autoselect, of the Secured
+    /// Silicon exit, or as the first of the unlock-bypass reset; a `0x00`
+    /// completes the last two.
+    AmdExit,
 }
 
 impl Pending {
@@ -476,6 +523,14 @@ impl Pending {
             Pending::BufferCount => 4,
             Pending::BufferData { .. } => 5,
             Pending::BufferConfirm => 6,
+            Pending::Unlock1 => 7,
+            Pending::Unlock2 => 8,
+            Pending::AmdProgram => 9,
+            Pending::EraseSetup => 10,
+            Pending::EraseUnlock1 => 11,
+            Pending::EraseUnlock2 => 12,
+            Pending::EraseMore => 13,
+            Pending::AmdExit => 14,
         }
     }
 }
@@ -496,6 +551,14 @@ struct Chip {
     /// The lock-down bit of each block: while set, the lock bit cannot be
     /// cleared.
     locked_down: Vec<bool>,
+    /// AMD: the part is in unlock bypass mode (S29JL064J §10.5.1).
+    bypass: bool,
+    /// AMD: the Secured Silicon Region replaces the bottom of the array
+    /// (S29JL064J §8.13) until the exit sequence.
+    secsi_mode: bool,
+    /// AMD: the Secured Silicon Region's 256 bytes. Non-volatile, so a reset
+    /// keeps them; empty on an Intel part.
+    secsi: Vec<u8>,
 }
 
 impl Chip {
@@ -507,7 +570,15 @@ impl Chip {
             buffer: Vec::new(),
             locked: alloc::vec![locked; blocks],
             locked_down: alloc::vec![down; blocks],
+            bypass: false,
+            secsi_mode: false,
+            secsi: Vec::new(),
         }
+    }
+
+    /// Whether a read of this part is a read of the array.
+    fn reads_array(&self) -> bool {
+        self.mode == Mode::Array && !self.secsi_mode
     }
 }
 
@@ -547,12 +618,17 @@ pub struct Array {
     /// Whether the part is write protected — modelled as the lock-down bit
     /// held set, which is what a board that ties `WP#` low produces.
     read_only: bool,
+    /// Which command set the state machines speak.
+    command_set: CommandSet,
+    /// The AMD set's part description; `None` on an Intel part.
+    amd: Option<AmdOptions>,
 }
 
 impl fmt::Debug for Array {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Array")
             .field("geometry", &self.geom)
+            .field("command_set", &self.command_set)
             .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
@@ -611,7 +687,51 @@ impl Array {
             device_id,
             power_up_locked,
             read_only,
+            command_set: CommandSet::Intel,
+            amd: None,
         })
+    }
+
+    /// Build parts that speak the **AMD** command set, erased.
+    ///
+    /// `protected` says whether every sector powers up protected.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] if the array does not fit in this host's memory, or
+    /// if `options` describes banks or a Secured Silicon image that do not fit
+    /// the geometry.
+    pub fn amd(
+        geom: Geometry,
+        manufacturer: u16,
+        device_id: u16,
+        options: AmdOptions,
+        protected: bool,
+        read_only: bool,
+    ) -> Result<Array> {
+        // `protected` is the Intel constructor's `power_up_locked`: on an AMD
+        // part the per-sector bit is the sector protection a programmer set,
+        // which is non-volatile, so a reset puts it back exactly as a power
+        // cycle would.
+        let mut array = Array::with_options(geom, manufacturer, device_id, protected, read_only)?;
+        options.check(&array.geom)?;
+        array.query = amd::build_query(&array.geom, &options);
+        {
+            let mut chips = array.chips.lock();
+            let lanes = chips.len();
+            for (lane, chip) in chips.iter_mut().enumerate() {
+                chip.secsi = options.secsi_for_lane(&array.geom, lane, lanes);
+            }
+        }
+        array.command_set = CommandSet::Amd;
+        array.amd = Some(options);
+        Ok(array)
+    }
+
+    /// Which command set the parts speak.
+    #[must_use]
+    pub fn command_set(&self) -> CommandSet {
+        self.command_set
     }
 
     /// The geometry these parts were built with.
@@ -701,6 +821,12 @@ impl Array {
             let locked = self.power_up_locked || self.read_only;
             chip.locked.fill(locked);
             chip.locked_down.fill(self.read_only);
+            // Bypass and the Secured Silicon window are modes, and a reset
+            // leaves both (S29JL064J §10.4: "until the system issues the Exit
+            // … command sequence, or until power is removed"). The region's
+            // *contents* are flash and stay.
+            chip.bypass = false;
+            chip.secsi_mode = false;
         }
         self.all_array.store(true, Ordering::Relaxed);
     }
@@ -725,11 +851,20 @@ impl Array {
         let dw = self.geom.device_width();
         let lane = ((offset / dw) % self.geom.interleave()) as usize;
         let chip = &chips[lane];
-        let word = match chip.mode {
-            Mode::Array => return self.array.read_u8(offset),
-            Mode::Status => chip.status,
-            Mode::Id => self.identifier(chip, offset),
-            Mode::Cfi => self.query_word(offset),
+        let word = match (chip.mode, self.command_set) {
+            (Mode::Array, _) => {
+                if chip.secsi_mode
+                    && let Some(at) = self.secsi_index(offset)
+                {
+                    return Ok(chip.secsi[at]);
+                }
+                return self.array.read_u8(offset);
+            }
+            (Mode::Status, _) => chip.status,
+            (Mode::Id, CommandSet::Intel) => self.identifier(chip, offset),
+            (Mode::Id, CommandSet::Amd) => self.amd_identifier(chip, offset),
+            (Mode::Cfi, CommandSet::Intel) => self.query_word(offset / self.geom.bus_width()),
+            (Mode::Cfi, CommandSet::Amd) => self.query_word(self.amd_word(offset)),
         };
         Ok((word >> (8 * (offset % dw))) as u8)
     }
@@ -759,8 +894,8 @@ impl Array {
         }
     }
 
-    fn query_word(&self, offset: u64) -> u16 {
-        let index = offset / self.geom.bus_width();
+    /// The query table's entry `index`, zero past its end.
+    fn query_word(&self, index: u64) -> u16 {
         usize::try_from(index)
             .ok()
             .and_then(|i| self.query.get(i))
@@ -770,9 +905,24 @@ impl Array {
     // -- the write path ----------------------------------------------------
 
     fn command(&self, chip: &mut Chip, offset: u64, value: u16) {
+        if self.command_set == CommandSet::Amd {
+            self.amd_command(chip, offset, value);
+            return;
+        }
         let cmd = (value & 0xff) as u8;
         match core::mem::replace(&mut chip.pending, Pending::None) {
-            Pending::None => self.first_cycle(chip, cmd),
+            // The AMD set's sequences cannot be pending on an Intel part —
+            // nothing but a hand-built snapshot puts them there — and one that
+            // is has nothing to continue, so the cycle starts afresh.
+            Pending::None
+            | Pending::Unlock1
+            | Pending::Unlock2
+            | Pending::AmdProgram
+            | Pending::EraseSetup
+            | Pending::EraseUnlock1
+            | Pending::EraseUnlock2
+            | Pending::EraseMore
+            | Pending::AmdExit => self.first_cycle(chip, cmd),
             Pending::Program => {
                 self.program(chip, offset, value);
                 chip.status |= SR_READY;
@@ -983,7 +1133,7 @@ impl Array {
     }
 
     fn refresh_fast_path(&self, chips: &[Chip]) {
-        let all = chips.iter().all(|c| c.mode == Mode::Array);
+        let all = chips.iter().all(Chip::reads_array);
         self.all_array.store(all, Ordering::Relaxed);
     }
 
@@ -1012,6 +1162,13 @@ impl Array {
             w.write_seq_len(chip.locked.len() as u64)?;
             for i in 0..chip.locked.len() {
                 w.write_u8(u8::from(chip.locked[i]) | (u8::from(chip.locked_down[i]) << 1))?;
+            }
+            // Only an AMD part has these, so an Intel part's chunk is exactly
+            // the bytes it always was.
+            if self.command_set == CommandSet::Amd {
+                w.write_bool(chip.bypass)?;
+                w.write_bool(chip.secsi_mode)?;
+                w.write_bytes(&chip.secsi)?;
             }
         }
         Ok(())
@@ -1064,6 +1221,14 @@ impl Array {
                     Pending::BufferData { left }
                 }
                 6 => Pending::BufferConfirm,
+                7 => Pending::Unlock1,
+                8 => Pending::Unlock2,
+                9 => Pending::AmdProgram,
+                10 => Pending::EraseSetup,
+                11 => Pending::EraseUnlock1,
+                12 => Pending::EraseUnlock2,
+                13 => Pending::EraseMore,
+                14 => Pending::AmdExit,
                 other => {
                     return Err(Error::State(format!(
                         "{other} is not a flash command sequence"
@@ -1086,6 +1251,19 @@ impl Array {
                 let bits = r.read_u8()?;
                 chip.locked[i] = bits & 1 != 0;
                 chip.locked_down[i] = bits & 2 != 0;
+            }
+            if self.command_set == CommandSet::Amd {
+                chip.bypass = r.read_bool()?;
+                chip.secsi_mode = r.read_bool()?;
+                let secsi: &[u8] = r.read_bytes()?;
+                if secsi.len() != amd::SECSI_BYTES {
+                    return Err(Error::State(format!(
+                        "a Secured Silicon Region of {} byte(s); this part's is {}",
+                        secsi.len(),
+                        amd::SECSI_BYTES
+                    )));
+                }
+                chip.secsi = secsi.to_vec();
             }
         }
         self.refresh_fast_path(&chips);
@@ -1313,15 +1491,40 @@ impl Cfi {
         let interleave = r.or_range("interleave", DEFAULT_INTERLEAVE, 1..=8)?;
         let block = r.or_size("block", DEFAULT_BLOCK)?;
         let blocks = r.optional_list("blocks")?.map(<[Value]>::to_vec);
-        let manufacturer =
-            r.or_range("manufacturer", u64::from(DEFAULT_MANUFACTURER), 0..=0xffff)?;
+        let command_set = match r.or_str("command-set", "intel")? {
+            "intel" => CommandSet::Intel,
+            "amd" => CommandSet::Amd,
+            other => {
+                return Err(Error::Property(format!(
+                    "`command-set = \"{other}\"`: a CFI part speaks \"intel\" (0x0001) or \
+                     \"amd\" (0x0002)"
+                )));
+            }
+        };
+        let amd = command_set == CommandSet::Amd;
+        // Each set's own defaults: an Intel P30 is Intel's and powers up with
+        // every block locked; an AMD-set part is AMD's (JEP106 `0x01`, which
+        // Spansion inherited) and powers up with nothing protected.
+        let default_manufacturer = if amd {
+            u64::from(amd::AMD_MANUFACTURER)
+        } else {
+            u64::from(DEFAULT_MANUFACTURER)
+        };
+        let manufacturer = r.or_range("manufacturer", default_manufacturer, 0..=0xffff)?;
         let device_id = r.or_range("device", 0u64, 0..=0xffff)?;
         let read_only = r.or("readonly", false)?;
-        let power_up_locked = r.or("locked", true)?;
+        let power_up_locked = r.or("locked", !amd)?;
         let media = r.optional_media("image")?;
         let slot = media.map(crate::core::props::Media::name);
         let image = media.map(crate::core::props::Media::to_bytes);
+        let amd_props = amd::AmdProps::read(&mut r)?;
         r.finish()?;
+        if !amd && let Some(name) = amd_props.first_given() {
+            return Err(Error::Property(format!(
+                "`{name}` describes the AMD command set, and this part speaks Intel's; add \
+                 `command-set = \"amd\"` or drop it"
+            )));
+        }
 
         // A medium the *host* installed under this bank's media slot name —
         // `--drive flash1=vars.fd`. It wins over the media table's bytes, the
@@ -1341,13 +1544,25 @@ impl Cfi {
                 geom.size()
             )));
         }
-        let array = Arc::new(Array::with_options(
-            geom,
-            manufacturer as u16,
-            device_id as u16,
-            power_up_locked,
-            read_only,
-        )?);
+        let array = Arc::new(if amd {
+            let options = amd_props.into_options()?;
+            Array::amd(
+                geom,
+                manufacturer as u16,
+                device_id as u16,
+                options,
+                power_up_locked,
+                read_only,
+            )?
+        } else {
+            Array::with_options(
+                geom,
+                manufacturer as u16,
+                device_id as u16,
+                power_up_locked,
+                read_only,
+            )?
+        });
         // The medium first, because it wins; the media table's bytes otherwise.
         if let Some(medium) = &supplied {
             // Exactly the bank's size, and not merely no larger. `flush` writes
@@ -1515,7 +1730,7 @@ fn block_regions(list: &[Value]) -> Result<Vec<BlockRegion>> {
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: 1,
-    summary: "CFI NOR flash: real program and erase semantics, Intel/Sharp command set",
+    summary: "CFI NOR flash: real program and erase semantics, Intel/Sharp or AMD command set",
     properties: &[
         PropertySpec {
             name: "size",
@@ -1575,7 +1790,53 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "locked",
             kind: ValueKind::Bool,
             required: false,
-            summary: "whether blocks power up locked, as an Intel P30 does (default true)",
+            summary: "whether blocks power up locked (Intel, default true) or sectors \
+                      protected (AMD, default false)",
+        },
+        PropertySpec {
+            name: "command-set",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "\"intel\" (0x0001, the default) or \"amd\" (0x0002)",
+        },
+        PropertySpec {
+            name: "device-ext",
+            kind: ValueKind::List,
+            required: false,
+            summary: "AMD: the second and third device-ID words, read at autoselect 0x0e and \
+                      0x0f, as in `[0x2202, 0x2201]`",
+        },
+        PropertySpec {
+            name: "banks",
+            kind: ValueKind::List,
+            required: false,
+            summary: "AMD: sectors per bank, bottom first, for the query's bank fields: \
+                      `[23, 48, 48, 23]`",
+        },
+        PropertySpec {
+            name: "boot-flag",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "AMD: the query's top/bottom boot sector flag (default derived from blocks)",
+        },
+        PropertySpec {
+            name: "secsi",
+            kind: ValueKind::Media,
+            required: false,
+            summary: "AMD: the media slot holding the Secured Silicon Region (default erased)",
+        },
+        PropertySpec {
+            name: "secsi-lock",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "AMD: \"none\" (default), \"customer\" or \"factory\", as autoselect \
+                      reports it; a locked region refuses program and erase",
+        },
+        PropertySpec {
+            name: "write-protect",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "AMD: hold WP# low, protecting the two outermost sectors at each end",
         },
     ],
     construct: |props| Ok(Box::new(Cfi::new(props)?)),
@@ -1731,6 +1992,15 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("device", ValueKind::Uint).range(0, 0xffff))
         .prop(PropSchema::new("readonly", ValueKind::Bool))
         .prop(PropSchema::new("locked", ValueKind::Bool))
+        .prop(PropSchema::new("command-set", ValueKind::Str).values(&["intel", "amd"]))
+        .prop(PropSchema::new("device-ext", ValueKind::List))
+        .prop(PropSchema::new("banks", ValueKind::List))
+        .prop(PropSchema::new("boot-flag", ValueKind::Uint).range(0, 0xff))
+        .prop(PropSchema::new("secsi", ValueKind::Media))
+        .prop(
+            PropSchema::new("secsi-lock", ValueKind::Str).values(&["none", "customer", "factory"]),
+        )
+        .prop(PropSchema::new("write-protect", ValueKind::Bool))
         .region("")
         .region("flash")
 }
