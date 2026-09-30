@@ -179,8 +179,15 @@ const INFO2_SCLKDIVEN: u16 = 1 << 13;
 /// Illegal access: a buffer access with no transfer.
 const INFO2_ILA: u16 = 1 << 15;
 /// The bits a write can clear.
-const INFO2_FLAGS: u16 = INFO2_CMDE | 0b10 | INFO2_ENDE | INFO2_DTO | 0b11_0000 | INFO2_RSPTO
-    | INFO2_BRE | INFO2_BWE | INFO2_ILA;
+const INFO2_FLAGS: u16 = INFO2_CMDE
+    | 0b10
+    | INFO2_ENDE
+    | INFO2_DTO
+    | 0b11_0000
+    | INFO2_RSPTO
+    | INFO2_BRE
+    | INFO2_BWE
+    | INFO2_ILA;
 /// The bits that can interrupt.
 const INFO2_IRQ: u16 = INFO2_FLAGS;
 /// The levels, which reflect the controller rather than latch.
@@ -188,6 +195,11 @@ const INFO2_LEVELS: u16 = INFO2_DAT0 | INFO2_SCLKDIVEN;
 
 /// `CC_EXT_MODE` bit 1: data moves by DMA request.
 const EXT_DMA: u16 = 1 << 1;
+
+/// The register lock's place in the SD ladder (`dev::sd`'s `SLOT_RANK`):
+/// below the socket, which is looked up first, and above the card's own
+/// state, which a command reaches with the registers held.
+const REGS_RANK: LockRank = LockRank::new(0x4d00);
 
 /// What `VERSION` reads. The lineage's controllers report an IP revision in the
 /// low byte; this is a plausible one and nothing in the traced driver reads it.
@@ -300,7 +312,10 @@ impl Sdhi {
         let mut r = props.reader();
         let slot_name = r.or("slot", String::from("sd0"))?;
         r.finish()?;
-        Ok(Sdhi::with_slot(slots::attach(props, &slot_name)?, slot_name))
+        Ok(Sdhi::with_slot(
+            slots::attach(props, &slot_name)?,
+            slot_name,
+        ))
     }
 
     /// Build one against a socket the caller already has.
@@ -309,7 +324,7 @@ impl Sdhi {
         let regs = Arc::new(Registers {
             slot,
             slot_name,
-            state: Mutex::with_rank(LockRank::DEVICE, State::new()),
+            state: Mutex::with_rank(REGS_RANK, State::new()),
             irq: Mutex::with_rank(LockRank::LEAF, None),
             rx_dreq: Mutex::with_rank(LockRank::LEAF, None),
             tx_dreq: Mutex::with_rank(LockRank::LEAF, None),
@@ -356,13 +371,16 @@ fn fixed_len(app: bool, index: u8) -> Option<usize> {
 }
 
 impl Registers {
+    /// The card in the socket. Looked up *before* the register lock is
+    /// taken — the socket ranks above it (`dev::sd::slot::SLOT_RANK`) — and
+    /// handed down to whatever needs it.
     fn card(&self) -> Option<Arc<SdCard>> {
         self.slot.card()
     }
 
     /// The card-detect and write-protect levels, from the socket.
-    fn levels(&self) -> u16 {
-        if self.slot.is_occupied() {
+    fn levels(card: Option<&Arc<SdCard>>) -> u16 {
+        if card.is_some() {
             INFO1_SDCD | INFO1_SDWP
         } else {
             INFO1_SDWP
@@ -398,7 +416,7 @@ impl Registers {
     }
 
     /// Issue the command `SD_CMD` names.
-    fn issue(&self, state: &mut State, value: u16) {
+    fn issue(&self, state: &mut State, card: Option<&Arc<SdCard>>, value: u16) {
         state.cmd = value;
         if state.soft_rst & 1 == 0 {
             return;
@@ -407,7 +425,7 @@ impl Registers {
         let app = (value >> 6) & 3 == 1;
         let rsp = (value >> CMD_RSP_SHIFT) & 7;
         state.xfer = None;
-        let Some(card) = self.card() else {
+        let Some(card) = card else {
             // Nobody on the CMD line: a timeout, unless nothing was expected.
             if rsp != 3 && index != 0 {
                 state.info2 |= INFO2_RSPTO;
@@ -489,7 +507,7 @@ impl Registers {
         let len = fixed_len(app, index).unwrap_or(usize::from(state.size.max(1)));
         match dir {
             Dir::Read => {
-                if !Self::fill(&card, &mut t, len) {
+                if !Self::fill(card, &mut t, len) {
                     state.info2 |= INFO2_DTO;
                     return;
                 }
@@ -513,13 +531,14 @@ impl Registers {
 
     /// The host has consumed (read) or supplied (write) a whole block: move
     /// to the next one or end the transfer.
-    fn block_done(&self, state: &mut State) {
+    fn block_done(&self, state: &mut State, card: Option<&Arc<SdCard>>) {
         let Some(mut t) = state.xfer.take() else {
             return;
         };
-        let card = self.card();
         if t.dir == Dir::Write {
-            let ok = card.as_ref().is_some_and(|c| c.write_data(&t.buf) != Data::Ended);
+            let ok = card
+                .as_ref()
+                .is_some_and(|c| c.write_data(&t.buf) != Data::Ended);
             if !ok {
                 state.info2 |= INFO2_DTO;
                 return;
@@ -555,7 +574,7 @@ impl Registers {
                     state.info2 |= INFO2_DTO;
                     return;
                 };
-                if !Self::fill(&card, &mut t, len) {
+                if !Self::fill(card, &mut t, len) {
                     state.info2 |= INFO2_DTO;
                     return;
                 }
@@ -571,7 +590,7 @@ impl Registers {
     }
 
     /// Read `n` bytes from the data port.
-    fn read_buf(&self, state: &mut State, n: usize) -> u32 {
+    fn read_buf(&self, state: &mut State, card: Option<&Arc<SdCard>>, n: usize) -> u32 {
         let Some(t) = state.xfer.as_mut().filter(|t| t.dir == Dir::Read) else {
             state.info2 |= INFO2_ILA;
             return 0;
@@ -585,13 +604,13 @@ impl Registers {
         }
         if t.pos >= t.buf.len() {
             state.info2 &= !INFO2_BRE;
-            self.block_done(state);
+            self.block_done(state, card);
         }
         value
     }
 
     /// Write `n` bytes to the data port.
-    fn write_buf(&self, state: &mut State, value: u32, n: usize) {
+    fn write_buf(&self, state: &mut State, card: Option<&Arc<SdCard>>, value: u32, n: usize) {
         let len = usize::from(state.size.max(1));
         let Some(t) = state.xfer.as_mut().filter(|t| t.dir == Dir::Write) else {
             state.info2 |= INFO2_ILA;
@@ -604,12 +623,12 @@ impl Registers {
         }
         if t.buf.len() >= len {
             state.info2 &= !INFO2_BWE;
-            self.block_done(state);
+            self.block_done(state, card);
         }
     }
 
     /// Read a sixteen-bit register (the data port is handled by the caller).
-    fn read_reg(&self, state: &State, offset: u64) -> u16 {
+    fn read_reg(&self, state: &State, card: Option<&Arc<SdCard>>, offset: u64) -> u16 {
         match offset {
             SD_CMD => state.cmd,
             SD_ARG0 => state.arg as u16,
@@ -620,7 +639,7 @@ impl Registers {
                 let half = ((offset - SD_RSP_FIRST) / 2) as usize;
                 (state.rsp[half / 2] >> (16 * (half % 2))) as u16
             }
-            SD_INFO1 => (state.info1 & INFO1_FLAGS) | self.levels(),
+            SD_INFO1 => (state.info1 & INFO1_FLAGS) | Self::levels(card),
             SD_INFO2 => (state.info2 & !INFO2_LEVELS) | INFO2_LEVELS,
             SD_INFO1_MASK => state.info1_mask,
             SD_INFO2_MASK => state.info2_mask,
@@ -635,9 +654,9 @@ impl Registers {
     }
 
     /// Write a sixteen-bit register (the data port is handled by the caller).
-    fn write_reg(&self, state: &mut State, offset: u64, value: u16) {
+    fn write_reg(&self, state: &mut State, card: Option<&Arc<SdCard>>, offset: u64, value: u16) {
         match offset {
-            SD_CMD => self.issue(state, value),
+            SD_CMD => self.issue(state, card, value),
             SD_ARG0 => state.arg = (state.arg & 0xffff_0000) | u32::from(value),
             SD_ARG1 => state.arg = (state.arg & 0x0000_ffff) | (u32::from(value) << 16),
             SD_STOP => {
@@ -682,6 +701,8 @@ impl MemOps for Registers {
         if !matches!(n, 1 | 2 | 4) {
             return Err(BusError::BadAccess);
         }
+        let card = self.card();
+        let card = card.as_ref();
         let value = {
             let mut state = self.state.lock();
             if offset & !3 == SD_BUF0 {
@@ -692,13 +713,13 @@ impl MemOps for Registers {
                         .as_ref()
                         .map_or(0, |t| t.buf.get(t.pos).copied().map_or(0, u32::from))
                 } else {
-                    self.read_buf(&mut state, n)
+                    self.read_buf(&mut state, card, n)
                 }
             } else if n == 4 {
-                u32::from(self.read_reg(&state, offset))
-                    | (u32::from(self.read_reg(&state, offset + 2)) << 16)
+                u32::from(self.read_reg(&state, card, offset))
+                    | (u32::from(self.read_reg(&state, card, offset + 2)) << 16)
             } else {
-                let half = self.read_reg(&state, offset & !1);
+                let half = self.read_reg(&state, card, offset & !1);
                 u32::from(if offset & 1 != 0 { half >> 8 } else { half })
             }
         };
@@ -721,25 +742,27 @@ impl MemOps for Registers {
         for (i, b) in src.iter().enumerate() {
             value |= u32::from(*b) << (8 * i);
         }
+        let card = self.card();
+        let card = card.as_ref();
         {
             let mut state = self.state.lock();
             if offset & !3 == SD_BUF0 {
-                self.write_buf(&mut state, value, n);
+                self.write_buf(&mut state, card, value, n);
             } else if n == 4 {
                 // A 32-bit write covers two registers; the high one second,
                 // so an argument or a status pair lands in order.
-                self.write_reg(&mut state, offset, value as u16);
-                self.write_reg(&mut state, offset + 2, (value >> 16) as u16);
+                self.write_reg(&mut state, card, offset, value as u16);
+                self.write_reg(&mut state, card, offset + 2, (value >> 16) as u16);
             } else if n == 2 {
-                self.write_reg(&mut state, offset & !1, value as u16);
+                self.write_reg(&mut state, card, offset & !1, value as u16);
             } else {
-                let old = self.read_reg(&state, offset & !1);
+                let old = self.read_reg(&state, card, offset & !1);
                 let merged = if offset & 1 != 0 {
                     (old & 0x00ff) | ((value as u16) << 8)
                 } else {
                     (old & 0xff00) | (value as u16 & 0xff)
                 };
-                self.write_reg(&mut state, offset & !1, merged);
+                self.write_reg(&mut state, card, offset & !1, merged);
             }
         }
         self.refresh();
@@ -872,7 +895,11 @@ impl Device for Sdhi {
             state.other.insert(k, v);
         }
         if r.read_bool()? {
-            let dir = if r.read_bool()? { Dir::Read } else { Dir::Write };
+            let dir = if r.read_bool()? {
+                Dir::Read
+            } else {
+                Dir::Write
+            };
             let buf = r.read_bytes()?.to_vec();
             let pos = r.read_u32()? as usize;
             let bounded = r.read_bool()?;

@@ -525,14 +525,18 @@ fn a_snapshot_round_trips_to_identical_state() {
         .load("du", CLASS.name, CLASS.version, &Migrations::new())
         .unwrap();
     restored.load(&mut chunk.reader()).unwrap();
-    assert_eq!(*restored.shared.regs.lock(), *saved.shared.regs.lock());
+    // One register lock at a time: two devices' locks share a rank.
+    let want = saved.shared.regs.lock().clone();
+    assert_eq!(*restored.shared.regs.lock(), want);
     assert_eq!(snapshot(&restored), bytes, "identical state bytes");
     assert_eq!(restored.next_event_tick(), saved.next_event_tick());
     assert_eq!(restored.irq_asserted(), saved.irq_asserted());
     saved.advance_to(10_000);
     restored.advance_to(10_000);
     assert_eq!(restored.frames(), saved.frames());
-    assert_eq!(*restored.shared.regs.lock(), *saved.shared.regs.lock());
+    // One register lock at a time: two devices' locks share a rank.
+    let want = saved.shared.regs.lock().clone();
+    assert_eq!(*restored.shared.regs.lock(), want);
 }
 
 #[test]

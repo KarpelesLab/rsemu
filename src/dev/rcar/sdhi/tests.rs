@@ -42,7 +42,9 @@ fn host(with_card: bool) -> (Sdhi, Arc<Slot>) {
 }
 
 fn w16(h: &Sdhi, off: u64, v: u16) {
-    h.regs.write(off, &v.to_le_bytes(), MemAttrs::DEFAULT).unwrap();
+    h.regs
+        .write(off, &v.to_le_bytes(), MemAttrs::DEFAULT)
+        .unwrap();
 }
 
 fn r16(h: &Sdhi, off: u64) -> u16 {
@@ -78,7 +80,11 @@ fn bring_up(h: &Sdhi) {
     w16(h, SOFT_RST, 0);
     w16(h, SOFT_RST, 1);
     command(h, 0, 0);
-    assert_eq!(command(h, 8, 0x1aa) & 0xfff, 0x1aa, "CMD8 echoes the check pattern");
+    assert_eq!(
+        command(h, 8, 0x1aa) & 0xfff,
+        0x1aa,
+        "CMD8 echoes the check pattern"
+    );
     command(h, 55, 0);
     let ocr = command(h, 0x40 | 41, 0x40ff_8000);
     assert_ne!(ocr & (1 << 31), 0, "powered up");
@@ -97,7 +103,11 @@ fn a_response_lands_in_the_response_registers_and_raises_rspend() {
     assert_eq!((status >> 9) & 0xf, 4, "CMD13 reports the transfer state");
     let info1 = r16(&h, SD_INFO1);
     assert_ne!(info1 & INFO1_RSPEND, 0);
-    assert_ne!(info1 & INFO1_ACEND, 0, "a command with no data ends at its response");
+    assert_ne!(
+        info1 & INFO1_ACEND,
+        0,
+        "a command with no data ends at its response"
+    );
     assert_ne!(info1 & INFO1_SDCD, 0, "card detect reports the card");
 }
 
@@ -176,7 +186,10 @@ fn a_block_write_reaches_the_card() {
     }
     assert_ne!(r16(&h, SD_INFO1) & INFO1_ACEND, 0);
     let mut back = [0u8; 2];
-    slot.card().unwrap().read_media(3 * BLOCK as u64, &mut back).unwrap();
+    slot.card()
+        .unwrap()
+        .read_media(3 * BLOCK as u64, &mut back)
+        .unwrap();
     assert_eq!(back, [0x00, 0xa5]);
 }
 
@@ -213,7 +226,11 @@ fn a_debugger_read_of_the_port_pops_nothing() {
     let mut b = [0u8; 4];
     h.regs.read(SD_BUF0, &mut b, MemAttrs::DEBUG).unwrap();
     h.regs.read(SD_BUF0, &mut b, MemAttrs::DEBUG).unwrap();
-    assert_eq!(r32(&h, SD_BUF0) & 0xff, 1, "the first byte is still the first");
+    assert_eq!(
+        r32(&h, SD_BUF0) & 0xff,
+        1,
+        "the first byte is still the first"
+    );
 }
 
 #[test]
@@ -242,5 +259,9 @@ fn the_snapshot_round_trips_mid_transfer() {
         .unwrap();
     other.load(&mut chunk.reader()).unwrap();
     assert_eq!(save(&other), bytes, "save, load, save is stable");
-    assert_eq!(r32(&other, SD_BUF0) & 0xff, 2 ^ 4, "the port resumes where it was");
+    assert_eq!(
+        r32(&other, SD_BUF0) & 0xff,
+        2 ^ 4,
+        "the port resumes where it was"
+    );
 }
