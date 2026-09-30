@@ -1,0 +1,93 @@
+# a9-private - two Cortex-A9s, their MPCore private region, an L2C-310 and an
+# S29JL064J boot flash: the shape of a Renesas R-Car H1's CPU side, and none of
+# the rest of it.
+#
+# Not in the catalog. `machines/tests/` is where a board that exists for one
+# test lives; `tests/a9_private.rs` runs it by path. It exists to prove that the
+# three device classes a Cortex-A9 board needs survive the machine layer: that
+# `clock = cpuclk / 2` is the PERIPHCLK the private timers count, that the
+# GIC's 256-byte GICv1 CPU interface fits between the SCU and the global timer,
+# that the timers' per-processor pins reach the right bank of the GIC, and that
+# the flash answers the AMD command set through a 16-bit bus.
+#
+# The addresses are the R-Car H1's: the private region at 0xf0000000 and the
+# L2C-310 at 0xf0100000. The layout inside the private region is the Cortex-A9
+# MPCore TRM's (DDI 0407 §1.5), and is fixed by the silicon:
+#
+#   +0x0000  SCU                 arm.a9mpcore  scu
+#   +0x0100  GIC CPU interface   arm.gic       cpu     (version 1: 256 bytes)
+#   +0x0200  global timer        arm.a9mpcore  global
+#   +0x0600  private timers      arm.a9mpcore  private
+#   +0x1000  GIC distributor     arm.gic       dist
+#
+# The two processors are parked on `B .` out of the flash; the test drives the
+# devices over the bus, the way `cia-pair.machine`'s does.
+
+machine "a9-private" {
+  osc cpuclk = 200000000 Hz
+
+  space mem { width = 32 }
+
+  object cpu0 "cpu.arm" {
+    clock  = cpuclk
+    space  = mem
+    engine = "interp"
+    cpu    = "cortex-a9"
+    cp15   = "none"
+  }
+  object cpu1 "cpu.arm" {
+    clock  = cpuclk
+    space  = mem
+    engine = "interp"
+    cpu    = "cortex-a9"
+    cp15   = "none"
+  }
+
+  # One S29JL064J on a 16-bit bus: the CPU's A1 is the part's A0.
+  object nor "flash.cfi" {
+    size        = 8M
+    width       = 2
+    interleave  = 1
+    command-set = "amd"
+    blocks      = [8, 8K, 126, 64K, 8, 8K]
+    device      = 0x227e
+    device-ext  = [0x2202, 0x2201]
+    banks       = [23, 48, 48, 23]
+    boot-flag   = 1
+    image       = "flash"
+  }
+  object dram "ram" { size = 16M }
+
+  # PERIPHCLK is the CPU clock over two.
+  object mpcore "arm.a9mpcore" {
+    clock      = cpuclk / 2
+    cpus       = 2
+    processors = [cpu0, cpu1]
+  }
+  object gic "arm.gic" {
+    version    = 1
+    cpus       = 2
+    spis       = 64
+    processors = [cpu0, cpu1]
+  }
+  object l2 "arm.l2c310" { size = 1M, ways = 16 }
+
+  map mem 0x00000000 size 8M     = nor
+  map mem 0x40000000 size 16M    = dram
+  map mem 0xf0000000 size 0x100  = mpcore.scu
+  map mem 0xf0000100 size 0x100  = gic.cpu
+  map mem 0xf0000200 size 0x100  = mpcore.global
+  map mem 0xf0000600 size 0x100  = mpcore.private
+  map mem 0xf0001000 size 0x1000 = gic.dist
+  map mem 0xf0100000 size 0x1000 = l2
+
+  # IDs 27, 29 and 30 of each processor (DDI 0407 §3.2): PPIs 11, 13, 14.
+  wire mpcore.gt0  -> gic.cpu0ppi11
+  wire mpcore.twd0 -> gic.cpu0ppi13
+  wire mpcore.wdt0 -> gic.cpu0ppi14
+  wire mpcore.gt1  -> gic.cpu1ppi11
+  wire mpcore.twd1 -> gic.cpu1ppi13
+  wire mpcore.wdt1 -> gic.cpu1ppi14
+  wire gic.irq0    -> cpu0.irq
+  wire gic.irq1    -> cpu1.irq
+}
