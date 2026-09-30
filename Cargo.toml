@@ -1178,6 +1178,18 @@ dev-arm = ["dev-fdt"]
 # module it lives in and the GIC its interrupts are wired to.
 dev-arm-mpcore = ["dev-arm"]
 
+# The ARM L2C-310 (PL310) level 2 cache controller's register file
+# (src/dev/arm/l2c310.rs, `arm.l2c310`): identification, control, auxiliary
+# control, latencies, event counters, interrupts, lockdown, prefetch and power
+# control, and every maintenance operation -- which completes the instant it is
+# written, because there is no cache behind it: host memory is already
+# coherent. What a kernel's L2 driver needs to find, size, enable and flush the
+# cache, and nothing it would have to wait on. A separate feature from
+# `dev-arm-mpcore` because it is a separate AMBA part: an A9 board usually has
+# one, but a Cortex-A5 or an A8-era SoC can carry it without an MPCore region.
+# Written from DDI 0246. `no_std + alloc`, no dependencies.
+dev-arm-l2c310 = ["dev-arm"]
+
 # The AArch64 `virt` board as a machine (machines/arm64-virt.machine plus the
 # classes it names). The board a real arm64 kernel is pointed at:
 #

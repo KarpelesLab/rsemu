@@ -17,6 +17,7 @@
 //! | [`boot`] | the reset vector, and where the generated tree lands |
 //! | [`loader`] | putting a kernel or a ramdisk into guest memory |
 //! | [`mpcore`] | the Cortex-A9 MPCore private region: SCU, global timer, private timers and watchdogs (`dev-arm-mpcore`) |
+//! | [`l2c310`] | the L2C-310 (PL310) level 2 cache controller's register file (`dev-arm-l2c310`) |
 //!
 //! PSCI itself is **not** here, and could not be: `SMC` and `HVC` are
 //! instructions, so the handler is in
@@ -133,6 +134,9 @@
 pub mod boot;
 pub mod dt;
 pub mod gic;
+#[cfg(feature = "dev-arm-l2c310")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-arm-l2c310")))]
+pub mod l2c310;
 pub mod loader;
 #[cfg(feature = "dev-arm-mpcore")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-arm-mpcore")))]
@@ -147,6 +151,8 @@ mod tests;
 
 pub use boot::BootRom;
 pub use gic::Gic;
+#[cfg(feature = "dev-arm-l2c310")]
+pub use l2c310::L2c310;
 pub use loader::Loader;
 #[cfg(feature = "dev-arm-mpcore")]
 pub use mpcore::A9MpCore;
@@ -165,6 +171,8 @@ pub fn register(registry: &mut crate::core::Registry) -> crate::core::Result<()>
     boot::register(registry)?;
     #[cfg(feature = "dev-arm-mpcore")]
     mpcore::register(registry)?;
+    #[cfg(feature = "dev-arm-l2c310")]
+    l2c310::register(registry)?;
     loader::register(registry)
 }
 
@@ -180,6 +188,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> crate::core::Result<()> 
     boot::bind(bindings)?;
     #[cfg(feature = "dev-arm-mpcore")]
     mpcore::bind(bindings)?;
+    #[cfg(feature = "dev-arm-l2c310")]
+    l2c310::bind(bindings)?;
     loader::bind(bindings)
 }
 
@@ -196,5 +206,7 @@ pub fn schemas() -> alloc::vec::Vec<crate::machine::validate::ClassSchema> {
     ];
     #[cfg(feature = "dev-arm-mpcore")]
     out.push(mpcore::schema());
+    #[cfg(feature = "dev-arm-l2c310")]
+    out.push(l2c310::schema());
     out
 }
