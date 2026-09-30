@@ -163,6 +163,28 @@ const GICD_IIDR: u32 = 0x0200_043b;
 /// `GICC_IIDR`: implementer Arm, architecture version 2 in bits 19:16.
 const GICC_IIDR: u32 = 0x0002_043b;
 
+/// How much address space a **version 1** CPU interface answers: one 256-byte
+/// block. There is no `GICC_DIR` in GICv1 — splitting priority drop from
+/// deactivation is a v2 addition — so nothing lives past `0xfc`, and in the
+/// Cortex-A9 MPCore private region the distributor begins `0xf00` bytes later
+/// (*Cortex-A9 MPCore TRM*, DDI 0407, §1.5, the private memory region map:
+/// CPU interface at `0x0100`-`0x01ff`, distributor at `0x1000`-`0x1fff`).
+pub const CPU_WINDOW_LEN_V1: u64 = 0x100;
+
+/// `ICDIIDR` of the interrupt controller integrated in the Cortex-A9 MPCore:
+/// implementer Arm (`0x43b`) with the part's variant and revision above it
+/// (DDI 0407 chapter 3, the distributor's register summary).
+///
+/// No driver of the period branches on it — the GICv1 programming sequence
+/// finds the controller by its compatible string or its base address and sizes
+/// it from `ICDICTR` — so this is here for a guest that prints it.
+const ICDIIDR_A9: u32 = 0x0102_043b;
+
+/// `ICCIIDR` of the same controller: part number `0x390` in 31:20, the
+/// architecture version (1) in 19:16, revision in 15:12, implementer Arm in
+/// 11:0 (DDI 0407 chapter 3, the CPU interface's register summary).
+const ICCIIDR_A9: u32 = 0x3901_243b;
+
 /// What one interrupt's configuration says: level-sensitive or edge-triggered.
 ///
 /// Two bits per interrupt in `GICD_ICFGR`, of which only the top one means
@@ -333,6 +355,10 @@ struct Registers {
     owners: Vec<AtomicU32>,
     cpus: usize,
     spis: usize,
+    /// Which architecture version the identification registers report: 2, or
+    /// 1 for the GICv1 a Cortex-A9 MPCore integrates. See
+    /// [`Gic::build_version`].
+    version: u8,
 }
 
 impl fmt::Debug for Registers {
@@ -373,6 +399,7 @@ impl Gic {
         let mut r = props.reader();
         let cpus = r.or_range("cpus", 1u64, 1..=MAX_CPUS)?;
         let spis = r.or_range("spis", 96u64, 32..=u64::from(MAX_INTID - SPI_BASE))?;
+        let version = r.or_range("version", 2u64, 1..=2)?;
         let processors = match r.optional_list("processors")? {
             Some(items) => items
                 .iter()
@@ -406,7 +433,7 @@ impl Gic {
                 processors.len()
             )));
         }
-        let mut gic = Gic::build(cpus as usize, spis as usize);
+        let mut gic = Gic::build_version(cpus as usize, spis as usize, version as u8);
         gic.processors = processors;
         Ok(gic)
     }
@@ -414,6 +441,40 @@ impl Gic {
     /// Build one directly, for a test or a hand-wired machine.
     #[must_use]
     pub fn build(cpus: usize, spis: usize) -> Gic {
+        Gic::build_version(cpus, spis, 2)
+    }
+
+    /// Build one that reports architecture `version` — 2, or 1 for the
+    /// interrupt controller inside a Cortex-A9 MPCore.
+    ///
+    /// # Why version 1 is a property and not a second device
+    ///
+    /// The GICv1 programmers' model a Cortex-A9 MPCore integrates (DDI 0407
+    /// chapter 3, the PL390's architecture) and GICv2's are the same register
+    /// file at the same offsets for everything a driver of either generation
+    /// touches: `ICDDCR`/`GICD_CTLR` at `0x000`, `ICDICTR`/`GICD_TYPER` at
+    /// `0x004` with `ITLinesNumber` in 4:0 and `CPUNumber` in 7:5, the
+    /// set-enable, pending, active, priority, target and configuration arrays
+    /// at `0x100`-`0xcff`, `ICDSGIR` at `0xf00`; and on the CPU interface
+    /// `ICCICR`, `ICCPMR`, `ICCBPR`, `ICCIAR`, `ICCEOIR`, `ICCRPR` and
+    /// `ICCHPIR` at `0x00`-`0x18`. What differs is what the part *says it is*
+    /// — the implementer registers — and the CPU interface's size, because
+    /// `GICC_DIR` at `0x1000` does not exist before v2. That is two constants
+    /// and a window length; a second controller would be two thousand lines to
+    /// hold them.
+    ///
+    /// Nothing else changes, deliberately. `ICDICTR` is not given a
+    /// `SecurityExtn` bit: this block implements no security extensions (every
+    /// interrupt is group 0), and a driver that found the bit set would go
+    /// looking for banked `ICDISR` state that is not there. The A9's fixed
+    /// PPI configuration (`ICDICFR1`, where IDs 27, 29 and 30 are
+    /// rising-edge) is not imposed either: the banked configuration stays
+    /// level-sensitive and writable, and the `arm.a9mpcore` timers drive a
+    /// *level* — event flag and interrupt enable — which a level-sensitive
+    /// input turns into exactly one interrupt per event as long as the handler
+    /// clears the flag, which is what every driver's handler does first.
+    #[must_use]
+    pub fn build_version(cpus: usize, spis: usize, version: u8) -> Gic {
         let regs = Arc::new(Registers {
             state: Mutex::with_rank(LockRank::DEVICE, State::new(cpus, spis)),
             outs: Mutex::with_rank(LockRank::LEAF, alloc::vec![None; cpus]),
@@ -423,6 +484,7 @@ impl Gic {
                 .collect(),
             cpus,
             spis,
+            version,
         });
         let dist: RegionRef = Arc::new(Region::io(
             "arm.gic.dist",
@@ -431,7 +493,11 @@ impl Gic {
         ));
         let cpuif: RegionRef = Arc::new(Region::io(
             "arm.gic.cpu",
-            CPU_WINDOW_LEN,
+            if version == 1 {
+                CPU_WINDOW_LEN_V1
+            } else {
+                CPU_WINDOW_LEN
+            },
             Arc::new(CpuIface {
                 regs: Arc::clone(&regs),
             }) as Arc<dyn MemOps>,
@@ -486,6 +552,12 @@ impl Gic {
     #[must_use]
     pub fn spis(&self) -> usize {
         self.regs.spis
+    }
+
+    /// Which architecture version it reports.
+    #[must_use]
+    pub fn version(&self) -> u8 {
+        self.regs.version
     }
 
     /// Drive an interrupt input directly, as a wire would.
@@ -729,7 +801,13 @@ impl Registers {
                 let lines = state.intids() / 32 - 1;
                 lines | ((self.cpus as u32 - 1) << 5)
             }
-            0x008 => GICD_IIDR,
+            0x008 => {
+                if self.version == 1 {
+                    ICDIIDR_A9
+                } else {
+                    GICD_IIDR
+                }
+            }
             0x080..0x100 => {
                 // `GICD_IGROUPR`: every interrupt is group 0 on a GIC without
                 // security extensions, and this model has none.
@@ -814,7 +892,7 @@ impl Registers {
             }
             // The identification registers, which say GICv2 to anything that
             // reads them the way it reads a PrimeCell part.
-            0xfe8 => 0x0000_0002,
+            0xfe8 => u32::from(self.version),
             _ => 0,
         }
     }
@@ -1091,7 +1169,13 @@ impl MemOps for CpuIface {
                 Registers::best(&self.regs.state.lock(), cpu).0
             }
             0x1c => u32::from(self.regs.state.lock().bpr[cpu]),
-            0xfc => GICC_IIDR,
+            0xfc => {
+                if self.regs.version == 1 {
+                    ICCIIDR_A9
+                } else {
+                    GICC_IIDR
+                }
+            }
             _ => 0,
         };
         dst.copy_from_slice(&value.to_le_bytes());
@@ -1142,7 +1226,12 @@ impl DtSource for Registers {
             // `arm,cortex-a15-gic` is the compatible string every GICv2 driver
             // has matched since GICv2 shipped; `arm,gic-400` is the part name
             // for the same programmers' model.
-            compatible: &["arm,cortex-a15-gic", "arm,gic-400"],
+            compatible: if self.version == 1 {
+                // The binding's name for the GICv1 inside an A9 MPCore.
+                &["arm,cortex-a9-gic"][..]
+            } else {
+                &["arm,cortex-a15-gic", "arm,gic-400"]
+            },
             cells: Vec::new(),
             strings: Vec::new(),
             irq_wire: None,
@@ -1229,6 +1318,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the processors the CPU interfaces belong to, in interface order; \
                       required once `cpus` is more than one",
+        },
+        PropertySpec {
+            name: "version",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "architecture version the identification registers report: 2 (default), \
+                      or 1 for the Cortex-A9 MPCore's GICv1 with its 256-byte CPU interface",
         },
     ],
     construct: |props| Ok(Box::new(Gic::new(props)?)),
@@ -1494,6 +1590,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("cpus", ValueKind::Uint).range(1, MAX_CPUS))
         .prop(PropSchema::new("spis", ValueKind::Uint).range(32, u64::from(MAX_INTID - SPI_BASE)))
         .prop(PropSchema::new("processors", ValueKind::List))
+        .prop(PropSchema::new("version", ValueKind::Uint).range(1, 2))
         .region("")
         .region("dist")
         .region("cpu");
@@ -2066,6 +2163,50 @@ mod tests {
             as_cpu_read(&restored, 0x014, CPU0),
             u32::from(IDLE_PRIORITY)
         );
+    }
+
+    #[test]
+    fn version_one_identifies_as_the_cortex_a9_controller_and_answers_the_same_map() {
+        let props = Props::new().with("version", 1u64).with("spis", 64u64);
+        let gic = Gic::new(&props).expect("a version 1 block");
+        assert_eq!(gic.version(), 1);
+        assert_eq!(dist_read(&gic, 0x008), ICDIIDR_A9, "ICDIIDR");
+        assert_eq!(cpu_read(&gic, 0x0fc), ICCIIDR_A9, "ICCIIDR");
+        assert_eq!((cpu_read(&gic, 0x0fc) >> 16) & 0xf, 1, "architecture 1");
+        // `ICDICTR` sizes the block exactly as `GICD_TYPER` does: 96 ids.
+        assert_eq!(dist_read(&gic, 0x004) & 0x1f, 2, "ITLinesNumber");
+        assert_eq!(dist_read(&gic, 0x004) & (1 << 10), 0, "no SecurityExtn");
+        // 256 bytes of CPU interface, so a map at +0x100 of an A9 private
+        // region stops short of the distributor at +0x1000.
+        assert_eq!(gic.region("cpu").unwrap().len(), CPU_WINDOW_LEN_V1);
+        assert_eq!(gic.region("dist").unwrap().len(), DIST_WINDOW_LEN);
+
+        // And the GICv1 sequence a period driver runs works unchanged:
+        // ICDDCR, ICCICR, ICCPMR, enable one SPI, claim it through ICCIAR,
+        // end it through ICCEOIR.
+        let ids = WireIdAllocator::new();
+        let id = ids.alloc();
+        let probe = Arc::new(Probe::default());
+        let wire = Wire::builder()
+            .source(id)
+            .sink(Arc::clone(&probe) as Arc<dyn WireSink>, 0)
+            .build_shared();
+        gic.connect("irq0", WireSource::new(wire, id)).unwrap();
+        dist_write(&gic, 0x000, 1);
+        cpu_write(&gic, 0x000, 1);
+        cpu_write(&gic, 0x004, 0xf0);
+        enable_spi(&gic, 5, 0xa0);
+        gic.set_source(SPI_BASE + 5, true);
+        assert!(probe.high());
+        assert_eq!(cpu_read(&gic, 0x00c), SPI_BASE + 5);
+        gic.set_source(SPI_BASE + 5, false);
+        cpu_write(&gic, 0x010, SPI_BASE + 5);
+        assert!(!probe.high());
+        // The default is still version 2, which is what every existing board
+        // has always been.
+        assert_eq!(Gic::build(1, 96).version(), 2);
+        assert_eq!(dist_read(&Gic::build(1, 96), 0x008), GICD_IIDR);
+        assert!(Gic::new(&Props::new().with("version", 3u64)).is_err());
     }
 
     #[test]
