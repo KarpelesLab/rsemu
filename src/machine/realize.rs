@@ -977,6 +977,7 @@ impl<'a> Realizer<'a> {
             sweep,
             shape: core::mem::take(&mut self.shape),
             deferred: core::mem::take(&mut self.deferred),
+            reset_request: crate::core::device::MachineReset::open(&self.options.hosts).ok(),
         });
         // A machine is born cold, and the sweep that follows a reset is what
         // makes its wire graph consistent (§4.3).

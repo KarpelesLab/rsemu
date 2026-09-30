@@ -340,6 +340,8 @@ pub struct Machine {
     sweep: Vec<PinRef>,
     shape: MachineShape,
     deferred: Deferred,
+    /// See [`MachineParts::reset_request`].
+    reset_request: Option<Arc<crate::core::device::MachineReset>>,
     /// The record/replay seam, if one is attached (§4.5).
     ///
     /// `None` is the ordinary case and costs one `Option` test per scheduling
@@ -382,6 +384,8 @@ pub(crate) struct MachineParts {
     pub(crate) sweep: Vec<PinRef>,
     pub(crate) shape: MachineShape,
     pub(crate) deferred: Deferred,
+    /// The build's machine-reset request, which devices file warm resets on.
+    pub(crate) reset_request: Option<Arc<crate::core::device::MachineReset>>,
 }
 
 impl Machine {
@@ -408,6 +412,7 @@ impl Machine {
             sweep: parts.sweep,
             shape: parts.shape,
             deferred: parts.deferred,
+            reset_request: parts.reset_request,
             recorder: None,
             debug_halted: false,
             spin: None,
@@ -639,6 +644,11 @@ impl Machine {
         self.sched.apply_clock_requests()?;
         self.dispatch(&report)?;
         crate::core::trace::quantum_report(&report);
+        // A device that resets the whole board asked for it during the
+        // quantum; the boundary is where nothing is in flight.
+        if self.reset_request.as_ref().is_some_and(|r| r.take()) {
+            self.reset(ResetKind::Warm);
+        }
         Ok(report)
     }
 

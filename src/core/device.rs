@@ -1179,6 +1179,55 @@ impl Deferred {
     }
 }
 
+/// A request to reset the whole machine, warm.
+///
+/// Most boards reset a processor by pulsing its reset pin, and that is right
+/// for a reset button wired to one core. It is wrong for the chip that resets
+/// a whole SoC — a supervisor, a companion microcontroller, a watchdog on the
+/// board — because on silicon every peripheral goes back to its reset state
+/// with the processor while memory keeps its contents, and a pin reaches only
+/// the core. A device that is such a chip takes this handle from
+/// [`RealizeCtx::machine_reset`] and calls [`request`](MachineReset::request);
+/// the machine resets every device with [`ResetKind::Warm`] at the next
+/// quantum boundary, in declaration order, exactly as
+/// [`Machine::reset`](crate::machine::Machine::reset) does.
+///
+/// It meets the machine through the build's host-object table as a
+/// [rendezvous](crate::core::hosts::HostKind::rendezvous): nothing
+/// non-deterministic crosses it, and the boundary it acts at is a function of
+/// virtual time alone.
+#[derive(Debug, Default)]
+pub struct MachineReset {
+    pending: crate::core::sync::AtomicBool,
+}
+
+impl MachineReset {
+    /// The kind the request is filed under.
+    pub const KIND: crate::core::hosts::HostKind =
+        crate::core::hosts::HostKind::rendezvous("machine-reset");
+
+    /// The build's one request, creating it on first mention.
+    ///
+    /// # Errors
+    ///
+    /// If another kind of host object holds the name.
+    pub fn open(hosts: &HostObjects) -> Result<Arc<MachineReset>> {
+        hosts.open(Self::KIND, "machine", MachineReset::default)
+    }
+
+    /// Ask for a warm reset of the whole machine at the next quantum boundary.
+    pub fn request(&self) {
+        self.pending
+            .store(true, crate::core::sync::Ordering::Release);
+    }
+
+    /// Whether one is owed, clearing it. The machine's side.
+    pub fn take(&self) -> bool {
+        self.pending
+            .swap(false, crate::core::sync::Ordering::AcqRel)
+    }
+}
+
 /// What a device is handed during [`Device::realize`].
 ///
 /// Holds the instance's identity and its deferred queue. Access to address
@@ -1232,6 +1281,17 @@ impl<'a> RealizeCtx<'a> {
     /// from a constructor.
     pub fn hosts(&self) -> &'a HostObjects {
         self.hosts
+    }
+
+    /// The machine's reset request: what a device holds to reset the **whole
+    /// machine** rather than one processor.
+    ///
+    /// # Errors
+    ///
+    /// If another kind of host object holds the name, which is a bug in this
+    /// file.
+    pub fn machine_reset(&self) -> Result<Arc<MachineReset>> {
+        MachineReset::open(self.hosts)
     }
 
     /// Queue an action to run after realize completes.

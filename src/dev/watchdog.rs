@@ -19,6 +19,9 @@
 //! * When `timeout` ticks of its clock pass with no edge, `reset` pulses
 //!   (high, then low) and the watchdog disarms until the next edge — the
 //!   rebooted firmware re-arms it by kicking.
+//! * With `scope = "machine"` the expiry also resets **every device**, warm
+//!   ([`MachineReset`](crate::core::device::MachineReset)): what a supervisor
+//!   that holds a whole SoC in reset does, where a pin reaches only a core.
 //!
 //! The countdown is lazily advanced (`ROADMAP.md` §4.2): the device schedules
 //! only its deadline and costs nothing between edges.
@@ -69,6 +72,10 @@ struct Shared {
     deadline: AtomicU64,
     lazy: Mutex<Option<LazyHandle>>,
     out: Mutex<Option<WireSource>>,
+    /// With `scope = "machine"`, the machine's reset request: the whole board
+    /// resets, not only whatever `reset` is wired to.
+    machine: Mutex<Option<Arc<crate::core::device::MachineReset>>>,
+    whole_machine: bool,
 }
 
 impl fmt::Debug for Shared {
@@ -82,6 +89,10 @@ impl fmt::Debug for Shared {
 
 impl Shared {
     fn pulse(&self) {
+        let machine = self.machine.lock().clone();
+        if let Some(machine) = machine {
+            machine.request();
+        }
         let out = self.out.lock().clone();
         if let Some(out) = out {
             out.set(Level::High);
@@ -158,8 +169,13 @@ impl PinWatchdog {
     pub fn new(props: &Props) -> Result<PinWatchdog> {
         let mut r = props.reader();
         let timeout = r.or_range("timeout", 0u64, 1..=u64::MAX / 2)?;
+        let scope = r.or_enum("scope", "pin", &["pin", "machine"])?;
         r.finish()?;
-        Ok(PinWatchdog::with_timeout(timeout))
+        let mut w = PinWatchdog::with_timeout(timeout);
+        if let Some(shared) = Arc::get_mut(&mut w.shared) {
+            shared.whole_machine = scope == "machine";
+        }
+        Ok(w)
     }
 
     /// A watchdog that fires `timeout` ticks after the last edge.
@@ -180,6 +196,8 @@ impl PinWatchdog {
                 deadline: AtomicU64::new(NEVER),
                 lazy: Mutex::with_rank(LockRank::LEAF, None),
                 out: Mutex::with_rank(LockRank::LEAF, None),
+                machine: Mutex::with_rank(LockRank::LEAF, None),
+                whole_machine: false,
             }),
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         }
@@ -197,12 +215,20 @@ pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
     summary: "an external watchdog: pulses `reset` when `kick` stops toggling for `timeout` ticks",
-    properties: &[PropertySpec {
-        name: "timeout",
-        kind: ValueKind::Uint,
-        required: true,
-        summary: "ticks of the device's clock allowed between two edges on `kick`",
-    }],
+    properties: &[
+        PropertySpec {
+            name: "timeout",
+            kind: ValueKind::Uint,
+            required: true,
+            summary: "ticks of the device's clock allowed between two edges on `kick`",
+        },
+        PropertySpec {
+            name: "scope",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "\"pin\" (the default): pulse `reset`; \"machine\": also reset every device, warm",
+        },
+    ],
     construct: |props| Ok(Box::new(PinWatchdog::new(props)?)),
 };
 
@@ -211,7 +237,10 @@ impl Device for PinWatchdog {
         &CLASS
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        if self.shared.whole_machine {
+            *self.shared.machine.lock() = Some(ctx.machine_reset()?);
+        }
         Ok(())
     }
 
@@ -318,6 +347,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("timeout", ValueKind::Uint).required())
+        .prop(PropSchema::new("scope", ValueKind::Str).values(&["pin", "machine"]))
         .port(KICK_PIN, PortDir::In)
         .port(RESET_PIN, PortDir::Out)
 }
