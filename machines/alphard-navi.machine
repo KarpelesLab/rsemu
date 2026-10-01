@@ -189,6 +189,11 @@ machine "alphard-navi" {
   object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
   object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }
 
+  # The power domains. The SD system's framebuffer driver switches the SGX on
+  # here and polls for the switch to finish; as plain memory it never did, and
+  # it logged "power on SGX error!".
+  object sysc "rcar.sysc" { }
+
   # GPIO banks 0-6. Their interrupts are GIC IDs 173-179, one per bank, which
   # the kernel's GPIO driver chains to. Pins nothing drives read high: the
   # sub-processor handshake lines are active-low with pull-ups, and a line that
@@ -245,8 +250,7 @@ machine "alphard-navi" {
   object misc0  "ram" { size = 32K }   # 0xffc00000: 0xffc00300/400 (DMA request routing, among others)
   object darc   "ram" { size = 4K }    # 0xffc55000: the kernel's UIO_DARC block
   object cpg    "ram" { size = 4K }    # 0xffc80000: clock pulse generator
-  object sysc   "ram" { size = 4K }    # 0xffcc0000: power control (the SGX power-up poll times out here)
-  object dma    "ram" { size = 4K }    # 0xffd85000: DMA controller registers
+  object ffcc   "ram" { size = 4K }    # 0xffcc0000: unidentified; touched during the SD system's bring-up
   object misc1  "ram" { size = 4K }    # 0xfff12000
   object audio0 "ram" { size = 4K }    # 0xffd8a000: audio, touched by the SD kernel's route_pdc_setReg
   object audio1 "ram" { size = 8K }    # 0xffd90000: audio routing and serial sound ports (route_pdc_setReg)
@@ -295,14 +299,14 @@ machine "alphard-navi" {
   map mem 0xffc71000 size 0x38   = i2c1
   map mem 0xffc72000 size 0x38   = i2c2
   map mem 0xffc80000 size 4K     = cpg
-  map mem 0xffcc0000 size 4K     = sysc
+  map mem 0xffcc0000 size 4K     = ffcc
   map mem 0xffd80000 size 0x30   = tmu0
   map mem 0xffd81000 size 0x30   = tmu1
   map mem 0xffd82000 size 0x30   = tmu2
   map mem 0xffd80030 size 0xfd0  = tmu0x
   map mem 0xffd81030 size 0xfd0  = tmu1x
   map mem 0xffd82030 size 0xfd0  = tmu2x
-  map mem 0xffd85000 size 4K     = dma
+  map mem 0xffd85000 size 4K     = sysc
   map mem 0xffe40000 size 0x100  = scif0
   map mem 0xffe41000 size 0x100  = scif1
   map mem 0xffe42000 size 0x100  = scif2

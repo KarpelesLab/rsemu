@@ -15,6 +15,7 @@
 //! | [`hspi`] | `rcar.hspi` | one HSPI channel: an SPI master with 8-byte FIFOs, by programmed I/O, on a named SPI bus |
 //! | [`hpbdmac`] | `rcar.hpbdmac` | the HPB-DMAC: 44 request-paced peripheral DMA channels with double-buffered register sets |
 //! | [`sdhi`] | `rcar.sdhi` | the SD host interface: command engine, one-block buffer, DMA requests, driving a `sd.card` through a socket |
+//! | [`sysc`] | `rcar.sysc` | the SYSC power domains: switches that complete at once, with status and completion bits |
 //! | [`du`] | `rcar.du` | the R-Car Display Unit: timing registers, up to eight planes composed from guest memory, a frame counter on the dot clock |
 //!
 //! The SCIF and TMU are written from the Renesas hardware manuals (the
@@ -35,6 +36,7 @@ pub mod hspi;
 pub mod i2c;
 pub mod scif;
 pub mod sdhi;
+pub mod sysc;
 pub mod tmu;
 
 pub use du::Du;
@@ -44,6 +46,7 @@ pub use hspi::Hspi;
 pub use i2c::I2c;
 pub use scif::Scif;
 pub use sdhi::Sdhi;
+pub use sysc::Sysc;
 pub use tmu::Tmu;
 
 /// Add every class here to a registry.
@@ -58,6 +61,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     i2c::register(registry)?;
     scif::register(registry)?;
     sdhi::register(registry)?;
+    sysc::register(registry)?;
     tmu::register(registry)?;
     du::register(registry)
 }
@@ -74,6 +78,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     i2c::bind(bindings)?;
     scif::bind(bindings)?;
     sdhi::bind(bindings)?;
+    sysc::bind(bindings)?;
     tmu::bind(bindings)?;
     du::bind(bindings)
 }
@@ -88,6 +93,7 @@ pub fn schemas() -> Vec<ClassSchema> {
         i2c::schema(),
         scif::schema(),
         sdhi::schema(),
+        sysc::schema(),
         tmu::schema(),
         du::schema()
     ]
