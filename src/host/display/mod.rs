@@ -49,14 +49,16 @@
 //!
 //! # Where the pixels go
 //!
-//! Two consumers exist today and neither of them is a window:
+//! Two consumers exist in every build and neither of them is a window:
 //!
 //! * [`png`] captures a surface as a PNG, or a sequence of them as an APNG —
 //!   headless, so CI and `docs/` get real screenshots of a real run.
 //! * [`crate::wasm`] hands the surface's address to a `<canvas>`; `web/` is the
 //!   page that draws it.
 //!
-//! **There is deliberately no native window.** `ROADMAP.md` §8 wants X11,
+//! **There is no native window in a default build.** The `window` feature adds
+//! one through `minifb` (`host::window`), the single GUI dependency the
+//! owner allowed in, opt-in and labelled. Without it, `ROADMAP.md` §8 wants X11,
 //! Wayland, Win32 and macOS backends eventually, and the dependency policy
 //! rules out every GUI crate that would make them short (`CLAUDE.md`), so each
 //! one is the wire protocol by hand: X11 means the connection handshake,

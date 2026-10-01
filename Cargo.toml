@@ -25,6 +25,14 @@ exclude       = ["/docs/local", "/.github"]
 # (CLAUDE.md). Optional, so the default `cargo tree` is still only `rsemu`.
 oxideav-png = { version = "0.1", default-features = false, optional = true }
 
+# A native window for `host::window` (the `window` feature): the one GUI
+# dependency the owner allowed, as an opt-in exception to CLAUDE.md's "no GUI
+# toolkit". Chosen for its size -- five crates on macOS, six on Windows -- over
+# winit + softbuffer (33/16) or wgpu + winit (75/85). `default-features =
+# false` keeps Linux to X11 (`x11`), without the Wayland stack. Optional, so the
+# default `cargo tree` is still only `rsemu`.
+minifb = { version = "0.28", default-features = false, features = ["x11"], optional = true }
+
 # Disk images and the block-device seam under `dev/blk`: `fstool::BlockDevice`
 # plus sparse raw, qcow2, DMG and DiskCopy 4.2 backends. First-party
 # (Karpelès Lab, MIT) and named as a permitted dependency in CLAUDE.md;
@@ -153,6 +161,14 @@ gdb = ["std"]
 # on `std::net`, no external crates, no thread per connection. Needs `std`, and
 # a display device to have anything to show.
 vnc = ["std"]
+
+# A native window onto the machine's display (src/host/window, `--window`):
+# the same loop as `vnc` -- slices of virtual time, input posted through the
+# recorder, real-time pacing from the rate controller -- presented through
+# `minifb` instead of a socket. **Breaks the dependency policy on purpose and
+# says so**: it is the one GUI crate allowed in, opt-in only, like the
+# Hypervisor.framework and WHPX backends. Needs `std`.
+window = ["std", "dep:minifb"]
 
 # The monitor console (src/host/monitor): an interactive prompt on a stopped
 # machine — the device tree and one device's whole current state, the memory

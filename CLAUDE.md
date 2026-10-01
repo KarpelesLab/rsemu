@@ -74,8 +74,11 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
   pull external crates under optional features, so CI checks the feature-enabled
   tree too.
 - OS interaction is by raw syscall (the `purestd` pattern), not via `libc`.
-- The two exceptions that break purity — macOS Hypervisor.framework and Windows
-  WHPX — are opt-in features labelled as such in the README. Never silent.
+- The exceptions that break purity — macOS Hypervisor.framework, Windows WHPX,
+  and the `window` feature's `minifb` (the one GUI crate, allowed by the owner
+  for a native display window) — are opt-in features labelled as such. Never
+  silent, never default. A second GUI or graphics crate is a new decision for
+  the owner, not a precedent this one sets.
 
 ## `no_std`
 

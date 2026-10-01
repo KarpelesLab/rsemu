@@ -19,6 +19,7 @@
 //! | `gdb` | yes | the GDB remote serial protocol over TCP (§8) |
 //! | `monitor` | yes | the console: a stopped machine, asked questions and steered (§8) |
 //! | `vnc` | yes | the RFB protocol over TCP: a screen and a keyboard (§8) |
+//! | `window` | yes | a native window through `minifb`, the one opt-in GUI dependency |
 //!
 //! # Why the trait is not itself `std`
 //!
@@ -72,3 +73,7 @@ pub mod monitor;
 #[cfg(feature = "vnc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "vnc")))]
 pub mod vnc;
+
+#[cfg(feature = "window")]
+#[cfg_attr(docsrs, doc(cfg(feature = "window")))]
+pub mod window;

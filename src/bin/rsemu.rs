@@ -245,6 +245,11 @@ RUN OPTIONS:
                         `5900`, `:5900` and `host:5900` all work; a bare port
                         binds the loopback interface only, because there is no
                         authentication. The machine runs at wall-clock speed
+    --window            Show the machine's display in a native window, with its
+                        keys and mouse as input; the machine runs at wall-clock
+                        speed, as under --vnc. Needs a build with `window`
+                        (the one opt-in GUI dependency, `minifb`).
+    --scale <n>         The window's size: 1, 2 or 4 times the display.
     --mon               Drop into the monitor console: the machine is held
                         stopped at a prompt that answers what a debugger has no
                         packet for -- the device tree and one device's whole
@@ -492,6 +497,12 @@ struct RunArgs {
     /// Where to listen for VNC clients, if `--vnc` was given.
     #[cfg(feature = "vnc")]
     vnc: Option<String>,
+    /// Whether to show the display in a native window (`--window`).
+    #[cfg(feature = "window")]
+    window: bool,
+    /// The window's scale (`--scale`), 1, 2 or 4.
+    #[cfg(feature = "window")]
+    scale: u32,
     /// Where to write the input log, if `--record-input` was given.
     ///
     /// Not VNC's any more. The recorder these two build is put in
@@ -916,6 +927,23 @@ fn run(args: &[String]) -> ExitCode {
     // debugger does — so it is checked before the console loop. It is the one
     // branch that delivers its own outputs, because the session owns the screen
     // and the sound it was handed for as long as it runs.
+    #[cfg(feature = "window")]
+    if parsed.window {
+        let status = window_session(
+            &mut machine,
+            &parsed,
+            &options.realize.hosts,
+            scanout.take(),
+            &mut drains,
+        );
+        let status = if traces.finish(&machine, &options.realize.hosts, parsed.quiet) {
+            status
+        } else {
+            ExitCode::FAILURE
+        };
+        return finish(&machine, status);
+    }
+
     #[cfg(feature = "vnc")]
     if parsed.vnc.is_some() {
         let status = vnc_session(
@@ -2052,6 +2080,10 @@ struct Console {
 /// A build without `vnc` cannot, and says so at compile time rather than
 /// carrying a flag it would never set.
 fn serving_vnc(args: &RunArgs) -> bool {
+    #[cfg(feature = "window")]
+    if args.window {
+        return true;
+    }
     #[cfg(feature = "vnc")]
     {
         args.vnc.is_some()
@@ -2597,6 +2629,116 @@ fn interact(
 /// A character port literally named `keyboard` is what `pc.kbc` opens, and a
 /// pad port is what `nes.ports` opens; a machine with a serial console does not
 /// get scan codes typed into it, because a serial console is not a keyboard.
+/// The input sinks a live frontend feeds: whichever of a keyboard, pads and
+/// pointers this board opened. Shared by `--vnc` and `--window`.
+#[cfg(any(feature = "vnc", feature = "window"))]
+fn input_sinks(hosts: &HostObjects) -> Vec<Arc<dyn rsemu::host::input::InputSink>> {
+    let mut sinks: Vec<Arc<dyn rsemu::host::input::InputSink>> = Vec::new();
+
+    // The keyboard, if this machine has one.
+    if let Ok(Some(port)) = rsemu::host::chardev::ports::get(hosts, "keyboard") {
+        sinks.push(Arc::new(rsemu::host::input::KeyboardSink::new(port)));
+    }
+    // The controllers, if it has those instead. Whichever console's they are:
+    // all three families file their port under the same `pad` host kind, so the
+    // loop this replaced — list the kind, ask for a NES-typed pad — got a Game
+    // Boy's and a Master System's *names* and then failed the downcast in
+    // silence, which is a screen with no buttons. `host::input::Pads` asks each
+    // family for its own type.
+    #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+    if let Some(pad) = rsemu::host::input::PadSink::open(hosts, 0) {
+        sinks.push(Arc::new(pad));
+    }
+    // The pointer, if it has one of those. Nothing in `machines/` does yet — a
+    // USB controller and a display are not on the same board in this tree — so
+    // this is the half of the path that lives in `host/`, wired where it will
+    // be needed. `tests/vnc_pointer.rs` drives it with a mouse built by hand.
+    #[cfg(feature = "dev-usb-hid")]
+    if let Some(mouse) = rsemu::host::input::MouseSink::open(hosts) {
+        sinks.push(Arc::new(mouse));
+    }
+    // An Amiga's keyboard and mouse. Their devices open named host objects of
+    // their own, and these sinks deliver into them downstream of the session's
+    // channel, so what a person does is recorded once, as keysyms and pointer
+    // positions, and replays through the same translation.
+    #[cfg(feature = "dev-amiga-keyboard")]
+    if let Some(keyboard) = rsemu::host::input::amiga::AmigaKeyboardSink::open(hosts) {
+        sinks.push(Arc::new(keyboard));
+    }
+    #[cfg(feature = "dev-amiga-mouse")]
+    if let Some(mouse) = rsemu::host::input::amiga::AmigaMouseSink::open(hosts) {
+        sinks.push(Arc::new(mouse));
+    }
+    // And a Macintosh's mouse, the same way. There is no keyboard half: nothing
+    // in this tree turns a keysym into one of the Guide's transition codes yet
+    // (`docs/platforms/mac-plus.md`'s ledger).
+    #[cfg(feature = "dev-mac")]
+    if let Some(mouse) = rsemu::host::input::mac::MacMouseSink::open(hosts) {
+        sinks.push(Arc::new(mouse));
+    }
+    sinks
+}
+
+/// `--window`: the display in a native window, the same loop as `--vnc`.
+#[cfg(feature = "window")]
+fn window_session(
+    machine: &mut Machine,
+    args: &RunArgs,
+    hosts: &HostObjects,
+    scanout: Option<Box<dyn rsemu::host::display::Scanout>>,
+    drains: &mut Drains,
+) -> ExitCode {
+    use rsemu::host::window::WindowSession;
+
+    let Some(scanout) = scanout else {
+        eprintln!("rsemu: --window: this machine has no display to show");
+        return ExitCode::from(2);
+    };
+    let mut session = match WindowSession::open(machine.name(), scanout, args.scale) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rsemu: --window: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    for sink in input_sinks(hosts) {
+        session = session.with_sink(sink);
+    }
+    if let Some(recorder) = machine.recorder().map(Arc::clone)
+        && let Err(e) = session.attach(&recorder)
+    {
+        eprintln!("rsemu: {e}");
+        return ExitCode::FAILURE;
+    }
+    if !args.quiet {
+        eprintln!("  window open -- close it or Ctrl-C to stop\n");
+    }
+    let term = Terminal::open();
+    let deadline = args
+        .span_given
+        .then(|| machine.now().saturating_add(args.span));
+    let status = session.run(machine, |m| {
+        drains.pump();
+        !term.interrupted() && !interrupted(m) && !deadline.is_some_and(|d| m.now() >= d)
+    });
+    drop(term);
+    if let Err(e) = status {
+        eprintln!("rsemu: {e}");
+        return ExitCode::FAILURE;
+    }
+    let logged = write_input_log(args, machine.recorder());
+    let captured = drains.finish(args.quiet);
+    if !args.quiet {
+        summarise(machine);
+    }
+    let drew = write_screenshot(args, Some(session.scanout()));
+    if drew && logged && captured {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 #[cfg(feature = "vnc")]
 fn vnc_session(
     machine: &mut Machine,
@@ -2629,47 +2771,8 @@ fn vnc_session(
     };
 
     let mut session = VncSession::new(server, scanout);
-
-    // The keyboard, if this machine has one.
-    if let Ok(Some(port)) = rsemu::host::chardev::ports::get(hosts, "keyboard") {
-        session = session.with_sink(Arc::new(rsemu::host::input::KeyboardSink::new(port)));
-    }
-    // The controllers, if it has those instead. Whichever console's they are:
-    // all three families file their port under the same `pad` host kind, so the
-    // loop this replaced — list the kind, ask for a NES-typed pad — got a Game
-    // Boy's and a Master System's *names* and then failed the downcast in
-    // silence, which is a screen with no buttons. `host::input::Pads` asks each
-    // family for its own type.
-    #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
-    if let Some(pad) = rsemu::host::input::PadSink::open(hosts, 0) {
-        session = session.with_sink(Arc::new(pad));
-    }
-    // The pointer, if it has one of those. Nothing in `machines/` does yet — a
-    // USB controller and a display are not on the same board in this tree — so
-    // this is the half of the path that lives in `host/`, wired where it will
-    // be needed. `tests/vnc_pointer.rs` drives it with a mouse built by hand.
-    #[cfg(feature = "dev-usb-hid")]
-    if let Some(mouse) = rsemu::host::input::MouseSink::open(hosts) {
-        session = session.with_sink(Arc::new(mouse));
-    }
-    // An Amiga's keyboard and mouse. Their devices open named host objects of
-    // their own, and these sinks deliver into them downstream of the session's
-    // channel, so what a person does is recorded once, as keysyms and pointer
-    // positions, and replays through the same translation.
-    #[cfg(feature = "dev-amiga-keyboard")]
-    if let Some(keyboard) = rsemu::host::input::amiga::AmigaKeyboardSink::open(hosts) {
-        session = session.with_sink(Arc::new(keyboard));
-    }
-    #[cfg(feature = "dev-amiga-mouse")]
-    if let Some(mouse) = rsemu::host::input::amiga::AmigaMouseSink::open(hosts) {
-        session = session.with_sink(Arc::new(mouse));
-    }
-    // And a Macintosh's mouse, the same way. There is no keyboard half: nothing
-    // in this tree turns a keysym into one of the Guide's transition codes yet
-    // (`docs/platforms/mac-plus.md`'s ledger).
-    #[cfg(feature = "dev-mac")]
-    if let Some(mouse) = rsemu::host::input::mac::MacMouseSink::open(hosts) {
-        session = session.with_sink(Arc::new(mouse));
+    for sink in input_sinks(hosts) {
+        session = session.with_sink(sink);
     }
 
     // Recording and replaying are `core::record`'s, not this frontend's, and
@@ -2884,6 +2987,10 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         gdb: None,
         #[cfg(feature = "vnc")]
         vnc: None,
+        #[cfg(feature = "window")]
+        window: false,
+        #[cfg(feature = "window")]
+        scale: 1,
         record_input: None,
         replay_input: None,
     };
@@ -2942,6 +3049,18 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--gdb" => out.gdb = Some(value(arg)?),
             #[cfg(feature = "vnc")]
             "--vnc" => out.vnc = Some(value(arg)?),
+            #[cfg(feature = "window")]
+            "--window" => out.window = true,
+            #[cfg(feature = "window")]
+            "--scale" => {
+                let v = value(arg)?;
+                out.scale = match v.as_str() {
+                    "1" => 1,
+                    "2" => 2,
+                    "4" => 4,
+                    _ => return Err(format!("--scale wants 1, 2 or 4, got `{v}`")),
+                };
+            }
             "--record-input" => out.record_input = Some(value(arg)?),
             "--replay-input" => out.replay_input = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
