@@ -81,6 +81,17 @@
 //! a break. `ORER` can, but only in loopback: the host side pushes back
 //! rather than overrunning (see below).
 //!
+//! # The receive timeout
+//!
+//! `SCLSR` bit 2 is a timeout: set once bytes have arrived and the line has
+//! then gone quiet, cleared like `ORER` (read 1, write 0), and by a receiver
+//! reset or `RE` going off. With `SCSCR` bit 2 set it interrupts. A driver
+//! that receives by DMA lives on it — the controller only interrupts the CPU
+//! when a whole buffer fills, so a short message would otherwise sit in a
+//! half-filled buffer until enough others arrived behind it. "Quiet" here is
+//! one [`Device::run`] slice in which no new byte came, a few character
+//! times at the rates these links run at.
+//!
 //! # Transmission, and why back pressure is modelled
 //!
 //! A byte written to `SCFTDR` enters the transmit FIFO and is offered to the
@@ -153,7 +164,7 @@ use crate::machine::realize::Instance;
 pub const CLASS_NAME: &str = "rcar.scif";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How much address space the register block answers.
 ///
@@ -214,11 +225,13 @@ const SCR_RE: u16 = 1 << 4;
 const SCR_REIE: u16 = 1 << 3;
 /// The bits of `SCSCR` that exist: the five above and CKE[1:0]. Bit 2 is
 /// reserved on the SH7780 SCIF.
-const SCR_MASK: u16 = 0x08fb;
+const SCR_MASK: u16 = 0x08ff;
 
 /// `SCSCR.TEIE` (bit 11): the transmit-end interrupt, on `TEND`. R-Car's
 /// SCIF has it; the SH7780's does not, which is why the mask above grew.
 const SCR_TEIE: u16 = 1 << 11;
+/// The receive-timeout interrupt enable.
+const SCR_TOIE: u16 = 1 << 2;
 
 // -- SCFSR (§25.3.7) ---------------------------------------------------------
 
@@ -256,6 +269,10 @@ const FCR_MASK: u16 = 0x07ff;
 
 /// Overrun error: a byte arrived with the receive FIFO full and was lost.
 const LSR_ORER: u16 = 1 << 0;
+/// Receive timeout: bytes arrived and the line then went quiet.
+const LSR_TO: u16 = 1 << 2;
+/// The `SCLSR` flags the read-1-write-0 rule clears.
+const LSR_CLEARABLE: u16 = LSR_ORER | LSR_TO;
 
 /// `SCSPTR`'s bits: the four pin pairs, each an I/O direction and a data bit.
 const SPTR_MASK: u16 = 0x00ff;
@@ -359,6 +376,10 @@ struct State {
     lsr: u16,
     /// Whether `ORER` was read as 1, for the same rule.
     lsr_seen: u16,
+    /// Bytes have arrived and the timeout has not yet fired for them.
+    rx_armed: bool,
+    /// A byte arrived since the last run slice.
+    rx_fresh: bool,
     dl: u16,
     cks: u16,
     hssrr: u16,
@@ -381,6 +402,8 @@ impl State {
             sptr: 0,
             lsr: 0,
             lsr_seen: 0,
+            rx_armed: false,
+            rx_fresh: false,
             dl: 0,
             cks: 0,
             hssrr: 0,
@@ -572,7 +595,8 @@ impl Registers {
         let tei = scr & SCR_TEIE != 0 && fsr & FSR_TEND != 0;
         let eri = scr & (SCR_RIE | SCR_REIE) != 0
             && (fsr & (FSR_ER | FSR_BRK) != 0 || state.lsr & LSR_ORER != 0);
-        txi || rxi || tei || eri
+        let toi = scr & SCR_TOIE != 0 && state.lsr & LSR_TO != 0;
+        txi || rxi || tei || eri || toi
     }
 
     /// Drive the interrupt line. Never called with the state lock held.
@@ -636,6 +660,36 @@ impl Registers {
             return;
         }
         state.rx.push_back(byte);
+        state.rx_armed = true;
+        state.rx_fresh = true;
+    }
+
+    /// A receiver turned off or reset has no timeout to report.
+    fn quiet_receiver(state: &mut State) {
+        state.lsr &= !LSR_TO;
+        state.lsr_seen &= !LSR_TO;
+        state.rx_armed = false;
+        state.rx_fresh = false;
+    }
+
+    /// One run slice has passed: a receiver that heard bytes before it and
+    /// none during it times out.
+    fn tick(&self) {
+        {
+            let mut state = self.state.lock();
+            if !state.rx_armed {
+                return;
+            }
+            if state.rx_fresh {
+                state.rx_fresh = false;
+                return;
+            }
+            state.rx_armed = false;
+            if Self::receiving(&state) {
+                state.lsr |= LSR_TO;
+            }
+        }
+        self.refresh();
     }
 
     /// Whether the receiver takes bytes: enabled, and not held in reset.
@@ -681,6 +735,8 @@ impl Registers {
                         break;
                     };
                     state.rx.push_back(byte);
+                    state.rx_armed = true;
+                    state.rx_fresh = true;
                 }
             }
             self.settle(&mut state);
@@ -763,6 +819,9 @@ impl Registers {
                 }
                 SCSCR => {
                     state.scr = merge(state.scr, SCR_MASK);
+                    if state.scr & SCR_RE == 0 {
+                        Self::quiet_receiver(&mut state);
+                    }
                     // Setting TE or RE may release bytes that were waiting.
                     transmit = true;
                 }
@@ -803,12 +862,13 @@ impl Registers {
                     }
                     if state.fcr & FCR_RFRST != 0 {
                         state.rx.clear();
+                        Self::quiet_receiver(&mut state);
                     }
                     transmit = true;
                 }
                 SCSPTR => state.sptr = merge(state.sptr, SPTR_MASK),
                 SCLSR => {
-                    let zeros = !v & m & state.lsr_seen & LSR_ORER;
+                    let zeros = !v & m & state.lsr_seen & LSR_CLEARABLE;
                     state.lsr &= !zeros;
                     state.lsr_seen &= !zeros;
                 }
@@ -990,6 +1050,7 @@ impl Device for Scif {
 
     fn run(&self, budget: Budget) -> Consumed {
         self.regs.pump();
+        self.regs.tick();
         Consumed::new(budget.ticks)
     }
 
@@ -1019,7 +1080,8 @@ impl Device for Scif {
         ] {
             w.write_u16(half)?;
         }
-        Ok(())
+        w.write_bool(state.rx_armed)?;
+        w.write_bool(state.rx_fresh)
         // The port's queues are the host's state, not the machine's, and are
         // deliberately absent (`ROADMAP.md` §4.5). The variant is a
         // construction property and is the machine file's to restate.
@@ -1059,6 +1121,8 @@ impl Device for Scif {
         state.hssrr = r.read_u16()?;
         state.hsrtrgr = r.read_u16()?;
         state.hsttrgr = r.read_u16()?;
+        state.rx_armed = r.read_bool()?;
+        state.rx_fresh = r.read_bool()?;
         *self.regs.state.lock() = state;
         self.regs.refresh();
         Ok(())
@@ -1348,6 +1412,36 @@ mod tests {
         assert_eq!(level(&probe), 1, "the empty FIFO asks for data");
         write(&s, SCSCR, 2, 0);
         assert_eq!(level(&probe), 0);
+    }
+
+    #[test]
+    fn a_quiet_line_after_bytes_times_out() {
+        let (s, port, probe) = with_irq(Variant::Scif);
+        write(&s, SCSCR, 2, u32::from(SCR_RE | SCR_TOIE));
+        s.regs.tick();
+        assert_eq!(read(&s, SCLSR, 2), 0, "nothing heard, nothing to time out");
+        port.feed(b"ack");
+        s.pump();
+        s.regs.tick();
+        assert_eq!(read(&s, SCLSR, 2), 0, "bytes arrived during this slice");
+        s.regs.tick();
+        assert_eq!(
+            read(&s, SCLSR, 2),
+            u32::from(LSR_TO),
+            "a quiet slice after them"
+        );
+        assert_eq!(level(&probe), 1, "TOIE enables it");
+        write(&s, SCLSR, 2, 0);
+        assert_eq!(read(&s, SCLSR, 2), 0, "read 1, write 0");
+        assert_eq!(level(&probe), 0);
+        s.regs.tick();
+        assert_eq!(read(&s, SCLSR, 2), 0, "once per burst");
+        port.feed(b"x");
+        s.pump();
+        write(&s, SCFCR, 2, u32::from(FCR_RFRST));
+        s.regs.tick();
+        s.regs.tick();
+        assert_eq!(read(&s, SCLSR, 2), 0, "a receiver reset forgets it");
     }
 
     #[test]
