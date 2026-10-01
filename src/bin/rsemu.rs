@@ -2247,7 +2247,15 @@ impl Drains {
                 continue;
             }
             capture.bytes += self.buf.len() as u64;
-            if let Err(e) = capture.sink.write_all(&self.buf) {
+            // Flushed every slice that wrote something: a capture is watched
+            // live -- `tail -f`, or a terminal beside a window -- and a buffer
+            // that only empties at 8 KiB or at exit shows a kernel log as
+            // nothing at all.
+            let wrote = capture
+                .sink
+                .write_all(&self.buf)
+                .and_then(|()| capture.sink.flush());
+            if let Err(e) = wrote {
                 // Once, not once a slice: a full disk would otherwise print a
                 // line per ten milliseconds of guest time for the rest of the
                 // run.
