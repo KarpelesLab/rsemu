@@ -467,7 +467,7 @@ pub use region::{
 pub use store::{DEFAULT_PAGE_BITS, HOST_PAGE, RamStore, RomStore};
 
 use crate::core::error::{BusError, Error};
-use crate::core::sync::{LockRank, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::core::sync::{LockRank, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::core::value::{Endian, Width};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -546,6 +546,9 @@ impl UnassignedPolicy {
         self
     }
 }
+
+/// How many distinct pages [`AddressSpace::unassigned_pages`] remembers.
+pub const UNASSIGNED_PAGES_KEPT: usize = 1024;
 
 /// A running tally of accesses that hit nothing.
 ///
@@ -626,6 +629,10 @@ pub struct AddressSpace {
     unassigned_count: AtomicU64,
     unassigned_last: AtomicU64,
     unassigned_last_write: AtomicU64,
+    /// Every 4 KiB page an unassigned access touched, with how many, when
+    /// logging is on: what a board's bring-up needs is the *list* of holes,
+    /// not the last one.
+    unassigned_pages: Mutex<alloc::collections::BTreeMap<u64, u64>>,
     /// The bus lock every master on this space contends for.
     ///
     /// **Last, deliberately.** Nothing on the read or write path reads it, so
@@ -667,6 +674,7 @@ impl AddressSpace {
             unassigned_count: AtomicU64::new(0),
             unassigned_last: AtomicU64::new(0),
             unassigned_last_write: AtomicU64::new(0),
+            unassigned_pages: Mutex::with_rank(LockRank::LEAF, alloc::collections::BTreeMap::new()),
             bus_lock: BusLock::new(),
         }
     }
@@ -799,6 +807,19 @@ impl AddressSpace {
             last_addr: self.unassigned_last.load(Ordering::Relaxed),
             last_was_write: self.unassigned_last_write.load(Ordering::Relaxed) != 0,
         }
+    }
+
+    /// The 4 KiB pages unassigned accesses have touched, lowest first, with
+    /// how many accesses each — when the policy logs them. At most
+    /// [`UNASSIGNED_PAGES_KEPT`] pages are kept; later new ones are counted in
+    /// [`UnassignedLog::count`] only.
+    #[must_use]
+    pub fn unassigned_pages(&self) -> Vec<(u64, u64)> {
+        self.unassigned_pages
+            .lock()
+            .iter()
+            .map(|(page, n)| (*page, *n))
+            .collect()
     }
 
     // -----------------------------------------------------------------
@@ -1026,6 +1047,15 @@ impl AddressSpace {
         }
         self.unassigned_count.fetch_add(1, Ordering::Relaxed);
         self.unassigned_last.store(addr, Ordering::Relaxed);
+        {
+            let mut pages = self.unassigned_pages.lock();
+            let page = addr & !0xfff;
+            if let Some(n) = pages.get_mut(&page) {
+                *n += 1;
+            } else if pages.len() < UNASSIGNED_PAGES_KEPT {
+                pages.insert(page, 1);
+            }
+        }
         self.unassigned_last_write
             .store(u64::from(is_write), Ordering::Relaxed);
     }

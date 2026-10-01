@@ -3419,6 +3419,23 @@ fn describe_media(_machine: &Machine) {}
 /// Where the machine got to.
 fn summarise(machine: &Machine) {
     println!("ran to {} ns of virtual time", machine.now().as_nanos());
+    // A space built with `log-unassigned = true` says which pages nothing
+    // answered: the list a board's bring-up works from.
+    for entry in machine.spaces() {
+        let pages = entry.space().unassigned_pages();
+        if pages.is_empty() {
+            continue;
+        }
+        println!(
+            "  unassigned in `{}`: {} page(s), {} access(es)",
+            entry.name(),
+            pages.len(),
+            entry.space().unassigned_log().count
+        );
+        for (page, n) in pages {
+            println!("    {page:#010x}  {n}");
+        }
+    }
     for device in machine.devices() {
         let Some(domain) = device.domain() else {
             continue;

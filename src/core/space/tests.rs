@@ -726,6 +726,20 @@ fn a_debug_access_does_not_move_the_unassigned_log() {
     assert!(log.last_was_write);
 }
 
+#[test]
+fn the_unassigned_log_keeps_every_page_it_saw() {
+    let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ZEROS.logged());
+    for addr in [0x1830_0000u64, 0x1830_0004, 0xffd0_1000, 0x1830_0ff0] {
+        space.read(addr, Width::U32, MemAttrs::DEFAULT).unwrap();
+    }
+    space.read(0x9999_0000, Width::U8, MemAttrs::DEBUG).unwrap();
+    assert_eq!(
+        space.unassigned_pages(),
+        [(0x1830_0000, 3), (0xffd0_1000, 1)],
+        "pages, lowest first, debug reads not counted"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Unassigned policy
 // ---------------------------------------------------------------------------

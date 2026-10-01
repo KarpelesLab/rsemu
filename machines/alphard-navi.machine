@@ -44,7 +44,12 @@ machine "alphard-navi" {
   osc pclk   = 60288000 Hz
   osc dotclk = 37044000 Hz
 
-  space mem { width = 32 }
+  # An access nothing answers is a bus fault, as on the board. For bring-up,
+  # `-p unassigned=read-as-zeros -p log-unassigned=true` lets the guest run
+  # through the holes and the run's summary lists every page it touched.
+  param unassigned = "fault"
+  param log-unassigned = false
+  space mem { width = 32, unassigned = unassigned, log-unassigned = log-unassigned }
 
   # -- the core --------------------------------------------------------------
   #
@@ -227,6 +232,7 @@ machine "alphard-navi" {
 
   # -- placeholders: storage, not models (see the header) ---------------------
   object extcs  "ram" { size = 4K }    # 0x18100000: a device on an LBSC chip select U-Boot probes
+  object extcs3 "ram" { size = 64K }   # 0x18300000: the device on chip select 3 the SD system maps (an external abort rebooted it)
   object intc   "ram" { size = 4K }    # 0xfe700000: interrupt mask registers
   object intcs  "ram" { size = 8K }    # 0xfe780000: the interrupt controller's configuration
   object dbsc0  "ram" { size = 4K }    # 0xfe800000: DDR controller, channel 0
@@ -255,6 +261,7 @@ machine "alphard-navi" {
   # -- the memory map --------------------------------------------------------
   map mem 0x00000000 size 8M     = nor
   map mem 0x18100000 size 4K     = extcs
+  map mem 0x18300000 size 64K    = extcs3
   map mem 0x60000000 size 1G     = dram
   map mem 0xf0000000 size 0x100  = mpcore.scu
   map mem 0xf0000100 size 0x100  = gic.cpu
