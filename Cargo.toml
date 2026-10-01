@@ -1523,7 +1523,7 @@ dev-linux-printk = []
 # link -- the ACK/NAK packet protocol the kernel uses to switch the SD slot's
 # supply, among much else. Learnt from the unit's own kernel image, read as
 # data. `no_std + alloc`, no dependencies beyond the UART link.
-dev-navi = ["bus-uart"]
+dev-navi = ["bus-uart", "bus-spi"]
 
 # The RISC-V `virt` board's chips (src/dev/riscv): the CLINT, the PLIC, a system
 # controller, virtio-MMIO with block and entropy devices, and a **device tree

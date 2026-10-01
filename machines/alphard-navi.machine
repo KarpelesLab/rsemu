@@ -130,6 +130,8 @@ machine "alphard-navi" {
   object hspi0 "rcar.hspi" { bus = "hspi0" }
   object hspi1 "rcar.hspi" { bus = "hspi1" }
   object hspi2 "rcar.hspi" { bus = "hspi2" }
+  # On channel 0: the DC-DC/ADC monitor the kernel's DCDCAD driver polls.
+  object dcdcad "navi.dcdcad" { bus = "hspi0" }
 
   # -- I2C -------------------------------------------------------------------
   #
