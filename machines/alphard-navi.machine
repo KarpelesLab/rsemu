@@ -270,6 +270,7 @@ machine "alphard-navi" {
   wire mapcard.cd  -> gpio2.in26      # GPIO 90: SDHI3's card-detect switch, low when a card is in
   wire mapcard.cd  -> gpio2.in28      # GPIO 92: the same switch as userspace watches it (falling edge)
   wire gpio4.out28 -> subwdt.kick     # GPIO 4.28: the watchdog kick
+  wire gpio0.out30 -> psc.reset-req   # GPIO 0.30: requestHardReset asks the MCU for a reset
   wire scif1.irq   -> gic.spi89       # ID 121
   wire scif2.irq   -> gic.spi90       # ID 122
   wire scif3.irq   -> gic.spi91       # ID 123

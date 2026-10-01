@@ -47,6 +47,14 @@
 //! second)`) and logs them verbatim, which is what a person tracing the
 //! SD-slot power switch needs to see.
 //!
+//! # The reset request
+//!
+//! The SoC asks the MCU to reset it by raising a GPIO (bank 0 bit 30 on this
+//! board) and spinning; the kernel's `requestHardReset` does exactly that
+//! after logging why. A rising edge on `reset-req` is that request, and the
+//! peer answers it the only way it can be observed — the whole machine is
+//! reset warm.
+//!
 //! # Sources
 //!
 //! The Alphard navi kernel's PSC driver, read as data from the flash image
@@ -62,12 +70,15 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::bus::uart::{Side, links};
-use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
+use crate::core::device::{
+    Device, DeviceClass, MachineReset, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+};
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::sched::{Budget, Consumed};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{LockRank, Mutex};
+use crate::core::sync::{AtomicBool, LockRank, Mutex, Ordering};
+use crate::core::wire::{Level, WireId, WireSink};
 use crate::host::chardev::{CharDevice, ports};
 use crate::machine::realize::Instance;
 
@@ -93,6 +104,9 @@ const PORTW: u8 = 0x25;
 const PORTR: u8 = 0x26;
 const VERG: u8 = 0x2a;
 const FANRPMGET: u8 = 0x3d;
+
+/// The input the SoC raises to ask for a reset.
+pub const RESET_REQ_PIN: &str = "reset-req";
 
 /// The default cyclic-notice period, in ticks of the device's clock: a
 /// tenth of a second on a millisecond clock, well inside the host's 500 ms.
@@ -127,6 +141,31 @@ pub struct Psc {
     inputs: [u8; 5],
     cycle: u64,
     state: Mutex<State>,
+    reset: Arc<ResetLine>,
+}
+
+/// The `reset-req` input: remembers its level so only a rising edge counts.
+struct ResetLine {
+    high: AtomicBool,
+    machine: Mutex<Option<Arc<MachineReset>>>,
+}
+
+impl fmt::Debug for ResetLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ResetLine")
+    }
+}
+
+impl WireSink for ResetLine {
+    fn set_level(&self, _src: WireId, _line: u32, level: Level) {
+        let was = self.high.swap(level.is_high(), Ordering::AcqRel);
+        if level.is_high()
+            && !was
+            && let Some(machine) = self.machine.lock().as_ref()
+        {
+            machine.request();
+        }
+    }
 }
 
 impl fmt::Debug for Psc {
@@ -218,6 +257,10 @@ impl Psc {
             fan,
             inputs,
             cycle: DEFAULT_CYCLE,
+            reset: Arc::new(ResetLine {
+                high: AtomicBool::new(false),
+                machine: Mutex::with_rank(LockRank::LEAF, None),
+            }),
             state: Mutex::with_rank(
                 LockRank::DEVICE,
                 State {
@@ -431,8 +474,16 @@ impl Device for Psc {
         &CLASS
     }
 
-    fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
+    fn realize(&self, ctx: &mut RealizeCtx<'_>) -> Result<()> {
+        *self.reset.machine.lock() = Some(ctx.machine_reset()?);
         Ok(())
+    }
+
+    fn sink(&self, port: &str, _sources: &[WireId]) -> Option<SinkPin> {
+        (port == RESET_REQ_PIN).then(|| SinkPin {
+            sink: Arc::clone(&self.reset) as Arc<dyn WireSink>,
+            line: 0,
+        })
     }
 
     fn reset(&self, kind: ResetKind) {
@@ -441,6 +492,8 @@ impl Device for Psc {
         // quiet and waits for the next START before it notifies again.
         s.cyclic = false;
         s.elapsed = 0;
+        // The line comes back low with the SoC that drove it.
+        self.reset.high.store(false, Ordering::Release);
         if kind == ResetKind::Cold {
             s.rx.clear();
             s.inputs = self.inputs;
@@ -514,8 +567,9 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 /// The validator's view of this class.
 #[must_use]
 pub fn schema() -> crate::machine::validate::ClassSchema {
-    use crate::machine::validate::{ClassSchema, PropSchema};
+    use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS_NAME)
+        .port(RESET_REQ_PIN, PortDir::In)
         .prop(PropSchema::new("link", ValueKind::Str).required())
         .prop(PropSchema::new("side", ValueKind::Str).values(&["a", "b"]))
         .prop(PropSchema::new("version", ValueKind::Uint).range(0, 0xff))
@@ -659,5 +713,19 @@ mod tests {
         let want = psc.state.lock().clone();
         assert_eq!(*back.state.lock(), want);
         assert_eq!(save(&back), bytes);
+    }
+
+    #[test]
+    fn a_rising_reset_request_resets_the_machine_once() {
+        let (psc, _host) = peer();
+        let machine = Arc::new(MachineReset::default());
+        *psc.reset.machine.lock() = Some(Arc::clone(&machine));
+        let pin = psc.sink(RESET_REQ_PIN, &[]).unwrap().sink;
+        pin.set_level(WireId(0), 0, Level::Low);
+        assert!(!machine.take(), "low is quiet");
+        pin.set_level(WireId(0), 0, Level::High);
+        assert!(machine.take(), "the rising edge asks");
+        pin.set_level(WireId(0), 0, Level::High);
+        assert!(!machine.take(), "holding it high asks once");
     }
 }
