@@ -192,6 +192,7 @@ full = [
     "dev-watchdog-pin",
     "dev-i2c-regfile",
     "dev-linux-printk",
+    "dev-sgx",
     "dev-navi",
     "dev-riscv",
     "dev-virtio",
@@ -1449,6 +1450,7 @@ machine-alphard-navi = [
     "dev-navi",
     "dev-i2c-regfile",
     "dev-linux-printk",
+    "dev-sgx",
     "dev-watchdog-pin",
     "dev-arm-mpcore",
     "dev-arm-l2c310",
@@ -1517,6 +1519,12 @@ dev-i2c-regfile = ["bus-i2c"]
 # port. Alters the guest on purpose; a bring-up aid, not a model. `no_std +
 # alloc`, no dependencies.
 dev-linux-printk = []
+
+# A PowerVR SGX stand-in (src/dev/sgx.rs, `pvr.sgx`): the register block and
+# the GPU firmware's side of the host driver's start-up and command
+# handshake, so the driver initialises and its kernel commands complete. No
+# rendering. `no_std + alloc`, no dependencies.
+dev-sgx = []
 
 # The Toyota Alphard navigation unit's board-level peers (src/dev/navi): today
 # `navi.psc`, the base board MCU's power-supply-control protocol peer on a UART

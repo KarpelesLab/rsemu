@@ -1227,6 +1227,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::i2c_regfile::register(&mut reg)?;
     #[cfg(feature = "dev-linux-printk")]
     crate::dev::linux_printk::register(&mut reg)?;
+    #[cfg(feature = "dev-sgx")]
+    crate::dev::sgx::register(&mut reg)?;
     #[cfg(feature = "dev-navi")]
     crate::dev::navi::register(&mut reg)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
@@ -1391,6 +1393,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::i2c_regfile::bind(&mut b)?;
     #[cfg(feature = "dev-linux-printk")]
     crate::dev::linux_printk::bind(&mut b)?;
+    #[cfg(feature = "dev-sgx")]
+    crate::dev::sgx::bind(&mut b)?;
     #[cfg(feature = "dev-navi")]
     crate::dev::navi::bind(&mut b)?;
     #[cfg(any(feature = "dev-flash-cfi", feature = "dev-flash-spinor"))]
@@ -1568,6 +1572,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::i2c_regfile::schema());
     #[cfg(feature = "dev-linux-printk")]
     table.insert(crate::dev::linux_printk::schema());
+    #[cfg(feature = "dev-sgx")]
+    table.insert(crate::dev::sgx::schema());
     #[cfg(feature = "dev-navi")]
     for schema in crate::dev::navi::schemas() {
         table.insert(schema);

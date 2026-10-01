@@ -240,6 +240,10 @@ pub mod i2c_regfile;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-linux-printk")))]
 pub mod linux_printk;
 
+#[cfg(feature = "dev-sgx")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-sgx")))]
+pub mod sgx;
+
 #[cfg(feature = "dev-scsi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-scsi")))]
 pub mod scsi;

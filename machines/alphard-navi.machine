@@ -189,6 +189,10 @@ machine "alphard-navi" {
   object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
   object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }
 
+  # The PowerVR SGX: a stand-in for its firmware's handshake with the host
+  # driver -- start, build check, kernel commands -- and no rendering.
+  object sgx "pvr.sgx" { clock = pclk / 1024, space = mem }
+
   # The power domains. The SD system's framebuffer driver switches the SGX on
   # here and polls for the switch to finish; as plain memory it never did, and
   # it logged "power on SGX error!".
@@ -257,7 +261,6 @@ machine "alphard-navi" {
   object misc2  "ram" { size = 4K }    # 0xffe49000: read once by route_pdc_setReg
   object usbh   "ram" { size = 4K }    # 0xffe70000: USB host bridge (the SD kernel's rcar_usbh_init)
   object adg    "ram" { size = 4K }    # 0xfffe0000: audio clock generator (route_pdc_setReg)
-  object sgx    "ram" { size = 64K }   # 0xfce00000: the PowerVR SGX core (the SD system's PVR driver)
   object gpsbb  "ram" { size = 16K }   # 0xffd00000: the on-chip GPS baseband (the SD kernel's GPSBBIODrv maps 0x3800)
   object usbh1  "ram" { size = 4K }    # 0xffd8c000: a second USB bridge, same 0x804 register as usbh
   object misc3  "ram" { size = 4K }    # 0xfffd1000: polled by the SD system's userspace (0x840)
@@ -340,6 +343,7 @@ machine "alphard-navi" {
   wire mpcore.twd0 -> gic.cpu0ppi13   # ID 29: private timer
   wire mpcore.wdt0 -> gic.cpu0ppi14   # ID 30: private watchdog
   wire sdhi0.irq   -> gic.spi104      # ID 136
+  wire sgx.irq     -> gic.spi57       # ID 89
   wire sdhi3.irq   -> gic.spi106      # ID 138
   wire sdhi2.irq   -> gic.spi107      # ID 139
   wire gpio0.irq   -> gic.spi141      # ID 173
