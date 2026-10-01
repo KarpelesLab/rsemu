@@ -29,9 +29,11 @@
 //! Transactional: nothing is clocked, and each step happens on the register
 //! write the guest's driver uses to release it.
 //!
-//! * A START goes out on the `MSR` write that clears `MDE` while `MCR`
-//!   requests one — the first message and a repeated START alike. The address
-//!   either earns `MAT` or `MNR`; neither raises `MDE` or `MDR`.
+//! * A START goes out when `MCR` gains its start request with the bus idle or
+//!   held after a message without a STOP, or on the `MSR` write that clears
+//!   `MDE` while `MCR` requests one in that state — the driver uses both
+//!   orders. It covers the first message and a repeated START alike. The
+//!   address either earns `MAT` or `MNR`; neither raises `MDE` or `MDR`.
 //! * Writing: the byte in the data register goes out on the `MSR` write that
 //!   clears `MDE` (and, straight after the address, `MAT`). An acknowledged
 //!   byte raises `MDE`, or — with a STOP requested — sends the STOP and
@@ -319,8 +321,15 @@ impl Registers {
             let mut s = self.state.lock();
             match offset {
                 MCR => {
+                    let rising_esg = s.mcr() & MCR_ESG == 0 && v & MCR_ESG != 0;
                     s.set(MCR, v & 0xff);
-                    if v == 0 {
+                    if rising_esg && matches!(s.phase, Phase::Idle | Phase::TxWait) {
+                        let mar = s.reg(MAR);
+                        match Address::seven(((mar >> 1) & 0x7f) as u8) {
+                            Some(address) => Step::Start(address, Direction::from_bit(mar as u8)),
+                            None => Step::None,
+                        }
+                    } else if v == 0 {
                         let busy = s.phase != Phase::Idle;
                         s.phase = Phase::Idle;
                         s.tx_pending = false;
@@ -746,6 +755,25 @@ mod tests {
         let (_, st) = driver(&c, 0x23, false, &[0x00], 1);
         assert_ne!(st & MNR, 0, "MNR stays set");
         assert_ne!(st & MST, 0);
+    }
+
+    #[test]
+    fn a_start_request_alone_sends_the_start() {
+        // The order the driver uses for some messages: no MSR write between
+        // the start request and enabling interrupts.
+        let (c, t) = controller();
+        w(&c, MAR, 0x50 << 1);
+        w(&c, DATA, 0x07);
+        w(&c, MSR, 0x0a);
+        w(&c, MCR, 0x89);
+        assert_ne!(r(&c, MSR) & MAT, 0, "the address went out");
+        w(&c, MCR, 0x88);
+        w(&c, MIER, 0x79);
+        assert!(c.irq_asserted());
+        w(&c, MCR, 0x8a);
+        w(&c, MSR, r(&c, MSR) & !0x0d);
+        assert_ne!(r(&c, MSR) & MST, 0, "the byte, then the STOP");
+        assert_eq!(t.inner.lock().0, 0x07, "the byte set the pointer");
     }
 
     #[test]
