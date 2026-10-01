@@ -25,12 +25,14 @@
 //! the kernel runs them, which the branch offsets need, and default to the
 //! physical ones for a kernel mapped one to one.
 //!
-//! `ready`, when given, holds the patch back until that word is nonzero — or,
-//! with `ready-value`, until it holds that value. A kernel that is checked
-//! before it is started — the navi's U-Boot hashes the image it boots — must
-//! not be touched until it is running, and a word in its data section that
-//! only the running kernel writes (its log's write index: a few things call
-//! `vprintk` directly even with `printk` stubbed) is the signal.
+//! `ready`, when given, holds the patch back until that word *changes* after
+//! the stub has appeared — or, with `ready-value`, until it holds that value.
+//! A kernel that is checked before it is started — the navi's U-Boot hashes
+//! the image it boots — must not be touched until it is running, and a word
+//! that only the running kernel moves (its log's write index: a few things
+//! call `vprintk` directly even with `printk` stubbed) is the signal. Whatever
+//! the word held before — zero, or bytes of the image a loader put there — is
+//! the baseline it has to move away from.
 //!
 //! `write-syscall` and `sys-write`, when given, add user space: the system call
 //! table's `write` entry (its physical address) is pointed at a hook that
@@ -75,7 +77,7 @@ use crate::machine::realize::{BindCtx, Instance};
 pub const CLASS_NAME: &str = "linux.printk";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// The first two words of the stubbed `printk`.
 const STUB: [u32; 2] = [0xe92d_000f, 0xe3e0_0102];
@@ -139,7 +141,7 @@ struct Layout {
     log_buf: u64,
     log_end: u64,
     log_len: u32,
-    /// A word to wait for, and the value it must hold (`None`: nonzero).
+    /// A word to wait for, and the value it must hold (`None`: any change).
     ready: Option<(u64, Option<u32>)>,
     /// The `write` tap: the system call table entry to redirect (physical)
     /// and `sys_write` (virtual).
@@ -151,6 +153,8 @@ struct State {
     patched: bool,
     /// The log index already copied out.
     pos: u32,
+    /// What the `ready` word held when the stub was first seen.
+    baseline: Option<u32>,
 }
 
 /// The tap.
@@ -273,10 +277,24 @@ impl LinuxPrintk {
         }
         if !s.patched {
             let stub_ok = at_stub == STUB[0] && rd(l.stub + 4) == STUB[1];
-            let ready = l.ready.is_none_or(|(a, v)| match v {
-                Some(v) => rd(a) == v,
-                None => rd(a) != 0,
-            });
+            if !stub_ok {
+                s.baseline = None;
+                return;
+            }
+            let ready = match l.ready {
+                None => true,
+                Some((a, Some(v))) => rd(a) == v,
+                Some((a, None)) => {
+                    let now = rd(a);
+                    match s.baseline {
+                        None => {
+                            s.baseline = Some(now);
+                            false
+                        }
+                        Some(b) => now != b,
+                    }
+                }
+            };
             if !(stub_ok && ready) {
                 return;
             }
@@ -387,7 +405,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "ready",
             kind: ValueKind::Uint,
             required: false,
-            summary: "a word that must be nonzero before patching",
+            summary: "a word that must change after the stub appears before patching",
         },
         PropertySpec {
             name: "ready-value",
@@ -439,13 +457,20 @@ impl Device for LinuxPrintk {
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let s = *self.state.lock();
         w.write_bool(s.patched)?;
-        w.write_u32(s.pos)
+        w.write_u32(s.pos)?;
+        w.write_bool(s.baseline.is_some())?;
+        w.write_u32(s.baseline.unwrap_or(0))
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
+        let patched = r.read_bool()?;
+        let pos = r.read_u32()?;
+        let has = r.read_bool()?;
+        let b = r.read_u32()?;
         let s = State {
-            patched: r.read_bool()?,
-            pos: r.read_u32()?,
+            patched,
+            pos,
+            baseline: has.then_some(b),
         };
         *self.state.lock() = s;
         Ok(())
@@ -613,19 +638,18 @@ mod tests {
     }
 
     #[test]
-    fn a_ready_word_alone_waits_for_nonzero_and_a_reset_disarms() {
+    fn a_ready_word_alone_waits_for_it_to_move_and_a_reset_disarms() {
         let (tap, space, _) = rig(Some((0x7000, None)));
+        // A loader left bytes there: nonzero, but not the kernel's doing.
+        w(&space, 0x7000, 0xdead);
         w(&space, 0x1000, STUB[0]);
         w(&space, 0x1004, STUB[1]);
         tap.poll();
-        assert_eq!(
-            r(&space, 0x1000),
-            STUB[0],
-            "the kernel has logged nothing yet"
-        );
-        w(&space, 0x7000, 3);
         tap.poll();
-        assert!(tap.state.lock().patched);
+        assert_eq!(r(&space, 0x1000), STUB[0], "still the image as loaded");
+        w(&space, 0x7000, 0xdeae);
+        tap.poll();
+        assert!(tap.state.lock().patched, "the running kernel moved it");
         tap.reset(ResetKind::Warm);
         tap.poll();
         assert!(

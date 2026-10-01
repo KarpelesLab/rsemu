@@ -167,7 +167,9 @@ machine "alphard-navi" {
   # off its symbol table: the flash kernel is mapped one to one, the SD card's
   # runs its text at 0x7f080000 from 0x62f80000 and its data at 0x80000000 from
   # 0x62e00000, and is patched only once it is running and its log index has
-  # moved -- U-Boot hashes the image before it jumps.
+  # moved off whatever the loader left in that word -- U-Boot hashes the image
+  # before it jumps, so a tap that fires on the loaded bytes alone sends it to
+  # the recovery system, forever.
   object klog_flash "linux.printk" {
     space = mem, port = "klog", clock = wdclk,
     stub = 0x8020c5b4, vprintk = 0x8003d0cc, tramp = 0x80091500,
