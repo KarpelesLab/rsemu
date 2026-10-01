@@ -118,6 +118,14 @@ machine "alphard-navi" {
 
   # The base board's MCU on the other end of SCIF3, as its PSC protocol peer.
   # One line per command it answers goes to the `psc` port.
+  # The HSPI: three SPI masters by programmed I/O, inside the pin
+  # controller's page. The driver's channel numbers are not address order:
+  # its channel 0 is at 0xfffc7000 (the DC-DC/ADC monitor), 1 at 0xfffc8000
+  # and 2 at 0xfffc6000 (the two CIS links to the base-board sub-CPUs).
+  object hspi0 "rcar.hspi" { bus = "hspi0" }
+  object hspi1 "rcar.hspi" { bus = "hspi1" }
+  object hspi2 "rcar.hspi" { bus = "hspi2" }
+
   object psc "navi.psc" { clock = wdclk, link = "psc", side = "b", log = "psc" }
   object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
   object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }
@@ -250,6 +258,9 @@ machine "alphard-navi" {
   map mem 0xfffd1000 size 4K     = misc3
   map mem 0xfff80000 size 0x40000 = du
   map mem 0xfffc0000 size 64K    = pfc
+  map mem 0xfffc7000 size 0x100  = hspi0 { priority = 1 }
+  map mem 0xfffc8000 size 0x100  = hspi1 { priority = 1 }
+  map mem 0xfffc6000 size 0x100  = hspi2 { priority = 1 }
 
   # -- the wires -------------------------------------------------------------
   wire tmu0.irq0   -> gic.spi32       # ID 64: the scheduler tick
@@ -270,6 +281,9 @@ machine "alphard-navi" {
   wire mapcard.cd  -> gpio2.in26      # GPIO 90: SDHI3's card-detect switch, low when a card is in
   wire mapcard.cd  -> gpio2.in28      # GPIO 92: the same switch as userspace watches it (falling edge)
   wire gpio4.out28 -> subwdt.kick     # GPIO 4.28: the watchdog kick
+  wire hspi0.irq   -> gic.spi73       # ID 105
+  wire hspi1.irq   -> gic.spi74       # ID 106
+  wire hspi2.irq   -> gic.spi75       # ID 107
   wire gpio0.out30 -> psc.reset-req   # GPIO 0.30: requestHardReset asks the MCU for a reset
   wire scif1.irq   -> gic.spi89       # ID 121
   wire scif2.irq   -> gic.spi90       # ID 122
