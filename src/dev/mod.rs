@@ -236,6 +236,10 @@ pub mod watchdog;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-i2c-regfile")))]
 pub mod i2c_regfile;
 
+#[cfg(feature = "dev-linux-printk")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-linux-printk")))]
+pub mod linux_printk;
+
 #[cfg(feature = "dev-scsi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-scsi")))]
 pub mod scsi;

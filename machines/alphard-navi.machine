@@ -148,6 +148,31 @@ machine "alphard-navi" {
   object tpnl    "i2c.regfile" { bus = "i2c2", addresses = "0x5c" }   # touch panel
   object e2prom  "i2c.regfile" { bus = "i2c2", addresses = "0x54, 0x55, 0x56, 0x57" }
 
+  # -- kernel logs (a debugging aid, not part of the board) ------------------
+  #
+  # Both kernels are built with printk reduced to a stub and no console, so the
+  # unit prints nothing anywhere. These taps put printk back (it calls the
+  # intact vprintk through a trampoline written into sys_swapon, which a unit
+  # without swap never runs) and copy each kernel's log ring to the `klog`
+  # port: `rsemu run alphard-navi ... --console klog`. They change the guest;
+  # delete them for an untouched run. Every address is the kernel image's own,
+  # off its symbol table: the flash kernel is mapped one to one, the SD card's
+  # runs its text at 0x7f080000 from 0x62f80000 and its data at 0x80000000 from
+  # 0x62e00000, and is patched only once its own startup has written
+  # log_buf_len -- U-Boot hashes the image before it jumps.
+  object klog_flash "linux.printk" {
+    space = mem, port = "klog", clock = wdclk,
+    stub = 0x8020c5b4, vprintk = 0x8003d0cc, tramp = 0x80091500,
+    log-buf = 0x80307400, log-end = 0x803073e4,
+  }
+  object klog_sd "linux.printk" {
+    space = mem, port = "klog", clock = wdclk,
+    stub = 0x6325e838, stub-va = 0x7f35e838, vprintk = 0x7f0b7cdc,
+    tramp = 0x6300d500, tramp-va = 0x7f10d500,
+    log-buf = 0x62e5e180, log-end = 0x62e5e164,
+    ready = 0x62e5e170, ready-value = 0x4000,
+  }
+
   object psc "navi.psc" { clock = wdclk, link = "psc", side = "b", log = "psc" }
   object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
   object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }

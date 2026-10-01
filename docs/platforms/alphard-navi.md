@@ -49,13 +49,19 @@ Findings that are not obvious from the part numbers:
   reference board, and U-Boot's banner says `R-CarM1A`. The owner reports the
   same U-Boot fork is used across products; the map below is the one this
   firmware uses, whatever the silicon's marketing name.
-* **There is no console.** `printk` in this production kernel is a four-
+* **There is no console.** `printk` in both production kernels is a four-
   instruction stub that returns without formatting anything, and no driver
   registers `ttyS0` — the only serial driver is Aisin's `scif_iif`, which moves
   data to the sub-processors over the SCIFs by DMA. The real unit therefore
-  prints nothing on any UART. A bring-up harness can restore the log by
-  pointing `printk` (`0x8020c5b4`) at the intact `vprintk` (`0x8003d0cc`) in
-  guest RAM after U-Boot has copied the kernel.
+  prints nothing on any UART. The machine file carries two `linux.printk`
+  taps (a debugging aid, not part of the board) that patch each kernel's
+  `printk` to call its intact `vprintk` and copy the log ring to a `klog`
+  port. Read it with `--console klog`, or with `--capture klog=/dev/stdout`
+  alongside `--window`:
+
+  ```
+  rsemu run alphard-navi --media flash=S29JL064J.bin --drive sd=map.img --window --capture klog=/dev/stdout
+  ```
 * **Any fatal user-mode fault reboots the unit.** `__do_user_fault` calls
   `v5plus_except_reset`, which ends in `requestHardReset`: a flag in SRAM, bit
   30 of GPIO bank 0 (a reset request to the sub-processor), and a `B .`. Setting
