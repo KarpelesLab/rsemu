@@ -56,11 +56,11 @@ Findings that are not obvious from the part numbers:
   prints nothing on any UART. The machine file carries two `linux.printk`
   taps (a debugging aid, not part of the board) that patch each kernel's
   `printk` to call its intact `vprintk` and copy the log ring to a `klog`
-  port. Read it with `--console klog`, or with `--capture klog=/dev/stdout`
+  port. Read it with `--console klog`, or with `--capture klog`
   alongside `--window`:
 
   ```
-  rsemu run alphard-navi --media flash=S29JL064J.bin --drive sd=map.img --window --capture klog=/dev/stdout
+  rsemu run alphard-navi --media flash=S29JL064J.bin --drive sd=map.img --window --capture klog
   ```
 * **Any fatal user-mode fault reboots the unit.** `__do_user_fault` calls
   `v5plus_except_reset`, which ends in `requestHardReset`: a flag in SRAM, bit
