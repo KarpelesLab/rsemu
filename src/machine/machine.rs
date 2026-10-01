@@ -644,11 +644,7 @@ impl Machine {
         self.sched.apply_clock_requests()?;
         self.dispatch(&report)?;
         crate::core::trace::quantum_report(&report);
-        // A device that resets the whole board asked for it during the
-        // quantum; the boundary is where nothing is in flight.
-        if self.reset_request.as_ref().is_some_and(|r| r.take()) {
-            self.reset(ResetKind::Warm);
-        }
+        self.take_reset_request();
         Ok(report)
     }
 
@@ -683,6 +679,14 @@ impl Machine {
         self.advance_to(deadline, Stepping::Fragment)
     }
 
+    /// Carry out a whole-board reset a device asked for during the quantum
+    /// that just ended; the boundary is where nothing is in flight.
+    fn take_reset_request(&mut self) {
+        if self.reset_request.as_ref().is_some_and(|r| r.take()) {
+            self.reset(ResetKind::Warm);
+        }
+    }
+
     fn advance_to(&mut self, deadline: GlobalTime, stepping: Stepping) -> Result<()> {
         while self.sched.now() < deadline {
             let before = self.sched.now();
@@ -704,6 +708,10 @@ impl Machine {
             // outright in a build without the `trace` feature, so this loop is
             // unchanged for everybody who is not asking a question.
             crate::core::trace::quantum_report(&report);
+            // The same boundary `run_quantum` honours a board reset at: a run
+            // driven by `run_until`/`run_for` -- the CLI's, a frontend's --
+            // must reboot when the board says so too.
+            self.take_reset_request();
             // Budget mode. One `Option` test per round when nothing is armed,
             // which is the same price the recorder already pays.
             if let Some(stuck) = self.spin_stop() {

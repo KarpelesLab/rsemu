@@ -716,3 +716,30 @@ fn build_text(name: &str, text: &str) -> Result<crate::machine::Machine, String>
     let registry = crate::machine::catalog::registry().expect("this build's registry");
     crate::machine::build(name, text, &registry, &options).map_err(|e| e.to_string())
 }
+
+/// A whole-board reset a device asks for is carried out by `run_for` too, not
+/// only by `run_quantum`. The CLI and every frontend drive the machine through
+/// `run_until`; the navi's hot reboot used to be ignored there, leaving the
+/// guest spinning where it asked to be reset.
+#[cfg(feature = "dev-watchdog-pin")]
+#[test]
+fn run_for_honours_a_requested_board_reset() {
+    const TEXT: &str = r#"machine "resettable" {
+  osc tick = 1000 Hz
+  object wdt "watchdog.pin" { clock = tick, timeout = 10, scope = "machine" }
+}"#;
+    let options = crate::machine::catalog::build_options().expect("this build's classes");
+    let registry = crate::machine::catalog::registry().expect("this build's registry");
+    let hosts = alloc::sync::Arc::clone(&options.realize.hosts);
+    let mut machine = crate::machine::build("resettable.machine", TEXT, &registry, &options)
+        .expect("a watchdog and a clock are a machine");
+    let request = crate::core::device::MachineReset::open(&hosts).expect("the build's request");
+    request.request();
+    machine
+        .run_for(crate::core::clock::GlobalTime::from_nanos(5_000_000))
+        .expect("runs");
+    assert!(
+        !request.take(),
+        "the run took the request and reset the board"
+    );
+}
