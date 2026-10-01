@@ -12,7 +12,7 @@
 //! | `0x04` | `SYSCISR` | one completion bit per domain, set when its request finishes |
 //! | `0x08` | `SYSCISCR` | write 1 to clear the matching `SYSCISR` bit |
 //! | `0x0c`, `0x10` | `SYSCIER`, `SYSCIMR` | interrupt enable and mask: stored; the driver masks its domain and polls |
-//! | `0x40 + 0x40·n` | `PWRSR` | domain *n*'s power status (+`0x00`) |
+//! | `0x40 + 0x40·n` | `PWRSR` | domain *n*'s power status (+`0x00`): a request bit *b* reads at *b* once switched off, at *b* + 4 once switched on |
 //! | | `PWROFFCR` | a write switches the written bits off (+`0x04`) |
 //! | | `PWRONCR` | a write switches them on (+`0x0c`) |
 //! | | `PWRER` | the request's error status (+`0x14`): reads 0, every request succeeds |
@@ -25,6 +25,11 @@
 //! driver waits for — it polls `SYSCSR`, writes the request, checks `PWRER`,
 //! and then waits for `SYSCISR` — and a real switch's few microseconds are
 //! inside its first `udelay`.
+//!
+//! The recovery kernel's framebuffer driver powers the SGX on and then waits
+//! for its `PWRSR` to read exactly `0x10`: bit 0 written to `PWRONCR` comes
+//! back as bit 4. The off side reading at the written bit is the mirror of
+//! that, and an inference.
 //!
 //! # Which bit each domain completes on
 //!
@@ -133,10 +138,11 @@ impl State {
             (SYSCISCR, _) => *self.word(SYSCISR) &= !v,
             (_, Some((n, reg @ (PWRONCR | PWROFFCR)))) => {
                 let status = DOMAIN_BASE + n * DOMAIN_STRIDE + PWRSR;
+                let (on, off) = (v << 4, v & 0xf);
                 if reg == PWRONCR {
-                    *self.word(status) |= v;
+                    *self.word(status) = (*self.word(status) & !off) | on;
                 } else {
-                    *self.word(status) &= !v;
+                    *self.word(status) = (*self.word(status) & !on) | off;
                 }
                 *self.word(SYSCISR) |= completion(n, v);
             }
@@ -201,11 +207,11 @@ impl Sysc {
         Ok(Sysc::default())
     }
 
-    /// Whether domain `n` reports bit `bit` powered.
+    /// Whether domain `n` reports request bit `bit` powered.
     #[must_use]
     pub fn powered(&self, n: u64, bit: u32) -> bool {
         let mut s = self.regs.state.lock();
-        *s.word(DOMAIN_BASE + n * DOMAIN_STRIDE + PWRSR) & (1 << bit) != 0
+        *s.word(DOMAIN_BASE + n * DOMAIN_STRIDE + PWRSR) & (1 << (bit + 4)) != 0
     }
 }
 
@@ -328,6 +334,7 @@ mod tests {
         assert_eq!(r(&s, 0xd4) & 1, 0, "no error");
         assert_ne!(r(&s, SYSCISR) & 1 << 20, 0, "complete");
         assert!(s.powered(2, 0));
+        assert_eq!(r(&s, 0xc0), 0x10, "what the framebuffer driver waits for");
         w(&s, SYSCISCR, 1 << 20);
         assert_eq!(r(&s, SYSCISR), 0, "cleared");
         assert_eq!(r(&s, 0x10), 1 << 20, "the mask is plain storage");
@@ -360,6 +367,7 @@ mod tests {
         assert!(s.powered(3, 0));
         w(&s, 0x104, 1);
         assert!(!s.powered(3, 0));
+        assert_eq!(r(&s, 0x100), 0x01);
         assert_ne!(r(&s, SYSCISR) & 1 << 21, 0, "an off request completes too");
     }
 
