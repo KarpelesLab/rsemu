@@ -32,6 +32,13 @@
 //! only the running kernel writes (its log's write index: a few things call
 //! `vprintk` directly even with `printk` stubbed) is the signal.
 //!
+//! `write-syscall` and `sys-write`, when given, add user space: the system call
+//! table's `write` entry (its physical address) is pointed at a hook that
+//! prints what a process writes to fd 1 or 2 — as `{fd}text` — through the
+//! restored `printk`, then calls `sys_write` as before. With no console, that
+//! is the only way to see what the init scripts and daemons say. The
+//! trampoline site then needs 96 bytes rather than 32.
+//!
 //! Any reset disarms the tap. After a warm reboot into a different kernel the
 //! old one's addresses belong to someone else; the tap re-arms only when its
 //! own stub appears again.
@@ -79,6 +86,35 @@ fn branch(from: u32, to: u32, link: bool) -> u32 {
     (if link { 0xeb00_0000 } else { 0xea00_0000 }) | (off as u32 & 0x00ff_ffff)
 }
 
+/// The `write` hook: a `write(fd, buf, len)` to fd 1 or 2 is printed through
+/// `printk` as `<6>{fd}text` (at most 200 bytes of it) before falling into
+/// the real `sys_write`. Placed at `tramp + 0x20`; its format string at
+/// `tramp + 0x50`.
+fn write_hook(at: u32, printk: u32, sys_write: u32) -> [u32; 12] {
+    [
+        0xe92d_400f, // push {r0-r3, lr}
+        0xe350_0002, // cmp r0, #2
+        0x8a00_0005, // bhi pop: only stdout and stderr
+        0xe352_00c8, // cmp r2, #200
+        0xc3a0_20c8, // movgt r2, #200
+        0xe1a0_3001, // mov r3, r1: buf
+        0xe1a0_1000, // mov r1, r0: fd
+        0xe59f_0008, // ldr r0, [pc, #8]: the format
+        branch(at + 32, printk, true),
+        0xe8bd_400f, // pop {r0-r3, lr}
+        branch(at + 40, sys_write, false),
+        at + 0x30, // the format's address (r2 is the length, r3 the text)
+    ]
+}
+
+/// `<6>{%d}%.*s`, NUL-terminated and padded to whole words.
+const WRITE_FORMAT: [u32; 4] = [
+    u32::from_le_bytes(*b"<6>{"),
+    u32::from_le_bytes(*b"%d}%"),
+    u32::from_le_bytes(*b".*s\0"),
+    0,
+];
+
 /// The trampoline: `printk(fmt, ...)` as `vprintk(fmt, va_list)`.
 fn trampoline(at: u32, vprintk: u32) -> [u32; 8] {
     [
@@ -105,6 +141,9 @@ struct Layout {
     log_len: u32,
     /// A word to wait for, and the value it must hold (`None`: nonzero).
     ready: Option<(u64, Option<u32>)>,
+    /// The `write` tap: the system call table entry to redirect (physical)
+    /// and `sys_write` (virtual).
+    write: Option<(u64, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -154,7 +193,18 @@ impl LinuxPrintk {
         let log_len: u64 = r.or_range("log-len", 0x4000, 1..=0x0100_0000)?;
         let ready: Option<u64> = r.optional("ready")?;
         let ready_value: Option<u64> = r.optional("ready-value")?;
+        let syscall: Option<u64> = r.optional("write-syscall")?;
+        let sys_write: Option<u64> = r.optional("sys-write")?;
         r.finish()?;
+        let write = match (syscall, sys_write) {
+            (Some(entry), Some(f)) => Some((entry, word(f, "sys-write")?)),
+            (None, None) => None,
+            _ => {
+                return Err(Error::Property(String::from(
+                    "linux.printk `write-syscall` and `sys-write` come together",
+                )));
+            }
+        };
         if !log_len.is_power_of_two() {
             return Err(Error::Property(String::from(
                 "linux.printk `log-len` is the kernel's ring size, a power of two",
@@ -180,6 +230,7 @@ impl LinuxPrintk {
             log_end,
             log_len: word(log_len, "log-len")?,
             ready,
+            write,
         };
         let port = ports::attach(props, &port)? as Arc<dyn CharDevice>;
         Ok(LinuxPrintk::with_port(layout, port))
@@ -233,6 +284,16 @@ impl LinuxPrintk {
                 wr(l.tramp + 4 * i as u64, *w);
             }
             wr(l.stub, ours);
+            if let Some((entry, sys_write)) = l.write {
+                let at = l.tramp_va + 0x20;
+                for (i, w) in write_hook(at, l.stub_va, sys_write).iter().enumerate() {
+                    wr(l.tramp + 0x20 + 4 * i as u64, *w);
+                }
+                for (i, w) in WRITE_FORMAT.iter().enumerate() {
+                    wr(l.tramp + 0x50 + 4 * i as u64, *w);
+                }
+                wr(entry, at);
+            }
             s.patched = true;
             // From the oldest byte still in the ring: a few things call
             // vprintk directly, so a stubbed kernel has usually logged
@@ -334,6 +395,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the value `ready` must hold instead",
         },
+        PropertySpec {
+            name: "write-syscall",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "physical address of the system call table's write entry, to tap user space",
+        },
+        PropertySpec {
+            name: "sys-write",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "virtual address of sys_write, which the tap calls on",
+        },
     ],
     construct: |props| Ok(Box::new(LinuxPrintk::new(props)?)),
 };
@@ -427,6 +500,8 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         ("log-len", false),
         ("ready", false),
         ("ready-value", false),
+        ("write-syscall", false),
+        ("sys-write", false),
     ] {
         let p = PropSchema::new(name, ValueKind::Uint);
         s = s.prop(if required { p.required() } else { p });
@@ -455,6 +530,7 @@ mod tests {
             log_end: 0x7000,
             log_len: 0x100,
             ready,
+            write: Some((0x7200, 0x2400)),
         };
         let tap = LinuxPrintk::with_port(layout, Arc::clone(&port) as Arc<dyn CharDevice>);
         *tap.space.lock() = Some(Arc::downgrade(&space));
@@ -556,5 +632,31 @@ mod tests {
             !tap.state.lock().patched,
             "the patched branch is not the stub: stays down"
         );
+    }
+
+    #[test]
+    fn the_write_entry_is_pointed_at_the_hook() {
+        let (tap, space, _) = rig(None);
+        w(&space, 0x7200, 0x2400);
+        w(&space, 0x1000, STUB[0]);
+        w(&space, 0x1004, STUB[1]);
+        tap.poll();
+        assert_eq!(
+            r(&space, 0x7200),
+            0x3020,
+            "write() now goes through the hook"
+        );
+        assert_eq!(
+            r(&space, 0x3048),
+            branch(0x3048, 0x2400, false),
+            "and on to sys_write"
+        );
+        assert_eq!(
+            r(&space, 0x3040),
+            branch(0x3040, 0x1000, true),
+            "via printk"
+        );
+        assert_eq!(r(&space, 0x304c), 0x3050, "with its format");
+        assert_eq!(r(&space, 0x3050).to_le_bytes(), *b"<6>{");
     }
 }

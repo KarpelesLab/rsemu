@@ -154,7 +154,8 @@ machine "alphard-navi" {
   # unit prints nothing anywhere. These taps put printk back (it calls the
   # intact vprintk through a trampoline written into sys_swapon, which a unit
   # without swap never runs) and copy each kernel's log ring to the `klog`
-  # port: `rsemu run alphard-navi ... --console klog`. They change the guest;
+  # port, along with whatever processes write to stdout and stderr (`{1}...`,
+  # `{2}...`: the system-call table's write entry goes through a hook too): `rsemu run alphard-navi ... --console klog`. They change the guest;
   # delete them for an untouched run. Every address is the kernel image's own,
   # off its symbol table: the flash kernel is mapped one to one, the SD card's
   # runs its text at 0x7f080000 from 0x62f80000 and its data at 0x80000000 from
@@ -164,6 +165,7 @@ machine "alphard-navi" {
     space = mem, port = "klog", clock = wdclk,
     stub = 0x8020c5b4, vprintk = 0x8003d0cc, tramp = 0x80091500,
     log-buf = 0x80307400, log-end = 0x803073e4,
+    write-syscall = 0x800222d4, sys-write = 0x80099da4,
   }
   object klog_sd "linux.printk" {
     space = mem, port = "klog", clock = wdclk,
@@ -171,6 +173,7 @@ machine "alphard-navi" {
     tramp = 0x6300d500, tramp-va = 0x7f10d500,
     log-buf = 0x62e5e180, log-end = 0x62e5e164,
     ready = 0x62e5e164,
+    write-syscall = 0x62f9c3d4, sys-write = 0x7f11b95c,
   }
 
   object psc "navi.psc" { clock = wdclk, link = "psc", side = "b", log = "psc" }
