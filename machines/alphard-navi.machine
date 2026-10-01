@@ -187,7 +187,12 @@ machine "alphard-navi" {
   # The map card: whatever the run supplies with `--drive sd=card.img`, and an
   # empty socket when it supplies nothing -- the unit's "no SD" case.
   param map-slot = "sd3"
-  object mapcard "sd.card" { drive = "sd", slot = map-slot }
+  # A genuine map card arrives password locked and the unit unlocks it with
+  # CMD42 before reading it. The password is not written here: pass it with
+  # `-p map-password=...` to run a card as the unit meets it. Empty (the
+  # default) is an unlocked card, which the unit also reads.
+  param map-password = ""
+  object mapcard "sd.card" { drive = "sd", slot = map-slot, password = map-password }
 
   # The Display Unit: rcarfb drives plane 1 as 800x480 RGB565 from 0x9e000000.
   object du "rcar.du" { clock = dotclk, space = mem }

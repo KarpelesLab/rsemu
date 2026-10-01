@@ -102,7 +102,7 @@ use crate::machine::validate::{ClassSchema, PropSchema};
 pub const CLASS_NAME: &str = "sd.card";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// The block a card reads and writes in, in bytes.
 ///
@@ -144,6 +144,10 @@ pub const READY_FOR_DATA: u32 = 1 << 8;
 pub const APP_CMD: u32 = 1 << 5;
 /// The sequence of an authentication process was wrong.
 pub const AKE_SEQ_ERROR: u32 = 1 << 3;
+/// `CARD_IS_LOCKED`: the card is password locked (§4.3.7).
+pub const CARD_IS_LOCKED: u32 = 1 << 25;
+/// `LOCK_UNLOCK_FAILED`: a `CMD42` password or sequence was wrong.
+pub const LOCK_UNLOCK_FAILED: u32 = 1 << 24;
 
 /// Where the state machine's position sits in the card status.
 const STATE_SHIFT: u32 = 9;
@@ -158,6 +162,7 @@ const CLEAR_ON_READ: u32 = OUT_OF_RANGE
     | ERASE_PARAM
     | WP_VIOLATION
     | ILLEGAL_COMMAND
+    | LOCK_UNLOCK_FAILED
     | AKE_SEQ_ERROR;
 
 // ---------------------------------------------------------------------------
@@ -209,6 +214,8 @@ pub mod cmd {
     pub const ERASE_WR_BLK_END: u8 = 33;
     /// `ERASE`.
     pub const ERASE: u8 = 38;
+    /// `LOCK_UNLOCK`: set, clear, lock or unlock the card password.
+    pub const LOCK_UNLOCK: u8 = 42;
     /// `APP_CMD`: the next command is an application command.
     pub const APP_CMD: u8 = 55;
 
@@ -389,6 +396,8 @@ struct Transfer {
     /// The block being assembled on a write. A card programs whole blocks, so
     /// a partial one is held here and never reaches the array.
     buf: Vec<u8>,
+    /// A `CMD42` data block rather than a write to the array.
+    lock_unlock: bool,
 }
 
 impl Transfer {
@@ -403,6 +412,7 @@ impl Transfer {
             multiple: false,
             left: None,
             buf: Vec::new(),
+            lock_unlock: false,
         }
     }
 }
@@ -438,9 +448,32 @@ struct Volatile {
     erase_end: Option<u32>,
     /// The transfer the last data command set up.
     transfer: Option<Transfer>,
+    /// The `CMD42` password, empty when none is set. Non-volatile on the
+    /// silicon: it survives `CMD0` and power cycles alike.
+    password: Vec<u8>,
+    /// Whether the card is locked.
+    locked: bool,
 }
 
 impl Volatile {
+    /// The state after `CMD0`: the protocol restarts, the password and the
+    /// lock stay as they were.
+    fn go_idle(&self) -> Volatile {
+        let mut v = Volatile::power_on(self.next_rca);
+        v.password = self.password.clone();
+        v.locked = self.locked;
+        v
+    }
+
+    /// The state after a power cycle: as `CMD0`, and a card with a password
+    /// comes up locked (§4.3.7).
+    fn powered_up(&self, first_rca: u16) -> Volatile {
+        let mut v = Volatile::power_on(first_rca);
+        v.password = self.password.clone();
+        v.locked = !self.password.is_empty();
+        v
+    }
+
     fn power_on(next_rca: u16) -> Volatile {
         Volatile {
             phase: Phase::Idle,
@@ -455,6 +488,8 @@ impl Volatile {
             erase_start: None,
             erase_end: None,
             transfer: None,
+            password: Vec::new(),
+            locked: false,
         }
     }
 }
@@ -675,7 +710,13 @@ impl SdCard {
         let image = r
             .optional_media("image")?
             .map(crate::core::props::Media::to_bytes);
+        let password = r.or_str("password", "")?.as_bytes().to_vec();
         r.finish()?;
+        if password.len() > 16 {
+            return Err(config(String::from(
+                "a card password is at most 16 bytes (Physical Layer §4.3.7)",
+            )));
+        }
 
         let id = Identity::new(
             capacity,
@@ -692,9 +733,12 @@ impl SdCard {
             },
         )?;
         if let Some(medium) = supplied {
-            return SdCard::with_medium(id, mode, rca, medium);
+            let card = SdCard::with_medium(id, mode, rca, medium)?;
+            card.set_password(&password);
+            return Ok(card);
         }
         let card = SdCard::with_identity(id, mode, rca)?;
+        card.set_password(&password);
         if let Some(image) = image {
             if image.len() as u64 > capacity {
                 return Err(config(format!(
@@ -875,7 +919,23 @@ impl SdCard {
     /// This is what a controller's `POWER` register does, and what a board
     /// reset does to a card that is soldered to it.
     pub fn power_cycle(&self) {
-        *self.state.lock() = Volatile::power_on(self.first_rca);
+        let mut state = self.state.lock();
+        *state = state.powered_up(self.first_rca);
+    }
+
+    /// Set the `CMD42` password and lock the card, as a card that left the
+    /// factory (or a previous owner) locked arrives. An empty password
+    /// clears it.
+    pub fn set_password(&self, password: &[u8]) {
+        let mut state = self.state.lock();
+        state.password = password.to_vec();
+        state.locked = !password.is_empty();
+    }
+
+    /// Whether the card is password locked.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.state.lock().locked
     }
 
     // -- the command path --------------------------------------------------
@@ -969,8 +1029,15 @@ impl SdCard {
             at += run;
             if t.buf.len() as u32 == t.len {
                 let addr = t.addr;
+                let lock_unlock = t.lock_unlock;
                 let block = core::mem::take(&mut t.buf);
                 t.done = t.len;
+                if lock_unlock {
+                    self.lock_unlock(&mut state, &block);
+                    state.transfer = None;
+                    state.phase = Phase::Transfer;
+                    return Data::Moved;
+                }
                 if !self.program(&mut state, addr, &block) {
                     return Data::Ended;
                 }
@@ -999,10 +1066,51 @@ impl SdCard {
     // -- the state machine -------------------------------------------------
 
     fn basic_command(&self, state: &mut Volatile, index: u8, arg: u32) -> Reply {
+        // §4.3.7: a locked card executes the basic class, the lock class and
+        // the application class, and refuses everything that would move
+        // data in or out of the array.
+        if state.locked
+            && matches!(
+                index,
+                cmd::READ_SINGLE_BLOCK
+                    | cmd::READ_MULTIPLE_BLOCK
+                    | cmd::SET_BLOCK_COUNT
+                    | cmd::WRITE_BLOCK
+                    | cmd::WRITE_MULTIPLE_BLOCK
+                    | cmd::ERASE_WR_BLK_START
+                    | cmd::ERASE_WR_BLK_END
+                    | cmd::ERASE
+                    | cmd::SWITCH_FUNC
+            )
+        {
+            return self.illegal(state, index);
+        }
         match index {
+            cmd::LOCK_UNLOCK => {
+                if state.phase != Phase::Transfer {
+                    return self.illegal(state, index);
+                }
+                let value = Self::take_status(state);
+                state.transfer = Some(Transfer {
+                    to_host: false,
+                    payload: None,
+                    addr: 0,
+                    done: 0,
+                    len: state.block_len,
+                    multiple: false,
+                    left: None,
+                    buf: Vec::new(),
+                    lock_unlock: true,
+                });
+                state.phase = Phase::ReceiveData;
+                Reply::Short {
+                    index,
+                    value,
+                    busy: false,
+                }
+            }
             cmd::GO_IDLE_STATE => {
-                let rca = state.next_rca;
-                *state = Volatile::power_on(rca);
+                *state = state.go_idle();
                 Reply::None
             }
             cmd::ALL_SEND_CID => {
@@ -1138,11 +1246,12 @@ impl SdCard {
                 // READ_BL_PARTIAL set, so a shorter read length is legal — and
                 // WRITE_BL_PARTIAL is clear, so a shorter *write* is not, which
                 // `start_media_transfer` enforces where it belongs.
-                let ok = if self.id.high_capacity {
-                    arg == BLOCK as u32
-                } else {
-                    arg >= 1 && u64::from(arg) <= BLOCK
-                };
+                // §4.3.7 adds the exception that makes both of those
+                // consistent: on any card the length CMD16 sets is the one a
+                // CMD42 data block has, so a high-capacity card accepts any
+                // length and uses it for CMD42 alone; its reads and writes
+                // stay at 512.
+                let ok = arg >= 1 && u64::from(arg) <= BLOCK;
                 if ok {
                     state.block_len = arg;
                 } else {
@@ -1335,7 +1444,7 @@ impl SdCard {
         };
         // WRITE_BL_PARTIAL is clear (§5.3.2), so a write is always a whole
         // block; READ_BL_PARTIAL is set, so a shorter read is legal.
-        let len = if to_host {
+        let len = if to_host && !self.id.high_capacity {
             state.block_len
         } else {
             BLOCK as u32
@@ -1348,7 +1457,7 @@ impl SdCard {
                 busy: false,
             }
         };
-        if !to_host && u64::from(state.block_len) != BLOCK {
+        if !to_host && !self.id.high_capacity && u64::from(state.block_len) != BLOCK {
             return refuse(state, BLOCK_LEN_ERROR);
         }
         if addr >= self.id.capacity || addr + u64::from(len) > self.id.capacity {
@@ -1381,6 +1490,7 @@ impl SdCard {
             multiple,
             left,
             buf: Vec::new(),
+            lock_unlock: false,
         });
         state.phase = if to_host {
             Phase::SendingData
@@ -1462,6 +1572,61 @@ impl SdCard {
         true
     }
 
+    /// Carry out a `CMD42` data block (§4.3.7): byte 0 holds the `ERASE`,
+    /// `LOCK_UNLOCK`, `CLR_PWD` and `SET_PWD` flags (bits 3 to 0), byte 1
+    /// the password length, then the password. Setting a password over an
+    /// existing one sends the old and the new back to back. Anything that
+    /// does not add up raises `LOCK_UNLOCK_FAILED` and changes nothing.
+    fn lock_unlock(&self, state: &mut Volatile, block: &[u8]) {
+        const SET_PWD: u8 = 1 << 0;
+        const CLR_PWD: u8 = 1 << 1;
+        const LOCK: u8 = 1 << 2;
+        const FORCE_ERASE: u8 = 1 << 3;
+        let fail = |state: &mut Volatile| state.sticky |= LOCK_UNLOCK_FAILED;
+        let Some(&flags) = block.first() else {
+            return fail(state);
+        };
+        if flags & FORCE_ERASE != 0 {
+            // Forced erase: only of a locked card, and only alone.
+            if flags != FORCE_ERASE || !state.locked || self.id.read_only {
+                return fail(state);
+            }
+            if self.media.fill(0, self.id.capacity, 0).is_err() {
+                return fail(state);
+            }
+            state.password.clear();
+            state.locked = false;
+            return;
+        }
+        let Some(&len) = block.get(1) else {
+            return fail(state);
+        };
+        let Some(given) = block.get(2..2 + usize::from(len)) else {
+            return fail(state);
+        };
+        if flags & SET_PWD != 0 {
+            // The old password first, if there is one; at most 16 new bytes.
+            let Some(new) = given.strip_prefix(state.password.as_slice()) else {
+                return fail(state);
+            };
+            if new.is_empty() || new.len() > 16 {
+                return fail(state);
+            }
+            state.password = new.to_vec();
+            state.locked = flags & LOCK != 0;
+            return;
+        }
+        if given != state.password.as_slice() || state.password.is_empty() {
+            return fail(state);
+        }
+        if flags & CLR_PWD != 0 {
+            state.password.clear();
+            state.locked = false;
+        } else {
+            state.locked = flags & LOCK != 0;
+        }
+    }
+
     fn erase(&self, state: &mut Volatile) {
         let (Some(start), Some(end)) = (state.erase_start, state.erase_end) else {
             state.sticky |= ERASE_SEQ_ERROR;
@@ -1511,6 +1676,9 @@ impl SdCard {
     /// The card status as it stands, with nothing cleared.
     fn status_of(state: &Volatile) -> u32 {
         let mut status = state.sticky | (state.phase.code() << STATE_SHIFT) | READY_FOR_DATA;
+        if state.locked {
+            status |= CARD_IS_LOCKED;
+        }
         if state.sticky & CLEAR_ON_READ != 0 {
             status |= CARD_ERROR;
         }
@@ -1643,9 +1811,11 @@ impl SdCard {
                 w.write_bool(t.multiple)?;
                 write_option_u32(w, t.left)?;
                 w.write_bytes(&t.buf)?;
+                w.write_bool(t.lock_unlock)?;
             }
         }
-        Ok(())
+        w.write_bytes(&state.password)?;
+        w.write_bool(state.locked)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1687,6 +1857,7 @@ impl SdCard {
             let multiple = r.read_bool()?;
             let left = read_option_u32(r)?;
             let buf = r.read_bytes()?.to_vec();
+            let lock_unlock = r.read_bool()?;
             if len == 0 || u64::from(len) > BLOCK || done > len || buf.len() as u32 > len {
                 return Err(Error::State(format!(
                     "a snapshot transfer of {done}/{len} byte(s) is not one this card can hold"
@@ -1701,10 +1872,18 @@ impl SdCard {
                 multiple,
                 left,
                 buf,
+                lock_unlock,
             })
         } else {
             None
         };
+        let password = r.read_bytes()?.to_vec();
+        let locked = r.read_bool()?;
+        if password.len() > 16 {
+            return Err(Error::State(String::from(
+                "a card password is at most 16 bytes",
+            )));
+        }
         if block_len == 0 || u64::from(block_len) > BLOCK {
             return Err(Error::State(format!(
                 "{block_len} is not a block length an SD card can hold"
@@ -1728,6 +1907,8 @@ impl SdCard {
             erase_start,
             erase_end,
             transfer,
+            password,
+            locked,
         };
         Ok(())
     }
@@ -1975,6 +2156,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "a media slot a run fills with a host file (`--drive sd0=card.img`); wins over `size` and `image`",
+        },
+        PropertySpec {
+            name: "password",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "a CMD42 password the card arrives locked with, up to 16 bytes (default none)",
         },
         PropertySpec {
             name: "slot",
@@ -2376,6 +2563,7 @@ pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("size", ValueKind::Size))
         .prop(PropSchema::new("drive", ValueKind::Str))
+        .prop(PropSchema::new("password", ValueKind::Str))
         .prop(PropSchema::new("image", ValueKind::Media))
         .prop(PropSchema::new("slot", ValueKind::Str))
         .prop(PropSchema::new("high-capacity", ValueKind::Bool))
