@@ -652,7 +652,11 @@ impl SdCard {
             let _ = r.or_size("size", 0)?;
         }
         let high_capacity = r.or("high-capacity", capacity > MAX_STANDARD_CAPACITY)?;
-        let read_only = r.or("readonly", false)?;
+        // A read-only medium is a write-protected card, as `ata.disk` takes
+        // it: the switch and the file agree, so the guest is told before it
+        // tries rather than finding out from a failed write.
+        let read_only =
+            r.or("readonly", false)? || supplied.as_ref().is_some_and(|m| m.is_read_only());
         let manufacturer = r.or_range("manufacturer", 0x03u64, 0..=0xff)? as u8;
         let oem = r.or_str("oem", "RE")?.to_string();
         let product = r.or_str("product", "RSEMU")?.to_string();
@@ -2202,7 +2206,7 @@ impl medium::Removable for Socket {
                     id.capacity
                 ),
                 capacity: id.capacity,
-                write_protected: false,
+                write_protected: id.read_only,
             }),
         }]
     }
