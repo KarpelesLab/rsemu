@@ -323,7 +323,7 @@ machine "alphard-navi" {
   wire scif5.irq   -> gic.spi93       # ID 125
   wire scif3.tx-dreq -> hpbdmac.dreq6
   wire scif3.rx-dreq -> hpbdmac.dreq7
-  wire sdhi3.rx-dreq -> hpbdmac.dreq39   # traced: the SCR read runs on ch39
+  wire sdhi3.dreq    -> hpbdmac.dreq39   # traced: ch39 serves SDHI3 both ways, reprogrammed per transfer
   wire hpbdmac.grp0  -> gic.spi110   # ID 142: channels 0-10
   wire hpbdmac.grp1  -> gic.spi111   # ID 143
   wire hpbdmac.grp2  -> gic.spi112   # ID 144

@@ -99,6 +99,9 @@ pub const IRQ_PIN: &str = "irq";
 pub const RX_DREQ_PIN: &str = "rx-dreq";
 /// The transmit DMA request.
 pub const TX_DREQ_PIN: &str = "tx-dreq";
+/// Either request: for a board whose DMA controller serves the host on one
+/// channel in both directions, reprogrammed per transfer.
+pub const DREQ_PIN: &str = "dreq";
 
 // -- registers -----------------------------------------------------------------
 
@@ -284,6 +287,7 @@ struct Registers {
     irq: Mutex<Option<WireSource>>,
     rx_dreq: Mutex<Option<WireSource>>,
     tx_dreq: Mutex<Option<WireSource>>,
+    dreq: Mutex<Option<WireSource>>,
 }
 
 impl fmt::Debug for Registers {
@@ -328,6 +332,7 @@ impl Sdhi {
             irq: Mutex::with_rank(LockRank::LEAF, None),
             rx_dreq: Mutex::with_rank(LockRank::LEAF, None),
             tx_dreq: Mutex::with_rank(LockRank::LEAF, None),
+            dreq: Mutex::with_rank(LockRank::LEAF, None),
         });
         let region: RegionRef = Arc::new(Region::io(
             "rcar.sdhi",
@@ -378,6 +383,19 @@ impl Registers {
         self.slot.card()
     }
 
+    /// `flag` (BRE or BWE) if the buffer is served by programmed I/O; nothing
+    /// in DMA mode, where the same condition is a DMA request instead. A
+    /// driver that left BWE unmasked for a DMA write would otherwise take a
+    /// PIO interrupt in the middle of it — the navi's does, and its DMA
+    /// completion then finds the request already finished.
+    fn buffer_flag(state: &State, flag: u16) -> u16 {
+        if state.ext_mode & EXT_DMA != 0 {
+            0
+        } else {
+            flag
+        }
+    }
+
     /// The card-detect and write-protect levels, from the socket.
     fn levels(card: Option<&Arc<SdCard>>) -> u16 {
         if card.is_some() {
@@ -407,7 +425,12 @@ impl Registers {
     /// Drive the three outputs from the state. Called with no lock held.
     fn refresh(&self) {
         let (irq, rx, tx) = self.outputs();
-        for (pin, level) in [(&self.irq, irq), (&self.rx_dreq, rx), (&self.tx_dreq, tx)] {
+        for (pin, level) in [
+            (&self.irq, irq),
+            (&self.rx_dreq, rx),
+            (&self.tx_dreq, tx),
+            (&self.dreq, rx || tx),
+        ] {
             let out = pin.lock().clone();
             if let Some(out) = out {
                 out.set(if level { Level::High } else { Level::Low });
@@ -511,11 +534,11 @@ impl Registers {
                     state.info2 |= INFO2_DTO;
                     return;
                 }
-                state.info2 |= INFO2_BRE;
+                state.info2 |= Self::buffer_flag(state, INFO2_BRE);
             }
             Dir::Write => {
                 t.buf.reserve(len);
-                state.info2 |= INFO2_BWE;
+                state.info2 |= Self::buffer_flag(state, INFO2_BWE);
             }
         }
         state.xfer = Some(t);
@@ -578,12 +601,12 @@ impl Registers {
                     state.info2 |= INFO2_DTO;
                     return;
                 }
-                state.info2 |= INFO2_BRE;
+                state.info2 |= Self::buffer_flag(state, INFO2_BRE);
             }
             Dir::Write => {
                 t.buf.clear();
                 t.pos = 0;
-                state.info2 |= INFO2_BWE;
+                state.info2 |= Self::buffer_flag(state, INFO2_BWE);
             }
         }
         state.xfer = Some(t);
@@ -813,10 +836,11 @@ impl Device for Sdhi {
             IRQ_PIN => &self.regs.irq,
             RX_DREQ_PIN => &self.regs.rx_dreq,
             TX_DREQ_PIN => &self.regs.tx_dreq,
+            DREQ_PIN => &self.regs.dreq,
             _ => {
                 return Err(Error::Config {
                     at: port.to_string(),
-                    message: String::from("an SDHI drives `irq`, `rx-dreq` and `tx-dreq`"),
+                    message: String::from("an SDHI drives `irq`, `rx-dreq`, `tx-dreq` and `dreq`"),
                 });
             }
         };
@@ -950,6 +974,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .port(IRQ_PIN, PortDir::Out)
         .port(RX_DREQ_PIN, PortDir::Out)
         .port(TX_DREQ_PIN, PortDir::Out)
+        .port(DREQ_PIN, PortDir::Out)
 }
 
 #[cfg(test)]
