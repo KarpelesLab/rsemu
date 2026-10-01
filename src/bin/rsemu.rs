@@ -3027,6 +3027,12 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                 let spec = value(arg)?;
                 out.drives.push(Drive::parse(&spec)?);
             }
+            #[cfg(not(feature = "dev-blk"))]
+            "--drive" => {
+                return Err(String::from(
+                    "--drive needs a build with the `dev-blk` feature",
+                ));
+            }
             "-p" | "--param" => {
                 let spec = value(arg)?;
                 let (key, val) = spec
@@ -3061,6 +3067,14 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                     _ => return Err(format!("--scale wants 1, 2 or 4, got `{v}`")),
                 };
             }
+            #[cfg(not(feature = "vnc"))]
+            "--vnc" => return Err(String::from("--vnc needs a build with the `vnc` feature")),
+            #[cfg(not(feature = "window"))]
+            "--window" | "--scale" => {
+                return Err(format!("{arg} needs a build with the `window` feature"));
+            }
+            #[cfg(not(feature = "gdb"))]
+            "--gdb" => return Err(String::from("--gdb needs a build with the `gdb` feature")),
             "--record-input" => out.record_input = Some(value(arg)?),
             "--replay-input" => out.replay_input = Some(value(arg)?),
             "--console" => out.console = Some(value(arg)?),
