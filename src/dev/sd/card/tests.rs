@@ -342,7 +342,11 @@ fn a_high_capacity_card_takes_a_lock_length_but_reads_512() {
     short(card.command(cmd::READ_SINGLE_BLOCK, 0));
     let mut buf = [0u8; 512];
     assert_eq!(card.read_data(&mut buf), Data::Moved);
-    assert_eq!(card.phase(), Phase::Transfer, "a whole 512-byte block moved");
+    assert_eq!(
+        card.phase(),
+        Phase::Transfer,
+        "a whole 512-byte block moved"
+    );
     let (_, status) = short(card.command(cmd::SET_BLOCKLEN, 600));
     assert_ne!(status & BLOCK_LEN_ERROR, 0, "but not more than a block");
 }
@@ -1049,14 +1053,24 @@ fn a_locked_card_refuses_reads_until_the_password_unlocks_it() {
     bring_up(&card);
     let (_, status) = short(card.command(cmd::SEND_STATUS, u32::from(card.rca()) << 16));
     assert_ne!(status & CARD_IS_LOCKED, 0);
-    assert!(matches!(card.command(cmd::READ_SINGLE_BLOCK, 0), Reply::None), "class 2 refused");
+    assert!(
+        matches!(card.command(cmd::READ_SINGLE_BLOCK, 0), Reply::None),
+        "class 2 refused"
+    );
     let status = lock_command(&card, 0, b"wrong");
     assert_ne!(status & LOCK_UNLOCK_FAILED, 0);
     assert_ne!(status & CARD_IS_LOCKED, 0, "still locked");
     let status = lock_command(&card, 0, b"masked-for-test!");
-    assert_eq!(status & (LOCK_UNLOCK_FAILED | CARD_IS_LOCKED), 0, "unlocked");
+    assert_eq!(
+        status & (LOCK_UNLOCK_FAILED | CARD_IS_LOCKED),
+        0,
+        "unlocked"
+    );
     short(card.command(cmd::SET_BLOCKLEN, 512));
-    assert!(matches!(card.command(cmd::READ_SINGLE_BLOCK, 0), Reply::Short { .. }));
+    assert!(matches!(
+        card.command(cmd::READ_SINGLE_BLOCK, 0),
+        Reply::Short { .. }
+    ));
 }
 
 #[test]
@@ -1064,7 +1078,11 @@ fn a_power_cycle_locks_a_card_with_a_password_again() {
     let card = sdhc();
     bring_up(&card);
     let status = lock_command(&card, 1, b"pw");
-    assert_eq!(status & (LOCK_UNLOCK_FAILED | CARD_IS_LOCKED), 0, "set, not locked");
+    assert_eq!(
+        status & (LOCK_UNLOCK_FAILED | CARD_IS_LOCKED),
+        0,
+        "set, not locked"
+    );
     assert!(matches!(card.command(cmd::GO_IDLE_STATE, 0), Reply::None));
     assert!(!card.is_locked(), "CMD0 is not a power cycle");
     card.power_cycle();
@@ -1077,7 +1095,11 @@ fn clearing_needs_the_password_and_setting_needs_the_old_one() {
     bring_up(&card);
     lock_command(&card, 1, b"one");
     let status = lock_command(&card, 1, b"two");
-    assert_ne!(status & LOCK_UNLOCK_FAILED, 0, "the old password was not given");
+    assert_ne!(
+        status & LOCK_UNLOCK_FAILED,
+        0,
+        "the old password was not given"
+    );
     let status = lock_command(&card, 1, b"onetwo");
     assert_eq!(status & LOCK_UNLOCK_FAILED, 0, "old then new");
     let status = lock_command(&card, 2, b"one");
@@ -1087,4 +1109,3 @@ fn clearing_needs_the_password_and_setting_needs_the_old_one() {
     card.power_cycle();
     assert!(!card.is_locked(), "no password, nothing to lock");
 }
-

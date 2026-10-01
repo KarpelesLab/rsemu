@@ -126,10 +126,21 @@ receive). Its `log` port prints one line per command.
 
 ## The SD card
 
+A genuine map card is password locked. Both kernels unlock it with CMD42
+before reading — a one-block DMA write of the flags byte, a length byte and a
+sixteen-byte password, at the length CMD16 set — and the full system checks
+it again after it loads its own SD driver. `sd.card` models the lock; run the
+machine with `-p map-password=...` to present a locked card, or leave it empty
+for an unlocked one, which the unit also reads. The password is not in this
+tree.
+
 The map card is in the SDHI3 socket; card detect is GPIO 90 (bank 2 pin 26),
 and userspace also watches GPIO 92 (bank 2 pin 28). Data moves by DMA on
 HPB-DMAC channel 39 in 16-bit units, one scatter-gather segment per register
-set load. The card is FAT32 on an MBR partition; osloader looks for
+set load, in both directions: the driver reprograms the channel's DCR for a
+write. In the full system the SD hosts are exposed to a user-space driver
+through UIO, and `tmio_mmc` is loaded as a module about eighteen guest seconds
+in. The card is FAT32 on an MBR partition; osloader looks for
 `HD14/EXE/<model>/LOADING.KWI`, where the model (`HC59` on this unit) is a
 U-Boot variable.
 
