@@ -244,7 +244,7 @@ machine "alphard-navi" {
   object usbh   "ram" { size = 4K }    # 0xffe70000: USB host bridge (the SD kernel's rcar_usbh_init)
   object adg    "ram" { size = 4K }    # 0xfffe0000: audio clock generator (route_pdc_setReg)
   object sgx    "ram" { size = 64K }   # 0xfce00000: the PowerVR SGX core (the SD system's PVR driver)
-  object imgp   "ram" { size = 4K }    # 0xffd00000: an image-processing block (coefficient tables at 0x400)
+  object gpsbb  "ram" { size = 16K }   # 0xffd00000: the on-chip GPS baseband (the SD kernel's GPSBBIODrv maps 0x3800)
   object usbh1  "ram" { size = 4K }    # 0xffd8c000: a second USB bridge, same 0x804 register as usbh
   object misc3  "ram" { size = 4K }    # 0xfffd1000: polled by the SD system's userspace (0x840)
   object tmu0x  "ram" { size = 0xfd0 } # 0xffd80030: the rest of each TMU page; the SD system's
@@ -309,7 +309,7 @@ machine "alphard-navi" {
   map mem 0xffe70000 size 4K     = usbh
   map mem 0xfffe0000 size 4K     = adg
   map mem 0xfce00000 size 64K    = sgx
-  map mem 0xffd00000 size 4K     = imgp
+  map mem 0xffd00000 size 16K    = gpsbb
   map mem 0xffd8c000 size 4K     = usbh1
   map mem 0xfffd1000 size 4K     = misc3
   map mem 0xfff80000 size 0x40000 = du
