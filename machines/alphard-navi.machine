@@ -176,6 +176,18 @@ machine "alphard-navi" {
   object sysc   "ram" { size = 4K }    # 0xffcc0000: power control (the SGX power-up poll times out here)
   object dma    "ram" { size = 4K }    # 0xffd85000: DMA controller registers
   object misc1  "ram" { size = 4K }    # 0xfff12000
+  object audio0 "ram" { size = 4K }    # 0xffd8a000: audio, touched by the SD kernel's route_pdc_setReg
+  object audio1 "ram" { size = 8K }    # 0xffd90000: audio routing and serial sound ports (route_pdc_setReg)
+  object misc2  "ram" { size = 4K }    # 0xffe49000: read once by route_pdc_setReg
+  object usbh   "ram" { size = 4K }    # 0xffe70000: USB host bridge (the SD kernel's rcar_usbh_init)
+  object adg    "ram" { size = 4K }    # 0xfffe0000: audio clock generator (route_pdc_setReg)
+  object sgx    "ram" { size = 64K }   # 0xfce00000: the PowerVR SGX core (the SD system's PVR driver)
+  object imgp   "ram" { size = 4K }    # 0xffd00000: an image-processing block (coefficient tables at 0x400)
+  object usbh1  "ram" { size = 4K }    # 0xffd8c000: a second USB bridge, same 0x804 register as usbh
+  object misc3  "ram" { size = 4K }    # 0xfffd1000: polled by the SD system's userspace (0x840)
+  object tmu0x  "ram" { size = 0xfd0 } # 0xffd80030: the rest of each TMU page; the SD system's
+  object tmu1x  "ram" { size = 0xfd0 } # kernel touches 0x38, past the three channels modelled
+  object tmu2x  "ram" { size = 0xfd0 }
   object pfc    "ram" { size = 64K }   # 0xfffc0000: pin function controller, RDS (0xfffc4000), IEBus (0xfffc9000)
 
   # -- the memory map --------------------------------------------------------
@@ -212,6 +224,9 @@ machine "alphard-navi" {
   map mem 0xffd80000 size 0x30   = tmu0
   map mem 0xffd81000 size 0x30   = tmu1
   map mem 0xffd82000 size 0x30   = tmu2
+  map mem 0xffd80030 size 0xfd0  = tmu0x
+  map mem 0xffd81030 size 0xfd0  = tmu1x
+  map mem 0xffd82030 size 0xfd0  = tmu2x
   map mem 0xffd85000 size 4K     = dma
   map mem 0xffe40000 size 0x100  = scif0
   map mem 0xffe41000 size 0x100  = scif1
@@ -224,6 +239,15 @@ machine "alphard-navi" {
   map mem 0xffe4e000 size 0x100  = sdhi2
   map mem 0xffe4f000 size 0x100  = sdhi3
   map mem 0xfff12000 size 4K     = misc1
+  map mem 0xffd8a000 size 4K     = audio0
+  map mem 0xffd90000 size 8K     = audio1
+  map mem 0xffe49000 size 4K     = misc2
+  map mem 0xffe70000 size 4K     = usbh
+  map mem 0xfffe0000 size 4K     = adg
+  map mem 0xfce00000 size 64K    = sgx
+  map mem 0xffd00000 size 4K     = imgp
+  map mem 0xffd8c000 size 4K     = usbh1
+  map mem 0xfffd1000 size 4K     = misc3
   map mem 0xfff80000 size 0x40000 = du
   map mem 0xfffc0000 size 64K    = pfc
 
