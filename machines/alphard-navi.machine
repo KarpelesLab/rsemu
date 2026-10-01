@@ -158,8 +158,8 @@ machine "alphard-navi" {
   # delete them for an untouched run. Every address is the kernel image's own,
   # off its symbol table: the flash kernel is mapped one to one, the SD card's
   # runs its text at 0x7f080000 from 0x62f80000 and its data at 0x80000000 from
-  # 0x62e00000, and is patched only once its own startup has written
-  # log_buf_len -- U-Boot hashes the image before it jumps.
+  # 0x62e00000, and is patched only once it is running and its log index has
+  # moved -- U-Boot hashes the image before it jumps.
   object klog_flash "linux.printk" {
     space = mem, port = "klog", clock = wdclk,
     stub = 0x8020c5b4, vprintk = 0x8003d0cc, tramp = 0x80091500,
@@ -170,7 +170,7 @@ machine "alphard-navi" {
     stub = 0x6325e838, stub-va = 0x7f35e838, vprintk = 0x7f0b7cdc,
     tramp = 0x6300d500, tramp-va = 0x7f10d500,
     log-buf = 0x62e5e180, log-end = 0x62e5e164,
-    ready = 0x62e5e170, ready-value = 0x4000,
+    ready = 0x62e5e164,
   }
 
   object psc "navi.psc" { clock = wdclk, link = "psc", side = "b", log = "psc" }

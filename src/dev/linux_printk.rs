@@ -25,11 +25,16 @@
 //! the kernel runs them, which the branch offsets need, and default to the
 //! physical ones for a kernel mapped one to one.
 //!
-//! `ready`/`ready-value`, when given, hold the patch back until that word
-//! holds that value. A kernel that is checked before it is started — the
-//! navi's U-Boot hashes the image it boots — must not be touched until it is
-//! running, and a word in its data section that only its own startup writes is
-//! the signal.
+//! `ready`, when given, holds the patch back until that word is nonzero — or,
+//! with `ready-value`, until it holds that value. A kernel that is checked
+//! before it is started — the navi's U-Boot hashes the image it boots — must
+//! not be touched until it is running, and a word in its data section that
+//! only the running kernel writes (its log's write index: a few things call
+//! `vprintk` directly even with `printk` stubbed) is the signal.
+//!
+//! Any reset disarms the tap. After a warm reboot into a different kernel the
+//! old one's addresses belong to someone else; the tap re-arms only when its
+//! own stub appears again.
 //!
 //! # The stub this recognises
 //!
@@ -98,7 +103,8 @@ struct Layout {
     log_buf: u64,
     log_end: u64,
     log_len: u32,
-    ready: Option<(u64, u32)>,
+    /// A word to wait for, and the value it must hold (`None`: nonzero).
+    ready: Option<(u64, Option<u32>)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -155,11 +161,12 @@ impl LinuxPrintk {
             )));
         }
         let ready = match (ready, ready_value) {
-            (Some(a), Some(v)) => Some((a, word(v, "ready-value")?)),
+            (Some(a), Some(v)) => Some((a, Some(word(v, "ready-value")?))),
+            (Some(a), None) => Some((a, None)),
             (None, None) => None,
-            _ => {
+            (None, Some(_)) => {
                 return Err(Error::Property(String::from(
-                    "linux.printk `ready` and `ready-value` come together",
+                    "linux.printk `ready-value` needs a `ready` address to compare",
                 )));
             }
         };
@@ -215,7 +222,10 @@ impl LinuxPrintk {
         }
         if !s.patched {
             let stub_ok = at_stub == STUB[0] && rd(l.stub + 4) == STUB[1];
-            let ready = l.ready.is_none_or(|(a, v)| rd(a) == v);
+            let ready = l.ready.is_none_or(|(a, v)| match v {
+                Some(v) => rd(a) == v,
+                None => rd(a) != 0,
+            });
             if !(stub_ok && ready) {
                 return;
             }
@@ -224,7 +234,11 @@ impl LinuxPrintk {
             }
             wr(l.stub, ours);
             s.patched = true;
-            s.pos = rd(l.log_end);
+            // From the oldest byte still in the ring: a few things call
+            // vprintk directly, so a stubbed kernel has usually logged
+            // something already.
+            let end = rd(l.log_end);
+            s.pos = end.wrapping_sub(end.min(l.log_len));
         }
         let end = rd(l.log_end);
         if end.wrapping_sub(s.pos) > l.log_len {
@@ -312,13 +326,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "ready",
             kind: ValueKind::Uint,
             required: false,
-            summary: "a word to wait for before patching",
+            summary: "a word that must be nonzero before patching",
         },
         PropertySpec {
             name: "ready-value",
             kind: ValueKind::Uint,
             required: false,
-            summary: "the value `ready` must hold",
+            summary: "the value `ready` must hold instead",
         },
     ],
     construct: |props| Ok(Box::new(LinuxPrintk::new(props)?)),
@@ -333,12 +347,11 @@ impl Device for LinuxPrintk {
         Ok(())
     }
 
-    fn reset(&self, kind: ResetKind) {
-        // The patch lives in guest RAM, which a warm reset keeps; `poll`
-        // notices whether it is still there. A cold start loses it.
-        if kind == ResetKind::Cold {
-            *self.state.lock() = State::default();
-        }
+    fn reset(&self, _kind: ResetKind) {
+        // Disarm on any reset: a warm reboot may bring a different kernel,
+        // and the old one's log ring is then somebody else's memory. The
+        // stub reappearing is what re-arms the tap.
+        *self.state.lock() = State::default();
     }
 
     fn is_runnable(&self) -> bool {
@@ -427,7 +440,7 @@ mod tests {
     use crate::core::space::{RamStore, Region};
     use crate::host::chardev::CharPort;
 
-    fn rig(ready: Option<(u64, u32)>) -> (LinuxPrintk, Arc<AddressSpace>, Arc<CharPort>) {
+    fn rig(ready: Option<(u64, Option<u32>)>) -> (LinuxPrintk, Arc<AddressSpace>, Arc<CharPort>) {
         let space = Arc::new(AddressSpace::new("mem", 32));
         let ram = Arc::new(RamStore::new(0x10000));
         space.topology().map(Region::ram("ram", ram), 0).unwrap();
@@ -497,7 +510,7 @@ mod tests {
 
     #[test]
     fn a_ready_word_holds_the_patch_back() {
-        let (tap, space, _) = rig(Some((0x7100, 0x4000)));
+        let (tap, space, _) = rig(Some((0x7100, Some(0x4000))));
         w(&space, 0x1000, STUB[0]);
         w(&space, 0x1004, STUB[1]);
         tap.poll();
@@ -520,6 +533,28 @@ mod tests {
             r(&space, 0x1000),
             branch(0x1000, 0x3000, false),
             "the kernel came back"
+        );
+    }
+
+    #[test]
+    fn a_ready_word_alone_waits_for_nonzero_and_a_reset_disarms() {
+        let (tap, space, _) = rig(Some((0x7000, None)));
+        w(&space, 0x1000, STUB[0]);
+        w(&space, 0x1004, STUB[1]);
+        tap.poll();
+        assert_eq!(
+            r(&space, 0x1000),
+            STUB[0],
+            "the kernel has logged nothing yet"
+        );
+        w(&space, 0x7000, 3);
+        tap.poll();
+        assert!(tap.state.lock().patched);
+        tap.reset(ResetKind::Warm);
+        tap.poll();
+        assert!(
+            !tap.state.lock().patched,
+            "the patched branch is not the stub: stays down"
         );
     }
 }
