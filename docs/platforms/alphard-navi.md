@@ -138,26 +138,49 @@ U-Boot variable.
 | stage | state |
 | --- | --- |
 | U-Boot: pin setup, DDR init from SRAM, relocation, `bootm` | runs |
-| Kernel: MMU, GIC, TMU tick and clocksource, calibration, drivers | runs |
-| Kernel: NOR via CFI (4 partitions), framebuffer, I2C, SDHI probe, VFP | runs |
-| Kernel: CramFS root mounted, `init` started | runs |
-| Userspace: `pmng` (Thumb-2) loads `tab_dd.ko`, exports its GPIOs, starts `osloader` | runs |
-| PSC link to the base-board MCU: sync, START, VERG, PORTW (SD slot power), cyclic STAT | runs, against `navi.psc` |
-| Map SD card: enumeration, SCR, partition table, FAT32 reads by DMA | runs |
-| `osloader` reads `HD14/EXE/HC59/LOADING.KWI` into RAM (xipImage at `0x62f80000`, rootfs at `0x68000000`) and requests the hot reboot | runs; the loaded image matches the file byte for byte |
-| U-Boot checks the loaded image and boots the XIP kernel from it | runs (a patched image is refused and the recovery kernel boots instead) |
-| XIP kernel | takes a fault during an initcall; its handler logs the context and requests a reset through GPIO 0 bit 30 |
-| Sub-processor link (`cis`, over HSPI) | fails: `cis:trans NG(-512)` |
-| I2C | placeholder: `i2c-1 Fatal error Cancel timeout` |
+| Recovery kernel: MMU, GIC, TMU, NOR via CFI, framebuffer, I2C, HSPI, SDHI, VFP | runs |
+| Recovery userspace: `pmng` starts `osloader`, which draws its splash | runs |
+| PSC link to the base-board MCU: sync, START, VERG, PORTW (SD slot power), cyclic STAT, reset requests | runs, against `navi.psc` |
+| Map SD card: enumeration, partition table, FAT32 reads by DMA | runs |
+| `osloader` loads `HD14/EXE/HC59/LOADING.KWI` (xipImage at `0x62f80000`, rootfs at `0x68000000`) and asks for the hot reboot | runs; the loaded image matches the file byte for byte |
+| U-Boot checks the loaded image and boots its XIP kernel | runs (a modified image is refused and the recovery kernel boots instead) |
+| Full system: XIP kernel, ext2 root in RAM, init scripts, udev, vendor modules, I2C devices, PSC wake-up | runs and stays up; it shows 「プログラム読込み中」 |
+| PowerVR SGX | placeholder: `SGXInit: Unable to validate device DDK version` |
+| DC-DC monitor on HSPI channel 0 | nothing behind it: `DCDC Version 255` |
+| Sub-processor links (`cis`, HSPI channels 1 and 2) | nothing behind them |
 
 The vendor binaries under `/vns` (`pmng`, `osloader`, `smng`) are ARMv7
 **Thumb-2**; glibc and busybox are ARMv6 ARM/Thumb-1 with VFPv2.
 
-With a map card the loaded kernel starts about nine guest seconds in, a
-little under two minutes of host time on an M-series Mac with the
-interpreter.
+With a map card the full system starts about six guest seconds in. Sixteen
+guest seconds take about four minutes of host time on an M-series Mac with
+the interpreter. Run it with the card file-backed (`--drive`, so the 32 GB
+image is not read into memory; add `,ro` to write-protect it):
 
-What would move it further: whatever the XIP kernel's faulting initcall wants
-(and the reset request on GPIO 0 bit 30 wired to the MCU, so it reboots rather
-than waiting for the watchdog); the I2C controllers; and the HSPI controller
-with a model of the sub-processor at its other end.
+```
+rsemu run alphard-navi --media flash=S29JL064J.bin --drive sd=map.img --for 16s --headless --screenshot shot.png
+```
+
+## The I2C and SPI buses
+
+The I2C parts sit where the kernel's own `i2cfs` table puts them (33
+entries; every transfer goes through it): bus 0 the Apple MFi coprocessor
+(0x10); bus 1 the AK7734 DSP (0x18), the two ADV7186 decoders (0x60/0x61,
+each with ten sub-map addresses), the CXD4905 GVIF (0x27), the rear-camera
+ADV7180 (0x20) and the USB hub (0x2c); bus 2 the RTC (0x51), the touch panel
+(0x5c) and the EEPROM (0x54–0x57). Each is an `i2c.regfile` stand-in that
+answers and reads back. The kernel's board-info table lists the same parts on
+bus 0 and generates no traffic.
+
+The HSPI's three channels are the driver's 0, 1 and 2 at `0xfffc7000`,
+`0xfffc8000` and `0xfffc6000` (GIC 105–107): channel 0 to the DC-DC/ADC
+monitor, 1 and 2 the CIS links to the base-board sub-CPUs, which raise GPIO
+134 and 146 when they have a 64-byte frame.
+
+## What would move it further
+
+* The CIS peers on HSPI channels 1 and 2 and the DC-DC monitor on channel 0.
+* Behaviour behind the I2C stand-ins the full system checks (the decoders'
+  status registers, the RTC's time, the EEPROM's contents).
+* The full system's own displays past the loading screen, which may want the
+  GPU.
