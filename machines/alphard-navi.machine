@@ -126,6 +126,28 @@ machine "alphard-navi" {
   object hspi1 "rcar.hspi" { bus = "hspi1" }
   object hspi2 "rcar.hspi" { bus = "hspi2" }
 
+  # -- I2C -------------------------------------------------------------------
+  #
+  # Three controllers. Which part sits on which bus is the kernel's own
+  # i2cfs table (33 entries, the one every transfer goes through), not its
+  # board-info table, which lists the same parts on bus 0 and generates no
+  # traffic. Every part is an `i2c.regfile` stand-in for now: it answers its
+  # addresses and reads back what was written. The ADV7186s answer their ten
+  # sub-map addresses each from the start.
+  object i2c0 "rcar.i2c" { bus = "i2c0" }
+  object i2c1 "rcar.i2c" { bus = "i2c1" }
+  object i2c2 "rcar.i2c" { bus = "i2c2" }
+  object mfi     "i2c.regfile" { bus = "i2c0", addresses = "0x10" }   # Apple MFi auth coprocessor
+  object ak7734  "i2c.regfile" { bus = "i2c1", addresses = "0x18" }   # AKM audio DSP
+  object adv_fse "i2c.regfile" { bus = "i2c1", addresses = "0x60, 0x48, 0x26, 0x50, 0x52, 0x70, 0x54, 0x4a, 0x42, 0x22, 0x24" }
+  object adv_rse "i2c.regfile" { bus = "i2c1", addresses = "0x61, 0x49, 0x2a, 0x29, 0x28, 0x71, 0x55, 0x4b, 0x43, 0x30, 0x25" }
+  object gvif    "i2c.regfile" { bus = "i2c1", addresses = "0x27" }   # CXD4905 GVIF
+  object rcam    "i2c.regfile" { bus = "i2c1", addresses = "0x20" }   # ADV7180 rear camera decoder
+  object usbhub  "i2c.regfile" { bus = "i2c1", addresses = "0x2c" }
+  object rtc     "i2c.regfile" { bus = "i2c2", addresses = "0x51" }   # RA-8581SA
+  object tpnl    "i2c.regfile" { bus = "i2c2", addresses = "0x5c" }   # touch panel
+  object e2prom  "i2c.regfile" { bus = "i2c2", addresses = "0x54, 0x55, 0x56, 0x57" }
+
   object psc "navi.psc" { clock = wdclk, link = "psc", side = "b", log = "psc" }
   object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
   object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }
@@ -179,7 +201,6 @@ machine "alphard-navi" {
   object lbsc   "ram" { size = 4K }    # 0xff800000: local bus state controller
   object misc0  "ram" { size = 32K }   # 0xffc00000: 0xffc00300/400 (DMA request routing, among others)
   object darc   "ram" { size = 4K }    # 0xffc55000: the kernel's UIO_DARC block
-  object i2c    "ram" { size = 12K }   # 0xffc70000: I2C 0-2
   object cpg    "ram" { size = 4K }    # 0xffc80000: clock pulse generator
   object sysc   "ram" { size = 4K }    # 0xffcc0000: power control (the SGX power-up poll times out here)
   object dma    "ram" { size = 4K }    # 0xffd85000: DMA controller registers
@@ -226,7 +247,9 @@ machine "alphard-navi" {
   map mem 0xffc45000 size 0x100  = gpio5
   map mem 0xffc46000 size 0x100  = gpio6
   map mem 0xffc55000 size 4K     = darc
-  map mem 0xffc70000 size 12K    = i2c
+  map mem 0xffc70000 size 0x38   = i2c0
+  map mem 0xffc71000 size 0x38   = i2c1
+  map mem 0xffc72000 size 0x38   = i2c2
   map mem 0xffc80000 size 4K     = cpg
   map mem 0xffcc0000 size 4K     = sysc
   map mem 0xffd80000 size 0x30   = tmu0
@@ -281,6 +304,9 @@ machine "alphard-navi" {
   wire mapcard.cd  -> gpio2.in26      # GPIO 90: SDHI3's card-detect switch, low when a card is in
   wire mapcard.cd  -> gpio2.in28      # GPIO 92: the same switch as userspace watches it (falling edge)
   wire gpio4.out28 -> subwdt.kick     # GPIO 4.28: the watchdog kick
+  wire i2c0.irq    -> gic.spi79       # ID 111
+  wire i2c1.irq    -> gic.spi82       # ID 114
+  wire i2c2.irq    -> gic.spi80       # ID 112
   wire hspi0.irq   -> gic.spi73       # ID 105
   wire hspi1.irq   -> gic.spi74       # ID 106
   wire hspi2.irq   -> gic.spi75       # ID 107

@@ -1235,6 +1235,7 @@ machine-arm926 = ["cpu-arm-aprofile"]
 machine-alphard-navi = [
     "cpu-arm-aprofile-vfp",
     "dev-navi",
+    "dev-i2c-regfile",
     "dev-watchdog-pin",
     "dev-arm-mpcore",
     "dev-arm-l2c310",
@@ -1281,7 +1282,7 @@ dev-uart-ns16550 = []
 # Renesas SH7780 Hardware Manual (SCIF §25, TMU §22), the R-Car SCIF/HSCIF and
 # DU chapters, and a black-box trace of a real DU driver's register writes.
 # `no_std + alloc`, no `unsafe`, no dependencies.
-dev-rcar = ["dev-sd-card", "bus-uart", "bus-spi"]
+dev-rcar = ["dev-sd-card", "bus-uart", "bus-spi", "bus-i2c"]
 
 # An external watchdog kicked by a pin (src/dev/watchdog.rs, `watchdog.pin`):
 # the supervisor chip or companion MCU that pulls a SoC's reset when the GPIO
@@ -1289,6 +1290,13 @@ dev-rcar = ["dev-sd-card", "bus-uart", "bus-spi"]
 # after the last one, lazily advanced so it costs nothing between kicks.
 # `no_std + alloc`, no dependencies.
 dev-watchdog-pin = []
+
+# A stand-in I2C target (src/dev/i2c_regfile.rs, `i2c.regfile`): a 256-byte
+# register file with an auto-incrementing pointer at each address it lists,
+# so a board's unmodelled codecs, decoders and serializers acknowledge and
+# read back instead of timing their drivers out. A placeholder by name.
+# `no_std + alloc`, no dependencies beyond the I2C bus.
+dev-i2c-regfile = ["bus-i2c"]
 
 # The Toyota Alphard navigation unit's board-level peers (src/dev/navi): today
 # `navi.psc`, the base board MCU's power-supply-control protocol peer on a UART

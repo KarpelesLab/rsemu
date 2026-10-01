@@ -232,6 +232,10 @@ pub mod riscv;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-watchdog-pin")))]
 pub mod watchdog;
 
+#[cfg(feature = "dev-i2c-regfile")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-i2c-regfile")))]
+pub mod i2c_regfile;
+
 #[cfg(feature = "dev-scsi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-scsi")))]
 pub mod scsi;
