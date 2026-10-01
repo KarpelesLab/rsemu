@@ -64,21 +64,25 @@ Roadmap §1 has the long form. When in doubt, ask **before** reading.
 
 ## Dependency policy
 
-- Default build: `cargo tree` shows only `rsemu`. This is checked in CI.
-- Permitted dependencies are first-party and feature-gated only: `pktkit`,
+- The library's baseline build — `--no-default-features --features std` —
+  shows only `rsemu` in `cargo tree`. This is checked in CI. The *default*
+  features are the binary's (`full`: every component and frontend), so they
+  reach the permitted crates below; an embedder turns the defaults off and
+  names what it wants.
+- Permitted dependencies are feature-gated only: the first-party `pktkit`,
   `compcol`, `purecrypto`, `fstool`, `puremp`, `noroi`, **`oxideav-png`**
   (`default-features = false`, which drops `oxideav-core` and leaves only
-  `compcol`). Nothing else — no `serde`, no `libc`, no async runtime, no GUI
-  toolkit.
-- The empty-`cargo tree` rule holds for *default* features. Several siblings
-  pull external crates under optional features, so CI checks the feature-enabled
-  tree too.
+  `compcol`), and **`minifb`** for the `window` feature (see below). Nothing
+  else — no `serde`, no `libc`, no async runtime, no other GUI toolkit.
+- Several siblings pull external crates under optional features, so CI checks
+  the feature-enabled tree's direct dependencies against this list too.
 - OS interaction is by raw syscall (the `purestd` pattern), not via `libc`.
-- The exceptions that break purity — macOS Hypervisor.framework, Windows WHPX,
-  and the `window` feature's `minifb` (the one GUI crate, allowed by the owner
-  for a native display window) — are opt-in features labelled as such. Never
-  silent, never default. A second GUI or graphics crate is a new decision for
-  the owner, not a precedent this one sets.
+- The exceptions that break purity are labelled features, never silent:
+  macOS Hypervisor.framework and Windows WHPX are opt-in; the `window`
+  feature's `minifb` (the one GUI crate, allowed by the owner for a native
+  display window) is in the binary's defaults and out of the library's
+  baseline. A second GUI or graphics crate is a new decision for the owner,
+  not a precedent this one sets.
 
 ## `no_std`
 

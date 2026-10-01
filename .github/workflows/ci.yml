@@ -236,7 +236,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      # Both halves of the rule. The default build pulls in nothing at all, and
+      # Both halves of the rule. The library's baseline build
+      # (--no-default-features --features std) pulls in nothing at all -- the
+      # defaults are the binary's and reach the permitted crates -- and
       # the *feature-enabled* tree is inspected too — ROADMAP §0 says it is
       # checked and, until now, only the default half was. The script says what
       # it gates on and what it merely reports, and why; `scripts/check.sh`
