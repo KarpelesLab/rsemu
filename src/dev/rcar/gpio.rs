@@ -11,13 +11,17 @@
 //! | `0x0c` | `INDT` | the pins: inputs as driven, outputs as latched |
 //! | `0x10` | `INTDT` | interrupts detected (read-only) |
 //! | `0x14` | `INTCLR` | write 1 to clear an `INTDT` bit (write-only) |
-//! | `0x18` | `INTMSK` | read: the mask; write 1 to mask |
-//! | `0x1c` | `MSKCLR` | write 1 to unmask (write-only) |
+//! | `0x18` | `INTMSK` | read: the enabled interrupts; write 0 to a bit to disable it, 1 leaves it |
+//! | `0x1c` | `MSKCLR` | write 1 to enable (write-only) |
 //! | `0x20` | `POSNEG` | a set bit detects low levels and falling edges |
 //! | `0x24` | `EDGLEVEL` | a set bit detects edges rather than levels |
 //! | `0x28` | `FILONOFF` | the input filter: stored, and inert |
 //!
-//! The mask registers' reset state is everything masked.
+//! Despite the names, `INTMSK` reads back as an *enable* mask — a set bit is
+//! an interrupt that may fire — which is how the navi kernel uses it: its
+//! demultiplexer takes `INTDT & INTMSK` as the pending set, its mask routine
+//! writes `~bit` to `INTMSK` and its unmask writes `bit` to `MSKCLR`. Reset is
+//! everything disabled.
 //!
 //! # Pins
 //!
@@ -57,7 +61,7 @@ use crate::machine::realize::Instance;
 pub const CLASS_NAME: &str = "rcar.gpio";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How much address space one bank answers.
 pub const REGISTER_WINDOW_LEN: u64 = 0x100;
@@ -85,7 +89,8 @@ struct State {
     outdt: u32,
     /// Latched edge detections. Level detections are computed, not latched.
     edges: u32,
-    intmsk: u32,
+    /// The enabled interrupts (`INTMSK` as read).
+    inten: u32,
     posneg: u32,
     edglevel: u32,
     filonoff: u32,
@@ -98,7 +103,7 @@ struct State {
 impl State {
     fn reset(pull: u32) -> State {
         State {
-            intmsk: u32::MAX,
+            inten: 0,
             pins: pull,
             ..State::default()
         }
@@ -118,7 +123,7 @@ impl State {
     }
 
     fn irq(&self) -> bool {
-        self.intdt() & !self.intmsk != 0
+        self.intdt() & self.inten != 0
     }
 
     /// The machine drove input `line` to `high`: record it, and latch an
@@ -205,7 +210,7 @@ impl Registers {
             OUTDT => s.outdt,
             INDT => s.indt(),
             INTDT => s.intdt(),
-            INTMSK => s.intmsk,
+            INTMSK => s.inten,
             POSNEG => s.posneg,
             EDGLEVEL => s.edglevel,
             FILONOFF => s.filonoff,
@@ -220,8 +225,8 @@ impl Registers {
             INOUTSEL => s.inoutsel = v,
             OUTDT => s.outdt = v,
             INTCLR => s.edges &= !v,
-            INTMSK => s.intmsk |= v,
-            MSKCLR => s.intmsk &= !v,
+            INTMSK => s.inten &= v,
+            MSKCLR => s.inten |= v,
             POSNEG => s.posneg = v,
             EDGLEVEL => s.edglevel = v,
             FILONOFF => s.filonoff = v,
@@ -420,7 +425,7 @@ impl Device for Gpio {
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let s = *self.regs.state.lock();
         for v in [
-            s.iointsel, s.inoutsel, s.outdt, s.edges, s.intmsk, s.posneg, s.edglevel, s.filonoff,
+            s.iointsel, s.inoutsel, s.outdt, s.edges, s.inten, s.posneg, s.edglevel, s.filonoff,
             s.pins, s.driven,
         ] {
             w.write_u32(v)?;
@@ -434,7 +439,7 @@ impl Device for Gpio {
             inoutsel: r.read_u32()?,
             outdt: r.read_u32()?,
             edges: r.read_u32()?,
-            intmsk: r.read_u32()?,
+            inten: r.read_u32()?,
             posneg: r.read_u32()?,
             edglevel: r.read_u32()?,
             filonoff: r.read_u32()?,
@@ -525,8 +530,9 @@ mod tests {
         w(&g, INTCLR, 1 << 28);
         assert!(!g.irq_asserted());
         g.set_input(28, false);
-        w(&g, INTMSK, 1 << 28);
+        w(&g, INTMSK, !(1 << 28));
         assert!(!g.irq_asserted(), "masked");
+        assert_eq!(r(&g, INTMSK), 0, "reads back as the enabled set");
         assert_eq!(r(&g, INTDT), 1 << 28, "but still detected");
     }
 
