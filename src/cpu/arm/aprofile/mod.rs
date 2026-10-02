@@ -121,6 +121,7 @@ pub mod cp;
 pub mod cp15;
 pub mod cp15v7;
 pub mod disasm;
+pub mod exclusive;
 mod exec;
 pub mod isa;
 pub mod isa_v6;
@@ -937,6 +938,9 @@ pub struct Arm {
     /// can hand the rest of its budget back at once instead of a cycle at a
     /// time.
     idle: AtomicBool,
+    /// The `arm.exclusive` object this core shares a global exclusive
+    /// monitor through (`monitor = …`), attached at bind time.
+    monitor_link: Option<String>,
     /// The strong end of every pin this core has handed to a wire.
     ///
     /// A net holds its sinks weakly — the machine owns devices and a wire
@@ -1039,6 +1043,7 @@ impl Arm {
             reset_address: Arc::new(AtomicU64::new(NO_RESET_ADDRESS)),
             held_at_reset: false,
             idle: AtomicBool::new(false),
+            monitor_link: None,
             pins: sync::Mutex::new(Pins::default()),
         }
     }
@@ -1185,6 +1190,7 @@ impl Arm {
         let cluster_id = r.or_range("cluster-id", 0u64, 0..=15)?;
         let periphbase = r.or_addr("periphbase", 0)?;
         let held = r.or("held", false)?;
+        let monitor_link = r.optional_link("monitor")?.map(|l| l.as_str().to_string());
         // Accepted and ignored: there is one engine until phase 5, and a
         // machine file that names it should not have to be edited when the
         // second one lands.
@@ -1231,7 +1237,9 @@ impl Arm {
             cluster_id: cluster_id as u8,
             periphbase,
         })?;
-        Ok(if held { core.held() } else { core })
+        let mut core = if held { core.held() } else { core };
+        core.monitor_link = monitor_link;
+        Ok(core)
     }
 
     /// This core's configuration, with the bind-time requester folded in.
@@ -1839,6 +1847,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "which execution engine; only `interp` exists until phase 5",
         },
         PropertySpec {
+            name: "monitor",
+            kind: ValueKind::Link,
+            required: false,
+            summary: "the `arm.exclusive` object whose global exclusive monitor this core shares",
+        },
+        PropertySpec {
             name: "held",
             kind: ValueKind::Bool,
             required: false,
@@ -2208,6 +2222,11 @@ impl crate::machine::Instance for Arm {
         })?;
         self.attach_space(Arc::clone(space));
         self.set_requester(ctx.requester());
+        if let Some(path) = &self.monitor_link {
+            let monitor =
+                ctx.export_as::<monitor::SharedMonitor>(path, ExportId::EXCLUSIVE_MONITOR)?;
+            self.attach_global_monitor(monitor);
+        }
         Ok(())
     }
 }
@@ -2236,6 +2255,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("cluster-id", ValueKind::Uint).range(0, 15))
         .prop(PropSchema::new("periphbase", ValueKind::Addr))
         .prop(PropSchema::new("held", ValueKind::Bool))
+        .prop(PropSchema::new("monitor", ValueKind::Link))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
         // Inputs only: an ARM926EJ-S drives nothing this core models. The
         // bus-facing outputs a real part has -- `nMREQ`, `nRW`, `nWAIT` -- are

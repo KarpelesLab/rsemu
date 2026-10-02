@@ -21,13 +21,18 @@
 //! and it is the safe one: an interrupted pair retries rather than
 //! succeeding across a handler that may have written the location.
 //!
-//! **The global monitor is not modelled yet**; there is one core per
-//! machine until SMP lands. The seam for it is [`GlobalMonitor`]: a machine
-//! with several cores builds one, hands it to each with
+//! The global monitor is the [`GlobalMonitor`] seam, and [`SharedMonitor`]
+//! the implementation a machine shares between its cores — in a machine
+//! file, an `arm.exclusive` object the cores name as their `monitor`. Each
+//! core is handed it with
 //! [`Arm::attach_global_monitor`](super::Arm::attach_global_monitor), and
 //! the interpreter consults it at exactly the three points the architecture
 //! names — mark, check-on-store-exclusive, and every other store — without
-//! any change to the instruction implementations.
+//! any change to the instruction implementations. Without one, a
+//! store-exclusive answers to its own core's local monitor, which is right
+//! for a single core and wrong for several: another core's store between a
+//! load-exclusive and its store-exclusive goes unseen, and two threads both
+//! take one lock.
 //!
 //! # The granule
 //!
@@ -111,9 +116,161 @@ pub trait GlobalMonitor: Send + Sync + fmt::Debug {
     fn observe_store(&self, requester: RequesterId, pa: u64, size: u32);
 }
 
+/// A global exclusive monitor shared by the cores of one machine.
+///
+/// One mark per core, kept in a slot a core claims the first time it marks
+/// anything. Lock-free, because [`observe_store`](GlobalMonitor::observe_store)
+/// runs on every store every core makes: a store compares one word per
+/// other core and writes nothing unless it hits a mark.
+///
+/// Granule-tagged like the local monitor ([`GRANULE`]): another core's store
+/// anywhere in a marked granule clears the mark, which the architecture
+/// permits (DDI 0406C A3.4.3) and which is what keeps a lock word and the
+/// data beside it consistent.
+#[derive(Debug)]
+pub struct SharedMonitor {
+    slots: alloc::vec::Vec<Slot>,
+}
+
+#[derive(Debug)]
+struct Slot {
+    owner: crate::core::sync::AtomicU32,
+    tag: crate::core::sync::AtomicU64,
+}
+
+/// A slot's tag when nothing is marked.
+const UNMARKED: u64 = u64::MAX;
+
+impl SharedMonitor {
+    /// A monitor for at most `cores` cores.
+    #[must_use]
+    pub fn new(cores: usize) -> SharedMonitor {
+        SharedMonitor {
+            slots: (0..cores)
+                .map(|_| Slot {
+                    owner: crate::core::sync::AtomicU32::new(RequesterId::ANONYMOUS.0),
+                    tag: crate::core::sync::AtomicU64::new(UNMARKED),
+                })
+                .collect(),
+        }
+    }
+
+    fn granule(pa: u64) -> u64 {
+        pa & !u64::from(GRANULE - 1)
+    }
+
+    /// `requester`'s slot, claiming a free one the first time.
+    fn slot(&self, requester: RequesterId) -> Option<&Slot> {
+        use crate::core::sync::Ordering;
+        if let Some(slot) = self
+            .slots
+            .iter()
+            .find(|s| s.owner.load(Ordering::Acquire) == requester.0)
+        {
+            return Some(slot);
+        }
+        self.slots.iter().find(|s| {
+            s.owner
+                .compare_exchange(
+                    RequesterId::ANONYMOUS.0,
+                    requester.0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        })
+    }
+
+    /// Clear every mark — what a reset of the whole machine does.
+    pub fn clear(&self) {
+        for slot in &self.slots {
+            slot.tag
+                .store(UNMARKED, crate::core::sync::Ordering::Release);
+        }
+    }
+}
+
+impl GlobalMonitor for SharedMonitor {
+    fn mark(&self, requester: RequesterId, pa: u64, _size: u32) {
+        if let Some(slot) = self.slot(requester) {
+            slot.tag
+                .store(Self::granule(pa), crate::core::sync::Ordering::Release);
+        }
+    }
+
+    fn store_exclusive(&self, requester: RequesterId, pa: u64, _size: u32) -> bool {
+        // A core this monitor has no room for is treated as alone: its local
+        // monitor already passed.
+        let Some(slot) = self.slot(requester) else {
+            return true;
+        };
+        slot.tag.swap(UNMARKED, crate::core::sync::Ordering::AcqRel) == Self::granule(pa)
+    }
+
+    fn observe_store(&self, requester: RequesterId, pa: u64, size: u32) {
+        use crate::core::sync::Ordering;
+        let first = Self::granule(pa);
+        let last = Self::granule(pa + u64::from(size.max(1)) - 1);
+        for slot in &self.slots {
+            if slot.owner.load(Ordering::Relaxed) == requester.0 {
+                continue;
+            }
+            let tag = slot.tag.load(Ordering::Acquire);
+            if tag != UNMARKED && (tag == first || tag == last) {
+                let _ =
+                    slot.tag
+                        .compare_exchange(tag, UNMARKED, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A: RequesterId = RequesterId(7);
+    const B: RequesterId = RequesterId(9);
+
+    #[test]
+    fn another_cores_store_breaks_a_mark_and_its_own_does_not() {
+        let m = SharedMonitor::new(2);
+        m.mark(A, 0x1004, 4);
+        m.observe_store(A, 0x1008, 4);
+        assert!(
+            m.store_exclusive(A, 0x1004, 4),
+            "a core's own store keeps its mark"
+        );
+        m.mark(A, 0x1004, 4);
+        m.observe_store(B, 0x101c, 4);
+        assert!(
+            !m.store_exclusive(A, 0x1004, 4),
+            "the other core's store in the granule broke it"
+        );
+    }
+
+    #[test]
+    fn two_cores_racing_for_one_lock_word_get_one_winner() {
+        // A: LDREX; B: LDREX, STREX (wins, and that store breaks A's mark);
+        // A: STREX fails and retries.
+        let m = SharedMonitor::new(2);
+        m.mark(A, 0x2000, 4);
+        m.mark(B, 0x2000, 4);
+        assert!(m.store_exclusive(B, 0x2000, 4));
+        m.observe_store(B, 0x2000, 4);
+        assert!(!m.store_exclusive(A, 0x2000, 4));
+    }
+
+    #[test]
+    fn a_store_exclusive_consumes_the_mark() {
+        let m = SharedMonitor::new(1);
+        m.mark(A, 0x40, 4);
+        assert!(m.store_exclusive(A, 0x40, 4));
+        assert!(
+            !m.store_exclusive(A, 0x40, 4),
+            "no second success without a new mark"
+        );
+    }
 
     #[test]
     fn a_mark_covers_its_granule_and_nothing_else() {

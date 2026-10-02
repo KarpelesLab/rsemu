@@ -304,6 +304,12 @@ impl ExportId {
     /// [`Export::Cell`]; `u64::MAX` means the architectural vector.
     pub const RESET_ADDRESS: ExportId = ExportId(13);
 
+    /// A multi-core machine's global exclusive monitor, which every core's
+    /// `LDREX`/`STREX` consults. Its type is the architecture's business
+    /// (`cpu::arm::aprofile::monitor::SharedMonitor`), so it travels as
+    /// [`Export::Opaque`].
+    pub const EXCLUSIVE_MONITOR: ExportId = ExportId(14);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -324,6 +330,7 @@ impl ExportId {
             ExportId::SCSI_CONTROLLER => Some("SCSI bus interface controller"),
             ExportId::REMOVABLE_MEDIA => Some("removable media"),
             ExportId::RESET_ADDRESS => Some("reset address"),
+            ExportId::EXCLUSIVE_MONITOR => Some("global exclusive monitor"),
             _ => None,
         }
     }

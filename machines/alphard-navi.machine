@@ -58,15 +58,19 @@ machine "alphard-navi" {
   # loader would only park them). The vendor software assumes the cores: on
   # one, its real-time threads spin where another core would have run the
   # thread they wait for, and starve the software watchdog.
+  # What LDREX/STREX consult across cores: without it two threads on two
+  # cores both take one lock (smng's malloc arena was the first casualty).
+  object excl "arm.exclusive" { cores = 4 }
   object cpu "cpu.arm" {
     clock      = cpuclk
     space      = mem
     cpu        = "cortex-a9"
     periphbase = 0xf0000000
+    monitor    = excl
   }
-  object cpu1 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 1, held = true }
-  object cpu2 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 2, held = true }
-  object cpu3 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 3, held = true }
+  object cpu1 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 1, held = true, monitor = excl }
+  object cpu2 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 2, held = true, monitor = excl }
+  object cpu3 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 3, held = true, monitor = excl }
 
   # Which secondaries are out of reset (0xfe6cf000), and where one starts when
   # released: the boot-address register at 0xfe700040, which the kernel
