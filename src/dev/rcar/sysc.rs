@@ -35,7 +35,7 @@
 //!
 //! | Domain | Offset | `SYSCISR` |
 //! | --- | --- | --- |
-//! | 0 | `0x40` | bits 1–3: the written bit, one place up |
+//! | 0 | `0x40` | bits 1–3: the written bit itself (the secondary cores: bit *n* for core *n*) |
 //! | 1 | `0x80` | bit 16 |
 //! | 2 | `0xc0` | bit 20 (the SGX) |
 //! | 3 | `0x100` | bit 21 |
@@ -94,7 +94,7 @@ const PWRER: u64 = 0x14;
 /// The `SYSCISR` bits a request on domain `n` for bits `v` completes on.
 fn completion(n: u64, v: u32) -> u32 {
     match n {
-        0 => (v & 0b111) << 1,
+        0 => v & 0b1110,
         1 => 1 << 16,
         2 => 1 << 20,
         3 => 1 << 21,
@@ -344,7 +344,7 @@ mod tests {
     fn each_domain_completes_on_its_own_bit() {
         let s = Sysc::default();
         for (n, want) in [
-            (0u64, 1u32 << 2),
+            (0u64, 1u32 << 1),
             (1, 1 << 16),
             (2, 1 << 20),
             (3, 1 << 21),
