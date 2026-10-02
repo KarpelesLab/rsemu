@@ -110,6 +110,8 @@ Findings that are not obvious from the part numbers:
 | `0xfff80000` | Display Unit (ID 63) | `rcar.du` |
 | `0xfffc0000` | pin function controller | placeholder |
 | `0xfffd1000` | CAN channel 1 (ID 116) | `rcar.can`: a silent bus |
+| `0xfffc9000` | IEBus controller (ID 140) | `rcar.iebus`: a silent bus |
+| `0xfe6cf000`, `0xfe700040` | secondary-core reset control, boot address | `rcar.rst` |
 
 A placeholder is a plain `ram` object: it reads back what was written and does
 nothing else. That carries the boot code's write-then-read-back sequences but
@@ -170,7 +172,9 @@ U-Boot variable.
 | PowerVR SGX | `pvr.sgx` stand-in: the driver initialises; nothing is rendered |
 | DC-DC monitor on HSPI channel 0 | `navi.dcdcad`: `DCDC Version 2` |
 | CAN channel 1 | `rcar.can`, a silent bus: the channel starts and its readers park |
-| Full system past the driver load: application layer, HMI screen layers | starts; resets itself about 85 guest seconds in (see the watchdogs, below) |
+| Full system past the driver load: application layer, HMI screen layers (`MAPPARENT` among them) | runs, on four cores, without a reset for as long as it has been run (three guest minutes); the screen is black, because the HMI draws through OpenGL ES and `pvr.sgx` renders nothing |
+| Four Cortex-A9s | both kernels bring up four CPUs: `rcar.rst` releases the secondaries at the boot address, the GIC's SGIs are always on, and the cores share `arm.exclusive` |
+| IEBus (AVC-LAN) | `rcar.iebus`, a silent bus: frames are delivered, nothing arrives |
 | Sub-processor links (`cis`, HSPI channels 1 and 2) | nothing behind them |
 
 The vendor binaries under `/vns` (`pmng`, `osloader`, `smng`) are ARMv7
@@ -233,7 +237,9 @@ monitor, 1 and 2 the CIS links to the base-board sub-CPUs, which raise GPIO
 
 ## What would move it further
 
-* Whatever resets the full system about 85 guest seconds in.
+* Rendering: the HMI's OpenGL ES output, which needs the SGX to draw.
+* The SCAC security chip (`sammc` polls its status and times out every few
+  seconds).
 * The CIS peers on HSPI channels 1 and 2.
 * Behaviour behind the I2C stand-ins the full system checks (the decoders'
   status registers, the RTC's time, the EEPROM's contents).
