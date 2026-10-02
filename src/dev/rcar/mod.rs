@@ -15,6 +15,7 @@
 //! | [`hspi`] | `rcar.hspi` | one HSPI channel: an SPI master with 8-byte FIFOs, by programmed I/O, on a named SPI bus |
 //! | [`hpbdmac`] | `rcar.hpbdmac` | the HPB-DMAC: 44 request-paced peripheral DMA channels with double-buffered register sets |
 //! | [`sdhi`] | `rcar.sdhi` | the SD host interface: command engine, one-block buffer, DMA requests, driving a `sd.card` through a socket |
+//! | [`can`] | `rcar.can` | one CAN channel on a silent bus: the mode handshake, transmissions that complete |
 //! | [`sysc`] | `rcar.sysc` | the SYSC power domains: switches that complete at once, with status and completion bits |
 //! | [`du`] | `rcar.du` | the R-Car Display Unit: timing registers, up to eight planes composed from guest memory, a frame counter on the dot clock |
 //!
@@ -29,6 +30,7 @@ use alloc::vec::Vec;
 use crate::core::error::Result;
 use crate::machine::validate::ClassSchema;
 
+pub mod can;
 pub mod du;
 pub mod gpio;
 pub mod hpbdmac;
@@ -39,6 +41,7 @@ pub mod sdhi;
 pub mod sysc;
 pub mod tmu;
 
+pub use can::Can;
 pub use du::Du;
 pub use gpio::Gpio;
 pub use hpbdmac::HpbDmac;
@@ -55,6 +58,7 @@ pub use tmu::Tmu;
 ///
 /// If something already claimed one of the names.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
+    can::register(registry)?;
     gpio::register(registry)?;
     hpbdmac::register(registry)?;
     hspi::register(registry)?;
@@ -72,6 +76,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// If one of the names is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
+    can::bind(bindings)?;
     gpio::bind(bindings)?;
     hpbdmac::bind(bindings)?;
     hspi::bind(bindings)?;
@@ -87,6 +92,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
     alloc::vec![
+        can::schema(),
         gpio::schema(),
         hpbdmac::schema(),
         hspi::schema(),

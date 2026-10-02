@@ -193,6 +193,12 @@ machine "alphard-navi" {
   # driver -- start, build check, kernel commands -- and no rendering.
   object sgx "pvr.sgx" { clock = pclk / 1024, space = mem }
 
+  # CAN channel 1 (the SD system's rcan driver reads its channel from its
+  # configuration: 1). Nothing else is on the bus; what matters is that the
+  # channel starts, so the driver parks its readers -- refused instead, the
+  # real-time CAN reader spun and starved the software watchdog's thread.
+  object can1 "rcar.can" { }
+
   # The power domains. The SD system's framebuffer driver switches the SGX on
   # here and polls for the switch to finish; as plain memory it never did, and
   # it logged "power on SGX error!".
@@ -263,7 +269,6 @@ machine "alphard-navi" {
   object adg    "ram" { size = 4K }    # 0xfffe0000: audio clock generator (route_pdc_setReg)
   object gpsbb  "ram" { size = 16K }   # 0xffd00000: the on-chip GPS baseband (the SD kernel's GPSBBIODrv maps 0x3800)
   object usbh1  "ram" { size = 4K }    # 0xffd8c000: a second USB bridge, same 0x804 register as usbh
-  object misc3  "ram" { size = 4K }    # 0xfffd1000: polled by the SD system's userspace (0x840)
   object tmu0x  "ram" { size = 0xfd0 } # 0xffd80030: the rest of each TMU page; the SD system's
   object tmu1x  "ram" { size = 0xfd0 } # kernel touches 0x38, past the three channels modelled
   object tmu2x  "ram" { size = 0xfd0 }
@@ -329,7 +334,7 @@ machine "alphard-navi" {
   map mem 0xfce00000 size 64K    = sgx
   map mem 0xffd00000 size 16K    = gpsbb
   map mem 0xffd8c000 size 4K     = usbh1
-  map mem 0xfffd1000 size 4K     = misc3
+  map mem 0xfffd1000 size 4K     = can1
   map mem 0xfff80000 size 0x40000 = du
   map mem 0xfffc0000 size 64K    = pfc
   map mem 0xfffc7000 size 0x100  = hspi0 { priority = 1 }
@@ -344,6 +349,7 @@ machine "alphard-navi" {
   wire mpcore.wdt0 -> gic.cpu0ppi14   # ID 30: private watchdog
   wire sdhi0.irq   -> gic.spi104      # ID 136
   wire sgx.irq     -> gic.spi57       # ID 89
+  wire can1.irq    -> gic.spi84       # ID 116
   wire sdhi3.irq   -> gic.spi106      # ID 138
   wire sdhi2.irq   -> gic.spi107      # ID 139
   wire gpio0.irq   -> gic.spi141      # ID 173
