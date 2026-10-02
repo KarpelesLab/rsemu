@@ -22,6 +22,9 @@
 //! * With `scope = "machine"` the expiry also resets **every device**, warm
 //!   ([`MachineReset`](crate::core::device::MachineReset)): what a supervisor
 //!   that holds a whole SoC in reset does, where a pin reaches only a core.
+//! * With `log = "port"` every expiry is reported, one line, on that
+//!   character port: a board that reboots has several ways to, and this says
+//!   which one it was.
 //!
 //! The countdown is lazily advanced (`ROADMAP.md` §4.2): the device schedules
 //! only its deadline and costs nothing between edges.
@@ -76,6 +79,8 @@ struct Shared {
     /// resets, not only whatever `reset` is wired to.
     machine: Mutex<Option<Arc<crate::core::device::MachineReset>>>,
     whole_machine: bool,
+    /// Where an expiry is reported, if anywhere.
+    log: Option<Arc<dyn crate::host::chardev::CharDevice>>,
 }
 
 impl fmt::Debug for Shared {
@@ -105,15 +110,23 @@ impl Shared {
             let mut s = self.state.lock();
             let now = self.tick.load(Ordering::Relaxed);
             let fire = target > now && s.deadline != NEVER && target >= s.deadline;
+            let at = s.deadline;
             if fire {
                 s.deadline = NEVER;
                 s.fired += 1;
             }
             self.tick.store(target.max(now), Ordering::Relaxed);
             self.deadline.store(s.deadline, Ordering::Relaxed);
-            fire
+            fire.then_some((at, s.fired))
         };
-        if fire {
+        if let Some((at, n)) = fire {
+            if let Some(log) = &self.log {
+                let line = alloc::format!(
+                    "watchdog: no kick for {} ticks, reset at tick {at} (expiry {n})\n",
+                    self.timeout
+                );
+                log.write(line.as_bytes());
+            }
             self.pulse();
         }
     }
@@ -170,10 +183,17 @@ impl PinWatchdog {
         let mut r = props.reader();
         let timeout = r.or_range("timeout", 0u64, 1..=u64::MAX / 2)?;
         let scope = r.or_enum("scope", "pin", &["pin", "machine"])?;
+        let log = r.optional_str("log")?.map(ToString::to_string);
         r.finish()?;
+        let log = match log {
+            Some(name) => Some(crate::host::chardev::ports::attach(props, &name)?
+                as Arc<dyn crate::host::chardev::CharDevice>),
+            None => None,
+        };
         let mut w = PinWatchdog::with_timeout(timeout);
         if let Some(shared) = Arc::get_mut(&mut w.shared) {
             shared.whole_machine = scope == "machine";
+            shared.log = log;
         }
         Ok(w)
     }
@@ -198,6 +218,7 @@ impl PinWatchdog {
                 out: Mutex::with_rank(LockRank::LEAF, None),
                 machine: Mutex::with_rank(LockRank::LEAF, None),
                 whole_machine: false,
+                log: None,
             }),
             pins: Mutex::with_rank(LockRank::LEAF, Vec::new()),
         }
@@ -227,6 +248,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Str,
             required: false,
             summary: "\"pin\" (the default): pulse `reset`; \"machine\": also reset every device, warm",
+        },
+        PropertySpec {
+            name: "log",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "a character port each expiry is reported on, one line",
         },
     ],
     construct: |props| Ok(Box::new(PinWatchdog::new(props)?)),
@@ -348,6 +375,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("timeout", ValueKind::Uint).required())
         .prop(PropSchema::new("scope", ValueKind::Str).values(&["pin", "machine"]))
+        .prop(PropSchema::new("log", ValueKind::Str))
         .port(KICK_PIN, PortDir::In)
         .port(RESET_PIN, PortDir::Out)
 }
@@ -355,6 +383,23 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expiry_is_reported_on_the_log_port() {
+        let port = Arc::new(crate::host::chardev::CharPort::new());
+        let mut w = PinWatchdog::with_timeout(100);
+        Arc::get_mut(&mut w.shared).unwrap().log =
+            Some(Arc::clone(&port) as Arc<dyn crate::host::chardev::CharDevice>);
+        w.shared.kick(true);
+        w.shared.advance_to(99);
+        assert!(port.drain().is_empty());
+        w.shared.advance_to(100);
+        let line = String::from_utf8(port.drain()).unwrap();
+        assert_eq!(
+            line,
+            "watchdog: no kick for 100 ticks, reset at tick 100 (expiry 1)\n"
+        );
+    }
 
     #[test]
     fn it_waits_for_the_first_kick_then_fires_when_the_kicks_stop() {

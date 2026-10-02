@@ -220,7 +220,7 @@ machine "alphard-navi" {
   # SRAM keep their contents, which is what the warm reboot into a kernel
   # loaded from the SD card depends on.
   osc wdclk = 1000 Hz
-  object subwdt "watchdog.pin" { clock = wdclk, timeout = 2000, scope = "machine" }
+  object subwdt "watchdog.pin" { clock = wdclk, timeout = 2000, scope = "machine", log = "wdt" }
 
   # The four SD host interfaces. The kernel's own resource tables give their
   # interrupts: SDHI0 is GIC ID 136, SDHI3 138, SDHI2 139 (SDHI1 is not used).
