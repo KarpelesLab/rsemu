@@ -258,6 +258,7 @@ machine "alphard-navi" {
   object dbsc1  "ram" { size = 4K }    # 0xfec00000: DDR controller, channel 1
   object lbsc   "ram" { size = 4K }    # 0xff800000: local bus state controller
   object misc0  "ram" { size = 32K }   # 0xffc00000: 0xffc00300/400 (DMA request routing, among others)
+  object vin    "ram" { size = 16K }   # 0xffc50000: video capture; the SD kernel's vc_* driver (an external abort reset it)
   object darc   "ram" { size = 4K }    # 0xffc55000: the kernel's UIO_DARC block
   object cpg    "ram" { size = 4K }    # 0xffc80000: clock pulse generator
   object ffcc   "ram" { size = 4K }    # 0xffcc0000: unidentified; touched during the SD system's bring-up
@@ -302,6 +303,7 @@ machine "alphard-navi" {
   map mem 0xffc44000 size 0x100  = gpio4
   map mem 0xffc45000 size 0x100  = gpio5
   map mem 0xffc46000 size 0x100  = gpio6
+  map mem 0xffc50000 size 16K    = vin
   map mem 0xffc55000 size 4K     = darc
   map mem 0xffc70000 size 0x38   = i2c0
   map mem 0xffc71000 size 0x38   = i2c1
@@ -348,6 +350,7 @@ machine "alphard-navi" {
   wire mpcore.twd0 -> gic.cpu0ppi13   # ID 29: private timer
   wire mpcore.wdt0 -> gic.cpu0ppi14   # ID 30: private watchdog
   wire sdhi0.irq   -> gic.spi104      # ID 136
+  wire du.irq      -> gic.spi31       # ID 63: vertical blanking and frame end
   wire sgx.irq     -> gic.spi57       # ID 89
   wire can1.irq    -> gic.spi84       # ID 116
   wire sdhi3.irq   -> gic.spi106      # ID 138
