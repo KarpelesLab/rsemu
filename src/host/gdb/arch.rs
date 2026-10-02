@@ -714,7 +714,9 @@ const fn arm_regs() -> [RegDesc; 17] {
 #[cfg(feature = "cpu-arm-aprofile")]
 pub static ARM: Arch = Arch {
     class: &crate::cpu::arm::aprofile::CLASS,
-    verified_version: 6,
+    // 7 appends the hold latch and reset address after everything else; the
+    // register offsets are those of 6.
+    verified_version: 7,
     features: &[Feature::whole("org.rsemu.arm")],
     architecture: Some("arm"),
     regs: &ARM_REGS,

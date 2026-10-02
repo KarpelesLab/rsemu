@@ -297,6 +297,13 @@ impl ExportId {
     /// cold path.
     pub const REMOVABLE_MEDIA: ExportId = ExportId(12);
 
+    /// Where a core starts when it leaves reset, for a board that decides:
+    /// an SoC whose secondary cores begin at an address software wrote into a
+    /// boot-address register, not at the architectural vector. Published by
+    /// the core, written by the board's register. Transported as
+    /// [`Export::Cell`]; `u64::MAX` means the architectural vector.
+    pub const RESET_ADDRESS: ExportId = ExportId(13);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -316,6 +323,7 @@ impl ExportId {
             ExportId::CD_DRIVE => Some("CD-ROM drive"),
             ExportId::SCSI_CONTROLLER => Some("SCSI bus interface controller"),
             ExportId::REMOVABLE_MEDIA => Some("removable media"),
+            ExportId::RESET_ADDRESS => Some("reset address"),
             _ => None,
         }
     }

@@ -156,7 +156,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::core::device::{
-    DebugTranslation, Device, DeviceClass, Initiator, PropertySpec, RealizeCtx, ResetKind, SinkPin,
+    DebugTranslation, Device, DeviceClass, Export, ExportId, Initiator, PropertySpec, RealizeCtx,
+    ResetKind, SinkPin,
 };
 use crate::core::error::{Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -164,7 +165,7 @@ use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
-use crate::core::sync::{self, AtomicBool, AtomicU32, LockRank, Ordering};
+use crate::core::sync::{self, AtomicBool, AtomicU32, AtomicU64, LockRank, Ordering};
 use crate::core::value::Endian;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink};
 
@@ -736,6 +737,9 @@ pub(crate) struct Lines {
     /// same reason as `reset`: whoever sends it must not need this core's
     /// execution lock.
     event: AtomicBool,
+    /// Held in reset by the `hold` input: the core executes nothing until it
+    /// is released, and the release is a reset.
+    hold: AtomicBool,
 }
 
 impl Lines {
@@ -765,7 +769,20 @@ impl Lines {
     fn take_event(&self) -> bool {
         self.event.swap(false, Ordering::AcqRel)
     }
+
+    /// Hold or release the core. A release latches a reset, so the core
+    /// starts from its reset address the way a part leaving reset does.
+    fn set_hold(&self, held: bool) {
+        let was = self.hold.swap(held, Ordering::AcqRel);
+        if was && !held {
+            self.request_reset();
+        }
+    }
 }
+
+/// [`ExportId::RESET_ADDRESS`]'s "no address": reset takes the architectural
+/// vector.
+pub const NO_RESET_ADDRESS: u64 = u64::MAX;
 
 /// Which system control coprocessor the core is built with.
 ///
@@ -906,6 +923,20 @@ pub struct Arm {
     /// after `new` (`ROADMAP.md` §4.4).
     requester: AtomicU32,
     session: sync::Mutex<Session>,
+    /// Where a reset starts the core, when the board says ([`ExportId::RESET_ADDRESS`]):
+    /// a SoC whose secondary cores leave reset at an address software wrote
+    /// into a boot-address register rather than at the vector. Published as a
+    /// cell, so the board's register can write it without reaching this
+    /// core's lock; [`NO_RESET_ADDRESS`] means the architectural vector.
+    reset_address: Arc<AtomicU64>,
+    /// Whether the core starts held (`held = true`), and goes back to held on
+    /// a warm reset of the machine.
+    held_at_reset: bool,
+    /// Set by [`step`](Arm::step) when the core did nothing and will go on
+    /// doing nothing until an input changes, so [`run_budget`](Arm::run_budget)
+    /// can hand the rest of its budget back at once instead of a cycle at a
+    /// time.
+    idle: AtomicBool,
     /// The strong end of every pin this core has handed to a wire.
     ///
     /// A net holds its sinks weakly — the machine owns devices and a wire
@@ -935,6 +966,7 @@ struct Pins {
     irq: Option<Arc<InterruptPin>>,
     fiq: Option<Arc<InterruptPin>>,
     reset: Option<Arc<ResetPin>>,
+    hold: Option<Arc<HoldPin>>,
 }
 
 impl Arm {
@@ -1004,8 +1036,32 @@ impl Arm {
                     global_monitor: None,
                 },
             ),
+            reset_address: Arc::new(AtomicU64::new(NO_RESET_ADDRESS)),
+            held_at_reset: false,
+            idle: AtomicBool::new(false),
             pins: sync::Mutex::new(Pins::default()),
         }
+    }
+
+    /// Start the core held in reset, as a secondary core of a SoC whose boot
+    /// ROM never runs it: it executes nothing until its `hold` input falls.
+    #[must_use]
+    pub fn held(mut self) -> Arm {
+        self.held_at_reset = true;
+        self.lines.hold.store(true, Ordering::Release);
+        self
+    }
+
+    /// Whether the core is held in reset.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.lines.hold.load(Ordering::Acquire)
+    }
+
+    /// The cell a reset reads its start address from.
+    #[must_use]
+    pub fn reset_address(&self) -> &Arc<AtomicU64> {
+        &self.reset_address
     }
 
     /// A core in its power-on state, refusing a part whose extensions this
@@ -1121,6 +1177,7 @@ impl Arm {
         let cpu_id = r.or_range("cpu-id", 0u64, 0..=3)?;
         let cluster_id = r.or_range("cluster-id", 0u64, 0..=15)?;
         let periphbase = r.or_addr("periphbase", 0)?;
+        let held = r.or("held", false)?;
         // Accepted and ignored: there is one engine until phase 5, and a
         // machine file that names it should not have to be edited when the
         // second one lands.
@@ -1151,7 +1208,7 @@ impl Arm {
             }
             _ => {}
         }
-        Arm::try_new(Config {
+        let core = Arm::try_new(Config {
             requester: RequesterId::ANONYMOUS,
             endian: if big_endian {
                 Endian::Big
@@ -1166,7 +1223,8 @@ impl Arm {
             cpu_id: cpu_id as u8,
             cluster_id: cluster_id as u8,
             periphbase,
-        })
+        })?;
+        Ok(if held { core.held() } else { core })
     }
 
     /// This core's configuration, with the bind-time requester folded in.
@@ -1434,6 +1492,14 @@ impl Arm {
     /// the caller must treat as "stop", not "retry". A core waiting for an
     /// interrupt returns one cycle per call and keeps waiting.
     pub fn step(&self) -> u64 {
+        if self.lines.hold.load(Ordering::Acquire) {
+            // Held in reset: no fetch, no state change, and the latch a release
+            // will set is still to come. A cycle passes all the same, so a
+            // caller stepping by hand still sees time move.
+            self.idle.store(true, Ordering::Relaxed);
+            self.session.lock().state.cycles += 1;
+            return 1;
+        }
         let (irq, fiq) = self.lines.snapshot();
         let reset = self.lines.take_reset_request();
         let event = self.lines.take_event();
@@ -1473,7 +1539,8 @@ impl Arm {
         };
         let mmu = Arc::clone(mmu);
         let global = global_monitor.clone();
-        Exec::new(
+        let resetting = state.reset_pending;
+        let used = Exec::new(
             state,
             &space,
             mmu.as_ref(),
@@ -1482,7 +1549,19 @@ impl Arm {
             &cfg,
             global.as_deref(),
         )
-        .step(irq, fiq)
+        .step(irq, fiq);
+        if resetting {
+            // The reset sequence put the PC on the vector; a board that says
+            // otherwise moves it, before the first fetch.
+            let at = self.reset_address.load(Ordering::Acquire);
+            if at != NO_RESET_ADDRESS {
+                state.regs.r[15] = at as u32;
+            }
+        }
+        // Still halted after a step means nothing woke it: no interrupt line,
+        // no event. Nothing will until an input changes.
+        self.idle.store(state.halted, Ordering::Relaxed);
+        used
     }
 
     /// Execute until at least `budget` cycles have been charged.
@@ -1531,6 +1610,17 @@ impl Arm {
                 break;
             }
             used += n;
+            if self.idle.load(Ordering::Relaxed) && used < allowance {
+                // Halted (WFI, WFE, or held in reset) with nothing to wake it.
+                // Stepping on would charge one cycle per call until the budget
+                // ran out and change nothing else: an input can only change
+                // when the scheduler runs whatever drives it, which is after
+                // this budget. So the rest passes at once, and the cycle count
+                // still says it passed.
+                let rest = allowance - used;
+                self.session.lock().state.cycles += rest;
+                used = allowance;
+            }
         }
         if used >= allowance {
             self.session.lock().state.debt = used - allowance;
@@ -1674,7 +1764,10 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    the event register after everything else. An ARMv5 core's bytes are
     //    unchanged, and a v5 chunk without the trailer means the reset values:
     //    see `migrations`.
-    version: 6,
+    // 7: every core appends its `hold` latch and its reset address, nine
+    //    bytes, last; the v6 step in `migrations` appends what a v6 core
+    //    implied (not held, the architectural vector).
+    version: 7,
     summary: "A-profile 32-bit ARM CPU core: ARMv5TE (ARM926EJ-S) with Thumb, or ARMv7-A (Cortex-A9) with A32 and Thumb-2",
     properties: &[
         PropertySpec {
@@ -1737,6 +1830,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "which execution engine; only `interp` exists until phase 5",
         },
+        PropertySpec {
+            name: "held",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "start held in reset until the `hold` input falls (default false)",
+        },
     ],
     construct: |props| Ok(Box::new(Arm::from_props(props)?)),
 };
@@ -1774,6 +1873,15 @@ pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()>
         let body = r.take(r.remaining())?;
         out.extend_from_slice(body);
         Ok(())
+    })?;
+    // v6 -> v7 appends the trailer a v6 core implied: not held, the
+    // architectural vector.
+    migrations.register(CLASS.name, 6, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.push(0);
+        out.extend_from_slice(&NO_RESET_ADDRESS.to_le_bytes());
+        Ok(())
     })
 }
 
@@ -1810,6 +1918,10 @@ impl Device for Arm {
             Some(pa) => DebugTranslation::Mapped(u64::from(pa)),
             None => DebugTranslation::Unmapped,
         }
+    }
+
+    fn export(&self, which: ExportId) -> Option<Export> {
+        (which == ExportId::RESET_ADDRESS).then(|| Export::Cell(Arc::clone(&self.reset_address)))
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {
@@ -1853,6 +1965,11 @@ impl Device for Arm {
         // The latch is internal bookkeeping either way: the sequence the
         // machine just asked for is the one it owed.
         self.lines.take_reset_request();
+        // A core the board holds in reset goes back to being held when the
+        // board resets; whatever releases it will again.
+        if self.held_at_reset {
+            self.lines.hold.store(true, Ordering::Release);
+        }
     }
 
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
@@ -1926,7 +2043,9 @@ impl Device for Arm {
             w.write_bool(event)?;
             w.write_bool(state.waiting_for_event)?;
         }
-        Ok(())
+        // v7, last for every part.
+        w.write_bool(self.lines.hold.load(Ordering::Acquire))?;
+        w.write_u64(self.reset_address.load(Ordering::Acquire))
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1966,17 +2085,22 @@ impl Device for Arm {
         if self.cfg.arch.ext.vfp.is_some() {
             state.vfp = vfp::VfpRegs::load(r)?;
         }
-        // The v4 trailer. A v3 chunk (carried forward unchanged by
+        // The v6 trailer, before the v7 one's nine bytes. A v3 chunk (carried forward unchanged by
         // `migrations`) has none, and a v3 build never executed an `LDREX` or
         // a `WFE` — it decoded both as Undefined — so the state it implies is
         // exactly the default: monitor open, no event, not waiting.
-        if self.cfg.arch.ext.v6 && r.remaining() > 0 {
+        if self.cfg.arch.ext.v6 && r.remaining() > 9 {
             let armed = r.read_bool()?;
             let tag = r.read_u32()?;
             state.monitor = LocalMonitor::from_tag(armed.then_some(tag));
             state.event = r.read_bool()?;
             state.waiting_for_event = r.read_bool()?;
         }
+        let held = r.read_bool()?;
+        let reset_address = r.read_u64()?;
+        // Stored, not set: a restore is not a release.
+        self.lines.hold.store(held, Ordering::Release);
+        self.reset_address.store(reset_address, Ordering::Release);
         self.lines.take_event();
         {
             let mut session = self.session.lock();
@@ -2018,6 +2142,14 @@ impl Device for Arm {
             "reset" => {
                 let pin = Arc::new(ResetPin::new(Arc::clone(&self.lines), sources));
                 pins.reset = Some(Arc::clone(&pin));
+                pin
+            }
+            "hold" => {
+                let pin = Arc::new(HoldPin {
+                    lines: Arc::clone(&self.lines),
+                    inputs: FanIn::new(sources),
+                });
+                pins.hold = Some(Arc::clone(&pin));
                 pin
             }
             _ => return None,
@@ -2092,6 +2224,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("cpu-id", ValueKind::Uint).range(0, 3))
         .prop(PropSchema::new("cluster-id", ValueKind::Uint).range(0, 15))
         .prop(PropSchema::new("periphbase", ValueKind::Addr))
+        .prop(PropSchema::new("held", ValueKind::Bool))
         .prop(PropSchema::new("engine", ValueKind::Str).values(&["interp"]))
         // Inputs only: an ARM926EJ-S drives nothing this core models. The
         // bus-facing outputs a real part has -- `nMREQ`, `nRW`, `nWAIT` -- are
@@ -2099,6 +2232,27 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .port("irq", PortDir::In)
         .port("fiq", PortDir::In)
         .port("reset", PortDir::In)
+        .port("hold", PortDir::In)
+}
+
+/// The `hold` input: the core is held in reset while it is high, and leaves
+/// reset — from its reset address — when it falls.
+///
+/// Separate from `reset`, which is a pulse the core answers at once even if
+/// the line stays asserted: a board that keeps a secondary core off until
+/// software releases it needs the level.
+#[derive(Debug)]
+pub struct HoldPin {
+    lines: Arc<Lines>,
+    inputs: FanIn,
+}
+
+impl WireSink for HoldPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        self.lines
+            .set_hold(self.inputs.resolve(Resolve::Or).is_high());
+    }
 }
 
 /// One of the core's two interrupt inputs, as something a [`Wire`] can drive.

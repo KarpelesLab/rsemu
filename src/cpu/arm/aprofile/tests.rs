@@ -2425,9 +2425,94 @@ fn the_reset_pin_latches_and_the_next_step_runs_the_sequence() {
 }
 
 #[test]
-fn the_pins_a_machine_file_may_name_are_exactly_these_three() {
+fn a_held_core_runs_nothing_until_released_then_starts_at_its_reset_address() {
     let h = Harness::new();
-    for port in ["irq", "fiq", "reset"] {
+    h.program(0x2000, &[0xe3a0_0042]); // MOV r0, #0x42
+    let held = Arc::new(Arm::new(Config::ARM926EJS).held());
+    held.attach_space(h.cpu.space().expect("the harness core has a space"));
+    let (wire, src) = net(&held, "hold");
+    wire.set(src, Level::High);
+    assert!(held.is_held());
+    let before = held.cycles();
+    assert_eq!(held.step(), 1, "time passes while held");
+    assert_eq!(held.cycles(), before + 1);
+    assert_eq!(held.reg(0), 0, "and nothing executes");
+
+    held.reset_address().store(0x2000, Ordering::Release);
+    wire.set(src, Level::Low);
+    assert!(!held.is_held());
+    held.step();
+    assert_eq!(
+        held.pc(),
+        0x2000,
+        "the release is a reset, from the address"
+    );
+    assert_eq!(held.mode(), Mode::SUPERVISOR);
+    held.step();
+    assert_eq!(held.reg(0), 0x42);
+}
+
+#[test]
+fn without_a_reset_address_a_release_takes_the_vector() {
+    let held = Arc::new(Arm::new(Config::ARM926EJS).held());
+    let h = Harness::new();
+    held.attach_space(h.cpu.space().expect("the harness core has a space"));
+    let (wire, src) = net(&held, "hold");
+    wire.set(src, Level::High);
+    wire.set(src, Level::Low);
+    held.step();
+    assert_eq!(held.pc(), 0);
+}
+
+#[test]
+fn an_idle_core_spends_its_budget_in_one_call() {
+    // MCR p15, 0, r0, c7, c0, 4 -- wait for interrupt.
+    let h = running(&[0xee07_0f90, 0xe3a0_0001]);
+    let cp15 = Arc::new(Cp15Stub::default());
+    h.cpu.attach_coprocessor(15, cp15.clone());
+    h.cpu.attach_mmu(cp15);
+    h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0) | psr::I);
+    h.step();
+    assert!(h.cpu.is_halted());
+    let before = h.cpu.cycles();
+    assert_eq!(h.cpu.run_budget(1_000_000), 1_000_000);
+    assert_eq!(h.cpu.cycles(), before + 1_000_000, "the cycles still pass");
+    assert!(h.cpu.is_halted());
+    h.cpu.set_irq(true);
+    h.cpu.run_budget(10);
+    assert!(!h.cpu.is_halted(), "and the line still wakes it");
+}
+
+#[test]
+fn the_hold_latch_and_reset_address_survive_a_snapshot_without_releasing() {
+    let held = Arm::new(Config::ARM926EJS).held();
+    held.reset_address().store(0x6000, Ordering::Release);
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name).unwrap();
+    let mut writer = StateWriter::new(shape);
+    {
+        let mut chunk = writer.chunk("cpu", CLASS.name, CLASS.version).unwrap();
+        held.save(&mut chunk).unwrap();
+    }
+    let bytes = writer.to_vec().unwrap();
+    let restored = Arm::new(Config::ARM926EJS);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("cpu", CLASS.name, CLASS.version, &Migrations::new())
+        .unwrap();
+    restored.load(&mut chunk.reader()).unwrap();
+    assert!(restored.is_held());
+    assert_eq!(restored.reset_address().load(Ordering::Acquire), 0x6000);
+    // A restore is not a release: still held, still running nothing.
+    restored.step();
+    assert!(restored.is_held());
+    assert_eq!(restored.pc(), 0);
+}
+
+#[test]
+fn the_pins_a_machine_file_may_name_are_exactly_these_four() {
+    let h = Harness::new();
+    for port in ["irq", "fiq", "reset", "hold"] {
         assert!(h.cpu.sink(port, &[]).is_some(), "`{port}` should be a pin");
     }
     for port in ["nmi", "vinithi", ""] {
