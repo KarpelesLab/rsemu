@@ -1052,6 +1052,13 @@ impl Arm {
         self
     }
 
+    /// Whether the core is fetching untranslated after switching its MMU on
+    /// (until its next branch).
+    #[must_use]
+    pub fn state_flat_fetch(&self) -> bool {
+        self.session.lock().state.flat_fetch
+    }
+
     /// Whether the core is held in reset.
     #[must_use]
     pub fn is_held(&self) -> bool {
@@ -1764,9 +1771,10 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    the event register after everything else. An ARMv5 core's bytes are
     //    unchanged, and a v5 chunk without the trailer means the reset values:
     //    see `migrations`.
-    // 7: every core appends its `hold` latch and its reset address, nine
+    // 7: every core appends its `hold` latch, its reset address and whether
+    //    it is fetching untranslated after switching the MMU on -- ten
     //    bytes, last; the v6 step in `migrations` appends what a v6 core
-    //    implied (not held, the architectural vector).
+    //    implied (not held, the architectural vector, translated fetches).
     version: 7,
     summary: "A-profile 32-bit ARM CPU core: ARMv5TE (ARM926EJ-S) with Thumb, or ARMv7-A (Cortex-A9) with A32 and Thumb-2",
     properties: &[
@@ -1881,6 +1889,7 @@ pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()>
         out.extend_from_slice(body);
         out.push(0);
         out.extend_from_slice(&NO_RESET_ADDRESS.to_le_bytes());
+        out.push(0);
         Ok(())
     })
 }
@@ -2045,7 +2054,8 @@ impl Device for Arm {
         }
         // v7, last for every part.
         w.write_bool(self.lines.hold.load(Ordering::Acquire))?;
-        w.write_u64(self.reset_address.load(Ordering::Acquire))
+        w.write_u64(self.reset_address.load(Ordering::Acquire))?;
+        w.write_bool(state.flat_fetch)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -2089,7 +2099,7 @@ impl Device for Arm {
         // `migrations`) has none, and a v3 build never executed an `LDREX` or
         // a `WFE` — it decoded both as Undefined — so the state it implies is
         // exactly the default: monitor open, no event, not waiting.
-        if self.cfg.arch.ext.v6 && r.remaining() > 9 {
+        if self.cfg.arch.ext.v6 && r.remaining() > 10 {
             let armed = r.read_bool()?;
             let tag = r.read_u32()?;
             state.monitor = LocalMonitor::from_tag(armed.then_some(tag));
@@ -2098,6 +2108,7 @@ impl Device for Arm {
         }
         let held = r.read_bool()?;
         let reset_address = r.read_u64()?;
+        state.flat_fetch = r.read_bool()?;
         // Stored, not set: a restore is not a release.
         self.lines.hold.store(held, Ordering::Release);
         self.reset_address.store(reset_address, Ordering::Release);

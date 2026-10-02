@@ -260,6 +260,10 @@ pub(super) struct State {
     /// The halt in progress is a `WFE`, which an event also ends, rather
     /// than a `WFI`, which only an interrupt does.
     pub waiting_for_event: bool,
+    /// The MMU was switched on by an instruction since the last branch, and
+    /// the instructions after it are still fetched untranslated — see
+    /// [`Exec::step`].
+    pub flat_fetch: bool,
 }
 
 impl State {
@@ -280,6 +284,7 @@ impl State {
             monitor: LocalMonitor::OPEN,
             event: false,
             waiting_for_event: false,
+            flat_fetch: false,
         }
     }
 }
@@ -424,6 +429,7 @@ impl<'a> Exec<'a> {
             #[cfg(feature = "cpu-arm-aprofile-vfp")]
             self.state.vfp.reset_control();
             self.state.waiting_for_event = false;
+            self.state.flat_fetch = false;
             self.take_exception(Exception::Reset, 0);
             return self.used;
         }
@@ -462,10 +468,27 @@ impl<'a> Exec<'a> {
             return self.used;
         }
 
+        // The instructions that follow the one switching the MMU on were
+        // already in the pipeline, fetched before translation began: they
+        // run from the addresses they were fetched at, and the next branch
+        // is the first fetch the MMU translates. The architecture leaves
+        // which translation those fetches use implementation defined (ARM DDI
+        // 0406C, the VMSA's rules for enabling the MMU — software is told to
+        // keep an identity mapping), and this is the behaviour a kernel whose
+        // identity map is wrong still boots on: the navi's XIP kernel maps
+        // its secondary entry's window a mebibyte off, and a Cortex-A9 runs
+        // straight through to the branch into virtual addresses.
+        let was_translating = self.regime.translating;
         if self.flag(psr::T) {
             self.step_thumb();
         } else {
             self.step_arm();
+        }
+        if self.branched {
+            self.state.flat_fetch = false;
+        }
+        if !was_translating && self.mmu.regime().translating {
+            self.state.flat_fetch = true;
         }
         self.used
     }
@@ -1081,7 +1104,11 @@ impl<'a> Exec<'a> {
         // an unaligned `R15` stops mattering, which is why the PC-writing
         // helpers above are free to keep the bits the manual keeps.
         let va = va & !(width.bytes() as u32 - 1);
-        let pa = self.translate(va, AccessKind::Fetch, self.privileged())?;
+        let pa = if self.state.flat_fetch {
+            va
+        } else {
+            self.translate(va, AccessKind::Fetch, self.privileged())?
+        };
         self.cycle(1);
         // The bus is told this is a fetch, so a mapping without `Perms::EXEC`
         // refuses it and still answers a load of the same bytes.

@@ -1187,3 +1187,33 @@ fn the_reset_pin_resets_cp15_too() {
     );
     assert_eq!(m.cpu.mode(), Mode::SUPERVISOR);
 }
+
+#[test]
+fn the_instructions_after_the_mmu_comes_on_run_from_where_they_were_fetched() {
+    // A page table whose "identity" entry for the code is wrong -- VA 0 maps
+    // a megabyte further on, where there is nothing -- and a virtual alias
+    // at 0xc0000000 that is right. The instructions up to the first branch
+    // still run; the branch is the first fetch the MMU translates.
+    let m = V7::with_config(Config::CORTEX_A9);
+    let section = |pa: u32| (pa & 0xfff0_0000) | (3 << 10) | 0b10;
+    m.poke(0x4000, section(0x0010_0000));
+    m.poke(0x4000 + 0xc00 * 4, section(0));
+    let sctlr = m.cpu.cp15v7().expect("a Cortex-A9 has its CP15").sctlr();
+    m.run(&[
+        0xee02_4f10, // mcr p15, 0, r4, c2, c0, 0   TTBR0
+        0xee03_5f10, // mcr p15, 0, r5, c3, c0, 0   DACR
+        0xee01_0f10, // mcr p15, 0, r0, c1, c0, 0   SCTLR: MMU on
+        0xe3a0_1042, // mov r1, #0x42               fetched flat
+        0xe1a0_f002, // mov pc, r2                  into the alias
+        0xe3a0_3043, // mov r3, #0x43               fetched translated
+    ]);
+    m.set(0, sctlr | 1);
+    m.set(2, 0xc000_0000 + CODE + 20);
+    m.set(4, 0x4000);
+    m.set(5, 3);
+    m.steps(6);
+    assert_eq!(m.r(1), 0x42, "the prefetched instruction ran");
+    assert_eq!(m.r(3), 0x43, "and the branch target was translated");
+    assert_eq!(m.cpu.pc(), 0xc000_0000 + CODE + 24);
+    assert!(!m.cpu.state_flat_fetch(), "the window closed at the branch");
+}
