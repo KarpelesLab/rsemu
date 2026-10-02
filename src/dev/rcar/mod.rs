@@ -17,6 +17,7 @@
 //! | [`sdhi`] | `rcar.sdhi` | the SD host interface: command engine, one-block buffer, DMA requests, driving a `sd.card` through a socket |
 //! | [`can`] | `rcar.can` | one CAN channel on a silent bus: the mode handshake, transmissions that complete |
 //! | [`iebus`] | `rcar.iebus` | the IEBus (AVC-LAN) controller on a silent bus: transmissions complete |
+//! | [`rst`] | `rcar.rst` | the H1's secondary-core reset control and boot address |
 //! | [`sysc`] | `rcar.sysc` | the SYSC power domains: switches that complete at once, with status and completion bits |
 //! | [`du`] | `rcar.du` | the R-Car Display Unit: timing registers, up to eight planes composed from guest memory, a frame counter on the dot clock |
 //!
@@ -38,6 +39,7 @@ pub mod hpbdmac;
 pub mod hspi;
 pub mod i2c;
 pub mod iebus;
+pub mod rst;
 pub mod scif;
 pub mod sdhi;
 pub mod sysc;
@@ -50,6 +52,7 @@ pub use hpbdmac::HpbDmac;
 pub use hspi::Hspi;
 pub use i2c::I2c;
 pub use iebus::IeBus;
+pub use rst::Rst;
 pub use scif::Scif;
 pub use sdhi::Sdhi;
 pub use sysc::Sysc;
@@ -68,6 +71,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     iebus::register(registry)?;
     i2c::register(registry)?;
     scif::register(registry)?;
+    rst::register(registry)?;
     sdhi::register(registry)?;
     sysc::register(registry)?;
     tmu::register(registry)?;
@@ -87,6 +91,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     iebus::bind(bindings)?;
     i2c::bind(bindings)?;
     scif::bind(bindings)?;
+    rst::bind(bindings)?;
     sdhi::bind(bindings)?;
     sysc::bind(bindings)?;
     tmu::bind(bindings)?;
@@ -104,6 +109,7 @@ pub fn schemas() -> Vec<ClassSchema> {
         iebus::schema(),
         i2c::schema(),
         scif::schema(),
+        rst::schema(),
         sdhi::schema(),
         sysc::schema(),
         tmu::schema(),

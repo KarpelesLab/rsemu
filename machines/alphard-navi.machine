@@ -53,15 +53,25 @@ machine "alphard-navi" {
 
   # -- the core --------------------------------------------------------------
   #
-  # One Cortex-A9. The SoC has more, but the kernel on this flash counts one
-  # ("Brought up 1 CPUs") from the SCU below, and a second core is a change to
-  # `cpus` here and in the SCU and GIC once secondary bring-up is understood.
+  # Four Cortex-A9s. Core 0 runs from power-on; 1-3 start held in reset and
+  # stay there until the kernel releases them through `rst` below (the boot
+  # loader would only park them). The vendor software assumes the cores: on
+  # one, its real-time threads spin where another core would have run the
+  # thread they wait for, and starve the software watchdog.
   object cpu "cpu.arm" {
     clock      = cpuclk
     space      = mem
     cpu        = "cortex-a9"
     periphbase = 0xf0000000
   }
+  object cpu1 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 1, held = true }
+  object cpu2 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 2, held = true }
+  object cpu3 "cpu.arm" { clock = cpuclk, space = mem, cpu = "cortex-a9", periphbase = 0xf0000000, cpu-id = 3, held = true }
+
+  # Which secondaries are out of reset (0xfe6cf000), and where one starts when
+  # released: the boot-address register at 0xfe700040, which the kernel
+  # points at its secondary entry while it brings the cores up.
+  object rst "rcar.rst" { processors = [cpu1, cpu2, cpu3] }
 
   # -- memory ----------------------------------------------------------------
 
@@ -88,8 +98,8 @@ machine "alphard-navi" {
   object dram "ram" { size = 1G }
 
   # -- the Cortex-A9 MPCore private region -----------------------------------
-  object mpcore "arm.a9mpcore" { clock = cpuclk / 2, cpus = 1 }
-  object gic    "arm.gic"      { version = 1, cpus = 1, spis = 288 }
+  object mpcore "arm.a9mpcore" { clock = cpuclk / 2, cpus = 4, processors = [cpu, cpu1, cpu2, cpu3] }
+  object gic    "arm.gic"      { version = 1, cpus = 4, spis = 288, processors = [cpu, cpu1, cpu2, cpu3], sgis-enabled = true }
   object l2     "arm.l2c310"   { size = 1M, ways = 16 }
 
   # -- SoC peripherals ---------------------------------------------------------
@@ -292,6 +302,8 @@ machine "alphard-navi" {
   map mem 0xf0001000 size 0x1000 = gic.dist
   map mem 0xf0100000 size 0x1000 = l2
   map mem 0xfe700000 size 4K     = intc
+  map mem 0xfe700040 size 4      = rst.bar { priority = 1 }
+  map mem 0xfe6cf000 size 4K     = rst
   map mem 0xfe780000 size 8K     = intcs
   map mem 0xfe782000 size 4K     = hpbdmac.status
   map mem 0xfe790000 size 64K    = sram
@@ -355,6 +367,15 @@ machine "alphard-navi" {
   wire mpcore.gt0  -> gic.cpu0ppi11   # ID 27: global timer
   wire mpcore.twd0 -> gic.cpu0ppi13   # ID 29: private timer
   wire mpcore.wdt0 -> gic.cpu0ppi14   # ID 30: private watchdog
+  wire mpcore.gt1  -> gic.cpu1ppi11
+  wire mpcore.twd1 -> gic.cpu1ppi13
+  wire mpcore.wdt1 -> gic.cpu1ppi14
+  wire mpcore.gt2  -> gic.cpu2ppi11
+  wire mpcore.twd2 -> gic.cpu2ppi13
+  wire mpcore.wdt2 -> gic.cpu2ppi14
+  wire mpcore.gt3  -> gic.cpu3ppi11
+  wire mpcore.twd3 -> gic.cpu3ppi13
+  wire mpcore.wdt3 -> gic.cpu3ppi14
   wire sdhi0.irq   -> gic.spi104      # ID 136
   wire du.irq      -> gic.spi31       # ID 63: vertical blanking and frame end
   wire sgx.irq     -> gic.spi57       # ID 89
@@ -400,4 +421,10 @@ machine "alphard-navi" {
   wire hpbdmac.grp10 -> gic.spi120   # ID 152
   wire hpbdmac.grp11 -> gic.spi121   # ID 153
   wire gic.irq0    -> cpu.irq
+  wire gic.irq1    -> cpu1.irq
+  wire gic.irq2    -> cpu2.irq
+  wire gic.irq3    -> cpu3.irq
+  wire rst.hold1   -> cpu1.hold
+  wire rst.hold2   -> cpu2.hold
+  wire rst.hold3   -> cpu3.hold
 }
