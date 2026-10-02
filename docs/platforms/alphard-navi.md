@@ -86,9 +86,11 @@ Findings that are not obvious from the part numbers:
 | --- | --- | --- |
 | `0x00000000` | NOR, 8 MiB | `flash.cfi`, AMD command set |
 | `0x18100000` | a device on an LBSC chip select | placeholder |
+| `0x18300000` | the SCAC security device (16-bit, big-endian ID at offset 0: `0xa001`) | placeholder; reads absent ("sec device not present"), which the system tolerates |
 | `0x60000000` | DDR3, 1 GiB (two channels) | `ram` |
 | `0xf0000000` | Cortex-A9 private region: SCU, GIC CPU interface, timers, GIC distributor | `arm.a9mpcore`, `arm.gic` (v1) |
 | `0xf0100000` | L2C-310 | `arm.l2c310` |
+| `0xfce00000` | PowerVR SGX (ID 89) | `pvr.sgx`: the firmware's handshake, no rendering |
 | `0xfe700000` | interrupt mask registers | placeholder |
 | `0xfe780000` | interrupt controller block | placeholder, with the HPB-DMAC status mirror at `0xfe782000` |
 | `0xfe790000` | on-chip SRAM, 64 KiB | `ram` |
@@ -96,21 +98,24 @@ Findings that are not obvious from the part numbers:
 | `0xff800000` | local bus controller | placeholder |
 | `0xffc08000` | HPB-DMAC channels, common registers at `0xffc09000` | `rcar.hpbdmac` |
 | `0xffc40000` | GPIO banks 0–6 (IDs 173–179) | `rcar.gpio` |
-| `0xffc70000` | I2C 0–2 (IDs 111, 114, 112) | placeholder |
+| `0xffc50000` | video capture (the SD kernel's `vc_*` driver) | placeholder |
+| `0xffc70000` | I2C 0–2 (IDs 111, 114, 112) | `rcar.i2c` |
 | `0xffc80000` | clock pulse generator | placeholder |
-| `0xffcc0000` | power control | placeholder |
+| `0xffcc0000` | unidentified; read-modify-written by the CAN driver's reset | placeholder |
 | `0xffd80000`–`0xffd82000` | TMU0–2 | `rcar.tmu` |
+| `0xffd85000` | SYSC power domains | `rcar.sysc` |
 | `0xffe40000` | SCIF0 | `rcar.scif` |
 | `0xffe41000` | SCIF1–5 (sub-processor links; SCIF3 is the PSC link) | `rcar.scif` |
 | `0xffe4c000` | SDHI0, SDHI2, SDHI3 (IDs 136, 139, 138); SDHI1 unused | `rcar.sdhi` |
 | `0xfff80000` | Display Unit (ID 63) | `rcar.du` |
 | `0xfffc0000` | pin function controller | placeholder |
+| `0xfffd1000` | CAN channel 1 (ID 116) | `rcar.can`: a silent bus |
 
 A placeholder is a plain `ram` object: it reads back what was written and does
 nothing else. That carries the boot code's write-then-read-back sequences but
-is not a model; the power controller's SGX status poll, for one, times out
-there ("power on SGX error!"), exactly as it would on a board whose power domain
-never came up.
+is not a model, and every model in the table above began as one of these
+until a driver's poll on it timed out: the SGX power domain ("power on SGX
+error!" until `rcar.sysc`), the CAN controller's mode handshake (below).
 
 Interrupts confirmed so far: TMU0 channel 0 is GIC ID 64 (the tick), TMU1
 channel 0 is ID 68, SCIF*n* is 120+*n*, GPIO bank *n* is 173+*n*. The
@@ -161,9 +166,11 @@ U-Boot variable.
 | Map SD card: enumeration, partition table, FAT32 reads by DMA | runs |
 | `osloader` loads `HD14/EXE/HC59/LOADING.KWI` (xipImage at `0x62f80000`, rootfs at `0x68000000`) and asks for the hot reboot | runs; the loaded image matches the file byte for byte |
 | U-Boot checks the loaded image and boots its XIP kernel | runs (a modified image is refused and the recovery kernel boots instead) |
-| Full system: XIP kernel, ext2 root in RAM, init scripts, udev, vendor modules, I2C devices, PSC wake-up | runs and stays up; it shows 「プログラム読込み中」 |
-| PowerVR SGX | placeholder: `SGXInit: Unable to validate device DDK version` |
-| DC-DC monitor on HSPI channel 0 | nothing behind it: `DCDC Version 255` |
+| Full system: XIP kernel, ext2 root in RAM, init scripts, udev, vendor modules, I2C devices, PSC wake-up | runs; it shows 「プログラム読込み中」 with its progress bar |
+| PowerVR SGX | `pvr.sgx` stand-in: the driver initialises; nothing is rendered |
+| DC-DC monitor on HSPI channel 0 | `navi.dcdcad`: `DCDC Version 2` |
+| CAN channel 1 | `rcar.can`, a silent bus: the channel starts and its readers park |
+| Full system past the driver load: application layer, HMI screen layers | starts; resets itself about 85 guest seconds in (see the watchdogs, below) |
 | Sub-processor links (`cis`, HSPI channels 1 and 2) | nothing behind them |
 
 The vendor binaries under `/vns` (`pmng`, `osloader`, `smng`) are ARMv7
@@ -177,6 +184,36 @@ image is not read into memory; add `,ro` to write-protect it):
 ```
 rsemu run alphard-navi --media flash=S29JL064J.bin --drive sd=map.img --for 16s --headless --screenshot shot.png
 ```
+
+## The watchdogs
+
+Two, and a reboot with nothing in the kernel log is one of them:
+
+* **The sub-processor's**, outside the SoC: the TMU1 interrupt toggles GPIO
+  4.28, and silence on the pin for two seconds resets the board
+  (`watchdog.pin`; its `log` port, `--capture wdt=...`, says when it fires).
+* **Aisin's software watchdog**, inside the kernel, which decides whether that
+  pin keeps toggling. `WDP_start` loads a countdown of `WDT_CYCLCHK` × 50
+  TMU1 ticks (60 × 50 at 50 Hz: a minute) and starts `WDP_task`, a real-time
+  kernel thread that reloads it every `WDT_INTERVAL` ms (5000). At zero the
+  tick handler calls `requestHardReset` and stops kicking. Anything that keeps
+  `WDP_task` off the CPU for a minute — a real-time user thread spinning
+  because a device answers at once where hardware would block — resets the
+  board a minute later. The CAN reader `LCAN02` (SCHED_FIFO 74) did exactly
+  that until `rcar.can` let the channel start.
+
+The monitor finds these faster than a trace: it is deterministic, so a script
+can run to just before the reset and sample.
+
+```
+printf 'run 60s\nx 816dd0bc 4\nregs\nquit\n' |
+  rsemu run alphard-navi --media flash=... --drive sd=... -p map-password=... --headless --mon
+```
+
+`0x816dd0bc` is CPU 0's countdown in the SD system's kernel (VA); a value that
+only ever falls is a starved `WDP_task`. A sample in SVC mode names the
+running task: its `thread_info` is `sp & ~0x1fff`, the task pointer at +12,
+and the task's name at +0x1dc.
 
 ## The I2C and SPI buses
 
@@ -196,8 +233,12 @@ monitor, 1 and 2 the CIS links to the base-board sub-CPUs, which raise GPIO
 
 ## What would move it further
 
-* The CIS peers on HSPI channels 1 and 2 and the DC-DC monitor on channel 0.
+* Whatever resets the full system about 85 guest seconds in.
+* The CIS peers on HSPI channels 1 and 2.
 * Behaviour behind the I2C stand-ins the full system checks (the decoders'
   status registers, the RTC's time, the EEPROM's contents).
-* The full system's own displays past the loading screen, which may want the
-  GPU.
+* The full system's own displays past the loading screen: the HMI draws
+  through OpenGL ES on the SGX, which `pvr.sgx` initialises but does not
+  render for.
+* USB: the host bridge at `0xffe70800` must report its PLL locked (`0x808`
+  bits 31 and 30) or the kernel drops both host controllers.
