@@ -136,6 +136,9 @@ pub const PPI_BASE: u32 = 16;
 /// sixteen PPIs.
 const BANKED: usize = 32;
 
+/// The software generated interrupts, 0-15.
+const SGIS: usize = 16;
+
 /// The id `GICC_IAR` returns when there is nothing to claim (IHI 0048 §3.2.4).
 pub const SPURIOUS: u32 = 1023;
 
@@ -237,18 +240,28 @@ struct State {
     config: Vec<u8>,
     /// What the SPI input lines are doing.
     line: Vec<bool>,
+    /// SGIs are permanently enabled: their enable bits read as one and
+    /// ignore writes. Configuration (`sgis-enabled`), not guest state.
+    sgis_fixed: bool,
 }
 
 impl State {
-    fn new(cpus: usize, spis: usize) -> State {
+    fn new(cpus: usize, spis: usize, sgis_fixed: bool) -> State {
+        let mut banked_enabled = alloc::vec![[false; BANKED]; cpus];
+        if sgis_fixed {
+            for bank in &mut banked_enabled {
+                bank[..SGIS].fill(true);
+            }
+        }
         State {
+            sgis_fixed,
             dist_enabled: false,
             cpu_enabled: alloc::vec![false; cpus],
             pmr: alloc::vec![0; cpus],
             bpr: alloc::vec![2; cpus],
             running: alloc::vec![Vec::new(); cpus],
             active_stack: alloc::vec![Vec::new(); cpus],
-            banked_enabled: alloc::vec![[false; BANKED]; cpus],
+            banked_enabled,
             banked_pending: alloc::vec![[false; BANKED]; cpus],
             banked_active: alloc::vec![[false; BANKED]; cpus],
             banked_priority: alloc::vec![[0u8; BANKED]; cpus],
@@ -359,6 +372,8 @@ struct Registers {
     /// 1 for the GICv1 a Cortex-A9 MPCore integrates. See
     /// [`Gic::build_version`].
     version: u8,
+    /// Whether SGIs are permanently enabled ([`State::sgis_fixed`]).
+    sgis_enabled: bool,
 }
 
 impl fmt::Debug for Registers {
@@ -400,6 +415,7 @@ impl Gic {
         let cpus = r.or_range("cpus", 1u64, 1..=MAX_CPUS)?;
         let spis = r.or_range("spis", 96u64, 32..=u64::from(MAX_INTID - SPI_BASE))?;
         let version = r.or_range("version", 2u64, 1..=2)?;
+        let sgis_enabled = r.or("sgis-enabled", false)?;
         let processors = match r.optional_list("processors")? {
             Some(items) => items
                 .iter()
@@ -433,7 +449,7 @@ impl Gic {
                 processors.len()
             )));
         }
-        let mut gic = Gic::build_version(cpus as usize, spis as usize, version as u8);
+        let mut gic = Gic::build_full(cpus as usize, spis as usize, version as u8, sgis_enabled);
         gic.processors = processors;
         Ok(gic)
     }
@@ -475,8 +491,17 @@ impl Gic {
     /// clears the flag, which is what every driver's handler does first.
     #[must_use]
     pub fn build_version(cpus: usize, spis: usize, version: u8) -> Gic {
+        Gic::build_full(cpus, spis, version, false)
+    }
+
+    /// The same, saying whether SGIs are permanently enabled — as the
+    /// Cortex-A9 MPCore's distributor has them, whose kernels never enable
+    /// them (see `sgis-enabled`).
+    #[must_use]
+    pub fn build_full(cpus: usize, spis: usize, version: u8, sgis_enabled: bool) -> Gic {
         let regs = Arc::new(Registers {
-            state: Mutex::with_rank(LockRank::DEVICE, State::new(cpus, spis)),
+            state: Mutex::with_rank(LockRank::DEVICE, State::new(cpus, spis, sgis_enabled)),
+            sgis_enabled,
             outs: Mutex::with_rank(LockRank::LEAF, alloc::vec![None; cpus]),
             wires: Mutex::with_rank(LockRank::LEAF, BTreeMap::new()),
             owners: (0..cpus)
@@ -923,7 +948,9 @@ impl Registers {
                         if intid >= intids {
                             continue;
                         }
-                        if intid < BANKED as u32 {
+                        if intid < SGIS as u32 && state.sgis_fixed {
+                            // Read-as-one, write-ignored.
+                        } else if intid < BANKED as u32 {
                             state.banked_enabled[cpu][intid as usize] = set;
                         } else if let Some(i) = state.spi_index(intid) {
                             state.enabled[i] = set;
@@ -1307,6 +1334,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "how many CPU interfaces it has (default 1, at most 8)",
         },
         PropertySpec {
+            name: "sgis-enabled",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "SGIs are permanently enabled, their enable bits read-as-one (the Cortex-A9 MPCore's distributor; default false)",
+        },
+        PropertySpec {
             name: "spis",
             kind: ValueKind::Uint,
             required: false,
@@ -1347,7 +1380,7 @@ impl Device for Gic {
     fn reset(&self, _kind: ResetKind) {
         let levels = {
             let mut state = self.regs.state.lock();
-            *state = State::new(self.regs.cpus, self.regs.spis);
+            *state = State::new(self.regs.cpus, self.regs.spis, self.regs.sgis_enabled);
             Registers::evaluate(&state)
         };
         self.regs.drive(&levels);
@@ -1432,7 +1465,7 @@ impl Device for Gic {
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
-        let mut state = State::new(self.regs.cpus, self.regs.spis);
+        let mut state = State::new(self.regs.cpus, self.regs.spis, self.regs.sgis_enabled);
         state.dist_enabled = r.read_bool()?;
         let cpus = r.read_seq_len(1)? as usize;
         if cpus != self.regs.cpus {
@@ -1592,6 +1625,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("spis", ValueKind::Uint).range(32, u64::from(MAX_INTID - SPI_BASE)))
         .prop(PropSchema::new("processors", ValueKind::List))
         .prop(PropSchema::new("version", ValueKind::Uint).range(1, 2))
+        .prop(PropSchema::new("sgis-enabled", ValueKind::Bool))
         .region("")
         .region("dist")
         .region("cpu");
@@ -1957,7 +1991,11 @@ mod tests {
     /// A two-interface GIC with both processors claimed, both `nIRQ` lines on
     /// probes, and the distributor and both interfaces enabled.
     fn paired() -> (Gic, Arc<Probe>, Arc<Probe>) {
-        let gic = Gic::build(2, 96);
+        paired_from(Gic::build(2, 96))
+    }
+
+    /// [`paired`] around a GIC built some other way.
+    fn paired_from(gic: Gic) -> (Gic, Arc<Probe>, Arc<Probe>) {
         assert!(gic.attach_processor(0, CPU0));
         assert!(gic.attach_processor(1, CPU1));
         let ids = WireIdAllocator::new();
@@ -2086,6 +2124,21 @@ mod tests {
         // And the other direction, with the target list naming CPU 1.
         as_dist_write(&gic, 0xf00, (2 << 16) | 3, CPU0);
         assert!(second.high());
+    }
+
+    #[test]
+    fn with_sgis_enabled_an_ipi_needs_no_enable_and_cannot_be_disabled() {
+        // The Cortex-A9 MPCore's distributor: the navi's kernel brings a
+        // secondary's interface up with PMR and CTLR alone and still expects
+        // its IPIs to arrive.
+        let (gic, first, second) = paired_from(Gic::build_full(2, 96, 1, true));
+        assert_eq!(dist_read(&gic, 0x100) & 0xffff, 0xffff, "SGIs read enabled");
+        as_dist_write(&gic, 0x180, 0xffff, CPU1);
+        as_dist_write(&gic, 0xf00, (1 << 24) | 3, CPU0);
+        assert!(second.high(), "CPU 1 was told, its disable ignored");
+        assert!(!first.high());
+        // PPIs are still the guest's to enable.
+        assert_eq!(dist_read(&gic, 0x100) & 0xffff_0000, 0);
     }
 
     #[test]
