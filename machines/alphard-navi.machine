@@ -199,6 +199,11 @@ machine "alphard-navi" {
   # real-time CAN reader spun and starved the software watchdog's thread.
   object can1 "rcar.can" { }
 
+  # The IEBus (AVC-LAN) controller, alone on its bus. Every frame the SD
+  # system sends completes; left unanswered, each one timed out into a reset
+  # that busy-waits from a real-time thread, starving the software watchdog.
+  object iebus "rcar.iebus" { }
+
   # The power domains. The SD system's framebuffer driver switches the SGX on
   # here and polls for the switch to finish; as plain memory it never did, and
   # it logged "power on SGX error!".
@@ -342,6 +347,7 @@ machine "alphard-navi" {
   map mem 0xfffc7000 size 0x100  = hspi0 { priority = 1 }
   map mem 0xfffc8000 size 0x100  = hspi1 { priority = 1 }
   map mem 0xfffc6000 size 0x100  = hspi2 { priority = 1 }
+  map mem 0xfffc9000 size 4K     = iebus { priority = 1 }
 
   # -- the wires -------------------------------------------------------------
   wire tmu0.irq0   -> gic.spi32       # ID 64: the scheduler tick
@@ -353,6 +359,7 @@ machine "alphard-navi" {
   wire du.irq      -> gic.spi31       # ID 63: vertical blanking and frame end
   wire sgx.irq     -> gic.spi57       # ID 89
   wire can1.irq    -> gic.spi84       # ID 116
+  wire iebus.irq   -> gic.spi108      # ID 140
   wire sdhi3.irq   -> gic.spi106      # ID 138
   wire sdhi2.irq   -> gic.spi107      # ID 139
   wire gpio0.irq   -> gic.spi141      # ID 173
