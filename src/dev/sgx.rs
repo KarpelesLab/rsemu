@@ -53,6 +53,11 @@
 //! the driver's lock-up watchdog takes as a core that is alive; `0x8ac0` and
 //! `0x8ac8` are the start and command kicks.
 //!
+//! Once started, the stand-in also keeps host-control word `0x7c` — the
+//! firmware's heartbeat, which the driver's lock-up timer counts down and
+//! acts on at zero — written, on every scheduler slice, as live firmware
+//! does.
+//!
 //! Work is done on the device's clock, never inside the register write: a
 //! kick only marks it pending.
 //!
@@ -119,6 +124,11 @@ const TA3D_CCB_CTL: u32 = 0x08;
 const TA3D_CCB_RING: u32 = 0xc4;
 /// How far past the kicker to look for the TA/3D control block.
 const TA3D_SCAN: u32 = 0x1_0000;
+
+/// Host-control word the firmware refreshes to show it is alive.
+const HOST_HEARTBEAT: u32 = 0x7c;
+/// What it writes there.
+const HEARTBEAT: u32 = 0x40;
 
 const CCB_SLOTS: u32 = 256;
 const CCB_SLOT: u32 = 32;
@@ -234,14 +244,20 @@ impl Shared {
 
     /// Do whatever a kick left pending.
     fn run(&self) {
-        let (start, kick, directory, kicker) = {
+        let (start, kick, directory, kicker, running) = {
             let mut s = self.state.lock();
             let work = (s.start_pending, s.kick_pending);
             s.start_pending = false;
             s.kick_pending = false;
-            (work.0, work.1, s.reg(KERNEL_DIRECTORY), s.reg(KICKER_ADDR))
+            (
+                work.0,
+                work.1,
+                s.reg(KERNEL_DIRECTORY),
+                s.reg(KICKER_ADDR),
+                s.ta3d.is_some(),
+            )
         };
-        if !start && !kick {
+        if !start && !kick && !running {
             return;
         }
         let Some(space) = self.space() else {
@@ -265,6 +281,14 @@ impl Shared {
             }
         }
         let ta3d = self.state.lock().ta3d;
+        // The firmware's heartbeat: the host's lock-up timer counts this
+        // word down while it stays put and resets the core when it reaches
+        // zero, so running firmware keeps writing it.
+        if let Some(ta3d) = ta3d
+            && let Some(host) = gpu.read(ta3d + TA3D_HOST_CTL)
+        {
+            gpu.write(host + HOST_HEARTBEAT, HEARTBEAT);
+        }
         let mut consumed = false;
         if kick && let Some(ta3d) = ta3d {
             consumed = self.drain(&gpu, ta3d);
@@ -660,6 +684,16 @@ mod tests {
         let (sgx, space) = started();
         assert_eq!(sgx.shared.state.lock().ta3d, Some(TA3D));
         assert_eq!(m(&space, HOST) & 1, 1);
+    }
+
+    #[test]
+    fn running_firmware_keeps_its_heartbeat_written() {
+        let (sgx, space) = started();
+        assert_eq!(m(&space, HOST + HOST_HEARTBEAT), HEARTBEAT);
+        // The host's timer counts it down; the next slice puts it back.
+        mw(&space, HOST + HOST_HEARTBEAT, 0);
+        sgx.shared.run();
+        assert_eq!(m(&space, HOST + HOST_HEARTBEAT), HEARTBEAT);
     }
 
     #[test]
