@@ -230,9 +230,18 @@ struct Shared {
     irq: Mutex<Option<WireSource>>,
     bus: Mutex<Option<Weak<AddressSpace>>>,
     requester: Mutex<RequesterId>,
+    /// Where every command the firmware side consumes is reported, if
+    /// anywhere (`log = "port"`).
+    log: Option<Arc<dyn crate::host::chardev::CharDevice>>,
 }
 
 impl Shared {
+    fn note(&self, text: &str) {
+        if let Some(log) = &self.log {
+            log.write(text.as_bytes());
+        }
+    }
+
     fn drive(&self) {
         let level = self.state.lock().irq();
         let out = self.irq.lock().clone();
@@ -342,6 +351,16 @@ impl Shared {
         while read % CCB_SLOTS != write {
             let slot = ring + (read % CCB_SLOTS) * CCB_SLOT;
             let word = |i: u32| gpu.read(slot + 4 * i).unwrap_or(0);
+            if self.log.is_some() {
+                self.note(&alloc::format!(
+                    "sgx: slot {read:3} cmd {:#05x} [{:#x} {:#x} {:#x} {:#x}]\n",
+                    word(0),
+                    word(2),
+                    word(3),
+                    word(4),
+                    word(5)
+                ));
+            }
             match word(0) {
                 CMD_MISC_INFO => {
                     let info = word(3);
@@ -359,7 +378,13 @@ impl Shared {
                 },
                 CMD_CLEANUP => gpu.update(host + 8, |v| v | 1),
                 CMD_KICK_TA | CMD_KICK_TRANSFER | CMD_KICK_2D => {
-                    complete_kick(gpu, word(0), word(3));
+                    let (from, to) = complete_kick(gpu, word(0), word(3));
+                    if self.log.is_some() {
+                        self.note(&alloc::format!(
+                            "sgx:   context {:#x} ring {from:#x} -> {to:#x}\n",
+                            word(3)
+                        ));
+                    }
                 }
                 _ => {}
             }
@@ -380,16 +405,17 @@ impl Shared {
 /// snapshotted, plus one — never "Complete = Pending" wholesale, because the
 /// host's waits are exact matches and CPU-side operations move the counters
 /// too.
-fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32) {
+fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32) -> (u32, u32) {
     let (Some(base), Some(ctl)) = (
         gpu.read(context + CTX_CCB_BASE),
         gpu.read(context + CTX_CCB_CTL),
     ) else {
-        return;
+        return (u32::MAX, u32::MAX);
     };
     let (Some(write), Some(mut read)) = (gpu.read(ctl), gpu.read(ctl + 4)) else {
-        return;
+        return (u32::MAX, u32::MAX);
     };
+    let from = read;
     // One command per kick for a transfer; the others walk by size. The
     // bound is a guard against a corrupt size, not a limit a guest meets.
     for _ in 0..256 {
@@ -413,6 +439,7 @@ fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32) {
         read = read.wrapping_add(size) & (CONTEXT_CCB_SIZE - 1);
     }
     gpu.write(ctl + 4, read);
+    (from, read)
 }
 
 /// A sync object read: `ReadOpsComplete` = the snapshotted pending + 1.
@@ -489,6 +516,11 @@ fn complete_transfer(gpu: &Gpu<'_>, cmd: u32) {
         .collect();
     let ta = (w(s + 0x98), w(s + 0x9c));
     let three_d = (w(s + 0xa8), w(s + 0xac));
+    // Then the status words the client polls, {address, value} -- the
+    // transfer queue's own fence among them.
+    let statuses: Vec<(u32, u32)> = (0..w(s + 0xb8).min(8))
+        .map(|i| (w(s + 0xbc + 8 * i), w(s + 0xc0 + 8 * i)))
+        .collect();
     for (pending, complete) in srcs {
         sync_read(gpu, pending, complete);
     }
@@ -500,6 +532,11 @@ fn complete_transfer(gpu: &Gpu<'_>, cmd: u32) {
     }
     if dst_count < 3 {
         sync_write(gpu, three_d.0, three_d.1);
+    }
+    for (at, value) in statuses {
+        if at != 0 {
+            gpu.write(at, value);
+        }
     }
 }
 
@@ -612,15 +649,26 @@ impl Sgx {
     pub fn new(props: &Props) -> Result<Sgx> {
         let mut r = props.reader();
         let revision = r.or_range("revision", 0x0001_0205u64, 0..=0xff_ffff)? as u32;
+        let log = r.optional_str("log")?.map(ToString::to_string);
         r.finish()?;
-        Ok(Sgx::with_revision(revision))
+        let log = match log {
+            Some(name) => Some(crate::host::chardev::ports::attach(props, &name)?
+                as Arc<dyn crate::host::chardev::CharDevice>),
+            None => None,
+        };
+        Ok(Sgx::build(revision, log))
     }
 
     /// Build one reporting `revision` (major.minor.maintenance in bits
     /// 23:16, 15:8, 7:0).
     #[must_use]
     pub fn with_revision(revision: u32) -> Sgx {
+        Sgx::build(revision, None)
+    }
+
+    fn build(revision: u32, log: Option<Arc<dyn crate::host::chardev::CharDevice>>) -> Sgx {
         let shared = Arc::new(Shared {
+            log,
             revision,
             state: Mutex::with_rank(LockRank::DEVICE, State::default()),
             irq: Mutex::with_rank(LockRank::LEAF, None),
@@ -646,12 +694,20 @@ pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
     summary: "a PowerVR SGX stand-in: registers and the firmware's command handshake, no rendering",
-    properties: &[PropertySpec {
-        name: "revision",
-        kind: ValueKind::Uint,
-        required: false,
-        summary: "the core revision it reports, as 0x00MMmmpp (default 0x010205)",
-    }],
+    properties: &[
+        PropertySpec {
+            name: "revision",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "the core revision it reports, as 0x00MMmmpp (default 0x010205)",
+        },
+        PropertySpec {
+            name: "log",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "a character port every consumed command is reported on, one line each",
+        },
+    ],
     construct: |props| Ok(Box::new(Sgx::new(props)?)),
 };
 
@@ -766,6 +822,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("revision", ValueKind::Uint).range(0, 0xff_ffff))
+        .prop(PropSchema::new("log", ValueKind::Str))
         .region("")
         .region("regs")
         .port(IRQ_PIN, PortDir::Out)
@@ -931,11 +988,15 @@ mod tests {
         mw(&space, s + 0x88 + 12, 0xe104);
         mw(&space, s + 0x98, 11); // TA sync write pending
         mw(&space, s + 0x9c, 0xe204);
+        mw(&space, s + 0xb8, 1); // one status: the queue's fence
+        mw(&space, s + 0xbc, 0xe300);
+        mw(&space, s + 0xc0, 2);
         let ctx = context(&space, 0x200);
         kick(&sgx, &space, CMD_KICK_TRANSFER, ctx);
         assert_eq!(m(&space, 0xe00c), 8);
         assert_eq!(m(&space, 0xe104), 5);
         assert_eq!(m(&space, 0xe204), 12);
+        assert_eq!(m(&space, 0xe300), 2, "the fence the client waits on");
         assert_eq!(m(&space, 0xc104), 0x200);
     }
 
