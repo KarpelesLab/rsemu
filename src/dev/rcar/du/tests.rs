@@ -495,6 +495,48 @@ fn planes_stack_by_priority_and_blend_with_alpha() {
     assert_eq!(px[5], half([0, 0, 0xff]));
 }
 
+#[test]
+fn with_dorcr_the_order_comes_from_ds1pr_and_spim_5_blends() {
+    // The navi's HMI: DORCR bit 0, DS1PR's nibble 0 on top, PnMR 0x5001.
+    let (machine, du) = board("");
+    let mem = space(&machine);
+    for (reg, value) in [(HDSR, 0), (HDER, 2), (VDSR, 0), (VDER, 1), (BPOR, 0)] {
+        replay(&mem, &[Op::Write(reg, value)]);
+    }
+    mem.write_bytes(FB, &[0x00, 0xf8, 0x00, 0xf8], MemAttrs::DEFAULT) // red 565
+        .unwrap();
+    mem.write_bytes(FB + 0x100, &[0x1f, 0x00, 0x1f, 0x00], MemAttrs::DEFAULT) // blue
+        .unwrap();
+    let p3 = |r| plane_reg(3, r);
+    let p4 = |r| plane_reg(4, r);
+    replay(
+        &mem,
+        &[
+            Op::Write(p3(PNMR), 0x4001),
+            Op::Write(p3(PNDSXR), 2),
+            Op::Write(p3(PNDSYR), 1),
+            Op::Write(p3(PNDSA0R), FB as u32),
+            Op::Write(p4(PNMR), 0x5001),
+            Op::Write(p4(PNALPHAR), 0x80),
+            Op::Write(p4(PNDSXR), 1),
+            Op::Write(p4(PNDSYR), 1),
+            Op::Write(p4(PNDSA0R), (FB + 0x100) as u32),
+            // A stale DPPR naming plane 1, which the routing overrides.
+            Op::Write(DPPR, 0x8000_0000),
+            Op::Write(DORCR, 1),
+            Op::Write(DS1PR, 0x34), // plane 4 on top of plane 3
+            Op::Write(DSYSR, DSYSR_DEN),
+        ],
+    );
+    let (_, _, px) = du.read_frame();
+    assert_eq!(
+        px[0],
+        blend([0xff, 0, 0], [0, 0, 0xff], 0x80),
+        "plane 4 blended over 3"
+    );
+    assert_eq!(px[1], [0xff, 0, 0], "plane 3 alone");
+}
+
 // ---------------------------------------------------------------------------
 // Snapshots and properties
 // ---------------------------------------------------------------------------

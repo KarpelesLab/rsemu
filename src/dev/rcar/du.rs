@@ -22,6 +22,10 @@
 //!   0x10  DIER    interrupt enable, DSSR's layout: FRE (14), VBE (11)
 //!   0x18  DPPR    plane priority: slot n (1..=8) is bits 4n-1 (DPEn, enable)
 //!                 and 4n-4..4n-2 (DPSn, plane number minus one)
+//!   0x11000 DORCR output routing: bit 0 set, display 1's planes come from
+//!                 DS1PR instead of DPPR
+//!   0x11020 DS1PR display 1's plane order: nibble k (k = 0 on top) is a
+//!                 plane number, 1..=8, or 0 for none
 //!   0x20, 0x34..0x3c  DEFR, DEFR2..DEFR4  (stored)
 //!   0x40  HDSR  0x44 HDER  0x48 VDSR  0x4c VDER    the active window
 //!   0x50  HCR   0x54 HSWR  0x58 VCR   0x5c VSPR    totals and syncs
@@ -66,10 +70,15 @@
 //! (the index is shown as a grey level); `DDDF = 3` is YCbCr, which is not
 //! modelled and is **decoded as RGB565** — a wrong picture, not a panic.
 //!
-//! Blending: `PnMR.SPIM = 1` (alpha) blends with `PnALPHAR[7:0]`, or with
-//! the pixel's own alpha for ARGB8888, and ARGB1555's `A = 0` is transparent.
-//! Every other `SPIM` value — transparent-colour keying, EOR, "transparency
-//! off" — draws the plane opaque; colour keying is not modelled.
+//! Blending: `PnMR` bit 12 (`SPIM` bit 0) blends with `PnALPHAR[7:0]`, or
+//! with the pixel's own alpha for ARGB8888, and ARGB1555's `A = 0` is
+//! transparent — `SPIM` 1 from the kernel's frame buffer driver, 5 from the
+//! navi's HMI. A plane without it draws opaque; colour keying is not
+//! modelled.
+//!
+//! The navi's HMI never touches `DPPR`: its display service sets `DORCR` bit
+//! 0 and orders the planes through `DS1PR`, a plane number per nibble with
+//! the top in nibble 0 (read off its own `duc.so`, disassembled as data).
 //!
 //! # Why not `lcd.scanout`
 //!
@@ -159,6 +168,12 @@ pub const DSRCR: u32 = 0x0c;
 pub const DIER: u32 = 0x10;
 /// Display plane priority.
 pub const DPPR: u32 = 0x18;
+/// Output routing: bit 0 hands the planes' order to [`DS1PR`].
+pub const DORCR: u32 = 0x1_1000;
+/// Display 1's plane order: nibble k (0 = top) is a plane number, 0 = none.
+pub const DS1PR: u32 = 0x1_1020;
+/// `PnMR` bit 12 (`SPIM` bit 0): blend.
+const PNMR_BLEND: u32 = 1 << 12;
 /// Horizontal display start.
 pub const HDSR: u32 = 0x40;
 /// Horizontal display end.
@@ -403,7 +418,7 @@ impl Regs {
 #[derive(Debug, Clone, Copy)]
 struct PlaneView {
     format: PlaneFormat,
-    /// `PnMR.SPIM == 1`: blend.
+    /// `PnMR` bit 12: blend.
     blend: bool,
     alpha: u8,
     mem_width: u64,
@@ -539,15 +554,26 @@ impl Shared {
         let (width, height) = regs.active().unwrap_or(self.fallback);
         let bpor = regs.get(BPOR);
         let background = [(bpor >> 16) as u8, (bpor >> 8) as u8, bpor as u8];
-        let dppr = regs.get(DPPR);
+        // The planes to draw, bottom first. With DORCR bit 0 set the display
+        // takes its order from DS1PR, a plane number per nibble with slot 0
+        // on top; otherwise from DPPR, slot 8 at the bottom (see *Uncertain*).
+        let order: Vec<u32> = if regs.get(DORCR) & 1 != 0 {
+            let ds1pr = regs.get(DS1PR);
+            (0..8u32)
+                .rev()
+                .map(|k| (ds1pr >> (4 * k)) & 0xf)
+                .filter(|n| (1..=8).contains(n))
+                .collect()
+        } else {
+            let dppr = regs.get(DPPR);
+            (1..=8u32)
+                .rev()
+                .filter(|slot| dppr & (1 << (4 * slot - 1)) != 0)
+                .map(|slot| ((dppr >> (4 * slot - 4)) & 7) + 1)
+                .collect()
+        };
         let mut planes = Vec::new();
-        // Slot 8 is drawn first (bottom), slot 1 last (top): see the module
-        // docs' *Uncertain*.
-        for slot in (1..=8u32).rev() {
-            if dppr & (1 << (4 * slot - 1)) == 0 {
-                continue;
-            }
-            let n = ((dppr >> (4 * slot - 4)) & 7) + 1;
+        for n in order {
             let r = |reg| regs.get(plane_reg(n, reg));
             let pnmr = r(PNMR);
             let width = r(PNDSXR).min(MAX_DIM);
@@ -557,7 +583,7 @@ impl Shared {
             };
             planes.push(PlaneView {
                 format: PlaneFormat::from_regs(pnmr, r(PNDDCR4)),
-                blend: (pnmr >> 12) & 7 == 1,
+                blend: pnmr & PNMR_BLEND != 0,
                 alpha: r(PNALPHAR) as u8,
                 mem_width,
                 width,
