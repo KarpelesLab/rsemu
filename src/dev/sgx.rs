@@ -36,6 +36,20 @@
 //! | `0x220` | get misc info | fills the buffer at word 3 with this build's identity and structure sizes, then sets its word 0 bit 0 |
 //! | `0xd1` | power | word 3 = 1 (off) sets host-control word 1 bit 3; 2 (idle) sets bit 2 |
 //! | `0x1a7` | clean-up | sets host-control word 2 bit 0 |
+//! | `0x176`, `0x157`, `0x132` | TA/3D, transfer, 2D kick | completes the work queued on the context (word 3) — below |
+//!
+//! # Kicks: completed, not drawn
+//!
+//! A kick names a hardware context; its commands sit on the context's own
+//! ring between the read offset (the firmware's) and the write offset (the
+//! host's). Each command lists the sync objects it reads and writes and the
+//! status words its client polls, and the clients' waits are exact matches
+//! with a half-second patience, after which they ask the driver to reset the
+//! core. So each command is finished at once: a source's `ReadOpsComplete`
+//! and a destination's `WriteOpsComplete` become the pending value the
+//! command snapshotted plus one, status words get their values (and a TA
+//! command's render-details and destination-list statuses go back to 0),
+//! and the read offset catches up. Nothing is rendered.
 //!
 //! The misc-info answer is what the host checks the firmware against: DDK
 //! 1.7.17 build 2145535, build options `0x1032241c`, and the sizes of the
@@ -136,6 +150,18 @@ const CCB_SLOT: u32 = 32;
 const CMD_MISC_INFO: u32 = 0x220;
 const CMD_POWER: u32 = 0xd1;
 const CMD_CLEANUP: u32 = 0x1a7;
+const CMD_KICK_TA: u32 = 0x176;
+const CMD_KICK_TRANSFER: u32 = 0x157;
+const CMD_KICK_2D: u32 = 0x132;
+
+/// A hardware context: its command ring's base and control pair.
+const CTX_CCB_BASE: u32 = 0x0c;
+const CTX_CCB_CTL: u32 = 0x10;
+/// A context's command ring (a command never wraps: the ring has an
+/// overflow area past its end).
+const CONTEXT_CCB_SIZE: u32 = 0x1_0000;
+/// TA command flag: the TA/3D dependency sync is the command's own.
+const TA_DEPENDENCY: u32 = 1 << 9;
 
 /// The misc-info answer: offset, value. Word 4 and word 6 (the core
 /// revision, hardware and software) are added from the `revision` prop.
@@ -332,6 +358,9 @@ impl Shared {
                     _ => {}
                 },
                 CMD_CLEANUP => gpu.update(host + 8, |v| v | 1),
+                CMD_KICK_TA | CMD_KICK_TRANSFER | CMD_KICK_2D => {
+                    complete_kick(gpu, word(0), word(3));
+                }
                 _ => {}
             }
             read = (read + 1) % CCB_SLOTS;
@@ -340,6 +369,153 @@ impl Shared {
         }
         any
     }
+}
+
+/// Finish, without drawing anything, the work a kick put on a context's
+/// command ring: every sync object the commands name is advanced as the
+/// firmware would on completion, every status word the host waits on is
+/// written, and the ring's read offset catches up with its write offset.
+///
+/// A sync object's Complete counter is set to the Pending value the command
+/// snapshotted, plus one — never "Complete = Pending" wholesale, because the
+/// host's waits are exact matches and CPU-side operations move the counters
+/// too.
+fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32) {
+    let (Some(base), Some(ctl)) = (
+        gpu.read(context + CTX_CCB_BASE),
+        gpu.read(context + CTX_CCB_CTL),
+    ) else {
+        return;
+    };
+    let (Some(write), Some(mut read)) = (gpu.read(ctl), gpu.read(ctl + 4)) else {
+        return;
+    };
+    // One command per kick for a transfer; the others walk by size. The
+    // bound is a guard against a corrupt size, not a limit a guest meets.
+    for _ in 0..256 {
+        if read == write {
+            break;
+        }
+        let cmd = base.wrapping_add(read);
+        let size = match kind {
+            CMD_KICK_TA => complete_ta(gpu, cmd),
+            CMD_KICK_TRANSFER => {
+                complete_transfer(gpu, cmd);
+                read = write;
+                break;
+            }
+            _ => complete_2d(gpu, cmd),
+        };
+        if size == 0 {
+            read = write;
+            break;
+        }
+        read = read.wrapping_add(size) & (CONTEXT_CCB_SIZE - 1);
+    }
+    gpu.write(ctl + 4, read);
+}
+
+/// A sync object read: `ReadOpsComplete` = the snapshotted pending + 1.
+fn sync_read(gpu: &Gpu<'_>, pending: u32, complete: u32) {
+    if complete != 0 {
+        gpu.write(complete, pending.wrapping_add(1));
+    }
+}
+
+/// A sync object written: `WriteOpsComplete` = the snapshotted pending + 1.
+fn sync_write(gpu: &Gpu<'_>, pending: u32, complete: u32) {
+    if complete != 0 {
+        gpu.write(complete, pending.wrapping_add(1));
+    }
+}
+
+/// A TA/3D command; returns its size.
+fn complete_ta(gpu: &Gpu<'_>, cmd: u32) -> u32 {
+    let w = |a: u32| gpu.read(a).unwrap_or(0);
+    let size = w(cmd);
+    let flags = w(cmd + 0x1c);
+    let details = w(cmd + 0x38);
+    let dst_list = w(cmd + 0x3c);
+    let s = cmd + 0x50;
+    // The status words the client polls, {address, value}.
+    for (at, count, max) in [(0xc0, w(s + 0x04), 32), (0x1c0, w(s + 0x08), 4)] {
+        for i in 0..count.min(max) {
+            let (a, v) = (w(s + at + 8 * i), w(s + at + 8 * i + 4));
+            if a != 0 {
+                gpu.write(a, v);
+            }
+        }
+    }
+    sync_read(gpu, w(s + 0x14), w(s + 0x18)); // TA
+    sync_read(gpu, w(s + 0x24), w(s + 0x28)); // 3D
+    if flags & TA_DEPENDENCY != 0 {
+        sync_write(gpu, w(s + 0x34), w(s + 0x38));
+    }
+    for i in 0..w(s + 0x3c).min(8) {
+        let e = s + 0x40 + 16 * i;
+        sync_read(gpu, w(e), w(e + 4));
+    }
+    if dst_list != 0 {
+        let status = w(dst_list);
+        for i in 0..w(dst_list + 4).min(32) {
+            let e = dst_list + 8 + 16 * i;
+            sync_write(gpu, w(e + 8), w(e + 12));
+        }
+        if status != 0 {
+            gpu.write(status, 0);
+        }
+    }
+    if details != 0 {
+        let status = w(details + 0xe4);
+        if status != 0 {
+            gpu.write(status, 0);
+        }
+    }
+    size
+}
+
+/// A transfer (blit) command.
+fn complete_transfer(gpu: &Gpu<'_>, cmd: u32) {
+    let w = |a: u32| gpu.read(a).unwrap_or(0);
+    let s = cmd + 0xa8;
+    // The TA and 3D sync slots overlap destinations 1 and 2: read
+    // everything before writing anything.
+    let srcs: Vec<(u32, u32)> = (0..w(s).min(5))
+        .map(|i| (w(s + 4 + 16 * i), w(s + 8 + 16 * i)))
+        .collect();
+    let dst_count = w(s + 0x84).min(5);
+    let dsts: Vec<(u32, u32)> = (0..dst_count)
+        .map(|i| (w(s + 0x88 + 16 * i + 8), w(s + 0x88 + 16 * i + 12)))
+        .collect();
+    let ta = (w(s + 0x98), w(s + 0x9c));
+    let three_d = (w(s + 0xa8), w(s + 0xac));
+    for (pending, complete) in srcs {
+        sync_read(gpu, pending, complete);
+    }
+    for (pending, complete) in dsts {
+        sync_write(gpu, pending, complete);
+    }
+    if dst_count < 2 {
+        sync_write(gpu, ta.0, ta.1);
+    }
+    if dst_count < 3 {
+        sync_write(gpu, three_d.0, three_d.1);
+    }
+}
+
+/// A 2D command; returns its size.
+fn complete_2d(gpu: &Gpu<'_>, cmd: u32) -> u32 {
+    let w = |a: u32| gpu.read(a).unwrap_or(0);
+    let size = w(cmd);
+    let s = cmd + 0x78;
+    for i in 0..w(s).min(3) {
+        let e = s + 4 + 16 * i;
+        sync_read(gpu, w(e), w(e + 4));
+    }
+    for e in [s + 0x34, s + 0x44, s + 0x54] {
+        sync_write(gpu, w(e + 8), w(e + 12));
+    }
+    size
 }
 
 /// Look forward from the kicker for the block whose word 0 is its own
@@ -694,6 +870,73 @@ mod tests {
         mw(&space, HOST + HOST_HEARTBEAT, 0);
         sgx.shared.run();
         assert_eq!(m(&space, HOST + HOST_HEARTBEAT), HEARTBEAT);
+    }
+
+    /// A context at 0xc000 whose ring is at 0x20000 with its control pair at
+    /// 0xc100, holding `len` bytes of commands from offset 0.
+    fn context(space: &AddressSpace, len: u32) -> u32 {
+        let ctx = 0xc000;
+        mw(space, ctx + CTX_CCB_BASE, 0x2_0000);
+        mw(space, ctx + CTX_CCB_CTL, 0xc100);
+        mw(space, 0xc100, len);
+        mw(space, 0xc104, 0);
+        ctx
+    }
+
+    fn kick(sgx: &Sgx, space: &AddressSpace, kind: u32, ctx: u32) {
+        submit(space, &[kind, 0, 0, ctx]);
+        reg_w(sgx, COMMAND_KICK, 1);
+        sgx.shared.run();
+    }
+
+    #[test]
+    fn a_ta_kick_completes_its_syncs_and_statuses_without_drawing() {
+        let (sgx, space) = started();
+        let cmd = 0x2_0000;
+        let s = cmd + 0x50;
+        mw(&space, cmd, 0x300); // size
+        mw(&space, cmd + 0x1c, TA_DEPENDENCY);
+        mw(&space, cmd + 0x38, 0xd000); // render details
+        mw(&space, 0xd000 + 0xe4, 0xd100); // its status word
+        mw(&space, 0xd100, 1);
+        mw(&space, s + 0x04, 1); // one TA status
+        mw(&space, s + 0xc0, 0xd200);
+        mw(&space, s + 0xc4, 0x77);
+        mw(&space, s + 0x14, 5); // TA sync: read pending 5
+        mw(&space, s + 0x18, 0xe00c);
+        mw(&space, s + 0x34, 9); // dependency: write pending 9
+        mw(&space, s + 0x38, 0xe104);
+        mw(&space, s + 0x3c, 1); // one source
+        mw(&space, s + 0x40, 2);
+        mw(&space, s + 0x44, 0xe20c);
+        let ctx = context(&space, 0x300);
+        kick(&sgx, &space, CMD_KICK_TA, ctx);
+        assert_eq!(m(&space, 0xe00c), 6, "TA read complete = pending + 1");
+        assert_eq!(m(&space, 0xe104), 10, "dependency write complete");
+        assert_eq!(m(&space, 0xe20c), 3, "source read complete");
+        assert_eq!(m(&space, 0xd200), 0x77, "the status word the client polls");
+        assert_eq!(m(&space, 0xd100), 0, "render details free again");
+        assert_eq!(m(&space, 0xc104), 0x300, "the ring is consumed");
+    }
+
+    #[test]
+    fn a_transfer_kick_completes_sources_and_destinations() {
+        let (sgx, space) = started();
+        let s = 0x2_0000 + 0xa8;
+        mw(&space, s, 1); // one source
+        mw(&space, s + 4, 7);
+        mw(&space, s + 8, 0xe00c);
+        mw(&space, s + 0x84, 1); // one destination {ROP, ROC, WOP, WOC}
+        mw(&space, s + 0x88 + 8, 4);
+        mw(&space, s + 0x88 + 12, 0xe104);
+        mw(&space, s + 0x98, 11); // TA sync write pending
+        mw(&space, s + 0x9c, 0xe204);
+        let ctx = context(&space, 0x200);
+        kick(&sgx, &space, CMD_KICK_TRANSFER, ctx);
+        assert_eq!(m(&space, 0xe00c), 8);
+        assert_eq!(m(&space, 0xe104), 5);
+        assert_eq!(m(&space, 0xe204), 12);
+        assert_eq!(m(&space, 0xc104), 0x200);
     }
 
     #[test]
