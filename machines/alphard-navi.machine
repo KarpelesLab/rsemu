@@ -229,7 +229,11 @@ machine "alphard-navi" {
   # read low would be a request nobody made.
   object gpio0 "rcar.gpio" { inputs = 0xffffffff }
   object gpio1 "rcar.gpio" { inputs = 0xffffffff }
-  object gpio2 "rcar.gpio" { inputs = 0xffffffff }
+  # Bank 2 pin 15 (GPIO 79) is ACC, the accessory-power sense, active low.
+  # U-Boot latches it at boot and the system manager picks its boot profile
+  # from it: read high, the unit comes up in its "ACC off" mode, which never
+  # turns the display on. Held low here: the key is in the ignition.
+  object gpio2 "rcar.gpio" { inputs = 0xffff7fff }
   object gpio3 "rcar.gpio" { inputs = 0xffffffff }
   object gpio4 "rcar.gpio" { inputs = 0xffffffff }
   object gpio5 "rcar.gpio" { inputs = 0xffffffff }
