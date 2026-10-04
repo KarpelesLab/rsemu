@@ -51,6 +51,26 @@ So any one of these:
    deprecation that lands in the same release as the reshape gives nobody a
    release to migrate in.
 
+## What to do about 0.1.11 now that it has shipped
+
+The options above are about the *next* breaking change. For this one, at least
+two crates already depend on the 0.1.11 shape at a `0.1` requirement — rsemu
+(`"0.1.11"`) and, per the `oxideav` workspace session on 2026-10-04,
+`oxideav-jpegxl`'s tests (`"0.1"`, `default-features = false`, using the new
+`decode` surface). That decides it:
+
+| option | rsemu | `oxideav-jpegxl` | crates still on the 0.1.8 shape |
+|---|---|---|---|
+| yank 0.1.11 (with or without a 0.1.12 restoring the old shape) | **breaks** | **breaks** | fixed, if a 0.1.12 restores it |
+| re-release the new shape as 0.2.0, 0.1.11 still published | fine | fine | still broken — 0.1.11 is still the newest 0.1 |
+| leave it | fine | fine | broken until they port, as rsemu did |
+
+Yanking now breaks the crates that already moved, and a 0.2.0 alone fixes
+nobody. **Leaving 0.1.11 in place breaks the fewest crates**; the lesson
+applies to the next reshape, not this one. (This replaces the "release it as
+0.2.0" advice this note first gave, which was written before anyone knew a
+second crate had adopted the new shape.)
+
 ## How to tell it is fixed
 
 A crate pinned to `oxideav-png = "0.1"` that uses the 0.1.8 struct expression
