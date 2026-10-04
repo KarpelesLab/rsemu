@@ -202,6 +202,14 @@ use crate::machine::machine::Machine;
 /// reason.
 pub const DEFAULT_CADENCE: GlobalTime = GlobalTime::from_nanos(1_000_000_000);
 
+/// How many bytes of snapshots a timeline holds before it thins its history.
+///
+/// A board with a gigabyte of RAM snapshots a gigabyte a second: an unbounded
+/// history held tens of gigabytes within a minute of virtual time. Past the
+/// budget every other keyframe goes, so the history keeps its reach and loses
+/// resolution — a rewind takes longer, and nothing runs out of memory.
+pub const DEFAULT_BUDGET: usize = 1 << 30;
+
 /// One snapshot and the instant it was taken at.
 #[derive(Debug, Clone)]
 struct Keyframe {
@@ -223,6 +231,8 @@ pub struct Timeline {
     keyframes: Vec<Keyframe>,
     /// The next instant at or after which a snapshot is due.
     due: GlobalTime,
+    /// The most snapshot bytes held before the history is thinned.
+    budget: usize,
 }
 
 impl Timeline {
@@ -238,6 +248,34 @@ impl Timeline {
             cadence,
             keyframes: Vec::new(),
             due: GlobalTime::ZERO,
+            budget: DEFAULT_BUDGET,
+        }
+    }
+
+    /// The same, holding at most `budget` bytes of snapshots (see
+    /// [`DEFAULT_BUDGET`]). The newest snapshot is always kept, whatever its
+    /// size.
+    #[must_use]
+    pub fn with_budget(mut self, budget: usize) -> Timeline {
+        self.budget = budget;
+        self.thin();
+        self
+    }
+
+    /// Drop every other keyframe, oldest first and never the newest, until
+    /// the history fits its budget.
+    fn thin(&mut self) {
+        while self.bytes_held() > self.budget && self.keyframes.len() > 1 {
+            let newest = self.keyframes.len() - 1;
+            let mut i = 0;
+            self.keyframes.retain(|_| {
+                let keep = i % 2 == 0 || i == newest;
+                i += 1;
+                keep
+            });
+            if self.keyframes.len() == 2 && self.bytes_held() > self.budget {
+                self.keyframes.remove(0);
+            }
         }
     }
 
@@ -298,6 +336,7 @@ impl Timeline {
             Some(last) if last.at == at => last.bytes = bytes,
             _ => self.keyframes.push(Keyframe { at, bytes }),
         }
+        self.thin();
         self.due = at.saturating_add(self.cadence);
         Ok(())
     }

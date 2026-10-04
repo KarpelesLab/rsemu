@@ -91,3 +91,28 @@ fn a_recorder_with_channels_still_starts_empty() {
     assert_eq!(timeline.keyframes(), 0);
     assert_eq!(timeline.bytes_held(), 0);
 }
+
+#[test]
+fn past_its_budget_the_history_thins_and_keeps_the_newest() {
+    // Nine 8-byte keyframes against a 40-byte budget: every other one goes,
+    // oldest first, until it fits, and the newest always stays.
+    let timeline = with_keyframes(&[0, 1, 2, 3, 4, 5, 6, 7, 8]).with_budget(40);
+    assert!(timeline.bytes_held() <= 40);
+    assert_eq!(
+        timeline.instants(),
+        with_keyframes(&[0, 2, 4, 6, 8]).instants(),
+        "one halving fits, keeping the reach and the newest"
+    );
+}
+
+#[test]
+fn a_single_snapshot_larger_than_the_budget_is_still_kept() {
+    // A board whose one snapshot exceeds the budget keeps exactly one.
+    let timeline = with_keyframes(&[0, 1, 2]).with_budget(4);
+    assert_eq!(timeline.instants(), with_keyframes(&[2]).instants());
+}
+
+#[test]
+fn the_default_budget_is_a_gibibyte() {
+    assert_eq!(DEFAULT_BUDGET, 1 << 30);
+}
