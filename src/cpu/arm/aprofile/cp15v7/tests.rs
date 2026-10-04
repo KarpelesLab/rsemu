@@ -14,7 +14,12 @@ use crate::core::device::{Device, ResetKind};
 use crate::core::space::{AddressSpace, MemAttrs, RamStore, Region};
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use crate::core::value::Width;
-use crate::cpu::arm::aprofile::{Arm, CLASS, Mode, System};
+use crate::cpu::arm::aprofile::{Arm, CLASS, Mode};
+// Only the VFP-gated tests below name a `System`, so without that feature the
+// import is unused and `-D warnings` makes it an error. Gated rather than
+// deleted: deleting it fixes that build and breaks the one with VFP.
+#[cfg(feature = "cpu-arm-aprofile-vfp")]
+use crate::cpu::arm::aprofile::System;
 
 // ---------------------------------------------------------------------------
 // Unit harness
@@ -1079,7 +1084,7 @@ fn a_cortex_a9_without_the_vfp_feature_is_refused_by_name() {
     props.insert("cpu", "cortex-a9");
     let err = Arm::from_props(&props).expect_err("VFP is not compiled in");
     assert!(
-        format!("{err}").contains("cpu-arm-aprofile-vfp"),
+        alloc::format!("{err}").contains("cpu-arm-aprofile-vfp"),
         "the error names the missing feature: {err}"
     );
 }
