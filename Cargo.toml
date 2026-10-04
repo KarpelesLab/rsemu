@@ -1526,10 +1526,12 @@ dev-i2c-regfile = ["bus-i2c"]
 # alloc`, no dependencies.
 dev-linux-printk = []
 
-# A PowerVR SGX stand-in (src/dev/sgx.rs, `pvr.sgx`): the register block and
+# A PowerVR SGX stand-in (src/dev/sgx, `pvr.sgx`): the register block and
 # the GPU firmware's side of the host driver's start-up and command
 # handshake, so the driver initialises and its kernel commands complete. No
-# rendering. `no_std + alloc`, no dependencies.
+# rendering. Also the USSE2 shader-engine ISA (`dev::sgx::usse`: decoder,
+# disassembler, interpreter), not yet wired into the device. `no_std + alloc`,
+# no dependencies.
 dev-sgx = []
 
 # The Toyota Alphard navigation unit's board-level peers (src/dev/navi): today

@@ -82,6 +82,15 @@
 //! module and the user-space set-up library — disassembled as data: the
 //! register offsets and values they write and poll, the command ring they
 //! fill, the structure sizes and build constants they pass and compare.
+//!
+//! # The shader engine
+//!
+//! [`usse`] holds the instruction set of the SGX's programmable core, the
+//! USSE2 — decoder, disassembler and interpreter — as the first piece of a
+//! hardware-level model that runs the real microkernel. It is not wired into
+//! this device yet: the stand-in above still answers the host itself.
+
+pub mod usse;
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
