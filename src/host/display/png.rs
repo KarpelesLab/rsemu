@@ -19,7 +19,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use oxideav_png::{PngImage, PngPixelFormat, encode_apng, encode_png_image};
+use oxideav_png::{EncodeOptions, Plane, PngImage, PngPixelFormat, encode_apng};
 
 use super::{PixelFormat, Surface};
 use crate::core::error::{Error, Result};
@@ -34,7 +34,7 @@ use crate::core::error::{Error, Result};
 /// one, this is the line that changes.
 pub fn encode(surface: &Surface) -> Result<Vec<u8>> {
     let image = to_image(surface);
-    encode_png_image(&image).map_err(|e| failed(&format!("{e}")))
+    oxideav_png::encode(&image, &EncodeOptions::default()).map_err(|e| failed(&format!("{e}")))
 }
 
 /// Encode a sequence of equally-shaped surfaces as an animated PNG.
@@ -87,14 +87,16 @@ fn to_image(surface: &Surface) -> PngImage {
         }
     };
     let stride = (surface.width() as usize) * pixel_format.bytes_per_pixel();
-    PngImage {
-        width: surface.width(),
-        height: surface.height(),
+    // Through the constructor rather than a struct expression: since 0.1.11
+    // `PngImage` is `#[non_exhaustive]` and keeps its pixels in planes, and a
+    // struct expression no longer compiles. One plane, because a PNG is packed;
+    // no palette and no transparency, which is what `new` leaves.
+    PngImage::new(
+        surface.width(),
+        surface.height(),
         pixel_format,
-        stride,
-        data,
-        palette: Vec::new(),
-    }
+        alloc::vec![Plane::new(stride, data)],
+    )
 }
 
 /// One place the codec's complaint becomes the crate's error.

@@ -296,9 +296,10 @@ fn a_nes_boots_renders_and_captures_a_png() {
     // an eight-byte magic number proves nothing about the pixels.
     let bytes = png::encode(&surface).expect("the surface encodes");
     assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-    let decoded = oxideav_png::decode_png(&bytes).expect("what we wrote decodes");
+    let decoded = oxideav_png::decode(&bytes).expect("what we wrote decodes");
     assert_eq!((decoded.width, decoded.height), (256, 240));
-    assert_eq!(&decoded.data[..3], &sky[..]);
+    // One plane: a PNG is packed (`oxideav-png` 0.1.11 keeps pixels in planes).
+    assert_eq!(&decoded.planes[0].data[..3], &sky[..]);
 
     // Written where a human or a CI job can look at it. `RSEMU_SCREENSHOT_DIR`
     // aims it somewhere durable; the temporary directory is the default so the

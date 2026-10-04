@@ -23,7 +23,13 @@ exclude       = ["/docs/local", "/.github"]
 # Lab, MIT) and pure Rust; `default-features = false` drops `oxideav-core`, so
 # the whole added tree is this crate plus `compcol` — already permitted
 # (CLAUDE.md). Optional, so the default `cargo tree` is still only `rsemu`.
-oxideav-png = { version = "0.1", default-features = false, optional = true }
+#
+# The floor is 0.1.11, not 0.1. That release reshaped `PngImage` (now
+# `#[non_exhaustive]`, pixels in `Plane`s) and deprecated `encode_png_image`,
+# which is a breaking change under Cargo's 0.x rules — so `host::display::png`
+# is written against 0.1.11 and a bare "0.1" would let a stale lock build it
+# against the old shape. `docs/upstream/oxideav-png-0.1.11-semver.md` has it.
+oxideav-png = { version = "0.1.11", default-features = false, optional = true }
 
 # A native window for `host::window` (the `window` feature): the one GUI
 # dependency the owner allowed, as an opt-in exception to CLAUDE.md's "no GUI
