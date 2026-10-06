@@ -24,11 +24,11 @@ exclude       = ["/docs/local", "/.github"]
 # the whole added tree is this crate plus `compcol` — already permitted
 # (CLAUDE.md). Optional, so the default `cargo tree` is still only `rsemu`.
 #
-# The floor is 0.1.11, not 0.1. That release reshaped `PngImage` (now
-# `#[non_exhaustive]`, pixels in `Plane`s) and deprecated `encode_png_image`,
-# which is a breaking change under Cargo's 0.x rules — so `host::display::png`
-# is written against 0.1.11 and a bare "0.1" would let a stale lock build it
-# against the old shape. `docs/upstream/oxideav-png-0.1.11-semver.md` has it.
+# The floor is 0.1.11, not 0.1: `host::display::png` is written against that
+# release's API (`PngImage::new`, `Plane`, `encode`), and a bare "0.1" would let
+# a stale lock build it against the older shape. oxideav is not production
+# grade and changes its API in patch releases by design, so expect to follow it
+# here when CI picks up a new one.
 oxideav-png = { version = "0.1.11", default-features = false, optional = true }
 
 # A native window for `host::window` (the `window` feature): the one GUI
