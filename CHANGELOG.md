@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/rsemu/compare/v0.0.6...v0.0.7) - 2026-10-06
+
+### Added
+
+- *(dev-sgx)* a USSE2 decoder, disassembler and interpreter
+
+### Fixed
+
+- gate the A9 board test on VFP, and drop four redundant doc-link targets
+
+### Other
+
+- oxideav changes its API in patch releases on purpose; drop the note that said otherwise
+- *(dev-sgx)* move the device into a module directory
+
 ## [0.0.6](https://github.com/KarpelesLab/rsemu/compare/v0.0.5...v0.0.6) - 2026-10-04
 
 ### Added
