@@ -64,10 +64,10 @@
 //! > `call_indirect` dispatcher — which removes the second-largest win in §9's
 //! > list.
 //!
-//! Kept, and sharpened. There is no [`Chain`](crate::jit::Chain) for this
+//! Kept, and sharpened. There is no [`Chain`] for this
 //! backend and there cannot be one: [`Engine::run`](crate::jit::wasm::rt::Engine::run) executes
 //! exactly one block and returns, so a `goto_tb` costs a full return to
-//! [`Dispatcher`](crate::jit::Dispatcher). What that loses is the *direct
+//! [`Dispatcher`]. What that loses is the *direct
 //! link*; what it keeps is everything the block cache already does — the
 //! keyed lookup, the patched exits at the cache level, the page-dirty
 //! invalidation — because all of that is `no_std` Rust above the backend and
@@ -80,7 +80,7 @@
 //!
 //! The native backends invalidate by *unpatching* a predecessor's jump. There
 //! is nothing to unpatch here, and there does not need to be: a module is only
-//! ever reached through [`BlockCache`](crate::jit::BlockCache), so a block the
+//! ever reached through [`BlockCache`], so a block the
 //! cache drops is a module nothing can reach. Three things drop one, and they
 //! are the three the rest of `jit/` already has:
 //!
@@ -88,7 +88,7 @@
 //!   log, drained at every block boundary;
 //! * a **topology bump**, which flushes the whole cache;
 //! * **eviction** from this backend's own module table, which bumps that
-//!   slot's generation so the [`CodeRef`](crate::jit::CodeRef) naming it stops
+//!   slot's generation so the [`CodeRef`] naming it stops
 //!   being live and the dispatcher compiles again.
 //!
 //! No third mechanism, and no window in which a stale module is reachable,

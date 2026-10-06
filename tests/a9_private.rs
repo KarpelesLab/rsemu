@@ -8,8 +8,12 @@
 //! of the interrupt controller. `machines/tests/a9-private.machine` is the
 //! board.
 
+// `cpu-arm-aprofile-vfp` too: the board is a Cortex-A9, which has a VFP, and a
+// build without one refuses to realize it (`Arm::from_props`). Without this
+// gate the file compiles under a combination that cannot build its board.
 #![cfg(all(
     feature = "cpu-arm-aprofile",
+    feature = "cpu-arm-aprofile-vfp",
     feature = "dev-arm-mpcore",
     feature = "dev-arm-l2c310",
     feature = "dev-flash-cfi"
