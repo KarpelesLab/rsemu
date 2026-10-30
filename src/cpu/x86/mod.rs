@@ -163,7 +163,8 @@
 //! - **No `MONITOR`/`MWAIT`**: SSE3 is here otherwise ([`Features::sse3`]),
 //!   and those two raise `#UD` with their own `CPUID` bit clear. SSSE3,
 //!   SSE4.1 and SSE4.2 are here ([`Features::ssse3`], [`Features::sse41`],
-//!   [`Features::sse42`]); no AVX.
+//!   [`Features::sse42`]), and so is `POPCNT` ([`Features::popcnt`]); no
+//!   AVX.
 //! - **No `XSAVES`/`XRSTORS`**, and so no `IA32_XSS`: they exist for
 //!   supervisor state components, and there are none to save. `CPUID` leaf
 //!   `0Dh` says so.
@@ -668,6 +669,10 @@ pub struct Features {
     /// general-purpose instruction that answers to this bit alone.
     /// `CPUID.01H:ECX[20]`. Requires [`sse41`](Features::sse41).
     pub sse42: bool,
+    /// `POPCNT`, and `CPUID.01H:ECX[23]`. Its own bit rather than part of
+    /// SSE4.2, though the two arrived together; requires
+    /// [`sse2`](Features::sse2), because no part had it without.
+    pub popcnt: bool,
 }
 
 impl Features {
@@ -695,6 +700,7 @@ impl Features {
         ssse3: false,
         sse41: false,
         sse42: false,
+        popcnt: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -747,6 +753,7 @@ impl Features {
         ssse3: false,
         sse41: false,
         sse42: false,
+        popcnt: false,
     };
 
     /// Whether this combination describes a part that could exist.
@@ -803,6 +810,9 @@ impl Features {
         }
         if self.sse42 && !self.sse41 {
             return missing("sse41", "sse42");
+        }
+        if self.popcnt && !self.sse2 {
+            return missing("sse2", "popcnt");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2539,7 +2549,8 @@ impl X86 {
         let mut features = variant.features();
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
-            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42", "xsave",
+            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
+            "popcnt", "xsave",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2566,7 +2577,8 @@ impl X86 {
                 "sse3" => features.sse3 = on,
                 "ssse3" => features.ssse3 = on,
                 "sse41" => features.sse41 = on,
-                _ => features.sse42 = on,
+                "sse42" => features.sse42 = on,
+                _ => features.popcnt = on,
             }
         }
         features.validate()?;
@@ -3825,6 +3837,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: SSE4.2, CRC32 included",
+        },
+        PropertySpec {
+            name: "popcnt",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: POPCNT",
         },
         PropertySpec {
             name: "model",

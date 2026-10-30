@@ -2716,6 +2716,7 @@ impl<'a> Exec<'a> {
             Op::XGETBV => self.xgetbv()?,
             Op::XSETBV => self.xsetbv()?,
             Op::CRC32 => self.crc32(f)?,
+            Op::POPCNT => self.popcnt(f, size)?,
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
@@ -4169,6 +4170,9 @@ impl<'a> Exec<'a> {
         }
         if features.sse42 {
             ecx1 |= 1 << 20; // SSE4.2
+        }
+        if features.popcnt {
+            ecx1 |= 1 << 23; // POPCNT
         }
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers

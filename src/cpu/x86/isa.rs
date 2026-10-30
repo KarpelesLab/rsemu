@@ -1293,6 +1293,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("PCMPGTQ", "pcmpgtq"),
     ("PCMPISTRI", "pcmpistri"),
     ("PCMPISTRM", "pcmpistrm"),
+    ("POPCNT", "popcnt"),
 ];
 
 define_ops! {
@@ -1873,6 +1874,9 @@ define_ops! {
     PCMPGTQ = "compare packed signed quadwords for greater than",
     PCMPISTRI = "compare implicit-length strings under an immediate, the index into ECX",
     PCMPISTRM = "compare implicit-length strings under an immediate, the mask into XMM0",
+
+    // ---- POPCNT ----------------------------------------------------------
+    POPCNT = "count the set bits",
 }
 
 impl Op {
@@ -2449,14 +2453,14 @@ impl Op {
     }
 
     /// Whether this is one of the general-purpose instructions that arrived
-    /// with a SIMD extension's `CPUID` bit — `CRC32` — and so is gated by
-    /// the bit alone: it touches no SIMD state, so `CR0.EM`, `CR0.TS` and
-    /// `CR4.OSFXSR` mean nothing to it (*Intel SDM* volume 2, `CRC32`,
-    /// "Protected Mode Exceptions": `#UD` for the `CPUID` bit and for
-    /// `LOCK`, and no `#NM`).
+    /// with an extension's `CPUID` bit — `CRC32` and `POPCNT` — and so is
+    /// gated by the bit alone: neither touches SIMD state, so `CR0.EM`,
+    /// `CR0.TS` and `CR4.OSFXSR` mean nothing to them (*Intel SDM* volume 2,
+    /// `CRC32` and `POPCNT`, "Protected Mode Exceptions": `#UD` for the
+    /// `CPUID` bit and for `LOCK`, and no `#NM`).
     #[must_use]
     pub const fn is_general_extension(self) -> bool {
-        matches!(self, Op::CRC32)
+        matches!(self, Op::CRC32 | Op::POPCNT)
     }
 
     /// Which post-SSE2 extension this operation arrived with, if any.
@@ -2549,6 +2553,7 @@ impl Op {
             | Op::PCMPGTQ
             | Op::PCMPISTRI
             | Op::PCMPISTRM => Extension::Sse42,
+            Op::POPCNT => Extension::Popcnt,
             _ => return None,
         };
         Some(ext)
@@ -2717,6 +2722,9 @@ pub enum Extension {
     /// SSE4.2: `CPUID.01H:ECX[20]`. Its one general-purpose member,
     /// `CRC32`, is gated by the bit and by nothing else.
     Sse42,
+    /// `POPCNT`: `CPUID.01H:ECX[23]`. A general-purpose instruction with a
+    /// `CPUID` bit of its own, announced beside SSE4.2 but not part of it.
+    Popcnt,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -3833,6 +3841,10 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     // Between the two register files: an `MM` register into the low
     // quadword of an `XMM` one. Register form only.
     0xd6 MOVQ2DQ   Vx Nq None Documented;
+    // `POPCNT`, an ordinary integer instruction at the effective operand
+    // size — a `66` beside the `F3` still narrows it. Without the `F3`,
+    // `0F B8` is `JMPE` on an Itanium and nothing on anything else.
+    0xb8 POPCNT    Gv Ev None Documented;
     // Two doublewords in, so the memory form is a quadword.
     0xe6 CVTDQ2PD  Vx Wq None Documented;
 };

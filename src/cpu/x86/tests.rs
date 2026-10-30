@@ -11151,6 +11151,7 @@ mod v2 {
             ssse3: true,
             sse41: true,
             sse42: true,
+            popcnt: true,
             ..Features::X86_64
         }
     }
@@ -11587,6 +11588,51 @@ mod v2 {
         let impossible = Features {
             sse42: true,
             ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    // -- POPCNT ------------------------------------------------------------
+
+    #[test]
+    fn popcnt_counts_and_clears_every_flag_but_zf() {
+        let pc = v2pc();
+        set_regs(&pc, |r| {
+            r.rcx = 0xf0f0_0001;
+            r.rbx = 0x1234_ffff;
+            r.eflags |= 0x8d5;
+        });
+        pc.write(DATA, &[0x07, 0x80]);
+        let mut code = alloc::vec![0xf3, 0x0f, 0xb8, 0xc1]; // popcnt eax, ecx
+        // popcnt bx, [DATA]: a `66` beside the `F3` is an operand size.
+        code.extend_from_slice(&mem(&[0x66, 0xf3, 0x0f, 0xb8], 3, DATA));
+        run(&pc, &code);
+        let r = pc.regs();
+        assert_eq!(r.rax, 9);
+        assert_eq!(r.rbx, 0x1234_0004, "a 16-bit write");
+        assert_eq!(r.eflags & 0x8d5, 0, "OF SF ZF AF PF CF all clear");
+        // A zero source sets ZF and nothing else.
+        let pc = v2pc();
+        set_regs(&pc, |r| r.eflags |= 0x8d5);
+        run(&pc, &[0x31, 0xc9, 0xf3, 0x0f, 0xb8, 0xc1]); // xor ecx, ecx ; popcnt
+        assert_eq!(pc.regs().rax, 0);
+        assert_eq!(pc.regs().eflags & 0x8d5, flags::ZF);
+    }
+
+    #[test]
+    fn popcnt_is_undefined_without_its_bit_and_cpuid_reports_it() {
+        let without = Features {
+            popcnt: false,
+            ..all()
+        };
+        faults(&pc_with(without), 6, &[0xf3, 0x0f, 0xb8, 0xc1]);
+        // Without the `F3` the encoding is nothing at all.
+        faults(&v2pc(), 6, &[0x0f, 0xb8, 0xc1]);
+        assert_eq!(leaf1_ecx(without) & (1 << 23), 0);
+        assert_ne!(leaf1_ecx(all()) & (1 << 23), 0, "CPUID.01H:ECX.POPCNT");
+        let impossible = Features {
+            popcnt: true,
+            ..Features::I80486
         };
         assert!(impossible.validate().is_err());
     }

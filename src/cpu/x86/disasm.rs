@@ -966,6 +966,15 @@ mod tests {
     }
 
     #[test]
+    fn popcnt_lists_without_a_repeat_prefix() {
+        assert_eq!(text32(&[0xf3, 0x0f, 0xb8, 0xc1]), "popcnt eax, ecx");
+        assert_eq!(
+            text32(&[0x66, 0xf3, 0x0f, 0xb8, 0x03]),
+            "popcnt ax, [ds:ebx]"
+        );
+    }
+
+    #[test]
     fn sse3_lists_without_a_repeat_prefix() {
         // The `F2`/`F3` are mandatory prefixes, part of the opcode.
         assert_eq!(text32(&[0xf2, 0x0f, 0x7c, 0xc1]), "haddps xmm0, xmm1");

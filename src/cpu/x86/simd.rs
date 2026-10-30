@@ -40,7 +40,25 @@ impl Exec<'_> {
             Some(Extension::Ssse3) => features.ssse3,
             Some(Extension::Sse41) => features.sse41,
             Some(Extension::Sse42) => features.sse42,
+            Some(Extension::Popcnt) => features.popcnt,
         }
+    }
+
+    /// `POPCNT`: the number of set bits in the source.
+    ///
+    /// Every arithmetic flag is cleared except `ZF`, which says the source
+    /// was zero (*Intel SDM* volume 2, `POPCNT`, "Flags Affected").
+    pub(super) fn popcnt(&mut self, f: &Fields, size: u8) -> Ex<()> {
+        if !self.has_extension(f.insn) {
+            return Err(Fault::bare(VEC_UD));
+        }
+        let value = self.read_arg(f, f.insn.src, size)?;
+        self.write_arg(f, f.insn.dst, size, u64::from(value.count_ones()))?;
+        for bit in [flags::OF, flags::SF, flags::AF, flags::CF, flags::PF] {
+            self.set_flag(bit, false);
+        }
+        self.set_flag(flags::ZF, value == 0);
+        Ok(())
     }
 
     /// `CRC32`: accumulate a CRC-32C over the source into the destination.
