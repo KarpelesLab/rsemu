@@ -49,6 +49,11 @@
 //!   then told apart by the r/m field ([`GROUP7_XCR`]). [`resolve_modrm`] is
 //!   the single place all of them are applied.
 //!
+//! Beyond those, `0F 38` and `0F 3A` escape to two **three-byte maps**
+//! ([`OpMap`], [`decode_map`]), each with its own mandatory-prefix columns:
+//! SSSE3 and SSE4 live there, and so will VEX, which names the same maps by
+//! number.
+//!
 //! # Why there is no cycle column
 //!
 //! Same reason as the 6502 core: an 8088 cycle is a bus state, and the number
@@ -69,7 +74,8 @@
 //! corpus itself; see `docs/cpu/x86.md`. The x87 escape maps and the SSE
 //! mandatory-prefix maps are the *Intel SDM* volume 2 appendix A — tables
 //! A-16 through A-23 for the escapes, §2.1.1 and the two-byte opcode map for
-//! the prefixes. No copyleft emulator was consulted.
+//! the prefixes, tables A-4 and A-5 for the three-byte maps. No copyleft
+//! emulator was consulted.
 
 use core::fmt;
 
@@ -346,6 +352,26 @@ pub enum Arg {
     /// An `MM` register from ModRM r/m, register form only — `Nq`. The
     /// shift-by-immediate groups, `PMOVMSKB`, `PEXTRW` and `MASKMOVQ`.
     Nq,
+
+    // ---- SSE4.1 --------------------------------------------------------
+    /// `XMM0`, named by no field at all: the mask of `PBLENDVB`, `BLENDVPS`
+    /// and `BLENDVPD`. Intel prints it `<XMM0>` in the instruction's form,
+    /// and it is an operand here rather than a fact the executor knows so the
+    /// disassembler shows it.
+    Xmm0,
+    /// An `XMM` register or a **16-bit** memory operand: `PMOVSXBQ` and
+    /// `PMOVZXBQ`, which widen two bytes. Intel's `Ux/Mw`.
+    Ww,
+    /// A general register or a **byte** of memory — Intel's `Rd/Mb`.
+    ///
+    /// Not `Eb`: the register form names a 32-bit register (64-bit in long
+    /// mode, zero-extended, `REX.W` ignored), never `AH` or `SPL`, and reads
+    /// or writes it whole. `PEXTRB` stores through it and `PINSRB` reads
+    /// its low byte (*Intel SDM* volume 2, `PEXTRB/PEXTRD/PEXTRQ`).
+    RdMb,
+    /// A general register or a **word** of memory — Intel's `Rd/Mw`, the
+    /// destination of the `0F 3A 15` form of `PEXTRW`.
+    RdMw,
 }
 
 impl Arg {
@@ -411,7 +437,11 @@ impl Arg {
             | Arg::Pq
             | Arg::Qq
             | Arg::Qd
-            | Arg::Nq => None,
+            | Arg::Nq
+            | Arg::Xmm0
+            | Arg::Ww
+            | Arg::RdMb
+            | Arg::RdMw => None,
         }
     }
 
@@ -430,7 +460,8 @@ impl Arg {
             Arg::Mf32 | Arg::Mi32 | Arg::Wd | Arg::Qd => Some(4),
             Arg::Mf64 | Arg::Mi64 | Arg::Wq | Arg::Mq | Arg::Qq => Some(8),
             Arg::Mf80 => Some(10),
-            Arg::Mi16 => Some(2),
+            Arg::Mi16 | Arg::Ww | Arg::RdMw => Some(2),
+            Arg::RdMb => Some(1),
             Arg::Wx => Some(16),
             Arg::Mfenv => Some(if osz == 2 { 14 } else { 28 }),
             Arg::Mfsave => Some(if osz == 2 { 94 } else { 108 }),
@@ -480,6 +511,9 @@ impl Arg {
                 | Arg::Qq
                 | Arg::Qd
                 | Arg::Nq
+                | Arg::Ww
+                | Arg::RdMb
+                | Arg::RdMw
         )
     }
 
@@ -3073,6 +3107,11 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     // modelled. *Intel SDM* volume 2, `SYSENTER`.
     0x34 SYSENTER None None None Documented;
 
+    // `0F 38` and `0F 3A` are not rows: they are escapes to the two
+    // three-byte maps, and [`decode_stream_as`] consumes the byte after them
+    // before any table is consulted. Both stay unassigned here so that a
+    // reader of this table alone cannot mistake them for instructions.
+
     // `CMOVcc`, from the Pentium Pro; gated by `Features::cmov`.
     0x40 CMOVO  Gv  Ev   None   Documented;
     0x41 CMOVNO Gv  Ev   None   Documented;
@@ -3549,6 +3588,89 @@ pub const fn decode_0f_as(prefix: Mandatory, opcode: u8) -> Insn {
         Mandatory::P66 => TABLE_0F_66[opcode as usize],
         Mandatory::PF3 => TABLE_0F_F3[opcode as usize],
         Mandatory::PF2 => TABLE_0F_F2[opcode as usize],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The three-byte maps
+// ---------------------------------------------------------------------------
+
+/// Which escape map an opcode byte is looked up in.
+///
+/// The legacy encoding reaches three maps beyond the primary one through
+/// escape bytes: `0F`, `0F 38` and `0F 3A`. SSSE3 opened the two three-byte
+/// ones because the two-byte map had run out of room, and every SIMD
+/// extension since has lived there. A VEX prefix reaches **the same three
+/// maps** by number rather than by escape byte — its `mmmmm` field is 1, 2 or
+/// 3 (*Intel SDM* volume 2 §2.3.6.1, and the VEX opcode-map tables of
+/// appendix A) — and its `pp` field names the same four mandatory prefixes
+/// [`Mandatory`] does. So the map is a value here, and [`decode_map`] is the
+/// one lookup both encodings can share, rather than a fact implied by how many
+/// bytes the legacy decoder happened to consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OpMap {
+    /// `0F xx`: the two-byte map.
+    M0F,
+    /// `0F 38 xx`: the first three-byte map. No row takes an immediate.
+    M0F38,
+    /// `0F 3A xx`: the second three-byte map. **Every** row takes an
+    /// immediate byte, which is the whole reason it is a separate map: the
+    /// escape byte tells a length decoder that one follows (*Intel SDM*
+    /// volume 2 appendix A.2.4, tables A-4 and A-5).
+    M0F3A,
+}
+
+impl OpMap {
+    /// The map a VEX prefix's `mmmmm` field selects: 1, 2 or 3. Every other
+    /// value is reserved and raises `#UD` (*Intel SDM* volume 2 §2.3.6.1).
+    #[must_use]
+    pub const fn from_vex(mmmmm: u8) -> Option<OpMap> {
+        match mmmmm {
+            1 => Some(OpMap::M0F),
+            2 => Some(OpMap::M0F38),
+            3 => Some(OpMap::M0F3A),
+            _ => None,
+        }
+    }
+}
+
+/// The `0F 38` map with no mandatory prefix: SSSE3's instructions on `MM`
+/// registers.
+pub static TABLE_0F38: [Insn; 256] = [UNASSIGNED; 256];
+
+/// The `0F 38` map with a `66` prefix.
+pub static TABLE_0F38_66: [Insn; 256] = [UNASSIGNED; 256];
+
+/// The `0F 38` map with an `F2` prefix.
+pub static TABLE_0F38_F2: [Insn; 256] = [UNASSIGNED; 256];
+
+/// The `0F 3A` map with no mandatory prefix.
+pub static TABLE_0F3A: [Insn; 256] = [UNASSIGNED; 256];
+
+/// The `0F 3A` map with a `66` prefix.
+pub static TABLE_0F3A_66: [Insn; 256] = [UNASSIGNED; 256];
+
+/// Decode one opcode byte of an escape map under a mandatory prefix.
+///
+/// The seam the legacy decoder and a VEX decoder share: the escape bytes or
+/// `mmmmm` pick the map, the prefix bytes or `pp` pick the column. Unlike the
+/// two-byte map, the three-byte maps are **not** deltas of one another — the
+/// no-prefix `0F 38` rows are `MM`-register forms and the `66` rows are `XMM`
+/// ones, and an unlisted prefix is `#UD` rather than the unprefixed
+/// instruction — so each column is its own table, and the two columns no
+/// x86-64-v2 instruction uses are simply unassigned.
+#[inline]
+#[must_use]
+pub const fn decode_map(map: OpMap, prefix: Mandatory, opcode: u8) -> Insn {
+    let i = opcode as usize;
+    match (map, prefix) {
+        (OpMap::M0F, _) => decode_0f_as(prefix, opcode),
+        (OpMap::M0F38, Mandatory::None) => TABLE_0F38[i],
+        (OpMap::M0F38, Mandatory::P66) => TABLE_0F38_66[i],
+        (OpMap::M0F38, Mandatory::PF2) => TABLE_0F38_F2[i],
+        (OpMap::M0F3A, Mandatory::None) => TABLE_0F3A[i],
+        (OpMap::M0F3A, Mandatory::P66) => TABLE_0F3A_66[i],
+        (OpMap::M0F38 | OpMap::M0F3A, _) => UNASSIGNED,
     }
 }
 
@@ -4588,8 +4710,11 @@ pub struct Fields {
     pub prefix66: bool,
     /// Which mandatory prefix selected the two-byte map this row came from.
     pub mandatory: Mandatory,
-    /// Whether the opcode came from the two-byte (`0F`) map.
+    /// Whether the opcode came from an escape map — `0F`, `0F 38` or
+    /// `0F 3A` — rather than the primary one. [`Fields::escape`] says which.
     pub two_byte: bool,
+    /// Which escape map the opcode came from, or `None` for the primary map.
+    pub escape: Option<OpMap>,
     /// The effective operand size in bytes: 2, 4 or 8.
     ///
     /// The code segment's width picks the default, a `66` prefix flips it and
@@ -4832,6 +4957,7 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
         prefix66: false,
         mandatory: Mandatory::None,
         two_byte: false,
+        escape: None,
         opsize: bits.operand(),
         addrsize: bits.address(),
         opcode: 0x90,
@@ -4924,10 +5050,28 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
     let mut insn;
     if matches!(map, Gen::I386) && opcode == 0x0f {
         f.two_byte = true;
-        let second = take(&mut f);
+        let mut second = take(&mut f);
         if f.truncated {
             return f;
         }
+        // `0F 38` and `0F 3A` are escapes of their own: the byte after them
+        // is the opcode, looked up in a third and a fourth map. That holds
+        // on every part that decodes `0F` at all — on one that predates SSSE3
+        // the rows are unassigned and execution raises `#UD`, and the length
+        // the decoder reports for an invalid encoding is never observed.
+        let mut escape = OpMap::M0F;
+        if matches!(second, 0x38 | 0x3a) {
+            escape = if second == 0x38 {
+                OpMap::M0F38
+            } else {
+                OpMap::M0F3A
+            };
+            second = take(&mut f);
+            if f.truncated {
+                return f;
+            }
+        }
+        f.escape = Some(escape);
         f.opcode = second;
         // A repeat prefix outranks an operand-size one (*Intel SDM* volume 2
         // §2.1.1), and every one of them is still recorded in its own field so
@@ -4938,7 +5082,7 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
             (None, true) => Mandatory::P66,
             (None, false) => Mandatory::None,
         };
-        insn = decode_0f_as(f.mandatory, second);
+        insn = decode_map(escape, f.mandatory, second);
     } else {
         f.opcode = opcode;
         insn = decode_as(map, opcode);
@@ -5151,6 +5295,11 @@ mod tests {
                 || TABLE_0F_66.iter().any(|i| i.op == op)
                 || TABLE_0F_F3.iter().any(|i| i.op == op)
                 || TABLE_0F_F2.iter().any(|i| i.op == op)
+                || TABLE_0F38.iter().any(|i| i.op == op)
+                || TABLE_0F38_66.iter().any(|i| i.op == op)
+                || TABLE_0F38_F2.iter().any(|i| i.op == op)
+                || TABLE_0F3A.iter().any(|i| i.op == op)
+                || TABLE_0F3A_66.iter().any(|i| i.op == op)
                 || X87_MEM.iter().flatten().any(|i| i.op == op)
                 || X87_REG.iter().flatten().any(|i| i.op == op)
                 // `MOVHLPS` and `MOVLHPS` have no row of their own for the
@@ -5305,6 +5454,90 @@ mod tests {
         assert_eq!(ModRm::new(0b00_000_010).default_segment(), seg::SS);
         assert_eq!(ModRm::new(0b00_000_011).default_segment(), seg::SS);
         assert_eq!(ModRm::new(0b00_000_000).default_segment(), seg::DS);
+    }
+
+    /// Decode from a slice as a 32-bit protected-mode part does.
+    fn decode32(bytes: &[u8]) -> Fields {
+        let mut at = 0usize;
+        decode_stream_as(Gen::I386, Bits::B32, &mut || {
+            let b = bytes.get(at).copied();
+            at += 1;
+            b
+        })
+    }
+
+    #[test]
+    fn the_three_byte_escapes_consume_the_opcode_byte_after_them() {
+        // An unassigned row has no ModRM byte, so the length is the escape
+        // plus the opcode and nothing more — what matters is that the third
+        // byte is read as the opcode and not as the next instruction.
+        let f = decode32(&[0x0f, 0x38, 0xff, 0x90]);
+        assert_eq!(f.escape, Some(OpMap::M0F38));
+        assert!(f.two_byte, "an escape map, not the primary one");
+        assert_eq!(f.opcode, 0xff);
+        assert_eq!(f.insn.op, Op::UD);
+        assert_eq!(f.len, 3);
+        let f = decode32(&[0x0f, 0x3a, 0xff, 0x90]);
+        assert_eq!(f.escape, Some(OpMap::M0F3A));
+        assert_eq!(f.len, 3);
+        // The two-byte map is still the two-byte map.
+        let f = decode32(&[0x0f, 0xa2]);
+        assert_eq!(f.escape, Some(OpMap::M0F));
+        assert_eq!(f.insn.op, Op::CPUID);
+        assert_eq!(decode32(&[0x90]).escape, None);
+        // A stream that ends inside the escape says so.
+        assert!(decode32(&[0x0f, 0x38]).truncated);
+    }
+
+    #[test]
+    fn the_map_lookup_is_the_two_byte_lookup_for_0f() {
+        for prefix in [
+            Mandatory::None,
+            Mandatory::P66,
+            Mandatory::PF3,
+            Mandatory::PF2,
+        ] {
+            for opcode in 0..=255u8 {
+                assert_eq!(
+                    decode_map(OpMap::M0F, prefix, opcode),
+                    decode_0f_as(prefix, opcode)
+                );
+            }
+        }
+        // VEX's `mmmmm` names the same three maps, and nothing else.
+        assert_eq!(OpMap::from_vex(1), Some(OpMap::M0F));
+        assert_eq!(OpMap::from_vex(2), Some(OpMap::M0F38));
+        assert_eq!(OpMap::from_vex(3), Some(OpMap::M0F3A));
+        assert_eq!(OpMap::from_vex(0), None);
+        assert_eq!(OpMap::from_vex(4), None);
+    }
+
+    #[test]
+    fn every_0f3a_row_takes_an_immediate_byte() {
+        // The escape byte is a promise to a length decoder, so a row that
+        // broke it would desynchronise every instruction after it.
+        for table in [&TABLE_0F3A, &TABLE_0F3A_66] {
+            for (opcode, insn) in table.iter().enumerate() {
+                if insn.op == Op::UD {
+                    continue;
+                }
+                let imm: u8 = [insn.dst, insn.src, insn.aux]
+                    .iter()
+                    .map(|a| a.immediate_bytes(4, 4))
+                    .sum();
+                assert_eq!(imm, 1, "0F 3A {opcode:02x} ({:?})", insn.op);
+            }
+        }
+        // And no `0F 38` row takes one.
+        for table in [&TABLE_0F38, &TABLE_0F38_66, &TABLE_0F38_F2] {
+            for (opcode, insn) in table.iter().enumerate() {
+                let imm: u8 = [insn.dst, insn.src, insn.aux]
+                    .iter()
+                    .map(|a| a.immediate_bytes(4, 4))
+                    .sum();
+                assert_eq!(imm, 0, "0F 38 {opcode:02x} ({:?})", insn.op);
+            }
+        }
     }
 
     #[test]

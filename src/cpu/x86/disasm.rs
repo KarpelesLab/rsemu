@@ -215,6 +215,10 @@ const fn fixes_size(arg: Arg) -> bool {
             | Arg::Qq
             | Arg::Qd
             | Arg::Nq
+            | Arg::Xmm0
+            | Arg::Ww
+            | Arg::RdMb
+            | Arg::RdMw
     )
 }
 
@@ -335,7 +339,17 @@ impl Disassembled {
         for arg in [insn.dst, insn.src, insn.aux] {
             match arg {
                 Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed if modrm_mem => return true,
-                Arg::Wx | Arg::Wq | Arg::Wd | Arg::Ey | Arg::Qq | Arg::Qd if modrm_mem => {
+                Arg::Wx
+                | Arg::Wq
+                | Arg::Wd
+                | Arg::Ww
+                | Arg::Ey
+                | Arg::Qq
+                | Arg::Qd
+                | Arg::RdMb
+                | Arg::RdMw
+                    if modrm_mem =>
+                {
                     return true;
                 }
                 Arg::M | Arg::Mp | Arg::Ms => return true,
@@ -494,7 +508,19 @@ impl Disassembled {
             // The SSE operands.
             Arg::Vx => write!(f, "xmm{}", fields.reg_num()),
             Arg::Ux => write!(f, "xmm{}", fields.rm_num()),
-            Arg::Wx | Arg::Wq | Arg::Wd => {
+            Arg::Xmm0 => f.write_str("xmm0"),
+            // A general register named whole, whatever width the memory form
+            // would have: `pextrb eax, xmm1, 3`.
+            Arg::RdMb | Arg::RdMw => {
+                let modrm = fields.modrm.unwrap_or(ModRm::new(0));
+                if modrm.is_register() {
+                    f.write_str(regs_for(4, rex)[fields.rm_num() as usize])
+                } else {
+                    let size = arg.fp_bytes(osz).unwrap_or(0);
+                    self.write_mem(f, modrm, size, true)
+                }
+            }
+            Arg::Wx | Arg::Wq | Arg::Wd | Arg::Ww => {
                 let modrm = fields.modrm.unwrap_or(ModRm::new(0));
                 if modrm.is_register() {
                     write!(f, "xmm{}", fields.rm_num())
