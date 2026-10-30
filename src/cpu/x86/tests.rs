@@ -4137,6 +4137,156 @@ mod long_mode {
         assert_eq!(r.rax, 0xe306_9283);
     }
 
+    /// Run `code` in 64-bit mode on a part with `features` and require that
+    /// it raises `vector`, taken by a handler that halts.
+    fn faults64(features: Features, vector: u64, code: &[u8]) {
+        let pc = Pc::with_features(Variant::X86_64, features);
+        pc.idt64(vector, 0x18, la::HANDLER);
+        pc.write(la::HANDLER, &[0xf4]);
+        let mut all = code.to_vec();
+        all.push(0xf4);
+        let pc = run64_on(pc, 0, &all);
+        assert_eq!(
+            pc.regs().rip,
+            la::HANDLER + 1,
+            "{code:02x?} raises vector {vector}"
+        );
+    }
+
+    /// `lock cmpxchg16b [addr]`.
+    fn cmpxchg16b(addr: u64) -> Vec<u8> {
+        let mut code = alloc::vec![0xf0, 0x48, 0x0f, 0xc7];
+        code.extend_from_slice(&abs32(1, addr));
+        code
+    }
+
+    /// Load `RDX:RAX` and `RCX:RBX` with `mov r64, imm64`.
+    fn pairs(want: [u64; 2], new: [u64; 2]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for (rex_op, value) in [
+            (0xb8u8, want[0]),
+            (0xba, want[1]),
+            (0xbb, new[0]),
+            (0xb9, new[1]),
+        ] {
+            code.extend_from_slice(&[0x48, rex_op]);
+            code.extend_from_slice(&value.to_le_bytes());
+        }
+        code
+    }
+
+    #[test]
+    fn cmpxchg16b_exchanges_sixteen_bytes_on_a_part_with_cx16() {
+        let features = Features {
+            cx16: true,
+            ..Features::X86_64
+        };
+        // Equal: RCX:RBX is stored and ZF set.
+        let pc = Pc::with_features(Variant::X86_64, features);
+        pc.write64(la::MARK, 0x1111);
+        pc.write64(la::MARK + 8, 0x2222);
+        let mut code = pairs([0x1111, 0x2222], [0x3333, 0x4444]);
+        code.extend_from_slice(&cmpxchg16b(la::MARK));
+        code.push(0xf4);
+        let pc = run64_on(pc, 0, &code);
+        assert_eq!(pc.read64(la::MARK), 0x3333);
+        assert_eq!(pc.read64(la::MARK + 8), 0x4444);
+        assert_ne!(pc.regs().eflags & flags::ZF, 0);
+        // Unequal: memory is loaded into RDX:RAX and ZF cleared.
+        let pc = Pc::with_features(Variant::X86_64, features);
+        pc.write64(la::MARK, 0x1111);
+        pc.write64(la::MARK + 8, 0x2222);
+        let mut code = pairs([0x1111, 0x9999], [0x3333, 0x4444]);
+        code.extend_from_slice(&cmpxchg16b(la::MARK));
+        code.push(0xf4);
+        let pc = run64_on(pc, 0, &code);
+        assert_eq!(pc.read64(la::MARK), 0x1111, "memory unchanged");
+        let r = pc.regs();
+        assert_eq!((r.rax, r.rdx), (0x1111, 0x2222));
+        assert_eq!(r.eflags & flags::ZF, 0);
+        // Sixteen-byte alignment is required, and says so with #GP(0).
+        faults64(features, 13, &cmpxchg16b(la::MARK + 8));
+    }
+
+    #[test]
+    fn cmpxchg16b_is_undefined_without_cx16_but_cmpxchg8b_is_not() {
+        // The baseline: CX8 and no CX16, as the first long-mode parts.
+        faults64(Features::X86_64, 6, &cmpxchg16b(la::MARK));
+        let mut code = alloc::vec![0xf0, 0x0f, 0xc7];
+        code.extend_from_slice(&abs32(1, la::MARK));
+        code.push(0xf4);
+        run64_on(pc64(), 0, &code);
+        // CX16 cannot be had without long mode or without CX8.
+        for impossible in [
+            Features {
+                cx16: true,
+                ..Features::I80486
+            },
+            Features {
+                cx16: true,
+                cx8: false,
+                ..Features::X86_64
+            },
+        ] {
+            assert!(impossible.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn lahf_and_sahf_need_lahf_lm_in_64_bit_mode_only() {
+        // mov ah, 0xd5 ; sahf ; mov ah, 0 ; lahf: every status flag round
+        // trips through AH.
+        let code = [0xb4, 0xd5, 0x9e, 0xb4, 0x00, 0x9f, 0xf4];
+        let features = Features {
+            lahf_lm: true,
+            ..Features::X86_64
+        };
+        let pc = run64_on(Pc::with_features(Variant::X86_64, features), 0, &code);
+        assert_eq!(
+            (pc.regs().rax >> 8) & 0xff,
+            0xd7,
+            "SF ZF AF PF CF and bit 1"
+        );
+        // The baseline has neither in 64-bit mode.
+        faults64(Features::X86_64, 6, &[0x9f]);
+        faults64(Features::X86_64, 6, &[0x9e]);
+        // And everywhere else they need nothing: the 32-bit bring-up runs
+        // them on the same baseline part.
+        let pc = pc64();
+        pc.start_protected();
+        pc.write(at::CODE0, &code);
+        pc.run(20);
+        assert_eq!((pc.regs().rax >> 8) & 0xff, 0xd7);
+        let impossible = Features {
+            lahf_lm: true,
+            ..Features::I80486
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    #[test]
+    fn cpuid_reports_cx16_and_lahf_lm_from_the_features() {
+        // mov eax, 1 ; cpuid ; mov esi, ecx ; mov eax, 0x80000001 ; cpuid
+        let code = [
+            0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0x89, 0xce, 0xb8, 0x01, 0x00, 0x00, 0x80,
+            0x0f, 0xa2, 0xf4,
+        ];
+        let leaves = |features: Features| {
+            let pc = run64_on(Pc::with_features(Variant::X86_64, features), 0, &code);
+            (pc.regs().rsi, pc.regs().rcx)
+        };
+        let (ecx1, ecx8) = leaves(Features::X86_64);
+        assert_eq!(ecx1 & (1 << 13), 0);
+        assert_eq!(ecx8 & 1, 0);
+        let (ecx1, ecx8) = leaves(Features {
+            cx16: true,
+            lahf_lm: true,
+            ..Features::X86_64
+        });
+        assert_ne!(ecx1 & (1 << 13), 0, "CPUID.01H:ECX.CMPXCHG16B");
+        assert_ne!(ecx8 & 1, 0, "CPUID.80000001H:ECX.LAHF-SAHF");
+    }
+
     #[test]
     fn movnti_with_rex_w_stores_all_eight_bytes() {
         // mov rax, imm64 ; movnti [MARK], rax ; movnti [MARK+8], eax ; hlt

@@ -2597,6 +2597,13 @@ impl<'a> Exec<'a> {
                 self.push(u64::from(value), f.opsize)?;
             }
             Op::POPF => self.popf(f)?,
+            // `LAHF` and `SAHF` are valid in 64-bit mode only on a part that
+            // says so in `CPUID.80000001H:ECX[0]`; the first long-mode
+            // processors left them out (*Intel SDM* volume 2, `LAHF`, the
+            // 64-bit mode column; *AMD64 APM* volume 3, `LAHF`).
+            Op::SAHF | Op::LAHF if self.sixty_four() && !self.cfg.features.lahf_lm => {
+                return Err(Fault::bare(VEC_UD));
+            }
             Op::SAHF => {
                 let ah = u32::from(self.state.regs.byte(4));
                 let kept = self.state.regs.eflags & !flags::LOW_BYTE;
@@ -4138,7 +4145,7 @@ impl<'a> Exec<'a> {
             edx1 |= 1 << 15; // CMOV
         }
         if features.cx8 {
-            edx1 |= 1 << 8; // CX8: CMPXCHG8B, and CMPXCHG16B in long mode
+            edx1 |= 1 << 8; // CX8: CMPXCHG8B; CMPXCHG16B is ECX's CX16
         }
         if features.fpu {
             edx1 |= 1 << 0; // FPU: an on-die x87 unit
@@ -4170,6 +4177,9 @@ impl<'a> Exec<'a> {
         }
         if features.sse42 {
             ecx1 |= 1 << 20; // SSE4.2
+        }
+        if features.cx16 {
+            ecx1 |= 1 << 13; // CMPXCHG16B
         }
         if features.popcnt {
             ecx1 |= 1 << 23; // POPCNT
@@ -4244,7 +4254,9 @@ impl<'a> Exec<'a> {
                 if features.syscall {
                     edx |= 1 << 11; // SYSCALL/SYSRET
                 }
-                set(signature, 0, 0, edx);
+                // `LAHF-SAHF`, ECX[0]: the two flag moves in 64-bit mode.
+                let ecx = u32::from(features.lahf_lm);
+                set(signature, 0, ecx, edx);
             }
             0x8000_0007 if features.long => {
                 // `TscInvariant`, EDX[8], and nothing else in this leaf: the

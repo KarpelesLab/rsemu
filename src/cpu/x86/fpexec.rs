@@ -2531,6 +2531,12 @@ impl Exec<'_> {
             // ask for it anywhere else.
             return Err(Fault::bare(VEC_UD));
         }
+        if wide && !self.cfg.features.cx16 {
+            // And only on a part with `CPUID.01H:ECX.CMPXCHG16B`, which the
+            // first long-mode processors did not have (*Intel SDM* volume 2,
+            // `CMPXCHG8B/CMPXCHG16B`, "64-Bit Mode Exceptions").
+            return Err(Fault::bare(VEC_UD));
+        }
         let half = if wide { 8u8 } else { 4 };
         let (sr, off) = self.ea();
         if wide {

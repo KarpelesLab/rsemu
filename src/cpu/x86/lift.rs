@@ -4132,6 +4132,11 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
         Op::CMC => Plan::Carry(None),
         Op::CLD => Plan::Direction(false),
         Op::STD => Plan::Direction(true),
+        // In 64-bit mode these two exist only on a part with
+        // `CPUID.80000001H:ECX.LAHF-SAHF`, which is a property of the
+        // instance this world does not carry — so they are the interpreter's
+        // there, which raises `#UD` or executes them as the part says.
+        Op::LAHF | Op::SAHF if long => return None,
         Op::LAHF => Plan::Lahf,
         Op::SAHF => Plan::Sahf,
         Op::CBW => Plan::Cbw,

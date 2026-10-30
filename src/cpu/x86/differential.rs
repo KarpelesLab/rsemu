@@ -1140,9 +1140,23 @@ fn diverged(case: &Case, what: String) -> Divergence {
 }
 
 /// The configuration the oracle is built from.
+///
+/// The part's own preset, with one addition in 64-bit mode: [`synthesize64`]
+/// generates `LAHF` and `SAHF`, which the baseline long-mode part does not
+/// have *in 64-bit mode* (`Features::lahf_lm`), so the oracle is a part that
+/// does — otherwise those programs would stop at a `#UD` and compare nothing
+/// after it. The lifter hands both to the interpreter in 64-bit mode either
+/// way, because whether they exist there is a fact about the instance it does
+/// not carry.
 #[must_use]
 pub fn config(case: &Case) -> Config {
-    Config::I8088.with_variant(case.variant)
+    let cfg = Config::I8088.with_variant(case.variant);
+    if !case.long {
+        return cfg;
+    }
+    let mut features = cfg.features;
+    features.lahf_lm = true;
+    cfg.with_features(features)
 }
 
 /// The world this case lifts in.

@@ -673,6 +673,16 @@ pub struct Features {
     /// SSE4.2, though the two arrived together; requires
     /// [`sse2`](Features::sse2), because no part had it without.
     pub popcnt: bool,
+    /// `CMPXCHG16B` — `CMPXCHG8B` with `REX.W` — and `CPUID.01H:ECX[13]`.
+    /// Requires [`cx8`](Features::cx8) and [`long`](Features::long): the
+    /// instruction exists only in 64-bit mode. The first long-mode parts did
+    /// not have it, which is why the baseline preset does not either.
+    pub cx16: bool,
+    /// `LAHF` and `SAHF` in 64-bit mode, and `CPUID.80000001H:ECX[0]`.
+    /// They work in every other mode on every part; in 64-bit mode they are
+    /// `#UD` without this, as on the first long-mode parts. Requires
+    /// [`long`](Features::long). Linux calls it `lahf_lm`.
+    pub lahf_lm: bool,
 }
 
 impl Features {
@@ -701,6 +711,8 @@ impl Features {
         sse41: false,
         sse42: false,
         popcnt: false,
+        cx16: false,
+        lahf_lm: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -754,6 +766,8 @@ impl Features {
         sse41: false,
         sse42: false,
         popcnt: false,
+        cx16: false,
+        lahf_lm: false,
     };
 
     /// Whether this combination describes a part that could exist.
@@ -813,6 +827,15 @@ impl Features {
         }
         if self.popcnt && !self.sse2 {
             return missing("sse2", "popcnt");
+        }
+        if self.cx16 && !self.cx8 {
+            return missing("cx8", "cx16");
+        }
+        if self.cx16 && !self.long {
+            return missing("long", "cx16");
+        }
+        if self.lahf_lm && !self.long {
+            return missing("long", "lahf_lm");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2550,7 +2573,7 @@ impl X86 {
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
             "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
-            "popcnt", "xsave",
+            "popcnt", "cx16", "lahf_lm", "xsave",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2578,7 +2601,9 @@ impl X86 {
                 "ssse3" => features.ssse3 = on,
                 "sse41" => features.sse41 = on,
                 "sse42" => features.sse42 = on,
-                _ => features.popcnt = on,
+                "popcnt" => features.popcnt = on,
+                "cx16" => features.cx16 = on,
+                _ => features.lahf_lm = on,
             }
         }
         features.validate()?;
@@ -3781,7 +3806,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "cx8",
             kind: ValueKind::Bool,
             required: false,
-            summary: "override the preset: CMPXCHG8B, and CMPXCHG16B in long mode",
+            summary: "override the preset: CMPXCHG8B (CMPXCHG16B is cx16)",
         },
         PropertySpec {
             name: "fxsr",
@@ -3843,6 +3868,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: POPCNT",
+        },
+        PropertySpec {
+            name: "cx16",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: CMPXCHG16B",
+        },
+        PropertySpec {
+            name: "lahf_lm",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: LAHF and SAHF in 64-bit mode",
         },
         PropertySpec {
             name: "model",
