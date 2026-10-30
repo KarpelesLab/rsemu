@@ -12415,5 +12415,7 @@ mod v2 {
 /// AVX, in its own file: `tests/avx.rs`.
 mod avx;
 
+/// AVX2, FMA and F16C: `tests/avx2.rs`.
+mod avx2;
 /// BMI1 and BMI2, in their own file: `tests/bmi.rs`.
 mod bmi;

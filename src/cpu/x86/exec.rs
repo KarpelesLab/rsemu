@@ -4214,6 +4214,12 @@ impl<'a> Exec<'a> {
         if features.avx {
             ecx1 |= 1 << 28; // AVX: the VEX encoding and the YMM registers
         }
+        if features.fma {
+            ecx1 |= 1 << 12; // FMA
+        }
+        if features.f16c {
+            ecx1 |= 1 << 29; // F16C
+        }
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers
         }
@@ -4373,8 +4379,7 @@ impl<'a> Exec<'a> {
 /// so that the maximum basic leaf can ask whether there is anything to say:
 /// a leaf that would answer all zero is not worth raising the maximum for.
 /// Each extension that lives here adds its line — `BMI1` is `EBX[3]`, `AVX2`
-/// `EBX[5]`, `BMI2` `EBX[8]` — and none of them is implemented yet, so
-/// nothing sets a bit today. (`MOVBE` and `LZCNT` are older and live in
+/// `EBX[5]`, `BMI2` `EBX[8]`. (`MOVBE` and `LZCNT` are older and live in
 /// leaves 1 and `8000_0001`.)
 pub(super) fn structured_extended(features: super::Features) -> (u32, u32, u32) {
     let mut ebx: u32 = 0;
@@ -4385,6 +4390,9 @@ pub(super) fn structured_extended(features: super::Features) -> (u32, u32, u32) 
     }
     if features.bmi2 {
         ebx |= 1 << 8; // BMI2
+    }
+    if features.avx2 {
+        ebx |= 1 << 5; // AVX2
     }
     (ebx, ecx, edx)
 }

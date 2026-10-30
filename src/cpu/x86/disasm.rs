@@ -226,6 +226,10 @@ const fn fixes_size(arg: Arg) -> bool {
             | Arg::Wqx
             | Arg::Vdq
             | Arg::Wdq
+            | Arg::Wb
+            | Arg::Wx4
+            | Arg::Wx8
+            | Arg::Mvsib
     )
 }
 
@@ -266,11 +270,16 @@ impl fmt::Display for Disassembled {
         // carry the `v` in their own names, and so do the general-register
         // ones, BMI1's and BMI2's, which have no legacy encoding to tell
         // apart from.
-        if fields.is_vex()
-            && insn.op != Op::UD
-            && insn.op.extension() != Some(isa::Extension::Avx)
-            && !insn.op.is_bmi()
-        {
+        let own = matches!(
+            insn.op.extension(),
+            Some(
+                isa::Extension::Avx
+                    | isa::Extension::Avx2
+                    | isa::Extension::Fma
+                    | isa::Extension::F16c
+            )
+        );
+        if fields.is_vex() && insn.op != Op::UD && !own && !insn.op.is_bmi() {
             f.write_str("v")?;
         }
         f.write_str(self.mnemonic())?;
@@ -369,6 +378,10 @@ impl Disassembled {
                 | Arg::Wq
                 | Arg::Wd
                 | Arg::Ww
+                | Arg::Wb
+                | Arg::Wx4
+                | Arg::Wx8
+                | Arg::Mvsib
                 | Arg::Ey
                 | Arg::Qq
                 | Arg::Qd
@@ -539,9 +552,9 @@ impl Disassembled {
 
             // The SSE operands, which are `YMM` registers in a `VEX.256`
             // encoding.
-            Arg::Vx => write!(f, "{}{}", self.vector_reg(), fields.reg_num()),
+            Arg::Vx => write!(f, "{}{}", self.data_reg(), fields.reg_num()),
             Arg::Ux => write!(f, "{}{}", self.vector_reg(), fields.rm_num()),
-            Arg::Hx => write!(f, "{}{}", self.vector_reg(), fields.vvvv()),
+            Arg::Hx => write!(f, "{}{}", self.data_reg(), fields.vvvv()),
             Arg::Lx => {
                 // `imm8[7:4]`, of which only three bits reach a register
                 // outside 64-bit mode (*Intel SDM* volume 2 §2.3.5).
@@ -550,6 +563,11 @@ impl Disassembled {
                 write!(f, "{}{n}", self.vector_reg())
             }
             Arg::Vdq => write!(f, "xmm{}", fields.reg_num()),
+            // A gather's memory operand, whose index is a vector register.
+            Arg::Mvsib => {
+                let modrm = fields.modrm.unwrap_or(ModRm::new(0));
+                self.write_mem(f, modrm, 0, false)
+            }
             Arg::Xmm0 => f.write_str("xmm0"),
             // A general register named whole, whatever width the memory form
             // would have: `pextrb eax, xmm1, 3`.
@@ -562,7 +580,16 @@ impl Disassembled {
                     self.write_mem(f, modrm, size, true)
                 }
             }
-            Arg::Wx | Arg::Wqx | Arg::Wh | Arg::Wdq | Arg::Wq | Arg::Wd | Arg::Ww => {
+            Arg::Wx
+            | Arg::Wqx
+            | Arg::Wh
+            | Arg::Wdq
+            | Arg::Wq
+            | Arg::Wd
+            | Arg::Ww
+            | Arg::Wb
+            | Arg::Wx4
+            | Arg::Wx8 => {
                 let modrm = fields.modrm.unwrap_or(ModRm::new(0));
                 if modrm.is_register() {
                     // Only the full-length kinds name a `YMM` register; the
@@ -614,6 +641,29 @@ impl Disassembled {
                     self.write_mem(f, modrm, size, true)
                 }
             }
+        }
+    }
+
+    /// The register-file prefix for the `reg` and `vvvv` operands: the
+    /// vector length's, except for the gathers of doublewords by quadword
+    /// indices, whose data and mask are half the length of the index —
+    /// `vpgatherqd xmm1, [rax+ymm2*4], xmm3`.
+    fn data_reg(&self) -> &'static str {
+        if matches!(self.fields.insn.op, Op::VPGATHERQD | Op::VGATHERQPS) {
+            "xmm"
+        } else {
+            self.vector_reg()
+        }
+    }
+
+    /// The register-file prefix of a VSIB index: the vector length's,
+    /// except for the gathers of quadwords by doubleword indices, which
+    /// need only half as many index bits as data.
+    fn index_reg(&self) -> &'static str {
+        if matches!(self.fields.insn.op, Op::VPGATHERDQ | Op::VGATHERDPD) {
+            "xmm"
+        } else {
+            self.vector_reg()
         }
     }
 
@@ -672,7 +722,19 @@ impl Disassembled {
                 f.write_str(wide[self.fields.base_num() as usize])?;
                 wrote = true;
             }
-            if self.fields.has_index() {
+            let vsib = self.fields.insn.src == Arg::Mvsib;
+            if vsib {
+                // Every index field names a vector register, `100b`
+                // included: there is no "no index" in a VSIB.
+                if wrote {
+                    f.write_str("+")?;
+                }
+                write!(f, "{}{}", self.index_reg(), self.fields.index_num())?;
+                if sib.scale != 0 {
+                    write!(f, "*{}", 1u32 << sib.scale)?;
+                }
+                wrote = true;
+            } else if self.fields.has_index() {
                 if wrote {
                     f.write_str("+")?;
                 }

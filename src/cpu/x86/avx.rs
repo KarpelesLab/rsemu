@@ -66,14 +66,14 @@
 //! same instructions from the other vendor's side. No copyleft emulator was
 //! consulted (`CLAUDE.md`, provenance).
 
-use crate::float::{Env, Flags};
+use crate::float::{B16, B32, Env, Flags, Round, binary};
 
 use super::exec::{Ex, Exec, Fault, VEC_NM, VEC_UD};
 use super::fpexec::{
-    approximate, arith, bitwise, compare, convert_dwords, is_arith, is_bitwise, is_shift,
+    approximate, arith, bitwise, compare, convert_dwords, fused, is_arith, is_bitwise, is_shift,
     narrow_doubles, packed, shift_lanes, shuffle, widen_to_doubles,
 };
-use super::isa::{Arg, Extension, Fields, ModRm, Op, VexForm};
+use super::isa::{Arg, Extension, Fields, ModRm, Op, VexForm, VexLen};
 use super::prot::{cr0, cr4, xcr0};
 use super::simd::{dot, duplicate, horizontal, pcmpgtq, round, sse41, ssse3};
 
@@ -193,9 +193,19 @@ impl Exec<'_> {
         if f.insn.op == Op::UD {
             return Err(Fault::bare(VEC_UD));
         }
+        let wide = f.vector_bytes() == 32;
+        // The extensions after AVX: an instruction a part does not have is
+        // `#UD` whatever the rest of the gate says — `CR0.TS` included,
+        // because there is no instruction for `#NM` to defer. AVX2 is
+        // asked twice: by the instructions it added (the row's extension)
+        // and by the `VEX.256` forms of the integer ones (the row's length).
+        if !self.has_extension(f.insn)
+            || (wide && f.insn.vex.len == VexLen::Avx2 && !self.cfg.features.avx2)
+        {
+            return Err(Fault::bare(VEC_UD));
+        }
         self.avx_gate()?;
         let op = f.insn.op;
-        let wide = f.vector_bytes() == 32;
         match op {
             Op::VZEROUPPER | Op::VZEROALL => {
                 // Outside 64-bit mode only the first eight registers are
@@ -270,14 +280,21 @@ impl Exec<'_> {
                 self.set_xmm_vex(f.reg_num(), out);
                 Ok(())
             }
-            Op::VBROADCASTSS | Op::VBROADCASTSD | Op::VBROADCASTF128 => self.vex_broadcast(f, wide),
-            Op::VINSERTF128 => {
+            Op::VBROADCASTSS
+            | Op::VBROADCASTSD
+            | Op::VBROADCASTF128
+            | Op::VBROADCASTI128
+            | Op::VPBROADCASTB
+            | Op::VPBROADCASTW
+            | Op::VPBROADCASTD
+            | Op::VPBROADCASTQ => self.vex_broadcast(f, wide),
+            Op::VINSERTF128 | Op::VINSERTI128 => {
                 let mut v = self.ymm(f.vvvv());
                 v[usize::from(f.imm as u8 & 1)] = self.vex_read(f, Arg::Wdq, false)?[0];
                 self.set_ymm(f.reg_num(), v, true);
                 Ok(())
             }
-            Op::VEXTRACTF128 => {
+            Op::VEXTRACTF128 | Op::VEXTRACTI128 => {
                 let half = self.ymm(f.reg_num())[usize::from(f.imm as u8 & 1)];
                 if f.modrm.is_some_and(ModRm::is_register) {
                     self.set_xmm_vex(f.rm_num(), half);
@@ -287,10 +304,10 @@ impl Exec<'_> {
                     self.write_vec_mem(sr, off, 16, [half, [0; 2]])
                 }
             }
-            Op::VPERM2F128 => {
+            Op::VPERM2F128 | Op::VPERM2I128 => {
                 // Each half of the result is one of the four source halves,
                 // or zero, by a nibble of the immediate (*Intel SDM* volume
-                // 2, `VPERM2F128`).
+                // 2, `VPERM2F128`, `VPERM2I128`).
                 let a = self.ymm(f.vvvv());
                 let b = self.vex_read(f, Arg::Wx, false)?;
                 let pick = [a[0], a[1], b[0], b[1]];
@@ -306,13 +323,73 @@ impl Exec<'_> {
                 Ok(())
             }
             Op::VPERMILPS | Op::VPERMILPD => self.vex_permil(f, wide),
-            Op::VMASKMOVPS | Op::VMASKMOVPD => self.vex_maskmov(f, wide),
+            Op::VPERMD | Op::VPERMPS => {
+                // Across the whole register: each doubleword of the result
+                // is the data doubleword its index's low three bits name.
+                // The indices are `VEX.vvvv` and the data r/m (*Intel SDM*
+                // volume 2, `VPERMD`, `VPERMPS`).
+                let index = flat(self.ymm(f.vvvv()));
+                let data = flat(self.vex_read(f, Arg::Wx, false)?);
+                let mut out = [0u64; 4];
+                for i in 0..8 {
+                    let sel = (dword_of(&index, i) & 7) as usize;
+                    out[i / 2] |= dword_of(&data, sel) << (32 * (i % 2));
+                }
+                self.set_ymm(f.reg_num(), unflat(out), true);
+                Ok(())
+            }
+            Op::VPERMQ | Op::VPERMPD => {
+                // Each quadword of the result is the source quadword two
+                // bits of the immediate name (*Intel SDM* volume 2,
+                // `VPERMQ`, `VPERMPD`).
+                let data = flat(self.vex_read(f, Arg::Wx, false)?);
+                let imm = f.imm as u8;
+                let out = core::array::from_fn(|i| data[usize::from((imm >> (2 * i)) & 3)]);
+                self.set_ymm(f.reg_num(), unflat(out), true);
+                Ok(())
+            }
+            Op::VMASKMOVPS | Op::VMASKMOVPD | Op::VPMASKMOVD | Op::VPMASKMOVQ => {
+                self.vex_maskmov(f, wide)
+            }
+            Op::VPGATHERDD
+            | Op::VPGATHERDQ
+            | Op::VPGATHERQD
+            | Op::VPGATHERQQ
+            | Op::VGATHERDPS
+            | Op::VGATHERDPD
+            | Op::VGATHERQPS
+            | Op::VGATHERQPD => self.vex_gather(f, wide),
+            Op::PMOVMSKB => {
+                // The sign of every byte: sixteen bits, or thirty-two at
+                // `VEX.256` (*Intel SDM* volume 2, `PMOVMSKB`), zero-extended
+                // into the general register.
+                if !f.modrm.is_some_and(ModRm::is_register) {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let q = flat(self.ymm(f.rm_num()));
+                let mut mask = 0u64;
+                for (i, &word) in q.iter().enumerate().take(if wide { 4 } else { 2 }) {
+                    for byte in 0..8 {
+                        mask |= ((word >> (8 * byte + 7)) & 1) << (8 * i + byte);
+                    }
+                }
+                self.write_arg(f, Arg::Gy, if f.rex_w() { 8 } else { 4 }, mask)
+            }
+            Op::VCVTPH2PS => self.vex_half_to_single(f, wide),
+            Op::VCVTPS2PH => self.vex_single_to_half(f, wide),
             // The shift-by-immediate groups: the source is r/m, the count the
-            // immediate, and the destination `VEX.vvvv`.
+            // immediate, and the destination `VEX.vvvv`. Each 128-bit lane
+            // shifts on its own, `VPSLLDQ`/`VPSRLDQ` included (*Intel SDM*
+            // volume 2, `PSLLDQ`: "VEX.256 … shifts each 128-bit lane").
             _ if f.insn.vex.form == VexForm::Ndd => {
-                let v = self.state.sse.get(f.rm_num());
-                let out = shift_lanes(op, v, u64::from(f.imm as u8));
-                self.set_xmm_vex(f.vvvv(), out);
+                let v = self.ymm(f.rm_num());
+                let count = u64::from(f.imm as u8);
+                let high = if wide {
+                    shift_lanes(op, v[1], count)
+                } else {
+                    [0; 2]
+                };
+                self.set_ymm(f.vvvv(), [shift_lanes(op, v[0], count), high], wide);
                 Ok(())
             }
             // `VEX.128` only, and the legacy instruction with `VEX.vvvv` as
@@ -339,7 +416,6 @@ impl Exec<'_> {
             | Op::PINSRW
             | Op::PINSRD
             | Op::INSERTPS
-            | Op::PMOVMSKB
             | Op::MASKMOVDQU
             | Op::PCMPESTRI
             | Op::PCMPESTRM
@@ -383,6 +459,16 @@ impl Exec<'_> {
     /// Every operation that works one 128-bit lane at a time, at either
     /// length: read both sources, apply the shared kernel per lane, raise
     /// what any lane raised, and only then write.
+    ///
+    /// Three operations need their second source arranged first. A shift by
+    /// a register count takes the count from the low quadword of an
+    /// `XMM` register or sixteen bytes of memory at either length, and
+    /// applies it to both lanes (*Intel SDM* volume 2, `PSLLW`: "VEX.256 …
+    /// xmm3/m128"). The widening moves cross lanes at 256 bits — the upper
+    /// lane widens the next elements of the source — so that lane is handed
+    /// the source moved down by what the lower lane consumed. And an FMA
+    /// reads its destination as a third source, passed where the is4
+    /// blends pass their mask.
     fn vex_lanes(&mut self, f: &Fields, wide: bool) -> Ex<()> {
         let op = f.insn.op;
         let reg = f.reg_num();
@@ -391,9 +477,19 @@ impl Exec<'_> {
         } else {
             self.ymm(reg)
         };
-        let b = self.vex_read(f, f.insn.src, false)?;
+        let shift = is_shift(op);
+        let mut b = self.vex_read(f, if shift { Arg::Wdq } else { f.insn.src }, false)?;
+        if shift {
+            b[1] = b[0];
+        } else if let Some(consumed) = widening_step(op) {
+            let whole = u128::from(b[0][0]) | (u128::from(b[0][1]) << 64);
+            let rest = whole >> (8 * consumed);
+            b[1] = [rest as u64, (rest >> 64) as u64];
+        }
         let mask = if f.insn.aux == Arg::Lx {
             self.ymm(self.is4(f))
+        } else if f.insn.extension() == Some(Extension::Fma) {
+            self.ymm(reg)
         } else {
             [[0; 2]; 2]
         };
@@ -510,22 +606,33 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// The broadcasts: one element or one 128-bit half of memory into every
-    /// lane. Memory sources only — the register forms are AVX2's.
+    /// The broadcasts: one element, or one 128-bit half of memory, into
+    /// every lane.
+    ///
+    /// AVX's three take memory only; AVX2 adds the register forms of
+    /// `VBROADCASTSS`/`SD` and the integer broadcasts, whose register form
+    /// is the low element of an `XMM` register. The 128-bit ones stay
+    /// memory-only (*Intel SDM* volume 2, `VBROADCAST`, `VPBROADCAST`).
     fn vex_broadcast(&mut self, f: &Fields, wide: bool) -> Ex<()> {
-        if f.modrm.is_some_and(ModRm::is_register) {
+        let op = f.insn.op;
+        if f.modrm.is_some_and(ModRm::is_register)
+            && (matches!(op, Op::VBROADCASTF128 | Op::VBROADCASTI128) || !self.cfg.features.avx2)
+        {
             return Err(Fault::bare(VEC_UD));
         }
         let src = self.vex_read(f, f.insn.src, false)?;
-        let out = match f.insn.op {
-            Op::VBROADCASTSS => {
-                let d = src[0][0] & 0xffff_ffff;
-                let q = d | (d << 32);
-                [[q; 2]; 2]
+        let e = src[0][0];
+        let q = match op {
+            Op::VPBROADCASTB => (e & 0xff) * 0x0101_0101_0101_0101,
+            Op::VPBROADCASTW => (e & 0xffff) * 0x0001_0001_0001_0001,
+            Op::VBROADCASTSS | Op::VPBROADCASTD => (e & 0xffff_ffff) * 0x0000_0001_0000_0001,
+            Op::VBROADCASTSD | Op::VPBROADCASTQ => e,
+            _ => {
+                self.set_ymm(f.reg_num(), [src[0], src[0]], wide);
+                return Ok(());
             }
-            Op::VBROADCASTSD => [[src[0][0]; 2]; 2],
-            _ => [src[0], src[0]],
         };
+        let out = [[q; 2]; 2];
         self.set_ymm(f.reg_num(), out, wide);
         Ok(())
     }
@@ -576,8 +683,9 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// `VMASKMOVPS` and `VMASKMOVPD`: a load or a store of the elements whose
-    /// mask element in `VEX.vvvv` has its sign bit set.
+    /// `VMASKMOVPS`, `VMASKMOVPD` and AVX2's `VPMASKMOVD`/`Q`: a load or a
+    /// store of the elements whose mask element in `VEX.vvvv` has its sign
+    /// bit set.
     ///
     /// An element whose mask bit is clear is **not accessed at all**: a load
     /// reads zero for it and a store leaves its bytes alone, and neither can
@@ -590,7 +698,11 @@ impl Exec<'_> {
         if f.modrm.is_some_and(ModRm::is_register) {
             return Err(Fault::bare(VEC_UD));
         }
-        let size: u8 = if f.insn.op == Op::VMASKMOVPS { 4 } else { 8 };
+        let size: u8 = if matches!(f.insn.op, Op::VMASKMOVPS | Op::VPMASKMOVD) {
+            4
+        } else {
+            8
+        };
         let count = usize::from(f.vector_bytes() / size);
         let mask = flat(self.ymm(f.vvvv()));
         let per = usize::from(8 / size);
@@ -628,23 +740,264 @@ impl Exec<'_> {
     }
 }
 
+impl Exec<'_> {
+    /// The gathers: one load per element whose mask element's sign is set,
+    /// from an address built from a general base, the element's index in a
+    /// vector register, the scale and the displacement — a VSIB operand
+    /// (*Intel SDM* volume 2 §2.3.12, and `VPGATHERDD`, `VGATHERDPS` and
+    /// their siblings).
+    ///
+    /// The mask is the progress record, which is what makes a fault
+    /// restartable: first every mask element becomes all ones or all zeros
+    /// by its sign, and the mask is cleared above the elements the
+    /// instruction uses; then elements are fetched lowest first, and each
+    /// one's mask element is cleared as it completes, whether it was fetched
+    /// or skipped. A fault leaves the destination with the elements already
+    /// fetched and the mask with them cleared, so the handler's return
+    /// re-executes only what is left. Faults must be delivered lowest element
+    /// first, and the elements above a fault may or may not have completed;
+    /// here none have. On completion the mask is zero and the destination is
+    /// cleared above its data.
+    ///
+    /// `#UD` for a register operand, a ModRM without a SIB byte, a 16-bit
+    /// address size, or any two of the destination, the index and the mask
+    /// being one register. No alignment, and no SIMD floating-point
+    /// exception: a floating-point gather moves bits.
+    fn vex_gather(&mut self, f: &Fields, wide: bool) -> Ex<()> {
+        let op = f.insn.op;
+        let Some(m) = f.modrm else {
+            return Err(Fault::bare(VEC_UD));
+        };
+        let Some(sib) = f.sib else {
+            return Err(Fault::bare(VEC_UD));
+        };
+        if m.is_register() || m.rm != 4 || f.addrsize == 2 {
+            return Err(Fault::bare(VEC_UD));
+        }
+        let (dest, mask_reg, index_reg) = (f.reg_num(), f.vvvv(), f.index_num());
+        if dest == mask_reg || dest == index_reg || mask_reg == index_reg {
+            return Err(Fault::bare(VEC_UD));
+        }
+        let (size, index_size): (u8, u8) = match op {
+            Op::VPGATHERDD | Op::VGATHERDPS => (4, 4),
+            Op::VPGATHERDQ | Op::VGATHERDPD => (8, 4),
+            Op::VPGATHERQD | Op::VGATHERQPS => (4, 8),
+            _ => (8, 8),
+        };
+        let count = usize::from(if wide { 32 } else { 16 } / size.max(index_size));
+        let index = flat(self.ymm(index_reg));
+        let mut mask = flat(self.ymm(mask_reg));
+        let mut data = flat(self.ymm(dest));
+        for i in 0..usize::from(32 / size) {
+            let on = i < count && element(&mask, i, size) >> (8 * u32::from(size) - 1) != 0;
+            set_element(&mut mask, i, size, if on { u64::MAX } else { 0 });
+        }
+        self.set_ymm(mask_reg, unflat(mask), true);
+
+        // The common part of every address: base and displacement, summed
+        // at the address size as any effective address is.
+        let regs = &self.state.regs;
+        let base_present = !(sib.base == 5 && m.md == 0);
+        let sr = f.mem_segment();
+        let base = if f.addrsize == 4 {
+            let b = if base_present {
+                regs.qword(f.base_num()) as u32
+            } else {
+                0
+            };
+            u64::from(b.wrapping_add(f.disp as u32))
+        } else {
+            let b = if base_present {
+                regs.qword(f.base_num())
+            } else {
+                0
+            };
+            b.wrapping_add(f.disp as i64 as u64)
+        };
+        for i in 0..count {
+            if element(&mask, i, size) != 0 {
+                let raw = element(&index, i, index_size);
+                let idx = if index_size == 4 {
+                    i64::from(raw as u32 as i32) as u64
+                } else {
+                    raw
+                };
+                let offset = base.wrapping_add(idx << sib.scale);
+                let at = if f.addrsize == 4 {
+                    offset & 0xffff_ffff
+                } else {
+                    offset
+                };
+                match self.read_mem(sr, at, size) {
+                    Ok(v) => set_element(&mut data, i, size, v),
+                    Err(fault) => {
+                        self.set_ymm(dest, unflat(data), true);
+                        self.set_ymm(mask_reg, unflat(mask), true);
+                        return Err(fault);
+                    }
+                }
+            }
+            set_element(&mut mask, i, size, 0);
+        }
+        for i in count..usize::from(32 / size) {
+            set_element(&mut data, i, size, 0);
+        }
+        self.set_ymm(dest, unflat(data), true);
+        self.set_ymm(mask_reg, [[0; 2]; 2], true);
+        Ok(())
+    }
+
+    /// `VCVTPH2PS`: four or eight half-precision values, from the low half
+    /// of an `XMM` register or eight or sixteen bytes of memory, as singles.
+    ///
+    /// Every half is exact as a single, so the only exception is invalid,
+    /// for a signaling NaN; `MXCSR.DAZ` is ignored, a denormal half becomes
+    /// the normal single it equals, and no denormal-operand exception is
+    /// reported (*Intel SDM* volume 2, `VCVTPH2PS`).
+    fn vex_half_to_single(&mut self, f: &Fields, wide: bool) -> Ex<()> {
+        let src = self.vex_read(f, Arg::Wh, false)?[0];
+        let env = self.state.sse.env().daz(false);
+        let mut out = [0u64; 4];
+        let mut flags = Flags::NONE;
+        for i in 0..if wide { 8 } else { 4 } {
+            let half = (src[i / 4] >> (16 * (i % 4))) & 0xffff;
+            let (v, fl) = binary::convert::<B16, B32>(half, env);
+            flags |= Flags(fl.0 & !Flags::DENORMAL.0);
+            out[i / 2] |= v << (32 * (i % 2));
+        }
+        self.sse_raise(flags)?;
+        self.set_ymm(f.reg_num(), unflat(out), wide);
+        Ok(())
+    }
+
+    /// `VCVTPS2PH`: four or eight singles as half-precision values, into
+    /// the low half of an `XMM` register (the rest zeroed) or eight or
+    /// sixteen bytes of memory.
+    ///
+    /// `imm8[2]` set rounds by `MXCSR.RC`, clear by `imm8[1:0]`, which is
+    /// encoded as `RC` is. `MXCSR.FTZ` is ignored — a tiny result is a
+    /// denormal half — while `DAZ` applies to the inputs; overflow,
+    /// underflow, inexact, invalid and denormal are reported, and an unmasked
+    /// one writes nothing (*Intel SDM* volume 2, `VCVTPS2PH`).
+    fn vex_single_to_half(&mut self, f: &Fields, wide: bool) -> Ex<()> {
+        let src = flat(self.ymm(f.reg_num()));
+        let imm = f.imm as u8;
+        let mut env = self.state.sse.env().ftz(false);
+        if imm & 4 == 0 {
+            env = env.round(Round::from_x86_rc(u32::from(imm & 3)));
+        }
+        let count = if wide { 8 } else { 4 };
+        let mut out = [0u64; 2];
+        let mut flags = Flags::NONE;
+        for i in 0..count {
+            let (v, fl) = binary::convert::<B32, B16>(dword_of(&src, i), env);
+            flags |= fl;
+            out[i / 4] |= v << (16 * (i % 4));
+        }
+        self.sse_raise(flags)?;
+        if f.modrm.is_some_and(ModRm::is_register) {
+            self.set_xmm_vex(f.rm_num(), out);
+            Ok(())
+        } else {
+            let bytes = 2 * count as u8;
+            let (sr, off) = self.vex_address(bytes, false)?;
+            self.write_vec_mem(sr, off, bytes, [out, [0; 2]])
+        }
+    }
+}
+
+/// Doubleword `i` of a flattened `YMM` value.
+fn dword_of(q: &[u64; 4], i: usize) -> u64 {
+    (q[i / 2] >> (32 * (i % 2))) & 0xffff_ffff
+}
+
+/// Element `i`, of `size` bytes (4 or 8), of a flattened `YMM` value.
+fn element(q: &[u64; 4], i: usize, size: u8) -> u64 {
+    if size == 4 { dword_of(q, i) } else { q[i] }
+}
+
+/// Replace element `i`, of `size` bytes (4 or 8).
+fn set_element(q: &mut [u64; 4], i: usize, size: u8, v: u64) {
+    if size == 4 {
+        let shift = 32 * (i % 2);
+        q[i / 2] = (q[i / 2] & !(0xffff_ffff << shift)) | ((v & 0xffff_ffff) << shift);
+    } else {
+        q[i] = v;
+    }
+}
+
+/// How many bytes of its source a widening move consumes per 128-bit lane
+/// of result — where the upper lane's elements begin. `None` for anything
+/// else.
+fn widening_step(op: Op) -> Option<u32> {
+    match op {
+        Op::PMOVSXBW | Op::PMOVSXWD | Op::PMOVSXDQ | Op::PMOVZXBW | Op::PMOVZXWD | Op::PMOVZXDQ => {
+            Some(8)
+        }
+        Op::PMOVSXBD | Op::PMOVSXWQ | Op::PMOVZXBD | Op::PMOVZXWQ => Some(4),
+        Op::PMOVSXBQ | Op::PMOVZXBQ => Some(2),
+        _ => None,
+    }
+}
+
+/// AVX2's shifts by a vector of counts on one 128-bit lane: each element of
+/// `a` shifted by the matching element of `b`, the whole element taken as
+/// the count. A count of the element width or more gives zero, or for
+/// `VPSRAVD` the sign in every bit (*Intel SDM* volume 2, `VPSLLVD`,
+/// `VPSRLVD`, `VPSRAVD`).
+fn variable_shift(op: Op, a: [u64; 2], b: [u64; 2]) -> Option<[u64; 2]> {
+    let mut out = [0u64; 2];
+    match op {
+        Op::VPSLLVQ | Op::VPSRLVQ => {
+            for i in 0..2 {
+                out[i] = match (op, b[i]) {
+                    (_, 64..) => 0,
+                    (Op::VPSLLVQ, n) => a[i] << n,
+                    (_, n) => a[i] >> n,
+                };
+            }
+        }
+        Op::VPSLLVD | Op::VPSRLVD | Op::VPSRAVD => {
+            let q = [a[0], a[1], 0, 0];
+            let c = [b[0], b[1], 0, 0];
+            for i in 0..4 {
+                let v = dword_of(&q, i) as u32;
+                let n = dword_of(&c, i);
+                let r = match op {
+                    Op::VPSRAVD => ((v as i32) >> n.min(31)) as u32,
+                    _ if n >= 32 => 0,
+                    Op::VPSLLVD => v << n,
+                    _ => v >> n,
+                };
+                out[i / 2] |= u64::from(r) << (32 * (i % 2));
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
 /// The immediate one 128-bit lane sees.
 ///
 /// The same byte for most operations; the next bits of it for the three
 /// whose 256-bit forms spend one immediate bit per element across the whole
-/// register — `VSHUFPD` and `VBLENDPD` two bits per lane, `VBLENDPS` four
-/// (*Intel SDM* volume 2, each instruction's `VEX.256` "Operation").
+/// register — `VSHUFPD` and `VBLENDPD` two bits per lane, `VBLENDPS` and
+/// `VPBLENDD` four — and for `VMPSADBW`, whose upper lane takes its block
+/// selectors from bits 5:3 rather than 2:0 (*Intel SDM* volume 2, each
+/// instruction's `VEX.256` "Operation").
 fn lane_imm(op: Op, imm: u8, lane: usize) -> u8 {
     match op {
         Op::SHUFPD | Op::BLENDPD => imm >> (2 * lane),
-        Op::BLENDPS => imm >> (4 * lane),
+        Op::BLENDPS | Op::VPBLENDD => imm >> (4 * lane),
+        Op::MPSADBW => imm >> (3 * lane),
         _ => imm,
     }
 }
 
 /// Every operation that works one 128-bit lane at a time, on one lane: `a`
 /// the first source, `b` the second, `imm` that lane's immediate and `mask`
-/// that lane of the blend mask. `None` for an operation that is not one.
+/// that lane of the blend mask — or, for an FMA, of the destination, its
+/// third source. `None` for an operation that is not one.
 ///
 /// The kernels are the legacy executors' own, so a `VEX.128` encoding and
 /// its legacy twin compute the same bits by construction.
@@ -663,7 +1016,23 @@ pub(super) fn lane_op(
     if is_bitwise(op) {
         return exact(bitwise(op, a, b));
     }
+    if let Some(r) = fused(op, mask, a, b, env) {
+        return Some(r);
+    }
+    if let Some(v) = variable_shift(op, a, b) {
+        return exact(v);
+    }
     match op {
+        Op::VPBLENDD => {
+            let mut out = a;
+            for i in 0..4 {
+                if imm & (1 << i) != 0 {
+                    let m = 0xffff_ffffu64 << (32 * (i % 2));
+                    out[i / 2] = (out[i / 2] & !m) | (b[i / 2] & m);
+                }
+            }
+            exact(out)
+        }
         // The full five-bit predicate: VEX reaches all thirty-two.
         Op::CMPPS | Op::CMPPD | Op::CMPSS | Op::CMPSD => Some(compare(op, a, b, imm & 31, env)),
         Op::UNPCKLPS | Op::UNPCKHPS | Op::UNPCKLPD | Op::UNPCKHPD | Op::SHUFPS | Op::SHUFPD => {
@@ -792,6 +1161,25 @@ mod tests {
             Op::PCMPISTRM,
             Op::LDMXCSR,
             Op::STMXCSR,
+            Op::VBROADCASTI128,
+            Op::VPBROADCASTB,
+            Op::VPBROADCASTW,
+            Op::VPBROADCASTD,
+            Op::VPBROADCASTQ,
+            Op::VINSERTI128,
+            Op::VEXTRACTI128,
+            Op::VPERM2I128,
+            Op::VPERMD,
+            Op::VPERMPS,
+            Op::VPERMQ,
+            Op::VPERMPD,
+            Op::VPMASKMOVD,
+            Op::VPGATHERDD,
+            Op::VPGATHERQD,
+            Op::VGATHERDPS,
+            Op::VGATHERQPS,
+            Op::VCVTPH2PS,
+            Op::VCVTPS2PH,
         ];
         let zero = [0u64; 2];
         let mut lane_wise = 0;
@@ -813,12 +1201,54 @@ mod tests {
     }
 
     #[test]
+    fn fma_form_matches_every_mnemonic() {
+        use crate::cpu::x86::fpexec::{Subtract, fma_form};
+        // The position arithmetic in `fma_form` against the names it decodes.
+        let mut seen = 0;
+        for &op in Op::ALL {
+            let form = fma_form(op);
+            if op.extension() != Some(Extension::Fma) {
+                assert_eq!(form, None, "{op:?}");
+                continue;
+            }
+            seen += 1;
+            let form = form.unwrap();
+            let name = op.mnemonic();
+            let (kind, rest) = [
+                "vfmaddsub",
+                "vfmsubadd",
+                "vfnmadd",
+                "vfnmsub",
+                "vfmadd",
+                "vfmsub",
+            ]
+            .iter()
+            .find_map(|k| name.strip_prefix(k).map(|r| (*k, r)))
+            .unwrap();
+            assert_eq!(rest[..3].parse::<u16>().unwrap(), form.order, "{name}");
+            assert_eq!(&rest[3..4] == "s", form.scalar, "{name}");
+            assert_eq!(&rest[4..] == "d", form.double, "{name}");
+            assert_eq!(kind.starts_with("vfn"), form.negate_product, "{name}");
+            let subtract = match kind {
+                "vfmaddsub" => Subtract::Even,
+                "vfmsubadd" => Subtract::Odd,
+                "vfmsub" | "vfnmsub" => Subtract::All,
+                _ => Subtract::None,
+            };
+            assert_eq!(subtract, form.subtract, "{name}");
+        }
+        assert_eq!(seen, 60);
+    }
+
+    #[test]
     fn the_lane_immediate_steps_through_the_byte_only_where_it_must() {
         assert_eq!(lane_imm(Op::SHUFPD, 0b1110, 1), 0b11);
         assert_eq!(lane_imm(Op::BLENDPD, 0b1110, 1), 0b11);
         assert_eq!(lane_imm(Op::BLENDPS, 0xa5, 1), 0x0a);
         assert_eq!(lane_imm(Op::SHUFPS, 0xa5, 1), 0xa5);
         assert_eq!(lane_imm(Op::CMPPS, 0x1f, 1), 0x1f);
+        assert_eq!(lane_imm(Op::VPBLENDD, 0xa5, 1), 0x0a);
+        assert_eq!(lane_imm(Op::MPSADBW, 0b101_011, 1), 0b101);
     }
 
     #[test]

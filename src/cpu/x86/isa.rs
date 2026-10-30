@@ -440,6 +440,24 @@ pub enum Arg {
     /// row's [`VexForm`] places it, and a row whose destination is `Gy` or
     /// `Ey` gets this rather than a vector register.
     By,
+
+    // ---- AVX2, FMA, F16C ------------------------------------------------
+    /// An `XMM` register or a **byte** of memory: the source of
+    /// `VPBROADCASTB`, which replicates the register's low byte.
+    Wb,
+    /// An `XMM` register or a memory operand of a **quarter** of the vector
+    /// length — four bytes at 128 bits, eight at 256: the widening moves
+    /// that quadruple each element (`PMOVSXBD`, `PMOVSXWQ` and their
+    /// zero-extending twins).
+    Wx4,
+    /// An `XMM` register or a memory operand of an **eighth** of the vector
+    /// length — two bytes or four: `PMOVSXBQ` and `PMOVZXBQ`.
+    Wx8,
+    /// A **VSIB** memory operand: ModRM r/m must be `100b` with a SIB byte
+    /// whose index field names a *vector* register, one address per element
+    /// (*Intel SDM* volume 2 §2.3.12). The gathers' source; a register form
+    /// or a missing SIB is `#UD`, which the executor raises.
+    Mvsib,
 }
 
 impl Arg {
@@ -516,7 +534,11 @@ impl Arg {
             | Arg::Wqx
             | Arg::Vdq
             | Arg::Wdq
-            | Arg::By => None,
+            | Arg::By
+            | Arg::Wb
+            | Arg::Wx4
+            | Arg::Wx8
+            | Arg::Mvsib => None,
         }
     }
 
@@ -532,14 +554,15 @@ impl Arg {
     #[must_use]
     pub const fn fp_bytes(self, osz: u8) -> Option<u8> {
         match self {
-            Arg::Mf32 | Arg::Mi32 | Arg::Wd | Arg::Qd => Some(4),
+            Arg::Mf32 | Arg::Mi32 | Arg::Wd | Arg::Qd | Arg::Wx4 => Some(4),
             // `Wh` and `Wqx` are a quadword at 128 bits, which is the only
             // length a legacy encoding has; [`Fields::mem_bytes`] answers
             // for the 256-bit forms.
             Arg::Mf64 | Arg::Mi64 | Arg::Wq | Arg::Mq | Arg::Qq | Arg::Wh | Arg::Wqx => Some(8),
             Arg::Mf80 => Some(10),
-            Arg::Mi16 | Arg::Ww | Arg::RdMw => Some(2),
-            Arg::RdMb => Some(1),
+            // `Wx4` and `Wx8` likewise answer for 128 bits.
+            Arg::Mi16 | Arg::Ww | Arg::RdMw | Arg::Wx8 => Some(2),
+            Arg::RdMb | Arg::Wb => Some(1),
             Arg::Wx | Arg::Wdq => Some(16),
             Arg::Mfenv => Some(if osz == 2 { 14 } else { 28 }),
             Arg::Mfsave => Some(if osz == 2 { 94 } else { 108 }),
@@ -596,6 +619,10 @@ impl Arg {
                 | Arg::Wqx
                 | Arg::Vdq
                 | Arg::Wdq
+                | Arg::Wb
+                | Arg::Wx4
+                | Arg::Wx8
+                | Arg::Mvsib
         )
     }
 
@@ -1410,6 +1437,96 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("VTESTPS", "vtestps"),
     ("VZEROALL", "vzeroall"),
     ("VZEROUPPER", "vzeroupper"),
+    ("VPBROADCASTB", "vpbroadcastb"),
+    ("VPBROADCASTW", "vpbroadcastw"),
+    ("VPBROADCASTD", "vpbroadcastd"),
+    ("VPBROADCASTQ", "vpbroadcastq"),
+    ("VBROADCASTI128", "vbroadcasti128"),
+    ("VINSERTI128", "vinserti128"),
+    ("VEXTRACTI128", "vextracti128"),
+    ("VPERM2I128", "vperm2i128"),
+    ("VPERMD", "vpermd"),
+    ("VPERMPS", "vpermps"),
+    ("VPERMQ", "vpermq"),
+    ("VPERMPD", "vpermpd"),
+    ("VPBLENDD", "vpblendd"),
+    ("VPSLLVD", "vpsllvd"),
+    ("VPSLLVQ", "vpsllvq"),
+    ("VPSRLVD", "vpsrlvd"),
+    ("VPSRLVQ", "vpsrlvq"),
+    ("VPSRAVD", "vpsravd"),
+    ("VPMASKMOVD", "vpmaskmovd"),
+    ("VPMASKMOVQ", "vpmaskmovq"),
+    ("VGATHERDPS", "vgatherdps"),
+    ("VGATHERDPD", "vgatherdpd"),
+    ("VGATHERQPS", "vgatherqps"),
+    ("VGATHERQPD", "vgatherqpd"),
+    ("VPGATHERDD", "vpgatherdd"),
+    ("VPGATHERDQ", "vpgatherdq"),
+    ("VPGATHERQD", "vpgatherqd"),
+    ("VPGATHERQQ", "vpgatherqq"),
+    ("VFMADD132PS", "vfmadd132ps"),
+    ("VFMADD132PD", "vfmadd132pd"),
+    ("VFMADD132SS", "vfmadd132ss"),
+    ("VFMADD132SD", "vfmadd132sd"),
+    ("VFMADD213PS", "vfmadd213ps"),
+    ("VFMADD213PD", "vfmadd213pd"),
+    ("VFMADD213SS", "vfmadd213ss"),
+    ("VFMADD213SD", "vfmadd213sd"),
+    ("VFMADD231PS", "vfmadd231ps"),
+    ("VFMADD231PD", "vfmadd231pd"),
+    ("VFMADD231SS", "vfmadd231ss"),
+    ("VFMADD231SD", "vfmadd231sd"),
+    ("VFMSUB132PS", "vfmsub132ps"),
+    ("VFMSUB132PD", "vfmsub132pd"),
+    ("VFMSUB132SS", "vfmsub132ss"),
+    ("VFMSUB132SD", "vfmsub132sd"),
+    ("VFMSUB213PS", "vfmsub213ps"),
+    ("VFMSUB213PD", "vfmsub213pd"),
+    ("VFMSUB213SS", "vfmsub213ss"),
+    ("VFMSUB213SD", "vfmsub213sd"),
+    ("VFMSUB231PS", "vfmsub231ps"),
+    ("VFMSUB231PD", "vfmsub231pd"),
+    ("VFMSUB231SS", "vfmsub231ss"),
+    ("VFMSUB231SD", "vfmsub231sd"),
+    ("VFNMADD132PS", "vfnmadd132ps"),
+    ("VFNMADD132PD", "vfnmadd132pd"),
+    ("VFNMADD132SS", "vfnmadd132ss"),
+    ("VFNMADD132SD", "vfnmadd132sd"),
+    ("VFNMADD213PS", "vfnmadd213ps"),
+    ("VFNMADD213PD", "vfnmadd213pd"),
+    ("VFNMADD213SS", "vfnmadd213ss"),
+    ("VFNMADD213SD", "vfnmadd213sd"),
+    ("VFNMADD231PS", "vfnmadd231ps"),
+    ("VFNMADD231PD", "vfnmadd231pd"),
+    ("VFNMADD231SS", "vfnmadd231ss"),
+    ("VFNMADD231SD", "vfnmadd231sd"),
+    ("VFNMSUB132PS", "vfnmsub132ps"),
+    ("VFNMSUB132PD", "vfnmsub132pd"),
+    ("VFNMSUB132SS", "vfnmsub132ss"),
+    ("VFNMSUB132SD", "vfnmsub132sd"),
+    ("VFNMSUB213PS", "vfnmsub213ps"),
+    ("VFNMSUB213PD", "vfnmsub213pd"),
+    ("VFNMSUB213SS", "vfnmsub213ss"),
+    ("VFNMSUB213SD", "vfnmsub213sd"),
+    ("VFNMSUB231PS", "vfnmsub231ps"),
+    ("VFNMSUB231PD", "vfnmsub231pd"),
+    ("VFNMSUB231SS", "vfnmsub231ss"),
+    ("VFNMSUB231SD", "vfnmsub231sd"),
+    ("VFMADDSUB132PS", "vfmaddsub132ps"),
+    ("VFMADDSUB132PD", "vfmaddsub132pd"),
+    ("VFMADDSUB213PS", "vfmaddsub213ps"),
+    ("VFMADDSUB213PD", "vfmaddsub213pd"),
+    ("VFMADDSUB231PS", "vfmaddsub231ps"),
+    ("VFMADDSUB231PD", "vfmaddsub231pd"),
+    ("VFMSUBADD132PS", "vfmsubadd132ps"),
+    ("VFMSUBADD132PD", "vfmsubadd132pd"),
+    ("VFMSUBADD213PS", "vfmsubadd213ps"),
+    ("VFMSUBADD213PD", "vfmsubadd213pd"),
+    ("VFMSUBADD231PS", "vfmsubadd231ps"),
+    ("VFMSUBADD231PD", "vfmsubadd231pd"),
+    ("VCVTPH2PS", "vcvtph2ps"),
+    ("VCVTPS2PH", "vcvtps2ph"),
 ];
 
 define_ops! {
@@ -2030,6 +2147,104 @@ define_ops! {
     VTESTPS = "set ZF and CF from the sign bits of the AND and the AND NOT of two vectors of singles",
     VZEROALL = "zero every YMM register",
     VZEROUPPER = "zero bits 255:128 of every YMM register",
+    // ---- AVX2: the instructions it adds -----------------------------------
+    VPBROADCASTB = "replicate the low byte of a register or a byte of memory into every lane",
+    VPBROADCASTW = "replicate the low word of a register or a word of memory into every lane",
+    VPBROADCASTD = "replicate the low doubleword of a register or memory into every lane",
+    VPBROADCASTQ = "replicate the low quadword of a register or memory into every lane",
+    VBROADCASTI128 = "replicate sixteen bytes of integer data into both halves of a YMM register",
+    VINSERTI128 = "replace the 128-bit half of a YMM register the immediate names, integer domain",
+    VEXTRACTI128 = "extract the 128-bit half of a YMM register the immediate names, integer domain",
+    VPERM2I128 = "select each 128-bit half of the result from either source, or zero, integer domain",
+    VPERMD = "permute doublewords across the whole register by a vector of indices",
+    VPERMPS = "permute singles across the whole register by a vector of indices",
+    VPERMQ = "permute quadwords across the whole register by an immediate",
+    VPERMPD = "permute doubles across the whole register by an immediate",
+    VPBLENDD = "select each doubleword from either source by a bit of the immediate",
+    VPSLLVD = "shift each doubleword left by the count in the matching lane",
+    VPSLLVQ = "shift each quadword left by the count in the matching lane",
+    VPSRLVD = "shift each doubleword right, logically, by the count in the matching lane",
+    VPSRLVQ = "shift each quadword right, logically, by the count in the matching lane",
+    VPSRAVD = "shift each doubleword right, arithmetically, by the count in the matching lane",
+    VPMASKMOVD = "load or store the doublewords whose mask lane has its sign bit set",
+    VPMASKMOVQ = "load or store the quadwords whose mask lane has its sign bit set",
+    VGATHERDPS = "gather singles from memory at doubleword indices, under a mask",
+    VGATHERDPD = "gather doubles from memory at doubleword indices, under a mask",
+    VGATHERQPS = "gather singles from memory at quadword indices, under a mask",
+    VGATHERQPD = "gather doubles from memory at quadword indices, under a mask",
+    VPGATHERDD = "gather doublewords from memory at doubleword indices, under a mask",
+    VPGATHERDQ = "gather quadwords from memory at doubleword indices, under a mask",
+    VPGATHERQD = "gather doublewords from memory at quadword indices, under a mask",
+    VPGATHERQQ = "gather quadwords from memory at quadword indices, under a mask",
+    // ---- FMA ------------------------------------------------------------
+    //
+    // Declared in a fixed order — the four kinds by the three operand
+    // orders by `PS`, `PD`, `SS`, `SD`, then the two alternating kinds by
+    // the three orders by `PS`, `PD` — which `fpexec::fma_form` decodes by
+    // position, and its test checks against the mnemonics.
+    VFMADD132PS = "fused multiply-add of packed singles: the destination times the third source, with the second",
+    VFMADD132PD = "fused multiply-add of packed doubles: the destination times the third source, with the second",
+    VFMADD132SS = "fused multiply-add of the low single: the destination times the third source, with the second",
+    VFMADD132SD = "fused multiply-add of the low double: the destination times the third source, with the second",
+    VFMADD213PS = "fused multiply-add of packed singles: the second source times the destination, with the third",
+    VFMADD213PD = "fused multiply-add of packed doubles: the second source times the destination, with the third",
+    VFMADD213SS = "fused multiply-add of the low single: the second source times the destination, with the third",
+    VFMADD213SD = "fused multiply-add of the low double: the second source times the destination, with the third",
+    VFMADD231PS = "fused multiply-add of packed singles: the second source times the third, with the destination",
+    VFMADD231PD = "fused multiply-add of packed doubles: the second source times the third, with the destination",
+    VFMADD231SS = "fused multiply-add of the low single: the second source times the third, with the destination",
+    VFMADD231SD = "fused multiply-add of the low double: the second source times the third, with the destination",
+    VFMSUB132PS = "fused multiply-subtract of packed singles: the destination times the third source, with the second",
+    VFMSUB132PD = "fused multiply-subtract of packed doubles: the destination times the third source, with the second",
+    VFMSUB132SS = "fused multiply-subtract of the low single: the destination times the third source, with the second",
+    VFMSUB132SD = "fused multiply-subtract of the low double: the destination times the third source, with the second",
+    VFMSUB213PS = "fused multiply-subtract of packed singles: the second source times the destination, with the third",
+    VFMSUB213PD = "fused multiply-subtract of packed doubles: the second source times the destination, with the third",
+    VFMSUB213SS = "fused multiply-subtract of the low single: the second source times the destination, with the third",
+    VFMSUB213SD = "fused multiply-subtract of the low double: the second source times the destination, with the third",
+    VFMSUB231PS = "fused multiply-subtract of packed singles: the second source times the third, with the destination",
+    VFMSUB231PD = "fused multiply-subtract of packed doubles: the second source times the third, with the destination",
+    VFMSUB231SS = "fused multiply-subtract of the low single: the second source times the third, with the destination",
+    VFMSUB231SD = "fused multiply-subtract of the low double: the second source times the third, with the destination",
+    VFNMADD132PS = "fused negated multiply-add of packed singles: the destination times the third source, with the second",
+    VFNMADD132PD = "fused negated multiply-add of packed doubles: the destination times the third source, with the second",
+    VFNMADD132SS = "fused negated multiply-add of the low single: the destination times the third source, with the second",
+    VFNMADD132SD = "fused negated multiply-add of the low double: the destination times the third source, with the second",
+    VFNMADD213PS = "fused negated multiply-add of packed singles: the second source times the destination, with the third",
+    VFNMADD213PD = "fused negated multiply-add of packed doubles: the second source times the destination, with the third",
+    VFNMADD213SS = "fused negated multiply-add of the low single: the second source times the destination, with the third",
+    VFNMADD213SD = "fused negated multiply-add of the low double: the second source times the destination, with the third",
+    VFNMADD231PS = "fused negated multiply-add of packed singles: the second source times the third, with the destination",
+    VFNMADD231PD = "fused negated multiply-add of packed doubles: the second source times the third, with the destination",
+    VFNMADD231SS = "fused negated multiply-add of the low single: the second source times the third, with the destination",
+    VFNMADD231SD = "fused negated multiply-add of the low double: the second source times the third, with the destination",
+    VFNMSUB132PS = "fused negated multiply-subtract of packed singles: the destination times the third source, with the second",
+    VFNMSUB132PD = "fused negated multiply-subtract of packed doubles: the destination times the third source, with the second",
+    VFNMSUB132SS = "fused negated multiply-subtract of the low single: the destination times the third source, with the second",
+    VFNMSUB132SD = "fused negated multiply-subtract of the low double: the destination times the third source, with the second",
+    VFNMSUB213PS = "fused negated multiply-subtract of packed singles: the second source times the destination, with the third",
+    VFNMSUB213PD = "fused negated multiply-subtract of packed doubles: the second source times the destination, with the third",
+    VFNMSUB213SS = "fused negated multiply-subtract of the low single: the second source times the destination, with the third",
+    VFNMSUB213SD = "fused negated multiply-subtract of the low double: the second source times the destination, with the third",
+    VFNMSUB231PS = "fused negated multiply-subtract of packed singles: the second source times the third, with the destination",
+    VFNMSUB231PD = "fused negated multiply-subtract of packed doubles: the second source times the third, with the destination",
+    VFNMSUB231SS = "fused negated multiply-subtract of the low single: the second source times the third, with the destination",
+    VFNMSUB231SD = "fused negated multiply-subtract of the low double: the second source times the third, with the destination",
+    VFMADDSUB132PS = "fused multiply, subtracting in the even lanes and adding in the odd of packed singles: the destination times the third source, with the second",
+    VFMADDSUB132PD = "fused multiply, subtracting in the even lanes and adding in the odd of packed doubles: the destination times the third source, with the second",
+    VFMADDSUB213PS = "fused multiply, subtracting in the even lanes and adding in the odd of packed singles: the second source times the destination, with the third",
+    VFMADDSUB213PD = "fused multiply, subtracting in the even lanes and adding in the odd of packed doubles: the second source times the destination, with the third",
+    VFMADDSUB231PS = "fused multiply, subtracting in the even lanes and adding in the odd of packed singles: the second source times the third, with the destination",
+    VFMADDSUB231PD = "fused multiply, subtracting in the even lanes and adding in the odd of packed doubles: the second source times the third, with the destination",
+    VFMSUBADD132PS = "fused multiply, adding in the even lanes and subtracting in the odd of packed singles: the destination times the third source, with the second",
+    VFMSUBADD132PD = "fused multiply, adding in the even lanes and subtracting in the odd of packed doubles: the destination times the third source, with the second",
+    VFMSUBADD213PS = "fused multiply, adding in the even lanes and subtracting in the odd of packed singles: the second source times the destination, with the third",
+    VFMSUBADD213PD = "fused multiply, adding in the even lanes and subtracting in the odd of packed doubles: the second source times the destination, with the third",
+    VFMSUBADD231PS = "fused multiply, adding in the even lanes and subtracting in the odd of packed singles: the second source times the third, with the destination",
+    VFMSUBADD231PD = "fused multiply, adding in the even lanes and subtracting in the odd of packed doubles: the second source times the third, with the destination",
+    // ---- F16C ------------------------------------------------------------
+    VCVTPH2PS = "convert half-precision values to singles, exactly",
+    VCVTPS2PH = "convert singles to half precision under the immediate's rounding",
 }
 
 impl Op {
@@ -2763,6 +2978,95 @@ impl Op {
             | Op::VTESTPS
             | Op::VZEROALL
             | Op::VZEROUPPER => Extension::Avx,
+            Op::VPBROADCASTB
+            | Op::VPBROADCASTW
+            | Op::VPBROADCASTD
+            | Op::VPBROADCASTQ
+            | Op::VBROADCASTI128
+            | Op::VINSERTI128
+            | Op::VEXTRACTI128
+            | Op::VPERM2I128
+            | Op::VPERMD
+            | Op::VPERMPS
+            | Op::VPERMQ
+            | Op::VPERMPD
+            | Op::VPBLENDD
+            | Op::VPSLLVD
+            | Op::VPSLLVQ
+            | Op::VPSRLVD
+            | Op::VPSRLVQ
+            | Op::VPSRAVD
+            | Op::VPMASKMOVD
+            | Op::VPMASKMOVQ
+            | Op::VGATHERDPS
+            | Op::VGATHERDPD
+            | Op::VGATHERQPS
+            | Op::VGATHERQPD
+            | Op::VPGATHERDD
+            | Op::VPGATHERDQ
+            | Op::VPGATHERQD
+            | Op::VPGATHERQQ => Extension::Avx2,
+            Op::VFMADD132PS
+            | Op::VFMADD132PD
+            | Op::VFMADD132SS
+            | Op::VFMADD132SD
+            | Op::VFMADD213PS
+            | Op::VFMADD213PD
+            | Op::VFMADD213SS
+            | Op::VFMADD213SD
+            | Op::VFMADD231PS
+            | Op::VFMADD231PD
+            | Op::VFMADD231SS
+            | Op::VFMADD231SD
+            | Op::VFMSUB132PS
+            | Op::VFMSUB132PD
+            | Op::VFMSUB132SS
+            | Op::VFMSUB132SD
+            | Op::VFMSUB213PS
+            | Op::VFMSUB213PD
+            | Op::VFMSUB213SS
+            | Op::VFMSUB213SD
+            | Op::VFMSUB231PS
+            | Op::VFMSUB231PD
+            | Op::VFMSUB231SS
+            | Op::VFMSUB231SD
+            | Op::VFNMADD132PS
+            | Op::VFNMADD132PD
+            | Op::VFNMADD132SS
+            | Op::VFNMADD132SD
+            | Op::VFNMADD213PS
+            | Op::VFNMADD213PD
+            | Op::VFNMADD213SS
+            | Op::VFNMADD213SD
+            | Op::VFNMADD231PS
+            | Op::VFNMADD231PD
+            | Op::VFNMADD231SS
+            | Op::VFNMADD231SD
+            | Op::VFNMSUB132PS
+            | Op::VFNMSUB132PD
+            | Op::VFNMSUB132SS
+            | Op::VFNMSUB132SD
+            | Op::VFNMSUB213PS
+            | Op::VFNMSUB213PD
+            | Op::VFNMSUB213SS
+            | Op::VFNMSUB213SD
+            | Op::VFNMSUB231PS
+            | Op::VFNMSUB231PD
+            | Op::VFNMSUB231SS
+            | Op::VFNMSUB231SD
+            | Op::VFMADDSUB132PS
+            | Op::VFMADDSUB132PD
+            | Op::VFMADDSUB213PS
+            | Op::VFMADDSUB213PD
+            | Op::VFMADDSUB231PS
+            | Op::VFMADDSUB231PD
+            | Op::VFMSUBADD132PS
+            | Op::VFMSUBADD132PD
+            | Op::VFMSUBADD213PS
+            | Op::VFMSUBADD213PD
+            | Op::VFMSUBADD231PS
+            | Op::VFMSUBADD231PD => Extension::Fma,
+            Op::VCVTPH2PS | Op::VCVTPS2PH => Extension::F16c,
             _ => return None,
         };
         Some(ext)
@@ -2951,6 +3255,14 @@ pub enum Extension {
     /// The VEX forms of older instructions keep their own extension, and the
     /// VEX prefix itself is what is gated on AVX.
     Avx,
+    /// AVX2: `CPUID.(EAX=07H,ECX=0):EBX[5]`. Like [`Extension::Avx`], only
+    /// the instructions AVX2 *added* answer this; the `VEX.256` forms of the
+    /// integer instructions are gated by their row ([`VexLen::Avx2`]).
+    Avx2,
+    /// FMA: `CPUID.01H:ECX[12]`, the fused multiply-adds.
+    Fma,
+    /// F16C: `CPUID.01H:ECX[29]`, the half-precision conversions.
+    F16c,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -3008,6 +3320,15 @@ pub struct Vex {
     /// `VEX.W` must be 0, and is `#UD` otherwise (the instruction page's
     /// `W0`, against `WIG` for "ignored").
     pub w0: bool,
+    /// `VEX.W` must be 1, and is `#UD` otherwise: `VPERMQ` and `VPERMPD`,
+    /// the instruction pages' `W1`.
+    pub w1: bool,
+    /// The operation `VEX.W = 1` selects instead of the row's own, where
+    /// the bit picks an element width rather than being ignored — the FMA
+    /// family's `PS`/`PD` and `SS`/`SD`, `VPMASKMOVD`/`Q`, the variable
+    /// shifts and the gathers. Intel prints the two as separate lines with
+    /// one opcode; they differ in nothing but the element.
+    pub w1_op: Option<Op>,
 }
 
 /// What `VEX.vvvv` means for one row.
@@ -3065,6 +3386,11 @@ pub enum VexLen {
     /// `VEX.L` ignored: the scalar instructions, which read and write one
     /// lane whatever it says. Intel's `LIG`.
     Ignored,
+    /// Both lengths, but `VEX.256` is **AVX2's**: the integer SSE2–SSE4.1
+    /// instructions AVX gave a `VEX.128` form and AVX2 widened. The decoder
+    /// accepts both, because it cannot see the part's features; the
+    /// executor raises `#UD` for `VEX.L = 1` on a part without AVX2.
+    Avx2,
 }
 
 impl Vex {
@@ -3074,6 +3400,8 @@ impl Vex {
         len: VexLen::Any,
         only: false,
         w0: false,
+        w1: false,
+        w1_op: None,
     };
 
     /// A VEX form with this `vvvv` use and these lengths.
@@ -3084,6 +3412,8 @@ impl Vex {
             len,
             only: false,
             w0: false,
+            w1: false,
+            w1_op: None,
         }
     }
 
@@ -3098,6 +3428,20 @@ impl Vex {
     #[must_use]
     pub const fn w0(mut self) -> Vex {
         self.w0 = true;
+        self
+    }
+
+    /// The same, with `VEX.W` required to be 1.
+    #[must_use]
+    pub const fn w1(mut self) -> Vex {
+        self.w1 = true;
+        self
+    }
+
+    /// The same, with `VEX.W = 1` selecting `op` instead.
+    #[must_use]
+    pub const fn wop(mut self, op: Op) -> Vex {
+        self.w1_op = Some(op);
         self
     }
 
@@ -3268,7 +3612,7 @@ macro_rules! opmap {
         base $base:expr;
         $($opcode:literal $op:ident $dst:ident $src:ident $(+ $aux:ident)? $group:ident $class:ident
           $(=> ($($long:tt)+))?
-          $(| $vform:ident $(($valt:ident))? $vlen:ident $($vflag:ident)*)? ;)*
+          $(| $vform:ident $(($valt:ident))? $vlen:ident $($vflag:ident $(($vfarg:ident))?)*)? ;)*
     ) => {{
         let mut t: [Insn; 256] = $base;
         let mut listed = [false; 256];
@@ -3277,7 +3621,7 @@ macro_rules! opmap {
                 Insn::new(Op::$op, Arg::$dst, Arg::$src, Grp::$group, Class::$class)
                 $(.with_aux(Arg::$aux))?
                 $(.with_long(long_spec!($($long)+)))?
-                $(.with_vex(vex_spec!($vform $(($valt))? $vlen $($vflag)*)))?;
+                $(.with_vex(vex_spec!($vform $(($valt))? $vlen $($vflag $(($vfarg))?)*)))?;
             listed[$opcode as usize] = true;
         )*
         (t, listed)
@@ -3288,14 +3632,15 @@ macro_rules! opmap {
 ///
 /// `| Nds Any` reads "VEX form with an `NDS` source, at either length";
 /// `| Plain L128` "VEX.128 only, `vvvv` unused". The flags after the length
-/// are `only` (no legacy encoding) and `w0` (`VEX.W1` is `#UD`).
+/// are `only` (no legacy encoding), `w0` (`VEX.W1` is `#UD`), `w1`
+/// (`VEX.W0` is `#UD`) and `wop(OP)` (`VEX.W1` is `OP`).
 /// `| Alt(OP) Any` is the one cell whose VEX encoding is another operation.
 macro_rules! vex_spec {
-    (Alt($op:ident) $len:ident $($flag:ident)*) => {
-        Vex::new(VexForm::Alt(Op::$op), VexLen::$len)$(.$flag())*
+    (Alt($op:ident) $len:ident $($flag:ident $(($farg:ident))?)*) => {
+        Vex::new(VexForm::Alt(Op::$op), VexLen::$len)$(.$flag($(Op::$farg)?))*
     };
-    ($form:ident $len:ident $($flag:ident)*) => {
-        Vex::new(VexForm::$form, VexLen::$len)$(.$flag())*
+    ($form:ident $len:ident $($flag:ident $(($farg:ident))?)*) => {
+        Vex::new(VexForm::$form, VexLen::$len)$(.$flag($(Op::$farg)?))*
     };
 }
 
@@ -4085,32 +4430,32 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x5d MINPD    Vx Wx None   Documented | Nds Any;
     0x5e DIVPD    Vx Wx None   Documented | Nds Any;
     0x5f MAXPD    Vx Wx None   Documented | Nds Any;
-    0x60 PUNPCKLBW  Vx Wx None   Documented | Nds L128;
-    0x61 PUNPCKLWD  Vx Wx None   Documented | Nds L128;
-    0x62 PUNPCKLDQ  Vx Wx None   Documented | Nds L128;
-    0x63 PACKSSWB   Vx Wx None   Documented | Nds L128;
-    0x64 PCMPGTB    Vx Wx None   Documented | Nds L128;
-    0x65 PCMPGTW    Vx Wx None   Documented | Nds L128;
-    0x66 PCMPGTD    Vx Wx None   Documented | Nds L128;
-    0x67 PACKUSWB   Vx Wx None   Documented | Nds L128;
-    0x68 PUNPCKHBW  Vx Wx None   Documented | Nds L128;
-    0x69 PUNPCKHWD  Vx Wx None   Documented | Nds L128;
-    0x6a PUNPCKHDQ  Vx Wx None   Documented | Nds L128;
-    0x6b PACKSSDW   Vx Wx None   Documented | Nds L128;
-    0x6c PUNPCKLQDQ Vx Wx None   Documented | Nds L128;
-    0x6d PUNPCKHQDQ Vx Wx None   Documented | Nds L128;
+    0x60 PUNPCKLBW  Vx Wx None   Documented | Nds Avx2;
+    0x61 PUNPCKLWD  Vx Wx None   Documented | Nds Avx2;
+    0x62 PUNPCKLDQ  Vx Wx None   Documented | Nds Avx2;
+    0x63 PACKSSWB   Vx Wx None   Documented | Nds Avx2;
+    0x64 PCMPGTB    Vx Wx None   Documented | Nds Avx2;
+    0x65 PCMPGTW    Vx Wx None   Documented | Nds Avx2;
+    0x66 PCMPGTD    Vx Wx None   Documented | Nds Avx2;
+    0x67 PACKUSWB   Vx Wx None   Documented | Nds Avx2;
+    0x68 PUNPCKHBW  Vx Wx None   Documented | Nds Avx2;
+    0x69 PUNPCKHWD  Vx Wx None   Documented | Nds Avx2;
+    0x6a PUNPCKHDQ  Vx Wx None   Documented | Nds Avx2;
+    0x6b PACKSSDW   Vx Wx None   Documented | Nds Avx2;
+    0x6c PUNPCKLQDQ Vx Wx None   Documented | Nds Avx2;
+    0x6d PUNPCKHQDQ Vx Wx None   Documented | Nds Avx2;
     0x6e MOVD     Vx Ey None   Documented | Plain L128;
     0x6f MOVDQA   Vx Wx None   Documented | Plain Any;
-    0x70 PSHUFD     Vx Wx +Ib None Documented | Plain L128;
+    0x70 PSHUFD     Vx Wx +Ib None Documented | Plain Avx2;
     // The three shift-by-immediate groups. Every one of them is a register
     // form only: the count is the immediate and there is nowhere for a memory
     // operand to go, which is why `mod != 11` is not an encoding.
-    0x71 PSRLW      Ux Ib  Grp12  Documented | Ndd L128;
-    0x72 PSRLD      Ux Ib  Grp13  Documented | Ndd L128;
-    0x73 PSRLQ      Ux Ib  Grp14  Documented | Ndd L128;
-    0x74 PCMPEQB    Vx Wx None   Documented | Nds L128;
-    0x75 PCMPEQW    Vx Wx None   Documented | Nds L128;
-    0x76 PCMPEQD    Vx Wx None   Documented | Nds L128;
+    0x71 PSRLW      Ux Ib  Grp12  Documented | Ndd Avx2;
+    0x72 PSRLD      Ux Ib  Grp13  Documented | Ndd Avx2;
+    0x73 PSRLQ      Ux Ib  Grp14  Documented | Ndd Avx2;
+    0x74 PCMPEQB    Vx Wx None   Documented | Nds Avx2;
+    0x75 PCMPEQW    Vx Wx None   Documented | Nds Avx2;
+    0x76 PCMPEQD    Vx Wx None   Documented | Nds Avx2;
     0x7e MOVD     Ey Vx None   Documented | Plain L128;
     0x7f MOVDQA   Wx Vx None   Documented | Plain Any;
     // SSE3's packed-double half.
@@ -4124,56 +4469,56 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0xc4 PINSRW     Vx Ew +Ib None Documented | Nds L128;
     0xc5 PEXTRW     Gy Ux +Ib None Documented | Plain L128;
     0xc6 SHUFPD   Vx Wx +Ib None Documented | Nds Any;
-    0xd1 PSRLW      Vx Wx None   Documented | Nds L128;
-    0xd2 PSRLD      Vx Wx None   Documented | Nds L128;
-    0xd3 PSRLQ      Vx Wx None   Documented | Nds L128;
-    0xd4 PADDQ      Vx Wx None   Documented | Nds L128;
-    0xd5 PMULLW     Vx Wx None   Documented | Nds L128;
+    0xd1 PSRLW      Vx Wx None   Documented | Nds Avx2;
+    0xd2 PSRLD      Vx Wx None   Documented | Nds Avx2;
+    0xd3 PSRLQ      Vx Wx None   Documented | Nds Avx2;
+    0xd4 PADDQ      Vx Wx None   Documented | Nds Avx2;
+    0xd5 PMULLW     Vx Wx None   Documented | Nds Avx2;
     0xd6 MOVQ     Wq Vx None   Documented | Plain L128;
-    0xd7 PMOVMSKB   Gy Ux None   Documented | Plain L128;
-    0xd8 PSUBUSB    Vx Wx None   Documented | Nds L128;
-    0xd9 PSUBUSW    Vx Wx None   Documented | Nds L128;
-    0xda PMINUB     Vx Wx None   Documented | Nds L128;
-    0xdb PAND     Vx Wx None   Documented | Nds L128;
-    0xdc PADDUSB    Vx Wx None   Documented | Nds L128;
-    0xdd PADDUSW    Vx Wx None   Documented | Nds L128;
-    0xde PMAXUB     Vx Wx None   Documented | Nds L128;
-    0xdf PANDN    Vx Wx None   Documented | Nds L128;
-    0xe0 PAVGB      Vx Wx None   Documented | Nds L128;
-    0xe1 PSRAW      Vx Wx None   Documented | Nds L128;
-    0xe2 PSRAD      Vx Wx None   Documented | Nds L128;
-    0xe3 PAVGW      Vx Wx None   Documented | Nds L128;
-    0xe4 PMULHUW    Vx Wx None   Documented | Nds L128;
-    0xe5 PMULHW     Vx Wx None   Documented | Nds L128;
+    0xd7 PMOVMSKB   Gy Ux None   Documented | Plain Avx2;
+    0xd8 PSUBUSB    Vx Wx None   Documented | Nds Avx2;
+    0xd9 PSUBUSW    Vx Wx None   Documented | Nds Avx2;
+    0xda PMINUB     Vx Wx None   Documented | Nds Avx2;
+    0xdb PAND     Vx Wx None   Documented | Nds Avx2;
+    0xdc PADDUSB    Vx Wx None   Documented | Nds Avx2;
+    0xdd PADDUSW    Vx Wx None   Documented | Nds Avx2;
+    0xde PMAXUB     Vx Wx None   Documented | Nds Avx2;
+    0xdf PANDN    Vx Wx None   Documented | Nds Avx2;
+    0xe0 PAVGB      Vx Wx None   Documented | Nds Avx2;
+    0xe1 PSRAW      Vx Wx None   Documented | Nds Avx2;
+    0xe2 PSRAD      Vx Wx None   Documented | Nds Avx2;
+    0xe3 PAVGW      Vx Wx None   Documented | Nds Avx2;
+    0xe4 PMULHUW    Vx Wx None   Documented | Nds Avx2;
+    0xe5 PMULHW     Vx Wx None   Documented | Nds Avx2;
     0xe6 CVTTPD2DQ  Vdq Wx None  Documented | Plain Any;
     // A non-temporal store is an ordinary one here: there is no cache to
     // bypass, and the architecture guarantees only weaker ordering, which a
     // single-bus core already satisfies.
     0xe7 MOVNTDQ    Wx Vx None   Documented | Plain Any;
-    0xe8 PSUBSB     Vx Wx None   Documented | Nds L128;
-    0xe9 PSUBSW     Vx Wx None   Documented | Nds L128;
-    0xea PMINSW     Vx Wx None   Documented | Nds L128;
-    0xeb POR      Vx Wx None   Documented | Nds L128;
-    0xec PADDSB     Vx Wx None   Documented | Nds L128;
-    0xed PADDSW     Vx Wx None   Documented | Nds L128;
-    0xee PMAXSW     Vx Wx None   Documented | Nds L128;
-    0xef PXOR     Vx Wx None   Documented | Nds L128;
-    0xf1 PSLLW      Vx Wx None   Documented | Nds L128;
-    0xf2 PSLLD      Vx Wx None   Documented | Nds L128;
-    0xf3 PSLLQ      Vx Wx None   Documented | Nds L128;
-    0xf4 PMULUDQ    Vx Wx None   Documented | Nds L128;
-    0xf5 PMADDWD    Vx Wx None   Documented | Nds L128;
-    0xf6 PSADBW     Vx Wx None   Documented | Nds L128;
+    0xe8 PSUBSB     Vx Wx None   Documented | Nds Avx2;
+    0xe9 PSUBSW     Vx Wx None   Documented | Nds Avx2;
+    0xea PMINSW     Vx Wx None   Documented | Nds Avx2;
+    0xeb POR      Vx Wx None   Documented | Nds Avx2;
+    0xec PADDSB     Vx Wx None   Documented | Nds Avx2;
+    0xed PADDSW     Vx Wx None   Documented | Nds Avx2;
+    0xee PMAXSW     Vx Wx None   Documented | Nds Avx2;
+    0xef PXOR     Vx Wx None   Documented | Nds Avx2;
+    0xf1 PSLLW      Vx Wx None   Documented | Nds Avx2;
+    0xf2 PSLLD      Vx Wx None   Documented | Nds Avx2;
+    0xf3 PSLLQ      Vx Wx None   Documented | Nds Avx2;
+    0xf4 PMULUDQ    Vx Wx None   Documented | Nds Avx2;
+    0xf5 PMADDWD    Vx Wx None   Documented | Nds Avx2;
+    0xf6 PSADBW     Vx Wx None   Documented | Nds Avx2;
     // The source is `reg` and the mask is `r/m`, register only; the address
     // is implicit, `[DS:rDI]`.
     0xf7 MASKMOVDQU Vx Ux None   Documented | Plain L128;
-    0xf8 PSUBB      Vx Wx None   Documented | Nds L128;
-    0xf9 PSUBW      Vx Wx None   Documented | Nds L128;
-    0xfa PSUBD      Vx Wx None   Documented | Nds L128;
-    0xfb PSUBQ      Vx Wx None   Documented | Nds L128;
-    0xfc PADDB      Vx Wx None   Documented | Nds L128;
-    0xfd PADDW      Vx Wx None   Documented | Nds L128;
-    0xfe PADDD      Vx Wx None   Documented | Nds L128;
+    0xf8 PSUBB      Vx Wx None   Documented | Nds Avx2;
+    0xf9 PSUBW      Vx Wx None   Documented | Nds Avx2;
+    0xfa PSUBD      Vx Wx None   Documented | Nds Avx2;
+    0xfb PSUBQ      Vx Wx None   Documented | Nds Avx2;
+    0xfc PADDB      Vx Wx None   Documented | Nds Avx2;
+    0xfd PADDW      Vx Wx None   Documented | Nds Avx2;
+    0xfe PADDD      Vx Wx None   Documented | Nds Avx2;
 };
 
 /// The two-byte map with a `66` mandatory prefix.
@@ -4208,7 +4553,7 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     0x5e DIVSS     Vx Wd None Documented | Nds Ignored;
     0x5f MAXSS     Vx Wd None Documented | Nds Ignored;
     0x6f MOVDQU    Vx Wx None Documented | Plain Any;
-    0x70 PSHUFHW   Vx Wx +Ib None Documented | Plain L128;
+    0x70 PSHUFHW   Vx Wx +Ib None Documented | Plain Avx2;
     // `F3 0F 7E` reads a quadword and **zeroes the upper half** of the
     // destination, which is what makes it different from `66 0F D6` writing
     // the same quadword the other way.
@@ -4270,7 +4615,7 @@ const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
     0x5d MINSD     Vx Wq None Documented | Nds Ignored;
     0x5e DIVSD     Vx Wq None Documented | Nds Ignored;
     0x5f MAXSD     Vx Wq None Documented | Nds Ignored;
-    0x70 PSHUFLW   Vx Wx +Ib None Documented | Plain L128;
+    0x70 PSHUFLW   Vx Wx +Ib None Documented | Plain Avx2;
     0xc2 CMPSD     Vx Wq +Ib None Documented | Nds Ignored;
     0xc3 UD        None None None Undefined;
     // `MOVQ2DQ`'s converse. Register form only.
@@ -4407,21 +4752,21 @@ pub static TABLE_0F38: [Insn; 256] = THREE_38.0;
 const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     base [UNASSIGNED; 256];
 
-    0x00 PSHUFB    Vx Wx None Documented | Nds L128;
-    0x01 PHADDW    Vx Wx None Documented | Nds L128;
-    0x02 PHADDD    Vx Wx None Documented | Nds L128;
-    0x03 PHADDSW   Vx Wx None Documented | Nds L128;
-    0x04 PMADDUBSW Vx Wx None Documented | Nds L128;
-    0x05 PHSUBW    Vx Wx None Documented | Nds L128;
-    0x06 PHSUBD    Vx Wx None Documented | Nds L128;
-    0x07 PHSUBSW   Vx Wx None Documented | Nds L128;
-    0x08 PSIGNB    Vx Wx None Documented | Nds L128;
-    0x09 PSIGNW    Vx Wx None Documented | Nds L128;
-    0x0a PSIGND    Vx Wx None Documented | Nds L128;
-    0x0b PMULHRSW  Vx Wx None Documented | Nds L128;
-    0x1c PABSB     Vx Wx None Documented | Plain L128;
-    0x1d PABSW     Vx Wx None Documented | Plain L128;
-    0x1e PABSD     Vx Wx None Documented | Plain L128;
+    0x00 PSHUFB    Vx Wx None Documented | Nds Avx2;
+    0x01 PHADDW    Vx Wx None Documented | Nds Avx2;
+    0x02 PHADDD    Vx Wx None Documented | Nds Avx2;
+    0x03 PHADDSW   Vx Wx None Documented | Nds Avx2;
+    0x04 PMADDUBSW Vx Wx None Documented | Nds Avx2;
+    0x05 PHSUBW    Vx Wx None Documented | Nds Avx2;
+    0x06 PHSUBD    Vx Wx None Documented | Nds Avx2;
+    0x07 PHSUBSW   Vx Wx None Documented | Nds Avx2;
+    0x08 PSIGNB    Vx Wx None Documented | Nds Avx2;
+    0x09 PSIGNW    Vx Wx None Documented | Nds Avx2;
+    0x0a PSIGND    Vx Wx None Documented | Nds Avx2;
+    0x0b PMULHRSW  Vx Wx None Documented | Nds Avx2;
+    0x1c PABSB     Vx Wx None Documented | Plain Avx2;
+    0x1d PABSW     Vx Wx None Documented | Plain Avx2;
+    0x1e PABSD     Vx Wx None Documented | Plain Avx2;
 
     // SSE4.1. The variable blends take their mask from `XMM0`, which no
     // field names — Intel writes it `<XMM0>` — so it is a third operand
@@ -4432,34 +4777,35 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x17 PTEST     Vx Wx None Documented | Plain Any;
     // The widening moves read exactly the lanes they widen, so the memory
     // form's width is the result's lane count times the source lane:
-    // eight, four or two bytes.
-    0x20 PMOVSXBW  Vx Wq None Documented | Plain L128;
-    0x21 PMOVSXBD  Vx Wd None Documented | Plain L128;
-    0x22 PMOVSXBQ  Vx Ww None Documented | Plain L128;
-    0x23 PMOVSXWD  Vx Wq None Documented | Plain L128;
-    0x24 PMOVSXWQ  Vx Wd None Documented | Plain L128;
-    0x25 PMOVSXDQ  Vx Wq None Documented | Plain L128;
-    0x28 PMULDQ    Vx Wx None Documented | Nds L128;
-    0x29 PCMPEQQ   Vx Wx None Documented | Nds L128;
+    // eight, four or two bytes at 128 bits, and twice that at 256, where
+    // the widening crosses lanes (`Wh`, `Wx4`, `Wx8`).
+    0x20 PMOVSXBW  Vx Wh None Documented | Plain Avx2;
+    0x21 PMOVSXBD  Vx Wx4 None Documented | Plain Avx2;
+    0x22 PMOVSXBQ  Vx Wx8 None Documented | Plain Avx2;
+    0x23 PMOVSXWD  Vx Wh None Documented | Plain Avx2;
+    0x24 PMOVSXWQ  Vx Wx4 None Documented | Plain Avx2;
+    0x25 PMOVSXDQ  Vx Wh None Documented | Plain Avx2;
+    0x28 PMULDQ    Vx Wx None Documented | Nds Avx2;
+    0x29 PCMPEQQ   Vx Wx None Documented | Nds Avx2;
     // Memory only (Intel's `Mx`); `Wx` so the register form decodes to
     // something the executor refuses.
-    0x2a MOVNTDQA  Vx Wx None Documented | Plain L128;
-    0x2b PACKUSDW  Vx Wx None Documented | Nds L128;
-    0x30 PMOVZXBW  Vx Wq None Documented | Plain L128;
-    0x31 PMOVZXBD  Vx Wd None Documented | Plain L128;
-    0x32 PMOVZXBQ  Vx Ww None Documented | Plain L128;
-    0x33 PMOVZXWD  Vx Wq None Documented | Plain L128;
-    0x34 PMOVZXWQ  Vx Wd None Documented | Plain L128;
-    0x35 PMOVZXDQ  Vx Wq None Documented | Plain L128;
-    0x38 PMINSB    Vx Wx None Documented | Nds L128;
-    0x39 PMINSD    Vx Wx None Documented | Nds L128;
-    0x3a PMINUW    Vx Wx None Documented | Nds L128;
-    0x3b PMINUD    Vx Wx None Documented | Nds L128;
-    0x3c PMAXSB    Vx Wx None Documented | Nds L128;
-    0x3d PMAXSD    Vx Wx None Documented | Nds L128;
-    0x3e PMAXUW    Vx Wx None Documented | Nds L128;
-    0x3f PMAXUD    Vx Wx None Documented | Nds L128;
-    0x40 PMULLD    Vx Wx None Documented | Nds L128;
+    0x2a MOVNTDQA  Vx Wx None Documented | Plain Avx2;
+    0x2b PACKUSDW  Vx Wx None Documented | Nds Avx2;
+    0x30 PMOVZXBW  Vx Wh None Documented | Plain Avx2;
+    0x31 PMOVZXBD  Vx Wx4 None Documented | Plain Avx2;
+    0x32 PMOVZXBQ  Vx Wx8 None Documented | Plain Avx2;
+    0x33 PMOVZXWD  Vx Wh None Documented | Plain Avx2;
+    0x34 PMOVZXWQ  Vx Wx4 None Documented | Plain Avx2;
+    0x35 PMOVZXDQ  Vx Wh None Documented | Plain Avx2;
+    0x38 PMINSB    Vx Wx None Documented | Nds Avx2;
+    0x39 PMINSD    Vx Wx None Documented | Nds Avx2;
+    0x3a PMINUW    Vx Wx None Documented | Nds Avx2;
+    0x3b PMINUD    Vx Wx None Documented | Nds Avx2;
+    0x3c PMAXSB    Vx Wx None Documented | Nds Avx2;
+    0x3d PMAXSD    Vx Wx None Documented | Nds Avx2;
+    0x3e PMAXUW    Vx Wx None Documented | Nds Avx2;
+    0x3f PMAXUD    Vx Wx None Documented | Nds Avx2;
+    0x40 PMULLD    Vx Wx None Documented | Nds Avx2;
     0x41 PHMINPOSUW Vx Wx None Documented | Plain L128;
 
     // SSE4.2.
@@ -4469,7 +4815,7 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     // own, and the instruction is the 16-bit one.
     0xf0 MOVBE     Gv Ev None Documented;
     0xf1 MOVBE     Ev Gv None Documented;
-    0x37 PCMPGTQ   Vx Wx None Documented | Nds L128;
+    0x37 PCMPGTQ   Vx Wx None Documented | Nds Avx2;
 
     // AVX's own, which have no legacy encoding at all (*Intel SDM* volume 2
     // table A-4, the `VEX.66.0F38` column). Every one is `VEX.W0`.
@@ -4497,6 +4843,72 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     // BMI2's left shift by a register count (`VEX.LZ.66.0F38 F7`), the
     // count in `VEX.vvvv`. Legacy `66 0F 38 F7` is nothing.
     0xf7 SHLX      Gy Ey None Documented | NdsLast L128 only;
+    // AVX2's own (*Intel SDM* volume 2 table A-4, `VEX.66.0F38`). The
+    // cross-lane permutes by a vector of indices: the indices are `vvvv`,
+    // the data ModRM r/m, and there is only a 256-bit form.
+    0x16 VPERMPS   Vx Wx None Documented | Nds L256 only w0;
+    0x36 VPERMD    Vx Wx None Documented | Nds L256 only w0;
+    // The shifts by a vector of counts, one count per element. `VEX.W`
+    // picks doublewords or quadwords, except for the arithmetic shift,
+    // which has no quadword form before AVX-512.
+    0x45 VPSRLVD   Vx Wx None Documented | Nds Any only wop(VPSRLVQ);
+    0x46 VPSRAVD   Vx Wx None Documented | Nds Any only w0;
+    0x47 VPSLLVD   Vx Wx None Documented | Nds Any only wop(VPSLLVQ);
+    // The integer broadcasts, from the low element of an `XMM` register or
+    // from exactly one element of memory. `VBROADCASTI128` is memory only.
+    0x58 VPBROADCASTD   Vx Wd  None Documented | Plain Any only w0;
+    0x59 VPBROADCASTQ   Vx Wq  None Documented | Plain Any only w0;
+    0x5a VBROADCASTI128 Vx Wdq None Documented | Plain L256 only w0;
+    0x78 VPBROADCASTB   Vx Wb  None Documented | Plain Any only w0;
+    0x79 VPBROADCASTW   Vx Ww  None Documented | Plain Any only w0;
+    // `VMASKMOVPS`/`PD` for integers, the element width by `VEX.W`.
+    0x8c VPMASKMOVD Vx Wx None Documented | Nds Any only wop(VPMASKMOVQ);
+    0x8e VPMASKMOVD Wx Vx None Documented | Nds Any only wop(VPMASKMOVQ);
+    // The gathers. `vvvv` is the mask, read and written; the memory
+    // operand is VSIB; `VEX.W` picks the element width and the opcode the
+    // index width.
+    0x90 VPGATHERDD Vx Mvsib None Documented | Nds Any only wop(VPGATHERDQ);
+    0x91 VPGATHERQD Vx Mvsib None Documented | Nds Any only wop(VPGATHERQQ);
+    0x92 VGATHERDPS Vx Mvsib None Documented | Nds Any only wop(VGATHERDPD);
+    0x93 VGATHERQPS Vx Mvsib None Documented | Nds Any only wop(VGATHERQPD);
+
+    // F16C: half precision in, singles out. Half the vector length in, so
+    // the source is `Wh`.
+    0x13 VCVTPH2PS Vx Wh None Documented | Plain Any only w0;
+
+    // FMA (*Intel SDM* volume 2 table A-4, `VEX.66.0F38` columns 9, A and
+    // B — one per operand order). `VEX.W` picks singles or doubles; the
+    // scalar forms ignore `VEX.L`.
+    0x96 VFMADDSUB132PS  Vx Wx None Documented | Nds Any only wop(VFMADDSUB132PD);
+    0x97 VFMSUBADD132PS  Vx Wx None Documented | Nds Any only wop(VFMSUBADD132PD);
+    0x98 VFMADD132PS     Vx Wx None Documented | Nds Any only wop(VFMADD132PD);
+    0x99 VFMADD132SS     Vx Wd None Documented | Nds Ignored only wop(VFMADD132SD);
+    0x9a VFMSUB132PS     Vx Wx None Documented | Nds Any only wop(VFMSUB132PD);
+    0x9b VFMSUB132SS     Vx Wd None Documented | Nds Ignored only wop(VFMSUB132SD);
+    0x9c VFNMADD132PS    Vx Wx None Documented | Nds Any only wop(VFNMADD132PD);
+    0x9d VFNMADD132SS    Vx Wd None Documented | Nds Ignored only wop(VFNMADD132SD);
+    0x9e VFNMSUB132PS    Vx Wx None Documented | Nds Any only wop(VFNMSUB132PD);
+    0x9f VFNMSUB132SS    Vx Wd None Documented | Nds Ignored only wop(VFNMSUB132SD);
+    0xa6 VFMADDSUB213PS  Vx Wx None Documented | Nds Any only wop(VFMADDSUB213PD);
+    0xa7 VFMSUBADD213PS  Vx Wx None Documented | Nds Any only wop(VFMSUBADD213PD);
+    0xa8 VFMADD213PS     Vx Wx None Documented | Nds Any only wop(VFMADD213PD);
+    0xa9 VFMADD213SS     Vx Wd None Documented | Nds Ignored only wop(VFMADD213SD);
+    0xaa VFMSUB213PS     Vx Wx None Documented | Nds Any only wop(VFMSUB213PD);
+    0xab VFMSUB213SS     Vx Wd None Documented | Nds Ignored only wop(VFMSUB213SD);
+    0xac VFNMADD213PS    Vx Wx None Documented | Nds Any only wop(VFNMADD213PD);
+    0xad VFNMADD213SS    Vx Wd None Documented | Nds Ignored only wop(VFNMADD213SD);
+    0xae VFNMSUB213PS    Vx Wx None Documented | Nds Any only wop(VFNMSUB213PD);
+    0xaf VFNMSUB213SS    Vx Wd None Documented | Nds Ignored only wop(VFNMSUB213SD);
+    0xb6 VFMADDSUB231PS  Vx Wx None Documented | Nds Any only wop(VFMADDSUB231PD);
+    0xb7 VFMSUBADD231PS  Vx Wx None Documented | Nds Any only wop(VFMSUBADD231PD);
+    0xb8 VFMADD231PS     Vx Wx None Documented | Nds Any only wop(VFMADD231PD);
+    0xb9 VFMADD231SS     Vx Wd None Documented | Nds Ignored only wop(VFMADD231SD);
+    0xba VFMSUB231PS     Vx Wx None Documented | Nds Any only wop(VFMSUB231PD);
+    0xbb VFMSUB231SS     Vx Wd None Documented | Nds Ignored only wop(VFMSUB231SD);
+    0xbc VFNMADD231PS    Vx Wx None Documented | Nds Any only wop(VFNMADD231PD);
+    0xbd VFNMADD231SS    Vx Wd None Documented | Nds Ignored only wop(VFNMADD231SD);
+    0xbe VFNMSUB231PS    Vx Wx None Documented | Nds Any only wop(VFNMSUB231PD);
+    0xbf VFNMSUB231SS    Vx Wd None Documented | Nds Ignored only wop(VFNMSUB231SD);
 };
 
 /// The `0F 38` map with a `66` prefix.
@@ -4555,7 +4967,7 @@ pub static TABLE_0F3A: [Insn; 256] = THREE_3A.0;
 const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
     base [UNASSIGNED; 256];
 
-    0x0f PALIGNR   Vx Wx +Ib None Documented | Nds L128;
+    0x0f PALIGNR   Vx Wx +Ib None Documented | Nds Avx2;
 
     // SSE4.1. The scalar rounds read one lane, so their memory forms are
     // four and eight bytes.
@@ -4565,7 +4977,7 @@ const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x0b ROUNDSD   Vx Wq +Ib None Documented | Nds Ignored;
     0x0c BLENDPS   Vx Wx +Ib None Documented | Nds Any;
     0x0d BLENDPD   Vx Wx +Ib None Documented | Nds Any;
-    0x0e PBLENDW   Vx Wx +Ib None Documented | Nds L128;
+    0x0e PBLENDW   Vx Wx +Ib None Documented | Nds Avx2;
     // The extractions name a whole general register, or exactly the bytes
     // they extract in memory. `PEXTRD` is `PEXTRQ` with `REX.W`, the way
     // `MOVD` is `MOVQ`; `EXTRACTPS` ignores `REX.W` and writes four bytes.
@@ -4579,7 +4991,7 @@ const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x22 PINSRD    Vx Ey +Ib None Documented | Nds L128;
     0x40 DPPS      Vx Wx +Ib None Documented | Nds Any;
     0x41 DPPD      Vx Wx +Ib None Documented | Nds L128;
-    0x42 MPSADBW   Vx Wx +Ib None Documented | Nds L128;
+    0x42 MPSADBW   Vx Wx +Ib None Documented | Nds Avx2;
 
     // SSE4.2's string compares. The immediate is the whole instruction —
     // element format, aggregation, polarity and output selection — and see
@@ -4602,7 +5014,20 @@ const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
     // no VEX form, and this has no legacy one.
     0x4a BLENDVPS Vx Wx +Lx None Documented | Nds Any only w0;
     0x4b BLENDVPD Vx Wx +Lx None Documented | Nds Any only w0;
-    0x4c PBLENDVB Vx Wx +Lx None Documented | Nds L128 only w0;
+    0x4c PBLENDVB Vx Wx +Lx None Documented | Nds Avx2 only w0;
+
+    // AVX2's own (*Intel SDM* volume 2 table A-5, `VEX.66.0F3A`). The
+    // quadword permutes are the one `W1` pair; the rest are `W0`.
+    0x00 VPERMQ       Vx  Wx  +Ib None Documented | Plain L256 only w1;
+    0x01 VPERMPD      Vx  Wx  +Ib None Documented | Plain L256 only w1;
+    0x02 VPBLENDD     Vx  Wx  +Ib None Documented | Nds Any only w0;
+    0x38 VINSERTI128  Vx  Wdq +Ib None Documented | Nds L256 only w0;
+    0x39 VEXTRACTI128 Wdq Vx  +Ib None Documented | Plain L256 only w0;
+    0x46 VPERM2I128   Vx  Wx  +Ib None Documented | Nds L256 only w0;
+
+    // F16C: singles in, half precision out — to an `XMM` register or to
+    // half the vector length of memory.
+    0x1d VCVTPS2PH    Wh  Vx  +Ib None Documented | Plain Any only w0;
 };
 
 /// The `0F 3A` map with a `66` prefix.
@@ -4862,11 +5287,11 @@ pub static GROUP9: [Insn; 8] = {
 pub static GROUP12: [Insn; 8] = {
     let mut t = [UNASSIGNED; 8];
     t[2] = Insn::new(Op::PSRLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t[4] = Insn::new(Op::PSRAW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t[6] = Insn::new(Op::PSLLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t
 };
 
@@ -4874,11 +5299,11 @@ pub static GROUP12: [Insn; 8] = {
 pub static GROUP13: [Insn; 8] = {
     let mut t = [UNASSIGNED; 8];
     t[2] = Insn::new(Op::PSRLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t[4] = Insn::new(Op::PSRAD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t[6] = Insn::new(Op::PSLLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t
 };
 
@@ -4891,13 +5316,13 @@ pub static GROUP13: [Insn; 8] = {
 pub static GROUP14: [Insn; 8] = {
     let mut t = [UNASSIGNED; 8];
     t[2] = Insn::new(Op::PSRLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t[3] = Insn::new(Op::PSRLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t[6] = Insn::new(Op::PSLLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t[7] = Insn::new(Op::PSLLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
-        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::Avx2));
     t
 };
 
@@ -5979,7 +6404,10 @@ impl Fields {
         } else {
             Arg::Hx
         };
-        if self.vvvv_is_source() {
+        if matches!(i.src, Arg::Mvsib) {
+            // A gather writes its mask last: `vpgatherdd xmm1, [vsib], xmm2`.
+            [i.dst, i.src, Arg::Hx, i.aux]
+        } else if self.vvvv_is_source() {
             [i.dst, h, i.src, i.aux]
         } else if self.vex.is_some() && matches!(i.vex.form, VexForm::Ndd) {
             [h, i.dst, i.src, i.aux]
@@ -5994,13 +6422,16 @@ impl Fields {
     /// encoding, where the kind fixes it.
     ///
     /// [`Arg::fp_bytes`] with the vector length applied: `Wx` is sixteen or
-    /// thirty-two bytes, `Wh` half that, `Wqx` eight or thirty-two.
+    /// thirty-two bytes, `Wh` half that, `Wx4` a quarter and `Wx8` an
+    /// eighth, `Wqx` eight or thirty-two.
     #[must_use]
     pub const fn mem_bytes(&self, arg: Arg) -> Option<u8> {
         let v = self.vector_bytes();
         match arg {
             Arg::Wx | Arg::Vx | Arg::Ux | Arg::Hx | Arg::Lx => Some(v),
             Arg::Wh => Some(v / 2),
+            Arg::Wx4 => Some(v / 4),
+            Arg::Wx8 => Some(v / 8),
             Arg::Wqx => Some(if v == 32 { 32 } else { 8 }),
             _ => arg.fp_bytes(self.opsize),
         }
@@ -6507,14 +6938,27 @@ const fn vex_valid(insn: Insn, v: VexPrefix, modrm: ModRm) -> Insn {
         VexForm::Plain | VexForm::Alt(_) => false,
     };
     let length_ok = match rule.len {
-        VexLen::Any | VexLen::Ignored => true,
+        VexLen::Any | VexLen::Ignored | VexLen::Avx2 => true,
         VexLen::L128 => !v.l,
         VexLen::L256 => v.l,
     };
-    if !length_ok || (!uses_vvvv && v.vvvv != 0) || (rule.w0 && v.w) {
+    if !length_ok || (!uses_vvvv && v.vvvv != 0) || (rule.w0 && v.w) || (rule.w1 && !v.w) {
         return UNASSIGNED;
     }
-    insn
+    match rule.w1_op {
+        // The `W1` twin. A scalar-single row's twin is the scalar double,
+        // whose memory operand is a quadword rather than a doubleword —
+        // the one operand the two lines of the instruction page disagree on.
+        Some(op) if v.w => {
+            let mut twin = insn;
+            twin.op = op;
+            if matches!(twin.src, Arg::Wd) {
+                twin.src = Arg::Wq;
+            }
+            twin
+        }
+        _ => insn,
+    }
 }
 
 #[cfg(test)]
@@ -6583,7 +7027,9 @@ mod tests {
                 || TABLE_0F_F3.iter().any(|i| i.op == op)
                 || TABLE_0F_F2.iter().any(|i| i.op == op)
                 || TABLE_0F38.iter().any(|i| i.op == op)
-                || TABLE_0F38_66.iter().any(|i| i.op == op)
+                || TABLE_0F38_66
+                    .iter()
+                    .any(|i| i.op == op || i.vex.w1_op == Some(op))
                 || TABLE_0F38_F2.iter().any(|i| i.op == op)
                 || TABLE_0F38_F3.iter().any(|i| i.op == op)
                 || TABLE_0F3A.iter().any(|i| i.op == op)
@@ -6967,9 +7413,38 @@ mod tests {
         // two-operand move.
         assert_eq!(decode32(&[0xc5, 0xfc, 0x10, 0x00]).insn.op, Op::MOVUPS);
         assert_eq!(decode32(&[0xc5, 0xf4, 0x10, 0x00]).insn.op, Op::UD);
-        // `VEX.L = 1` on a 128-bit-only row: `vpaddb` is AVX2's at 256.
-        assert_eq!(decode32(&[0xc5, 0xe9, 0xfc, 0xcb]).insn.op, Op::PADDB);
-        assert_eq!(decode32(&[0xc5, 0xed, 0xfc, 0xcb]).insn.op, Op::UD);
+        // `VEX.L = 1` on a 128-bit-only row: `vpextrw`. (`vpaddb` at 256
+        // decodes — the length is AVX2's, which the executor asks about.)
+        assert_eq!(
+            decode32(&[0xc5, 0xf9, 0xc5, 0xc1, 0x00]).insn.op,
+            Op::PEXTRW
+        );
+        assert_eq!(decode32(&[0xc5, 0xfd, 0xc5, 0xc1, 0x00]).insn.op, Op::UD);
+        assert_eq!(decode32(&[0xc5, 0xed, 0xfc, 0xcb]).insn.op, Op::PADDB);
+        // `VEX.W` selecting the element width: `vfmadd132ps`/`pd`, and the
+        // scalar double's memory operand is a quadword.
+        assert_eq!(
+            decode32(&[0xc4, 0xe2, 0x69, 0x98, 0xcb]).insn.op,
+            Op::VFMADD132PS
+        );
+        assert_eq!(
+            decode32(&[0xc4, 0xe2, 0xe9, 0x98, 0xcb]).insn.op,
+            Op::VFMADD132PD
+        );
+        let f = decode32(&[0xc4, 0xe2, 0xe9, 0x99, 0x08]);
+        assert_eq!(
+            (f.insn.op, f.mem_bytes(f.insn.src)),
+            (Op::VFMADD132SD, Some(8))
+        );
+        // `VEX.W0` on a `W1` row: `vpermq`.
+        assert_eq!(
+            decode32(&[0xc4, 0xe3, 0xfd, 0x00, 0xc1, 0x1b]).insn.op,
+            Op::VPERMQ
+        );
+        assert_eq!(
+            decode32(&[0xc4, 0xe3, 0x7d, 0x00, 0xc1, 0x1b]).insn.op,
+            Op::UD
+        );
         // `VEX.L = 0` on a 256-bit-only row: `vbroadcastsd`.
         assert_eq!(
             decode32(&[0xc4, 0xe2, 0x7d, 0x19, 0x00]).insn.op,

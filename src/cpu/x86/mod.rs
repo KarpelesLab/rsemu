@@ -111,6 +111,15 @@
 //! and `VZEROUPPER`/`VZEROALL`. The 256-bit lanes run the same kernels SSE
 //! does, once per 128-bit half. See `avx.rs`.
 //!
+//! **AVX2, FMA and F16C** (`avx2`, `fma`, `f16c`, off in every preset; each
+//! needs `avx`): the 256-bit integer forms, with the cross-lane widening
+//! moves, `VPMOVMSKB` and the shift counts done as the SDM says rather than
+//! per lane; the integer broadcasts and 128-bit moves, the cross-lane
+//! permutes, `VPBLENDD`, the variable shifts, `VPMASKMOVD`/`Q` and the
+//! gathers (VSIB addressing, the mask as a restartable progress record); the
+//! sixty fused multiply-adds, rounded once with the SDM's NaN order; and the
+//! half-precision conversions.
+//!
 //! **MMX** (`mmx`): the eight `MM` registers, which are the significands of
 //! the eight x87 registers rather than storage of their own, with the
 //! architectural side effects of that aliasing — every MMX instruction sets
@@ -184,12 +193,10 @@
 //!   in no preset); without it `F3 0F BD` executes as `BSR`. So is
 //!   `MOVBE` ([`Features::movbe`], in no preset either).
 //!   AVX is here too ([`Features::avx`]: the VEX
-//!   encoding, the `YMM` registers, XSAVE component 2), and so are the
-//!   VEX-encoded general-register instructions, BMI1 and BMI2
-//!   ([`Features::bmi1`], [`Features::bmi2`], with `TZCNT`); **nothing
-//!   else after AVX is** — AVX2, FMA and F16C decode as `#UD`, and so do the
-//!   256-bit integer forms AVX2 adds and the register forms of the
-//!   broadcasts.
+//!   encoding, the `YMM` registers, XSAVE component 2), and so are AVX2, FMA
+//!   and F16C ([`Features::avx2`], [`Features::fma`], [`Features::f16c`])
+//!   and the VEX-encoded general-register instructions, BMI1 and BMI2
+//!   ([`Features::bmi1`], [`Features::bmi2`], with `TZCNT`).
 //! - **The legacy-SSE alignment rule is partial.** A 128-bit memory operand
 //!   must be sixteen-byte aligned; the instructions that exist to assert it
 //!   (`MOVAPS`, `MOVDQA`, the non-temporal moves, `MOVNTDQA`, `CMPXCHG16B`)
@@ -765,6 +772,22 @@ pub struct Features {
     /// [`bmi1`](Features::bmi1) is, and independent of it: no instruction of
     /// one uses the other, and they are separate bits.
     pub bmi2: bool,
+    /// AVX2: the `VEX.256` forms of the integer SSE2–SSE4.1 instructions,
+    /// and AVX2's own — the integer broadcasts and 128-bit moves, the
+    /// cross-lane permutes `VPERMD`/`VPERMPS`/`VPERMQ`/`VPERMPD`,
+    /// `VPBLENDD`, the shifts by a vector of counts, `VPMASKMOVD`/`Q` and
+    /// the gathers. `CPUID.(EAX=07H,ECX=0):EBX[5]`. Requires
+    /// [`avx`](Features::avx).
+    pub avx2: bool,
+    /// FMA: the fused multiply-adds, `VFMADD*`, `VFMSUB*`, `VFNMADD*`,
+    /// `VFNMSUB*`, `VFMADDSUB*` and `VFMSUBADD*` in their three operand
+    /// orders, rounded once. `CPUID.01H:ECX[12]`. Requires
+    /// [`avx`](Features::avx): every one is VEX-encoded.
+    pub fma: bool,
+    /// F16C: `VCVTPH2PS` and `VCVTPS2PH`, the conversions between half and
+    /// single precision. `CPUID.01H:ECX[29]`. Requires
+    /// [`avx`](Features::avx).
+    pub f16c: bool,
 }
 
 impl Features {
@@ -800,6 +823,9 @@ impl Features {
         avx: false,
         bmi1: false,
         bmi2: false,
+        avx2: false,
+        fma: false,
+        f16c: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -860,6 +886,9 @@ impl Features {
         avx: false,
         bmi1: false,
         bmi2: false,
+        avx2: false,
+        fma: false,
+        f16c: false,
     };
 
     /// The x86-64-v2 micro-architecture level: the baseline plus
@@ -969,6 +998,12 @@ impl Features {
             // Their bits are in `CPUID` leaf 7; see `Features::bmi1` for why
             // that is the whole of it.
             return missing("extras_486", "bmi1 or bmi2");
+        }
+        for (on, name) in [(self.avx2, "avx2"), (self.fma, "fma"), (self.f16c, "f16c")] {
+            if on && !self.avx {
+                // Each is VEX-encoded and works on `YMM` state AVX enables.
+                return missing("avx", name);
+            }
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2729,7 +2764,8 @@ impl X86 {
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
             "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
-            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt", "movbe", "avx", "bmi1", "bmi2",
+            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt", "movbe", "avx", "bmi1", "bmi2", "avx2",
+            "fma", "f16c",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2760,6 +2796,9 @@ impl X86 {
                 "popcnt" => features.popcnt = on,
                 "cx16" => features.cx16 = on,
                 "avx" => features.avx = on,
+                "avx2" => features.avx2 = on,
+                "fma" => features.fma = on,
+                "f16c" => features.f16c = on,
                 "lahf_lm" => features.lahf_lm = on,
                 "lzcnt" => features.lzcnt = on,
                 "bmi1" => features.bmi1 = on,
@@ -4008,6 +4047,24 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "override the preset: AVX — the VEX encoding and the YMM registers \
                       (needs xsave and sse42)",
+        },
+        PropertySpec {
+            name: "avx2",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: AVX2 — 256-bit integer SIMD, permutes, gathers (needs avx)",
+        },
+        PropertySpec {
+            name: "fma",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: FMA — the fused multiply-adds (needs avx)",
+        },
+        PropertySpec {
+            name: "f16c",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: F16C — half-precision conversions (needs avx)",
         },
         PropertySpec {
             name: "mmx",

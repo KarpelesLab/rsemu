@@ -46,6 +46,9 @@ impl Exec<'_> {
             Some(Extension::Avx) => features.avx,
             Some(Extension::Bmi1) => features.bmi1,
             Some(Extension::Bmi2) => features.bmi2,
+            Some(Extension::Avx2) => features.avx2,
+            Some(Extension::Fma) => features.fma,
+            Some(Extension::F16c) => features.f16c,
         }
     }
 

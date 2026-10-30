@@ -12,28 +12,28 @@ use crate::cpu::x86::fpu::mxcsr;
 use crate::cpu::x86::prot::{cr4, xcr0};
 
 /// Scratch memory, thirty-two-byte aligned.
-const DATA: u64 = 0xb000;
+pub(super) const DATA: u64 = 0xb000;
 /// A second scratch area.
-const OUT: u64 = 0xc000;
+pub(super) const OUT: u64 = 0xc000;
 /// Where a fault handler sits, and `RIP` once its `hlt` has retired.
-const HANDLER: u64 = 0x3800;
+pub(super) const HANDLER: u64 = 0x3800;
 
 /// The `VEX.mmmmm` maps.
-const M0F: u8 = 1;
-const M38: u8 = 2;
-const M3A: u8 = 3;
+pub(super) const M0F: u8 = 1;
+pub(super) const M38: u8 = 2;
+pub(super) const M3A: u8 = 3;
 /// The `VEX.pp` columns.
-const NP: u8 = 0;
-const P66: u8 = 1;
-const PF3: u8 = 2;
-const PF2: u8 = 3;
+pub(super) const NP: u8 = 0;
+pub(super) const P66: u8 = 1;
+pub(super) const PF3: u8 = 2;
+pub(super) const PF2: u8 = 3;
 
-type Ymm = [[u64; 2]; 2];
+pub(super) type Ymm = [[u64; 2]; 2];
 
 /// A three-byte VEX instruction for registers 0-7: `R̄X̄B̄` all set, then
 /// `map`, `W`, `vvvv` (inverted here), `L` and `pp`, the opcode, and `rest`
 /// (ModRM, displacement, immediate).
-fn vex(map: u8, pp: u8, l: bool, w: bool, vvvv: u8, opcode: u8, rest: &[u8]) -> Vec<u8> {
+pub(super) fn vex(map: u8, pp: u8, l: bool, w: bool, vvvv: u8, opcode: u8, rest: &[u8]) -> Vec<u8> {
     let mut out = alloc::vec![
         0xc4,
         0xe0 | map,
@@ -45,24 +45,24 @@ fn vex(map: u8, pp: u8, l: bool, w: bool, vvvv: u8, opcode: u8, rest: &[u8]) -> 
 }
 
 /// A register-form ModRM byte.
-const fn rr(reg: u8, rm: u8) -> u8 {
+pub(super) const fn rr(reg: u8, rm: u8) -> u8 {
     0xc0 | (reg << 3) | rm
 }
 
 /// A `disp32` ModRM naming `reg` and the absolute address `addr`.
-fn m32(reg: u8, addr: u64) -> Vec<u8> {
+pub(super) fn m32(reg: u8, addr: u64) -> Vec<u8> {
     let mut out = alloc::vec![(reg << 3) | 0b101];
     out.extend_from_slice(&(addr as u32).to_le_bytes());
     out
 }
 
 /// `rest` with an immediate appended.
-fn with(mut rest: Vec<u8>, imm: u8) -> Vec<u8> {
+pub(super) fn with(mut rest: Vec<u8>, imm: u8) -> Vec<u8> {
     rest.push(imm);
     rest
 }
 
-fn features() -> Features {
+pub(super) fn features() -> Features {
     Features {
         xsave: true,
         avx: true,
@@ -74,7 +74,7 @@ fn features() -> Features {
 /// of `CR4`, `CR4.OSXSAVE` and `XCR0 = x87 | SSE | AVX` — what an operating
 /// system that uses AVX sets — and a `hlt` handler for every vector a test
 /// here can raise.
-fn pc_with(features: Features) -> Pc {
+pub(super) fn pc_with(features: Features) -> Pc {
     let pc = Pc::with_features(Variant::X86_64, features);
     pc.start_protected();
     let mut sys = pc.cpu.sys();
@@ -92,12 +92,12 @@ fn pc_with(features: Features) -> Pc {
     pc
 }
 
-fn avx() -> Pc {
+pub(super) fn avx() -> Pc {
     pc_with(features())
 }
 
 /// Run `code` and a `hlt`; the vector it faulted with, or `None`.
-fn exec(pc: &Pc, code: &[u8]) -> Option<u64> {
+pub(super) fn exec(pc: &Pc, code: &[u8]) -> Option<u64> {
     let mut all = code.to_vec();
     all.push(0xf4);
     pc.write(at::CODE0, &all);
@@ -118,15 +118,15 @@ fn exec(pc: &Pc, code: &[u8]) -> Option<u64> {
 }
 
 /// Run `code` and require that it does not fault.
-fn run(pc: &Pc, code: &[u8]) {
+pub(super) fn run(pc: &Pc, code: &[u8]) {
     assert_eq!(exec(pc, code), None, "{code:02x?}");
 }
 
-fn ymm(pc: &Pc, n: u8) -> Ymm {
+pub(super) fn ymm(pc: &Pc, n: u8) -> Ymm {
     pc.cpu.sse().ymm(n)
 }
 
-fn set_ymm(pc: &Pc, values: &[(u8, Ymm)]) {
+pub(super) fn set_ymm(pc: &Pc, values: &[(u8, Ymm)]) {
     let mut sse = pc.cpu.sse();
     for &(n, v) in values {
         sse.set_ymm(n, v);
@@ -134,53 +134,53 @@ fn set_ymm(pc: &Pc, values: &[(u8, Ymm)]) {
     pc.cpu.set_sse(sse);
 }
 
-fn write_ymm(pc: &Pc, addr: u64, v: Ymm) {
+pub(super) fn write_ymm(pc: &Pc, addr: u64, v: Ymm) {
     for (i, q) in [v[0][0], v[0][1], v[1][0], v[1][1]].into_iter().enumerate() {
         write64(pc, addr + 8 * i as u64, q);
     }
 }
 
-fn write64(pc: &Pc, addr: u64, value: u64) {
+pub(super) fn write64(pc: &Pc, addr: u64, value: u64) {
     pc.write(addr, &value.to_le_bytes());
 }
 
-fn read64(pc: &Pc, addr: u64) -> u64 {
+pub(super) fn read64(pc: &Pc, addr: u64) -> u64 {
     (0..8u64).fold(0, |v, i| {
         v | (u64::from(pc.ram.read_u8(addr + i).unwrap()) << (8 * i))
     })
 }
 
 /// Eight singles, low lane first, as a `YMM` value.
-fn ps(v: [u32; 8]) -> Ymm {
+pub(super) fn ps(v: [u32; 8]) -> Ymm {
     let q = |i: usize| u64::from(v[i]) | (u64::from(v[i + 1]) << 32);
     [[q(0), q(2)], [q(4), q(6)]]
 }
 
 /// Four doubles (any four quadwords), low first.
-const fn pd(v: [u64; 4]) -> Ymm {
+pub(super) const fn pd(v: [u64; 4]) -> Ymm {
     [[v[0], v[1]], [v[2], v[3]]]
 }
 
 // Singles.
-const S1: u32 = 0x3f80_0000;
-const S2: u32 = 0x4000_0000;
-const S3: u32 = 0x4040_0000;
-const S4: u32 = 0x4080_0000;
-const S5: u32 = 0x40a0_0000;
-const S6: u32 = 0x40c0_0000;
-const S7: u32 = 0x40e0_0000;
-const S8: u32 = 0x4100_0000;
-const S9: u32 = 0x4110_0000;
-const S16: u32 = 0x4180_0000;
-const SQNAN: u32 = 0x7fc0_0000;
+pub(super) const S1: u32 = 0x3f80_0000;
+pub(super) const S2: u32 = 0x4000_0000;
+pub(super) const S3: u32 = 0x4040_0000;
+pub(super) const S4: u32 = 0x4080_0000;
+pub(super) const S5: u32 = 0x40a0_0000;
+pub(super) const S6: u32 = 0x40c0_0000;
+pub(super) const S7: u32 = 0x40e0_0000;
+pub(super) const S8: u32 = 0x4100_0000;
+pub(super) const S9: u32 = 0x4110_0000;
+pub(super) const S16: u32 = 0x4180_0000;
+pub(super) const SQNAN: u32 = 0x7fc0_0000;
 // Doubles.
-const D1: u64 = 0x3ff0_0000_0000_0000;
-const D2: u64 = 0x4000_0000_0000_0000;
-const D3: u64 = 0x4008_0000_0000_0000;
-const D4: u64 = 0x4010_0000_0000_0000;
+pub(super) const D1: u64 = 0x3ff0_0000_0000_0000;
+pub(super) const D2: u64 = 0x4000_0000_0000_0000;
+pub(super) const D3: u64 = 0x4008_0000_0000_0000;
+pub(super) const D4: u64 = 0x4010_0000_0000_0000;
 
 /// `vaddps ymm1, ymm2, ymm3`.
-fn vaddps256() -> Vec<u8> {
+pub(super) fn vaddps256() -> Vec<u8> {
     vex(M0F, NP, true, false, 2, 0x58, &[rr(1, 3)])
 }
 

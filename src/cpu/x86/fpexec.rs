@@ -1597,8 +1597,9 @@ impl Exec<'_> {
             self.require_aligned(off)?;
         }
         match arg {
-            Arg::Ww => Ok([self.read_mem(sr, off, 2)?, 0]),
-            Arg::Wd => Ok([self.read_mem(sr, off, 4)?, 0]),
+            // `Wx4` and `Wx8` are four and two bytes at 128 bits, like `Wh`.
+            Arg::Ww | Arg::Wx8 => Ok([self.read_mem(sr, off, 2)?, 0]),
+            Arg::Wd | Arg::Wx4 => Ok([self.read_mem(sr, off, 4)?, 0]),
             // `Wh` and `Wqx` are a quadword at the only length a legacy
             // encoding has.
             Arg::Wq | Arg::Mq | Arg::Wh | Arg::Wqx => Ok([self.read_mem(sr, off, 8)?, 0]),
@@ -2686,6 +2687,179 @@ fn arith_lane<F: crate::float::Format>(op: Op, a: u64, b: u64, env: Env) -> (u64
         // destination lane is overwritten, which is why `a` goes unused.
         _ => binary::sqrt::<F>(b, env),
     }
+}
+
+/// What one FMA operation computes, decoded from its position in the
+/// declaration (see `isa`'s `define_ops!`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FmaForm {
+    /// The operand order, as the mnemonic spells it: 132, 213 or 231.
+    pub(super) order: u16,
+    /// `-(x*y)`: the `VFNM*` forms.
+    pub(super) negate_product: bool,
+    /// Which elements subtract the addend: none, all, or (for the
+    /// alternating forms) the even ones or the odd ones.
+    pub(super) subtract: Subtract,
+    /// Doubles rather than singles.
+    pub(super) double: bool,
+    /// The low element only, the rest of the destination kept.
+    pub(super) scalar: bool,
+}
+
+/// Which elements of an FMA subtract the addend rather than add it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Subtract {
+    /// `VFMADD`, `VFNMADD`.
+    None,
+    /// `VFMSUB`, `VFNMSUB`.
+    All,
+    /// `VFMADDSUB`: elements 0, 2, 4, … subtract.
+    Even,
+    /// `VFMSUBADD`: elements 1, 3, 5, … subtract.
+    Odd,
+}
+
+/// The FMA operation `op` is, or `None` for anything else.
+///
+/// The sixty are declared four kinds by three orders by four element
+/// types, then two alternating kinds by three orders by two, so the
+/// position decides everything; `fma_form_matches_every_mnemonic` checks the
+/// arithmetic against the names.
+pub(super) fn fma_form(op: Op) -> Option<FmaForm> {
+    let first = Op::VFMADD132PS as usize;
+    let i = (op as usize).checked_sub(first)?;
+    let orders = [132, 213, 231];
+    if i < 48 {
+        let kind = i / 12;
+        Some(FmaForm {
+            order: orders[(i / 4) % 3],
+            negate_product: kind >= 2,
+            subtract: if kind % 2 == 1 {
+                Subtract::All
+            } else {
+                Subtract::None
+            },
+            double: i % 2 == 1,
+            scalar: i % 4 >= 2,
+        })
+    } else if i < 60 {
+        let j = i - 48;
+        Some(FmaForm {
+            order: orders[(j / 2) % 3],
+            negate_product: false,
+            subtract: if j < 6 { Subtract::Even } else { Subtract::Odd },
+            double: j % 2 == 1,
+            scalar: false,
+        })
+    } else {
+        None
+    }
+}
+
+/// An FMA on one 128-bit lane: `dst` the destination's old value, `src2`
+/// `VEX.vvvv` and `src3` ModRM r/m.
+///
+/// The three orders name which operands multiply and which adds, each
+/// instruction page's "Operation" (*Intel SDM* volume 2, `VFMADD132PS`):
+/// 132 is `dst * src3 + src2`, 213 `src2 * dst + src3`, 231
+/// `src2 * src3 + dst`. Every element is rounded **once**, under `MXCSR`
+/// ([`fma_element`]). A scalar form computes the low element and keeps the
+/// rest of `dst`.
+pub(super) fn fused(
+    op: Op,
+    dst: [u64; 2],
+    src2: [u64; 2],
+    src3: [u64; 2],
+    env: Env,
+) -> Option<([u64; 2], Flags)> {
+    let form = fma_form(op)?;
+    let (x, y, z) = match form.order {
+        132 => (dst, src3, src2),
+        213 => (src2, dst, src3),
+        _ => (src2, src3, dst),
+    };
+    let subtracts = |i: usize| match form.subtract {
+        Subtract::None => false,
+        Subtract::All => true,
+        Subtract::Even => i.is_multiple_of(2),
+        Subtract::Odd => i % 2 == 1,
+    };
+    let mut out = dst;
+    let mut flags = Flags::NONE;
+    if form.double {
+        for i in 0..if form.scalar { 1 } else { 2 } {
+            let (v, fl) =
+                fma_element::<B64>(x[i], y[i], z[i], form.negate_product, subtracts(i), env);
+            out[i] = v;
+            flags |= fl;
+        }
+    } else {
+        for i in 0..if form.scalar { 1 } else { 4 } {
+            let (v, fl) = fma_element::<B32>(
+                u64::from(dword_lane(x, i)),
+                u64::from(dword_lane(y, i)),
+                u64::from(dword_lane(z, i)),
+                form.negate_product,
+                subtracts(i),
+                env,
+            );
+            let shift = 32 * (i % 2);
+            out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (v << shift);
+            flags |= fl;
+        }
+    }
+    Some((out, flags))
+}
+
+/// One element of an FMA: `±(x * y) ± z`, rounded once.
+///
+/// The arithmetic is [`binary::fma`]'s; what is x86's is the NaN rule. The
+/// *Intel SDM* volume 1 table 14-17 ("FMA Numeric Behavior") names the
+/// operands `x * y + z` in the order of the multiplication, not of the
+/// encoding, and returns the first NaN of `x`, `y`, `z`, quieted — with
+/// invalid raised for any signaling one. Two consequences need care:
+///
+/// - A negation is applied only to an operand that is not a NaN, so
+///   `VFNMADD` of a NaN returns that NaN and not its sign-flipped twin.
+/// - `inf * 0 + z` with `z` a quiet NaN is `Q(z)` with **no** invalid: the
+///   table's NaN rows precede its `inf * 0` rows, and its comment for a NaN
+///   `z` raises invalid only for a signaling one. IEEE 754-2019 §7.2 leaves
+///   that case to the implementation; `float`'s own `fma` raises invalid,
+///   which is the RISC-V and ARM answer and not this one.
+fn fma_element<F: crate::float::Format>(
+    x: u64,
+    y: u64,
+    z: u64,
+    negate_product: bool,
+    negate_addend: bool,
+    env: Env,
+) -> (u64, Flags) {
+    let is_nan = |v: u64| v & F::INF == F::INF && v & F::SIG_MASK != 0;
+    let is_inf = |v: u64| v & !F::SIGN == F::INF;
+    let is_zero = |v: u64| {
+        let magnitude = v & !F::SIGN;
+        magnitude == 0 || (magnitude < 1 << F::SIG_BITS && env.subnormal_inputs.flushes())
+    };
+    let zero_times_inf = (is_inf(x) && is_zero(y)) || (is_zero(x) && is_inf(y));
+    if zero_times_inf && is_nan(z) && !is_nan(x) && !is_nan(y) {
+        let flags = if z & F::QUIET == 0 {
+            Flags::INVALID
+        } else {
+            Flags::NONE
+        };
+        return (z | F::QUIET, flags);
+    }
+    let x = if negate_product && !is_nan(x) {
+        x ^ F::SIGN
+    } else {
+        x
+    };
+    let z = if negate_addend && !is_nan(z) {
+        z ^ F::SIGN
+    } else {
+        z
+    };
+    binary::fma::<F>(x, y, z, env)
 }
 
 /// `RCPPS`, `RCPSS`, `RSQRTPS` and `RSQRTSS` on one 128-bit lane.
