@@ -41,6 +41,7 @@ impl Exec<'_> {
             Some(Extension::Sse41) => features.sse41,
             Some(Extension::Sse42) => features.sse42,
             Some(Extension::Popcnt) => features.popcnt,
+            Some(Extension::Lzcnt) => features.lzcnt,
         }
     }
 
@@ -58,6 +59,32 @@ impl Exec<'_> {
             self.set_flag(bit, false);
         }
         self.set_flag(flags::ZF, value == 0);
+        Ok(())
+    }
+
+    /// `LZCNT`: the number of zero bits above the most significant set one.
+    ///
+    /// A part without the feature ignores the `F3` and executes `BSR`
+    /// (*Intel SDM* volume 2, `LZCNT`: "on processors that do not support
+    /// LZCNT, the instruction byte encoding is executed as BSR"), so the
+    /// fallback is [`Exec::bit_scan`] rather than `#UD`. `TZCNT` and `BSF`
+    /// are the same arrangement one opcode down.
+    ///
+    /// `CF` says the source was zero — the result is then the operand width
+    /// — and `ZF` that the result is zero, the top bit set. `OF`, `SF`, `AF`
+    /// and `PF` are undefined and are left as they were, as `BSF`/`BSR` leave
+    /// theirs in this core: deterministic, and the cheapest answer.
+    pub(super) fn lzcnt(&mut self, f: &Fields, size: u8) -> Ex<()> {
+        if !self.has_extension(f.insn) {
+            return self.bit_scan(f, size, true);
+        }
+        let value = self.read_arg(f, f.insn.src, size)?;
+        // The source is masked to the operand size, so the count from 64
+        // overstates by the bits above the operand.
+        let count = value.leading_zeros() - (64 - u32::from(size) * 8);
+        self.write_arg(f, f.insn.dst, size, u64::from(count))?;
+        self.set_flag(flags::CF, value == 0);
+        self.set_flag(flags::ZF, count == 0);
         Ok(())
     }
 

@@ -1294,6 +1294,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("PCMPISTRI", "pcmpistri"),
     ("PCMPISTRM", "pcmpistrm"),
     ("POPCNT", "popcnt"),
+    ("LZCNT", "lzcnt"),
 ];
 
 define_ops! {
@@ -1877,6 +1878,9 @@ define_ops! {
 
     // ---- POPCNT ----------------------------------------------------------
     POPCNT = "count the set bits",
+
+    // ---- LZCNT -----------------------------------------------------------
+    LZCNT = "count the leading zero bits",
 }
 
 impl Op {
@@ -2453,14 +2457,15 @@ impl Op {
     }
 
     /// Whether this is one of the general-purpose instructions that arrived
-    /// with an extension's `CPUID` bit — `CRC32` and `POPCNT` — and so is
-    /// gated by the bit alone: neither touches SIMD state, so `CR0.EM`,
+    /// with an extension's `CPUID` bit — `CRC32`, `POPCNT` and `LZCNT` — and
+    /// so is gated by the bit alone: none touches SIMD state, so `CR0.EM`,
     /// `CR0.TS` and `CR4.OSFXSR` mean nothing to them (*Intel SDM* volume 2,
     /// `CRC32` and `POPCNT`, "Protected Mode Exceptions": `#UD` for the
-    /// `CPUID` bit and for `LOCK`, and no `#NM`).
+    /// `CPUID` bit and for `LOCK`, and no `#NM`). `LZCNT` without its bit is
+    /// `BSR` rather than `#UD`.
     #[must_use]
     pub const fn is_general_extension(self) -> bool {
-        matches!(self, Op::CRC32 | Op::POPCNT)
+        matches!(self, Op::CRC32 | Op::POPCNT | Op::LZCNT)
     }
 
     /// Which post-SSE2 extension this operation arrived with, if any.
@@ -2554,6 +2559,7 @@ impl Op {
             | Op::PCMPISTRI
             | Op::PCMPISTRM => Extension::Sse42,
             Op::POPCNT => Extension::Popcnt,
+            Op::LZCNT => Extension::Lzcnt,
             _ => return None,
         };
         Some(ext)
@@ -2725,6 +2731,9 @@ pub enum Extension {
     /// `POPCNT`: `CPUID.01H:ECX[23]`. A general-purpose instruction with a
     /// `CPUID` bit of its own, announced beside SSE4.2 but not part of it.
     Popcnt,
+    /// `LZCNT`: `CPUID.80000001H:ECX[5]`, AMD's `ABM`. Unlike the others
+    /// its absence is not `#UD`: the encoding executes as `BSR`.
+    Lzcnt,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -3845,6 +3854,10 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     // size — a `66` beside the `F3` still narrows it. Without the `F3`,
     // `0F B8` is `JMPE` on an Itanium and nothing on anything else.
     0xb8 POPCNT    Gv Ev None Documented;
+    // `LZCNT` is `BSR` with an `F3` in front, which a part without it
+    // ignores — so this row is `BSR` there, and the executor, not the
+    // table, decides which it is (*Intel SDM* volume 2, `LZCNT`).
+    0xbd LZCNT     Gv Ev None Documented;
     // Two doublewords in, so the memory form is a quadword.
     0xe6 CVTDQ2PD  Vx Wq None Documented;
 };

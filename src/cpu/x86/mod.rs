@@ -165,7 +165,8 @@
 //!   SSE4.1 and SSE4.2 are here ([`Features::ssse3`], [`Features::sse41`],
 //!   [`Features::sse42`]), and so is `POPCNT` ([`Features::popcnt`]) —
 //!   with `CMPXCHG16B` and 64-bit `LAHF`/`SAHF`, the whole x86-64-v2 level
-//!   ([`Features::X86_64_V2`]). No AVX.
+//!   ([`Features::X86_64_V2`]). `LZCNT` is here too ([`Features::lzcnt`],
+//!   in no preset); without it `F3 0F BD` executes as `BSR`. No AVX.
 //! - **The legacy-SSE alignment rule is partial.** A 128-bit memory operand
 //!   must be sixteen-byte aligned; the instructions that exist to assert it
 //!   (`MOVAPS`, `MOVDQA`, the non-temporal moves, `MOVNTDQA`, `CMPXCHG16B`)
@@ -690,6 +691,13 @@ pub struct Features {
     /// `#UD` without this, as on the first long-mode parts. Requires
     /// [`long`](Features::long). Linux calls it `lahf_lm`.
     pub lahf_lm: bool,
+    /// `LZCNT` (`F3 0F BD`), and `CPUID.80000001H:ECX[5]` — AMD's `ABM`
+    /// bit, which Intel calls `LZCNT`. Without it the encoding is not `#UD`
+    /// but `BSR`: the `F3` is ignored (*Intel SDM* volume 2, `LZCNT`).
+    /// Requires [`long`](Features::long), because the only place to announce
+    /// it is an extended leaf this core answers only for a long-mode part,
+    /// and every part that had it had long mode.
+    pub lzcnt: bool,
 }
 
 impl Features {
@@ -720,6 +728,7 @@ impl Features {
         popcnt: false,
         cx16: false,
         lahf_lm: false,
+        lzcnt: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -775,6 +784,7 @@ impl Features {
         popcnt: false,
         cx16: false,
         lahf_lm: false,
+        lzcnt: false,
     };
 
     /// The x86-64-v2 micro-architecture level: the baseline plus
@@ -864,6 +874,9 @@ impl Features {
         }
         if self.lahf_lm && !self.long {
             return missing("long", "lahf_lm");
+        }
+        if self.lzcnt && !self.long {
+            return missing("long", "lzcnt");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2624,7 +2637,7 @@ impl X86 {
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
             "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
-            "popcnt", "cx16", "lahf_lm", "xsave",
+            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2654,7 +2667,8 @@ impl X86 {
                 "sse42" => features.sse42 = on,
                 "popcnt" => features.popcnt = on,
                 "cx16" => features.cx16 = on,
-                _ => features.lahf_lm = on,
+                "lahf_lm" => features.lahf_lm = on,
+                _ => features.lzcnt = on,
             }
         }
         features.validate()?;
@@ -3939,6 +3953,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: LAHF and SAHF in 64-bit mode",
+        },
+        PropertySpec {
+            name: "lzcnt",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: LZCNT (without it, F3 0F BD is BSR)",
         },
         PropertySpec {
             name: "model",

@@ -1036,6 +1036,8 @@ fn the_level_property_is_a_preset_the_overrides_refine() {
     )
     .unwrap();
     assert_eq!(built, Features::X86_64_V2);
+    // An extension past v2 is a boolean on top of either level.
+    assert!(level(&[("lzcnt", true)], "v1", "x86-64").unwrap().lzcnt);
 }
 
 /// An extension set no part could have is refused by the *core*, with the
@@ -4389,6 +4391,94 @@ mod long_mode {
         // No extension in this core lives in leaf 7 yet, so no part raises
         // the maximum for it: the baseline and v2 still stop at leaf 1.
         assert_eq!(cpuid64(v2, 0, 0).0, 1);
+    }
+
+    /// `mov rcx, src ; mov rax, PATTERN ; <insn> ; pushfq ; pop rdx ; hlt`
+    /// on a part with `features`, in 64-bit mode: `(RAX, RFLAGS)`.
+    fn count64(features: Features, insn: &[u8], src: u64) -> (u64, u64) {
+        let mut code = alloc::vec![0x48, 0xb9];
+        code.extend_from_slice(&src.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&PATTERN.to_le_bytes());
+        code.extend_from_slice(insn);
+        code.extend_from_slice(&[0x9c, 0x5a, 0xf4]);
+        let pc = run64_on(Pc::with_features(Variant::X86_64, features), 0, &code);
+        (pc.regs().rax, pc.regs().rdx)
+    }
+
+    /// What `RAX` holds before an instruction under test writes it.
+    const PATTERN: u64 = 0x5555_5555_5555_5555;
+
+    fn with_lzcnt() -> Features {
+        Features {
+            lzcnt: true,
+            ..Features::X86_64
+        }
+    }
+
+    #[test]
+    fn lzcnt_counts_at_every_width_and_says_zero_in_cf() {
+        // *Intel SDM* volume 2, `LZCNT`: a zero source gives the operand
+        // width and `CF`; a set top bit gives zero and `ZF`.
+        let cf_zf = |flags: u64| {
+            (
+                flags & u64::from(flags::CF) != 0,
+                flags & u64::from(flags::ZF) != 0,
+            )
+        };
+        // lzcnt ax, cx ; lzcnt eax, ecx ; lzcnt rax, rcx
+        let forms: [(&[u8], u64, u64); 3] = [
+            (&[0x66, 0xf3, 0x0f, 0xbd, 0xc1], 16, 0xffff),
+            (&[0xf3, 0x0f, 0xbd, 0xc1], 32, 0xffff_ffff),
+            (&[0xf3, 0x48, 0x0f, 0xbd, 0xc1], 64, u64::MAX),
+        ];
+        // A 16-bit write keeps the rest of `RAX`; a 32-bit one clears it.
+        let merge = |width: u64, value: u64| match width {
+            16 => (PATTERN & !0xffff) | value,
+            _ => value,
+        };
+        for (insn, width, ones) in forms {
+            // Bits above the operand are not part of the source.
+            let above = !ones;
+            let (rax, fl) = count64(with_lzcnt(), insn, above);
+            assert_eq!(rax, merge(width, width), "{width}: zero is the width");
+            assert_eq!(cf_zf(fl), (true, false), "{width}: CF for a zero source");
+            let (rax, fl) = count64(with_lzcnt(), insn, ones);
+            assert_eq!(rax, merge(width, 0), "{width}: all ones");
+            assert_eq!(cf_zf(fl), (false, true), "{width}: ZF for a zero count");
+            let (rax, fl) = count64(with_lzcnt(), insn, above | 1);
+            assert_eq!(rax, merge(width, width - 1), "{width}: one");
+            assert_eq!(cf_zf(fl), (false, false), "{width}");
+        }
+    }
+
+    #[test]
+    fn lzcnt_without_its_bit_is_bsr() {
+        // *Intel SDM* volume 2, `LZCNT`: on a part without it the encoding
+        // executes as `BSR`, the `F3` ignored.
+        let lzcnt = [0xf3, 0x0f, 0xbd, 0xc1];
+        let (rax, fl) = count64(Features::X86_64, &lzcnt, 0x10);
+        assert_eq!(rax, 4, "the index of the top bit, not 27");
+        assert_eq!(fl & u64::from(flags::ZF), 0);
+        // And a zero source is BSR's: ZF, and the destination untouched.
+        let (rax, fl) = count64(Features::X86_64, &lzcnt, 0);
+        assert_eq!(rax, PATTERN);
+        assert_ne!(fl & u64::from(flags::ZF), 0);
+        assert_eq!(count64(with_lzcnt(), &lzcnt, 0x10).0, 27);
+    }
+
+    #[test]
+    fn cpuid_reports_lzcnt_in_the_extended_leaf() {
+        let ecx = |features| cpuid64(features, 0x8000_0001, 0).2;
+        assert_eq!(ecx(Features::X86_64) & (1 << 5), 0);
+        assert_eq!(ecx(Features::X86_64_V2) & (1 << 5), 0, "not a v2 bit");
+        assert_ne!(ecx(with_lzcnt()) & (1 << 5), 0, "CPUID.80000001H:ECX.ABM");
+        // The bit lives in a leaf only a long-mode part answers.
+        let impossible = Features {
+            lzcnt: true,
+            ..Features::I80486
+        };
+        assert!(impossible.validate().is_err());
     }
 
     #[test]

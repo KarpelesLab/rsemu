@@ -2724,6 +2724,7 @@ impl<'a> Exec<'a> {
             Op::XSETBV => self.xsetbv()?,
             Op::CRC32 => self.crc32(f)?,
             Op::POPCNT => self.popcnt(f, size)?,
+            Op::LZCNT => self.lzcnt(f, size)?,
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
@@ -2883,25 +2884,7 @@ impl<'a> Exec<'a> {
                 }
             }
             Op::BT | Op::BTS | Op::BTR | Op::BTC => self.bit_test(f, size)?,
-            Op::BSF | Op::BSR => {
-                let src = self.read_arg(f, insn.src, size)?;
-                self.set_flag(flags::ZF, src == 0);
-                if src != 0 {
-                    let bits = u32::from(size) * 8;
-                    let index = if insn.op == Op::BSF {
-                        src.trailing_zeros()
-                    } else {
-                        // The source has already been masked to the operand
-                        // size, so the highest set bit is counted from the
-                        // operand's own width rather than from 64.
-                        bits - 1 - (src.leading_zeros() - (64 - bits))
-                    };
-                    self.write_arg(f, insn.dst, size, u64::from(index))?;
-                }
-                // A source of zero leaves the destination untouched. That is
-                // the architecture, not an omission: the manual says the
-                // result is undefined and the silicon writes nothing.
-            }
+            Op::BSF | Op::BSR => self.bit_scan(f, size, insn.op == Op::BSR)?,
             Op::CPUID => self.cpuid()?,
             Op::CLTS => {
                 if self.protected() && self.cpl() != 0 {
@@ -4075,6 +4058,32 @@ impl<'a> Exec<'a> {
         self.take_interrupt(vector, None)
     }
 
+    /// `BSF` (`reverse` clear) and `BSR`: the index of the lowest or highest
+    /// set bit of the source, and `ZF` for a source of zero.
+    ///
+    /// Its own function because `LZCNT` on a part without it is this, and
+    /// `TZCNT` on one without BMI1 will be too.
+    pub(super) fn bit_scan(&mut self, f: &Fields, size: u8, reverse: bool) -> Ex<()> {
+        let src = self.read_arg(f, f.insn.src, size)?;
+        self.set_flag(flags::ZF, src == 0);
+        if src != 0 {
+            let bits = u32::from(size) * 8;
+            let index = if reverse {
+                // The source has already been masked to the operand size, so
+                // the highest set bit is counted from the operand's own width
+                // rather than from 64.
+                bits - 1 - (src.leading_zeros() - (64 - bits))
+            } else {
+                src.trailing_zeros()
+            };
+            self.write_arg(f, f.insn.dst, size, u64::from(index))?;
+        }
+        // A source of zero leaves the destination untouched. That is the
+        // architecture, not an omission: the manual says the result is
+        // undefined and the silicon writes nothing.
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // CPUID
     // -----------------------------------------------------------------
@@ -4277,7 +4286,10 @@ impl<'a> Exec<'a> {
                     edx |= 1 << 11; // SYSCALL/SYSRET
                 }
                 // `LAHF-SAHF`, ECX[0]: the two flag moves in 64-bit mode.
-                let ecx = u32::from(features.lahf_lm);
+                let mut ecx = u32::from(features.lahf_lm);
+                if features.lzcnt {
+                    ecx |= 1 << 5; // ABM: LZCNT (Intel's name for it is LZCNT)
+                }
                 set(signature, 0, ecx, edx);
             }
             0x8000_0007 if features.long => {

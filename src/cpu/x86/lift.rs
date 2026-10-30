@@ -4952,6 +4952,10 @@ mod tests {
             (&[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x04], "palignr"),
             (&[0xf2, 0x0f, 0x38, 0xf1, 0xc1], "crc32"),
             (&[0xf3, 0x0f, 0xb8, 0xc1], "popcnt"),
+            // `LZCNT` is `BSR` on a part without it, and the lifter's world
+            // does not know which part it is — so the `F3` form is never
+            // lifted as the `BSR` that is.
+            (&[0xf3, 0x0f, 0xbd, 0xc1], "lzcnt"),
         ] {
             let mut code = alloc::vec![0x40];
             code.extend_from_slice(bytes);

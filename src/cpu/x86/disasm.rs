@@ -975,6 +975,19 @@ mod tests {
     }
 
     #[test]
+    fn lzcnt_lists_as_lzcnt_whatever_the_part() {
+        // The listing cannot know the features: on a part without `LZCNT`
+        // these bytes execute as `BSR`, and the listing still says `lzcnt`,
+        // which is what they were assembled from.
+        assert_eq!(text32(&[0xf3, 0x0f, 0xbd, 0xc1]), "lzcnt eax, ecx");
+        assert_eq!(
+            text32(&[0x66, 0xf3, 0x0f, 0xbd, 0x03]),
+            "lzcnt ax, [ds:ebx]"
+        );
+        assert_eq!(text32(&[0x0f, 0xbd, 0xc1]), "bsr eax, ecx");
+    }
+
+    #[test]
     fn sse3_lists_without_a_repeat_prefix() {
         // The `F2`/`F3` are mandatory prefixes, part of the opcode.
         assert_eq!(text32(&[0xf2, 0x0f, 0x7c, 0xc1]), "haddps xmm0, xmm1");
