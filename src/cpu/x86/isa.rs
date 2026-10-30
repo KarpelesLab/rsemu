@@ -1241,6 +1241,52 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("PSIGNB", "psignb"),
     ("PSIGND", "psignd"),
     ("PSIGNW", "psignw"),
+    ("BLENDPD", "blendpd"),
+    ("BLENDPS", "blendps"),
+    ("BLENDVPD", "blendvpd"),
+    ("BLENDVPS", "blendvps"),
+    ("DPPD", "dppd"),
+    ("DPPS", "dpps"),
+    ("EXTRACTPS", "extractps"),
+    ("INSERTPS", "insertps"),
+    ("MOVNTDQA", "movntdqa"),
+    ("MPSADBW", "mpsadbw"),
+    ("PACKUSDW", "packusdw"),
+    ("PBLENDVB", "pblendvb"),
+    ("PBLENDW", "pblendw"),
+    ("PCMPEQQ", "pcmpeqq"),
+    ("PEXTRB", "pextrb"),
+    ("PEXTRD", "pextrd"),
+    ("PHMINPOSUW", "phminposuw"),
+    ("PINSRB", "pinsrb"),
+    ("PINSRD", "pinsrd"),
+    ("PMAXSB", "pmaxsb"),
+    ("PMAXSD", "pmaxsd"),
+    ("PMAXUD", "pmaxud"),
+    ("PMAXUW", "pmaxuw"),
+    ("PMINSB", "pminsb"),
+    ("PMINSD", "pminsd"),
+    ("PMINUD", "pminud"),
+    ("PMINUW", "pminuw"),
+    ("PMOVSXBD", "pmovsxbd"),
+    ("PMOVSXBQ", "pmovsxbq"),
+    ("PMOVSXBW", "pmovsxbw"),
+    ("PMOVSXDQ", "pmovsxdq"),
+    ("PMOVSXWD", "pmovsxwd"),
+    ("PMOVSXWQ", "pmovsxwq"),
+    ("PMOVZXBD", "pmovzxbd"),
+    ("PMOVZXBQ", "pmovzxbq"),
+    ("PMOVZXBW", "pmovzxbw"),
+    ("PMOVZXDQ", "pmovzxdq"),
+    ("PMOVZXWD", "pmovzxwd"),
+    ("PMOVZXWQ", "pmovzxwq"),
+    ("PMULDQ", "pmuldq"),
+    ("PMULLD", "pmulld"),
+    ("PTEST", "ptest"),
+    ("ROUNDPD", "roundpd"),
+    ("ROUNDPS", "roundps"),
+    ("ROUNDSD", "roundsd"),
+    ("ROUNDSS", "roundss"),
 ];
 
 define_ops! {
@@ -1765,6 +1811,54 @@ define_ops! {
     PSIGNB = "negate, zero or keep each byte by the sign of the source's",
     PSIGND = "negate, zero or keep each doubleword by the sign of the source's",
     PSIGNW = "negate, zero or keep each word by the sign of the source's",
+
+    // ---- SSE4.1 ----------------------------------------------------------
+    BLENDPD = "select each double from the source or the destination by an immediate bit",
+    BLENDPS = "select each single from the source or the destination by an immediate bit",
+    BLENDVPD = "select each double from the source or the destination by the sign of XMM0's",
+    BLENDVPS = "select each single from the source or the destination by the sign of XMM0's",
+    DPPD = "dot product of the doubles an immediate selects, broadcast where it says",
+    DPPS = "dot product of the singles an immediate selects, broadcast where it says",
+    EXTRACTPS = "extract one single into a general register or memory",
+    INSERTPS = "insert one single, from a register lane or memory, and zero lanes by mask",
+    MOVNTDQA = "load an aligned double quadword with a non-temporal hint",
+    MPSADBW = "eight sums of absolute differences of byte quadruples, at immediate offsets",
+    PACKUSDW = "pack signed doublewords into words with unsigned saturation",
+    PBLENDVB = "select each byte from the source or the destination by the sign of XMM0's",
+    PBLENDW = "select each word from the source or the destination by an immediate bit",
+    PCMPEQQ = "compare packed quadwords for equality",
+    PEXTRB = "extract one byte into a general register or memory",
+    PEXTRD = "extract one doubleword (a quadword with REX.W) into a general register or memory",
+    PHMINPOSUW = "the smallest unsigned word and its index",
+    PINSRB = "insert one byte from a general register or memory",
+    PINSRD = "insert one doubleword (a quadword with REX.W) from a general register or memory",
+    PMAXSB = "the larger of each pair of signed bytes",
+    PMAXSD = "the larger of each pair of signed doublewords",
+    PMAXUD = "the larger of each pair of unsigned doublewords",
+    PMAXUW = "the larger of each pair of unsigned words",
+    PMINSB = "the smaller of each pair of signed bytes",
+    PMINSD = "the smaller of each pair of signed doublewords",
+    PMINUD = "the smaller of each pair of unsigned doublewords",
+    PMINUW = "the smaller of each pair of unsigned words",
+    PMOVSXBD = "sign-extend the low four bytes to doublewords",
+    PMOVSXBQ = "sign-extend the low two bytes to quadwords",
+    PMOVSXBW = "sign-extend the low eight bytes to words",
+    PMOVSXDQ = "sign-extend the low two doublewords to quadwords",
+    PMOVSXWD = "sign-extend the low four words to doublewords",
+    PMOVSXWQ = "sign-extend the low two words to quadwords",
+    PMOVZXBD = "zero-extend the low four bytes to doublewords",
+    PMOVZXBQ = "zero-extend the low two bytes to quadwords",
+    PMOVZXBW = "zero-extend the low eight bytes to words",
+    PMOVZXDQ = "zero-extend the low two doublewords to quadwords",
+    PMOVZXWD = "zero-extend the low four words to doublewords",
+    PMOVZXWQ = "zero-extend the low two words to quadwords",
+    PMULDQ = "multiply the even signed doublewords into quadwords",
+    PMULLD = "the low halves of doubleword products",
+    PTEST = "set ZF if the AND is zero and CF if the AND NOT is zero",
+    ROUNDPD = "round packed doubles to integers under an immediate mode",
+    ROUNDPS = "round packed singles to integers under an immediate mode",
+    ROUNDSD = "round the low double to an integer under an immediate mode",
+    ROUNDSS = "round the low single to an integer under an immediate mode",
 }
 
 impl Op {
@@ -2378,6 +2472,52 @@ impl Op {
             | Op::PSIGNB
             | Op::PSIGND
             | Op::PSIGNW => Extension::Ssse3,
+            Op::BLENDPD
+            | Op::BLENDPS
+            | Op::BLENDVPD
+            | Op::BLENDVPS
+            | Op::DPPD
+            | Op::DPPS
+            | Op::EXTRACTPS
+            | Op::INSERTPS
+            | Op::MOVNTDQA
+            | Op::MPSADBW
+            | Op::PACKUSDW
+            | Op::PBLENDVB
+            | Op::PBLENDW
+            | Op::PCMPEQQ
+            | Op::PEXTRB
+            | Op::PEXTRD
+            | Op::PHMINPOSUW
+            | Op::PINSRB
+            | Op::PINSRD
+            | Op::PMAXSB
+            | Op::PMAXSD
+            | Op::PMAXUD
+            | Op::PMAXUW
+            | Op::PMINSB
+            | Op::PMINSD
+            | Op::PMINUD
+            | Op::PMINUW
+            | Op::PMOVSXBD
+            | Op::PMOVSXBQ
+            | Op::PMOVSXBW
+            | Op::PMOVSXDQ
+            | Op::PMOVSXWD
+            | Op::PMOVSXWQ
+            | Op::PMOVZXBD
+            | Op::PMOVZXBQ
+            | Op::PMOVZXBW
+            | Op::PMOVZXDQ
+            | Op::PMOVZXWD
+            | Op::PMOVZXWQ
+            | Op::PMULDQ
+            | Op::PMULLD
+            | Op::PTEST
+            | Op::ROUNDPD
+            | Op::ROUNDPS
+            | Op::ROUNDSD
+            | Op::ROUNDSS => Extension::Sse41,
             _ => return None,
         };
         Some(ext)
@@ -2541,6 +2681,8 @@ pub enum Extension {
     /// Supplemental SSE3: `CPUID.01H:ECX[9]`. Every instruction of it has an
     /// `MM` form and an `XMM` form.
     Ssse3,
+    /// SSE4.1: `CPUID.01H:ECX[19]`.
+    Sse41,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -2672,6 +2814,12 @@ impl Insn {
     /// the encoding as well as the operation.
     #[must_use]
     pub const fn extension(self) -> Option<Extension> {
+        // `66 0F 3A 15` is `PEXTRW` again, SSE4.1's form of it, which can
+        // store to memory where SSE2's `66 0F C5` cannot. Same operation,
+        // different extension, and only the destination says which.
+        if matches!(self.op, Op::PEXTRW) && matches!(self.dst, Arg::RdMw) {
+            return Some(Extension::Sse41);
+        }
         self.op.extension()
     }
 
@@ -3827,6 +3975,45 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x1c PABSB     Vx Wx None Documented;
     0x1d PABSW     Vx Wx None Documented;
     0x1e PABSD     Vx Wx None Documented;
+
+    // SSE4.1. The variable blends take their mask from `XMM0`, which no
+    // field names — Intel writes it `<XMM0>` — so it is a third operand
+    // here that the decoder reads nothing for.
+    0x10 PBLENDVB  Vx Wx +Xmm0 None Documented;
+    0x14 BLENDVPS  Vx Wx +Xmm0 None Documented;
+    0x15 BLENDVPD  Vx Wx +Xmm0 None Documented;
+    0x17 PTEST     Vx Wx None Documented;
+    // The widening moves read exactly the lanes they widen, so the memory
+    // form's width is the result's lane count times the source lane:
+    // eight, four or two bytes.
+    0x20 PMOVSXBW  Vx Wq None Documented;
+    0x21 PMOVSXBD  Vx Wd None Documented;
+    0x22 PMOVSXBQ  Vx Ww None Documented;
+    0x23 PMOVSXWD  Vx Wq None Documented;
+    0x24 PMOVSXWQ  Vx Wd None Documented;
+    0x25 PMOVSXDQ  Vx Wq None Documented;
+    0x28 PMULDQ    Vx Wx None Documented;
+    0x29 PCMPEQQ   Vx Wx None Documented;
+    // Memory only (Intel's `Mx`); `Wx` so the register form decodes to
+    // something the executor refuses.
+    0x2a MOVNTDQA  Vx Wx None Documented;
+    0x2b PACKUSDW  Vx Wx None Documented;
+    0x30 PMOVZXBW  Vx Wq None Documented;
+    0x31 PMOVZXBD  Vx Wd None Documented;
+    0x32 PMOVZXBQ  Vx Ww None Documented;
+    0x33 PMOVZXWD  Vx Wq None Documented;
+    0x34 PMOVZXWQ  Vx Wd None Documented;
+    0x35 PMOVZXDQ  Vx Wq None Documented;
+    0x38 PMINSB    Vx Wx None Documented;
+    0x39 PMINSD    Vx Wx None Documented;
+    0x3a PMINUW    Vx Wx None Documented;
+    0x3b PMINUD    Vx Wx None Documented;
+    0x3c PMAXSB    Vx Wx None Documented;
+    0x3d PMAXSD    Vx Wx None Documented;
+    0x3e PMAXUW    Vx Wx None Documented;
+    0x3f PMAXUD    Vx Wx None Documented;
+    0x40 PMULLD    Vx Wx None Documented;
+    0x41 PHMINPOSUW Vx Wx None Documented;
 };
 
 /// The `0F 38` map with a `66` prefix.
@@ -3851,6 +4038,30 @@ const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
     base [UNASSIGNED; 256];
 
     0x0f PALIGNR   Vx Wx +Ib None Documented;
+
+    // SSE4.1. The scalar rounds read one lane, so their memory forms are
+    // four and eight bytes.
+    0x08 ROUNDPS   Vx Wx +Ib None Documented;
+    0x09 ROUNDPD   Vx Wx +Ib None Documented;
+    0x0a ROUNDSS   Vx Wd +Ib None Documented;
+    0x0b ROUNDSD   Vx Wq +Ib None Documented;
+    0x0c BLENDPS   Vx Wx +Ib None Documented;
+    0x0d BLENDPD   Vx Wx +Ib None Documented;
+    0x0e PBLENDW   Vx Wx +Ib None Documented;
+    // The extractions name a whole general register, or exactly the bytes
+    // they extract in memory. `PEXTRD` is `PEXTRQ` with `REX.W`, the way
+    // `MOVD` is `MOVQ`; `EXTRACTPS` ignores `REX.W` and writes four bytes.
+    0x14 PEXTRB    RdMb Vx +Ib None Documented;
+    0x15 PEXTRW    RdMw Vx +Ib None Documented;
+    0x16 PEXTRD    Ey   Vx +Ib None Documented;
+    0x17 EXTRACTPS Ed   Vx +Ib None Documented;
+    0x20 PINSRB    Vx RdMb +Ib None Documented;
+    // `INSERTPS` reads a lane of a register or four bytes of memory.
+    0x21 INSERTPS  Vx Wd +Ib None Documented;
+    0x22 PINSRD    Vx Ey +Ib None Documented;
+    0x40 DPPS      Vx Wx +Ib None Documented;
+    0x41 DPPD      Vx Wx +Ib None Documented;
+    0x42 MPSADBW   Vx Wx +Ib None Documented;
 };
 
 /// The `0F 3A` map with a `66` prefix.

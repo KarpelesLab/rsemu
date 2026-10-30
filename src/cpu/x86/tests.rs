@@ -4051,8 +4051,21 @@ mod long_mode {
     /// [`a_guest_enters_long_mode_and_executes_64_bit_code`] is the one test
     /// that walks through it explicitly.
     fn run64(code: &[u8]) -> Pc {
-        let pc = pc64();
+        run64_on(pc64(), 0, code)
+    }
+
+    /// [`run64`] on a part with `features`, with `CR4.OSFXSR` set so the
+    /// SIMD extensions are usable.
+    fn run64_with(features: Features, code: &[u8]) -> Pc {
+        let pc = Pc::with_features(Variant::X86_64, features);
+        run64_on(pc, cr4::OSFXSR | cr4::OSXMMEXCPT, code)
+    }
+
+    fn run64_on(pc: Pc, cr4_bits: u64, code: &[u8]) -> Pc {
         pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4_bits;
+        pc.cpu.set_sys(sys);
         pc.prepare_long();
         pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
         pc.write(la::CODE64, code);
@@ -4060,6 +4073,35 @@ mod long_mode {
         assert!(steps < 200, "the 64-bit program halted");
         assert!(pc.cpu.sys().sixty_four(), "and did so in 64-bit mode");
         pc
+    }
+
+    /// The x86-64-v2 extensions on top of the baseline.
+    fn v2_features() -> Features {
+        Features {
+            sse3: true,
+            ssse3: true,
+            sse41: true,
+            ..Features::X86_64
+        }
+    }
+
+    #[test]
+    fn pinsrq_and_pextrq_are_the_rex_w_forms_and_narrow_writes_zero_extend() {
+        let mut code = alloc::vec![0x48u8, 0xb8];
+        code.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes()); // mov rax, imm64
+        code.extend_from_slice(&[0x66, 0x48, 0x0f, 0x3a, 0x22, 0xc8, 0x01]); // pinsrq xmm1, rax, 1
+        code.extend_from_slice(&[0x66, 0x48, 0x0f, 0x3a, 0x16, 0xcb, 0x01]); // pextrq rbx, xmm1, 1
+        code.extend_from_slice(&[0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff]); // mov rcx, -1
+        code.extend_from_slice(&[0x66, 0x0f, 0x3a, 0x16, 0xc9, 0x03]); // pextrd ecx, xmm1, 3
+        code.extend_from_slice(&[0x48, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff]); // mov rdx, -1
+        code.extend_from_slice(&[0x66, 0x0f, 0x3a, 0x14, 0xca, 0x08]); // pextrb edx, xmm1, 8
+        code.push(0xf4);
+        let pc = run64_with(v2_features(), &code);
+        let r = pc.regs();
+        assert_eq!(pc.cpu.sse().get(1)[1], 0x1122_3344_5566_7788);
+        assert_eq!(r.rbx, 0x1122_3344_5566_7788);
+        assert_eq!(r.rcx, 0x1122_3344, "a 32-bit write clears the upper half");
+        assert_eq!(r.rdx, 0x88, "so does PEXTRB's");
     }
 
     #[test]
@@ -11052,6 +11094,8 @@ mod v2 {
 
     /// Scratch memory, sixteen-byte aligned.
     const DATA: u64 = 0xb000;
+    /// Where a result is stored.
+    const OUT: u64 = 0xc000;
     /// Where a fault handler sits, and `RIP` once its `hlt` has retired.
     const HANDLER: u64 = 0x3800;
     const HANDLED: u64 = HANDLER + 1;
@@ -11072,6 +11116,7 @@ mod v2 {
         Features {
             sse3: true,
             ssse3: true,
+            sse41: true,
             ..Features::X86_64
         }
     }
@@ -11209,6 +11254,167 @@ mod v2 {
         // And it needs SSE3 under it.
         let impossible = Features {
             ssse3: true,
+            ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    // -- SSE4.1 ------------------------------------------------------------
+
+    fn set_regs(pc: &Pc, f: impl FnOnce(&mut Regs)) {
+        let mut regs = pc.cpu.regs();
+        f(&mut regs);
+        pc.cpu.set_regs(regs);
+    }
+
+    fn read64(pc: &Pc, addr: u64) -> u64 {
+        (0..8u64).fold(0, |v, i| {
+            v | (u64::from(pc.ram.read_u8(addr + i).unwrap()) << (8 * i))
+        })
+    }
+
+    #[test]
+    fn pextrb_and_pinsrb_reach_a_whole_register_or_one_byte() {
+        let pc = v2pc();
+        set_xmm(&pc, &[(1, [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908])]);
+        set_regs(&pc, |r| r.rax = 0xffff_ffff);
+        write64(&pc, OUT, 0x5555_5555_5555_5555);
+        let mut code = Vec::new();
+        // pextrb eax, xmm1, 13: the register is written whole, zero-extended.
+        code.extend_from_slice(&[0x66, 0x0f, 0x3a, 0x14, 0xc8, 13]);
+        // pextrb [OUT], xmm1, 9: one byte, the rest left alone.
+        code.extend_from_slice(&mem(&[0x66, 0x0f, 0x3a, 0x14], 1, OUT));
+        code.push(9);
+        // mov ecx, 0x1234_56aa ; pinsrb xmm1, ecx, 0: the low byte only.
+        code.extend_from_slice(&[0xb9, 0xaa, 0x56, 0x34, 0x12]);
+        code.extend_from_slice(&[0x66, 0x0f, 0x3a, 0x20, 0xc9, 0]);
+        // pinsrb xmm1, [OUT+1], 15: a byte of memory.
+        code.extend_from_slice(&mem(&[0x66, 0x0f, 0x3a, 0x20], 1, OUT + 1));
+        code.push(15);
+        // pextrw [OUT+8], xmm1, 7: SSE4.1's form, which can store.
+        code.extend_from_slice(&mem(&[0x66, 0x0f, 0x3a, 0x15], 1, OUT + 8));
+        code.push(7);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rax, 0x0d);
+        assert_eq!(read64(&pc, OUT), 0x5555_5555_5555_5509);
+        assert_eq!(xmm(&pc, 1), [0x0706_0504_0302_01aa, 0x550e_0d0c_0b0a_0908]);
+        assert_eq!(read64(&pc, OUT + 8), 0x550e, "two bytes and no more");
+    }
+
+    #[test]
+    fn extractps_and_insertps_move_one_single() {
+        let pc = v2pc();
+        set_xmm(
+            &pc,
+            &[
+                (0, [0x2222_2222_1111_1111, 0x4444_4444_3333_3333]),
+                (1, [0xbbbb_bbbb_aaaa_aaaa, 0xdddd_dddd_cccc_cccc]),
+            ],
+        );
+        write64(&pc, DATA, 0x9999_9999);
+        let mut code = Vec::new();
+        // extractps edx, xmm0, 2
+        code.extend_from_slice(&[0x66, 0x0f, 0x3a, 0x17, 0xc2, 2]);
+        // insertps xmm0, xmm1, 0b11_01_0001: lane 3 of xmm1 into lane 1,
+        // then zero lane 0.
+        code.extend_from_slice(&[0x66, 0x0f, 0x3a, 0x21, 0xc1, 0b1101_0001]);
+        // insertps xmm1, [DATA], 0b11_10_0000: memory ignores imm[7:6].
+        code.extend_from_slice(&mem(&[0x66, 0x0f, 0x3a, 0x21], 1, DATA));
+        code.push(0b1110_0000);
+        run(&pc, &code);
+        assert_eq!(pc.regs().rdx, 0x3333_3333);
+        assert_eq!(xmm(&pc, 0), [0xdddd_dddd_0000_0000, 0x4444_4444_3333_3333]);
+        assert_eq!(xmm(&pc, 1), [0xbbbb_bbbb_aaaa_aaaa, 0xdddd_dddd_9999_9999]);
+    }
+
+    #[test]
+    fn ptest_sets_zf_and_cf_and_clears_the_rest() {
+        // (dst, src, ZF, CF): ZF when the AND is zero, CF when src AND NOT
+        // dst is.
+        for (dst, src, zf, cf) in [
+            ([0xf0u64, 0], [0x0fu64, 0], true, false),
+            ([0xff, 0], [0x0f, 0], false, true),
+            ([0, 0], [0, 0], true, true),
+            ([0, 1], [0, 3], false, false),
+        ] {
+            let pc = v2pc();
+            set_xmm(&pc, &[(2, dst), (3, src)]);
+            // Every arithmetic flag set first, so the clears are visible.
+            set_regs(&pc, |r| r.eflags |= 0x8d5);
+            run(&pc, &[0x66, 0x0f, 0x38, 0x17, 0xd3]); // ptest xmm2, xmm3
+            let e = pc.regs().eflags;
+            assert_eq!(e & flags::ZF != 0, zf, "{dst:x?} {src:x?}");
+            assert_eq!(e & flags::CF != 0, cf, "{dst:x?} {src:x?}");
+            assert_eq!(e & (flags::AF | flags::OF | flags::PF | flags::SF), 0);
+        }
+    }
+
+    #[test]
+    fn the_variable_blends_read_xmm0_without_naming_it() {
+        let pc = v2pc();
+        set_xmm(
+            &pc,
+            &[(0, [0x8000_0000_0000_0000, 0]), (1, [1, 2]), (2, [3, 4])],
+        );
+        run(&pc, &[0x66, 0x0f, 0x38, 0x15, 0xca]); // blendvpd xmm1, xmm2, xmm0
+        assert_eq!(xmm(&pc, 1), [3, 2]);
+    }
+
+    #[test]
+    fn pmovsxbq_reads_two_bytes_of_memory() {
+        let pc = v2pc();
+        write64(&pc, DATA, 0x7777_7777_7777_80ff);
+        run(&pc, &mem(&[0x66, 0x0f, 0x38, 0x22], 4, DATA));
+        assert_eq!(xmm(&pc, 4), [u64::MAX, 0xffff_ffff_ffff_ff80]);
+        let pc = v2pc();
+        write64(&pc, DATA, 0x7777_7777_7777_80ff);
+        run(&pc, &mem(&[0x66, 0x0f, 0x38, 0x32], 4, DATA));
+        assert_eq!(xmm(&pc, 4), [0xff, 0x80]);
+    }
+
+    #[test]
+    fn roundps_follows_mxcsr_when_the_immediate_says_so() {
+        // roundps xmm0, [DATA], 4 with MXCSR.RC = down: [2.5, -2.5] become
+        // [2, -3].
+        let pc = v2pc();
+        let mut sse = pc.cpu.sse();
+        sse.mxcsr |= 1 << 13;
+        pc.cpu.set_sse(sse);
+        write128(&pc, DATA, [0xc020_0000_4020_0000, 0]);
+        let mut code = mem(&[0x66, 0x0f, 0x3a, 0x08], 0, DATA);
+        code.push(4);
+        run(&pc, &code);
+        assert_eq!(xmm(&pc, 0), [0xc040_0000_4000_0000, 0]);
+        assert_ne!(pc.cpu.sse().mxcsr & (1 << 5), 0, "PE");
+    }
+
+    #[test]
+    fn movntdqa_is_an_aligned_load_with_no_register_form() {
+        let pc = v2pc();
+        write128(&pc, DATA, [1, 2]);
+        run(&pc, &mem(&[0x66, 0x0f, 0x38, 0x2a], 5, DATA));
+        assert_eq!(xmm(&pc, 5), [1, 2]);
+        faults(&v2pc(), 13, &mem(&[0x66, 0x0f, 0x38, 0x2a], 5, DATA + 8));
+        faults(&v2pc(), 6, &[0x66, 0x0f, 0x38, 0x2a, 0xc1]);
+    }
+
+    #[test]
+    fn sse41_is_undefined_without_it() {
+        let without = Features {
+            sse3: true,
+            ssse3: true,
+            ..Features::X86_64
+        };
+        faults(&pc_with(without), 6, &[0x66, 0x0f, 0x38, 0x17, 0xc1]); // ptest
+        faults(&pc_with(without), 6, &[0x66, 0x0f, 0x3a, 0x0e, 0xc1, 0]); // pblendw
+        // The SSE4.1 PEXTRW needs SSE4.1; SSE2's does not.
+        faults(&pc_with(without), 6, &[0x66, 0x0f, 0x3a, 0x15, 0xc0, 0]);
+        run(&pc_with(without), &[0x66, 0x0f, 0xc5, 0xc0, 0]);
+        assert_eq!(leaf1_ecx(without) & (1 << 19), 0);
+        assert_ne!(leaf1_ecx(all()) & (1 << 19), 0, "CPUID.01H:ECX.SSE4_1");
+        let impossible = Features {
+            sse3: true,
+            sse41: true,
             ..Features::X86_64
         };
         assert!(impossible.validate().is_err());

@@ -161,8 +161,9 @@
 //!   the chipset to IRQ 13, and no wire models that, so the exception stays
 //!   pending instead of being delivered down a path that does not exist.
 //! - **No `MONITOR`/`MWAIT`**: SSE3 is here otherwise ([`Features::sse3`]),
-//!   and those two raise `#UD` with their own `CPUID` bit clear. SSSE3 is
-//!   here ([`Features::ssse3`]); no SSE4 or later, and no AVX.
+//!   and those two raise `#UD` with their own `CPUID` bit clear. SSSE3 and
+//!   SSE4.1 are here ([`Features::ssse3`], [`Features::sse41`]); no SSE4.2
+//!   or later, no AVX.
 //! - **No `XSAVES`/`XRSTORS`**, and so no `IA32_XSS`: they exist for
 //!   supervisor state components, and there are none to save. `CPUID` leaf
 //!   `0Dh` says so.
@@ -657,6 +658,11 @@ pub struct Features {
     /// `MM` and on `XMM` registers. `CPUID.01H:ECX[9]`. Requires
     /// [`sse3`](Features::sse3).
     pub ssse3: bool,
+    /// SSE4.1: the blends, `PTEST`, the widening moves, the rounds, the
+    /// dot products, `MPSADBW`, `PHMINPOSUW`, the byte/doubleword
+    /// extractions and insertions and the rest of the packed-integer gaps
+    /// SSE2 left. `CPUID.01H:ECX[19]`. Requires [`ssse3`](Features::ssse3).
+    pub sse41: bool,
 }
 
 impl Features {
@@ -682,6 +688,7 @@ impl Features {
         sse3: false,
         xsave: false,
         ssse3: false,
+        sse41: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -732,6 +739,7 @@ impl Features {
         sse3: false,
         xsave: false,
         ssse3: false,
+        sse41: false,
     };
 
     /// Whether this combination describes a part that could exist.
@@ -782,6 +790,9 @@ impl Features {
         }
         if self.ssse3 && !self.sse3 {
             return missing("sse3", "ssse3");
+        }
+        if self.sse41 && !self.ssse3 {
+            return missing("ssse3", "sse41");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2518,7 +2529,7 @@ impl X86 {
         let mut features = variant.features();
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
-            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "xsave", "ssse3",
+            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "xsave",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2543,7 +2554,8 @@ impl X86 {
                 "sse2" => features.sse2 = on,
                 "xsave" => features.xsave = on,
                 "sse3" => features.sse3 = on,
-                _ => features.ssse3 = on,
+                "ssse3" => features.ssse3 = on,
+                _ => features.sse41 = on,
             }
         }
         features.validate()?;
@@ -3790,6 +3802,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: supplemental SSE3, on MM and XMM registers",
+        },
+        PropertySpec {
+            name: "sse41",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: SSE4.1",
         },
         PropertySpec {
             name: "model",

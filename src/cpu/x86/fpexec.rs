@@ -1572,6 +1572,7 @@ impl Exec<'_> {
             self.require_aligned(off)?;
         }
         match arg {
+            Arg::Ww => Ok([self.read_mem(sr, off, 2)?, 0]),
             Arg::Wd => Ok([self.read_mem(sr, off, 4)?, 0]),
             Arg::Wq | Arg::Mq => Ok([self.read_mem(sr, off, 8)?, 0]),
             _ => self.read_xmm_mem(sr, off),

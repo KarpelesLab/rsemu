@@ -316,6 +316,9 @@ impl Disassembled {
             // `REX.W` move a quadword; Intel gave the wide forms the `MOVQ`
             // name rather than a new opcode.
             (Op::MOVD, _) if self.fields.rex_w() => "movq",
+            // SSE4.1's doubleword extract and insert, likewise.
+            (Op::PEXTRD, _) if self.fields.rex_w() => "pextrq",
+            (Op::PINSRD, _) if self.fields.rex_w() => "pinsrq",
             // The two save/restore instructions likewise: `REX.W` selects the
             // 64-bit image, which has its own mnemonic.
             (Op::FXSAVE, _) if self.fields.rex_w() => "fxsave64",
@@ -875,6 +878,51 @@ mod tests {
             &[0x66, 0x0f, 0x3a, 0x0f, 0x43, 0x10, 0x08, 0x90],
         );
         assert_eq!(d.fields.len, 7);
+    }
+
+    #[test]
+    fn sse4_1_lists_its_implicit_and_narrow_operands() {
+        // XMM0 is named by no field and listed all the same.
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x38, 0x10, 0xca]),
+            "pblendvb xmm1, xmm2, xmm0"
+        );
+        // The widening moves read exactly the bytes they widen.
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x38, 0x22, 0x03]),
+            "pmovsxbq xmm0, word [ds:ebx]"
+        );
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x38, 0x31, 0x03]),
+            "pmovzxbd xmm0, dword [ds:ebx]"
+        );
+        // A whole general register, or one byte of memory.
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x3a, 0x14, 0xc8, 0x0d]),
+            "pextrb eax, xmm1, 0xd"
+        );
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x3a, 0x20, 0x0b, 0x02]),
+            "pinsrb xmm1, byte [ds:ebx], 0x2"
+        );
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x3a, 0x0a, 0xc1, 0x09]),
+            "roundss xmm0, xmm1, 0x9"
+        );
+        // `REX.W` renames the doubleword forms, as it renames `MOVD`.
+        let text64 = |b: &[u8]| format!("{}", disassemble_as(Gen::I386, Bits::B64, 0, 0x100, b));
+        assert_eq!(
+            text64(&[0x66, 0x48, 0x0f, 0x3a, 0x16, 0xcb, 0x01]),
+            "pextrq rbx, xmm1, 0x1"
+        );
+        assert_eq!(
+            text64(&[0x66, 0x49, 0x0f, 0x3a, 0x22, 0xc8, 0x01]),
+            "pinsrq xmm1, r8, 0x1"
+        );
+        assert_eq!(
+            text64(&[0x66, 0x0f, 0x3a, 0x16, 0xc9, 0x03]),
+            "pextrd ecx, xmm1, 0x3"
+        );
     }
 
     #[test]

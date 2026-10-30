@@ -1,4 +1,4 @@
-//! Executing the SIMD extensions past SSE2: SSE3 and SSSE3.
+//! Executing the SIMD extensions past SSE2: SSE3, SSSE3 and SSE4.1.
 //!
 //! Every one of these is an SSE instruction in everything but its `CPUID`
 //! bit — the same sixteen `XMM` registers, the same `MXCSR`, the same `CR0`
@@ -21,9 +21,10 @@
 //! section, and appendix A's opcode maps. No copyleft emulator was consulted
 //! (`CLAUDE.md`, provenance).
 
-use crate::float::{B32, B64, Env, Flags, binary};
+use crate::float::{B32, B64, Env, Flags, InputSubnormal, Round, binary};
 
 use super::exec::{Ex, Exec, Fault, VEC_UD};
+use super::flags;
 use super::isa::{Arg, Extension, Fields, Insn, ModRm, Op};
 
 impl Exec<'_> {
@@ -37,6 +38,7 @@ impl Exec<'_> {
             None => true,
             Some(Extension::Sse3) => features.sse3,
             Some(Extension::Ssse3) => features.ssse3,
+            Some(Extension::Sse41) => features.sse41,
         }
     }
 
@@ -92,11 +94,424 @@ impl Exec<'_> {
                     .set(reg, ssse3(op, dst, src, 16, f.imm as u8));
                 Ok(())
             }
+            _ if f.insn.extension() == Some(Extension::Sse41) => self.sse41(f),
             // The table and this match are written together; a row that
             // reaches here unmatched is a decoder bug, and `#UD` is the
             // architecture's answer to an instruction a part does not have.
             _ => Err(Fault::bare(VEC_UD)),
         }
+    }
+
+    /// SSE4.1.
+    fn sse41(&mut self, f: &Fields) -> Ex<()> {
+        let op = f.insn.op;
+        let reg = f.reg_num();
+        let register_form = f.modrm.is_some_and(ModRm::is_register);
+        let imm = f.imm as u8;
+        match op {
+            // -- Between an `XMM` lane and a general register or memory ----
+            Op::PEXTRB | Op::PEXTRW => {
+                let v = bytes(self.state.sse.get(reg));
+                let value = if op == Op::PEXTRB {
+                    u64::from(v[usize::from(imm & 15)])
+                } else {
+                    let i = 2 * usize::from(imm & 7);
+                    u64::from(u16::from_le_bytes([v[i], v[i + 1]]))
+                };
+                self.write_narrow(f, if op == Op::PEXTRB { 1 } else { 2 }, value)
+            }
+            Op::PEXTRD => {
+                let v = self.state.sse.get(reg);
+                if f.rex_w() {
+                    self.write_arg(f, Arg::Ey, 8, v[usize::from(imm & 1)])
+                } else {
+                    let value = u64::from(dwords(v)[usize::from(imm & 3)] as u32);
+                    self.write_arg(f, Arg::Ey, 4, value)
+                }
+            }
+            // `REX.W` changes nothing here: the single is four bytes, and a
+            // 64-bit destination register is zero-extended by the 32-bit
+            // write (*Intel SDM* volume 2, `EXTRACTPS`).
+            Op::EXTRACTPS => {
+                let v = self.state.sse.get(reg);
+                let value = u64::from(dwords(v)[usize::from(imm & 3)] as u32);
+                self.write_arg(f, Arg::Ed, 4, value)
+            }
+            Op::PINSRB => {
+                let value = self.read_narrow(f, 1)? as u8;
+                let mut v = bytes(self.state.sse.get(reg));
+                v[usize::from(imm & 15)] = value;
+                self.state.sse.set(reg, of_bytes(v));
+                Ok(())
+            }
+            Op::PINSRD => {
+                let mut v = self.state.sse.get(reg);
+                if f.rex_w() {
+                    v[usize::from(imm & 1)] = self.read_arg(f, Arg::Ey, 8)?;
+                } else {
+                    let value = self.read_arg(f, Arg::Ey, 4)? as i32;
+                    let mut d = dwords(v);
+                    d[usize::from(imm & 3)] = value;
+                    v = of_dwords(d);
+                }
+                self.state.sse.set(reg, v);
+                Ok(())
+            }
+            // The source lane is `imm[7:6]` of a register, or the four bytes
+            // of memory, which ignore those bits; it lands in lane
+            // `imm[5:4]`, and then `imm[3:0]` zeroes lanes — the inserted one
+            // included, if its bit says so (*Intel SDM* volume 2,
+            // `INSERTPS`).
+            Op::INSERTPS => {
+                let src = self.sse_read_rm(f, Arg::Wd, false)?;
+                let value = if register_form {
+                    dwords(src)[usize::from(imm >> 6)]
+                } else {
+                    src[0] as i32
+                };
+                let mut d = dwords(self.state.sse.get(reg));
+                d[usize::from((imm >> 4) & 3)] = value;
+                for (i, lane) in d.iter_mut().enumerate() {
+                    if imm & (1 << i) != 0 {
+                        *lane = 0;
+                    }
+                }
+                self.state.sse.set(reg, of_dwords(d));
+                Ok(())
+            }
+
+            // -- Loads -----------------------------------------------------
+            // A non-temporal *load* is an ordinary aligned one here, for the
+            // reason `66 0F E7` gives in `isa` about the store; memory only,
+            // and misalignment is `#GP(0)` (*Intel SDM* volume 2,
+            // `MOVNTDQA`).
+            Op::MOVNTDQA => {
+                if register_form {
+                    return Err(Fault::bare(VEC_UD));
+                }
+                let v = self.sse_read_rm(f, Arg::Wx, true)?;
+                self.state.sse.set(reg, v);
+                Ok(())
+            }
+
+            // -- Flags -----------------------------------------------------
+            // `ZF` if `src AND dst` is zero, `CF` if `src AND NOT dst` is,
+            // and the other four arithmetic flags cleared (*Intel SDM*
+            // volume 2, `PTEST`).
+            Op::PTEST => {
+                let src = self.sse_read_rm(f, Arg::Wx, false)?;
+                let dst = self.state.sse.get(reg);
+                let zf = (src[0] & dst[0]) | (src[1] & dst[1]) == 0;
+                let cf = (src[0] & !dst[0]) | (src[1] & !dst[1]) == 0;
+                self.set_flag(flags::ZF, zf);
+                self.set_flag(flags::CF, cf);
+                for bit in [flags::AF, flags::OF, flags::PF, flags::SF] {
+                    self.set_flag(bit, false);
+                }
+                Ok(())
+            }
+
+            // -- Floating point --------------------------------------------
+            Op::ROUNDPS | Op::ROUNDPD | Op::ROUNDSS | Op::ROUNDSD => {
+                let src = self.sse_read_rm(f, f.insn.src, false)?;
+                let dst = self.state.sse.get(reg);
+                let (out, flags) = round(op, dst, src, imm, self.state.sse.env());
+                self.sse_raise(flags)?;
+                self.state.sse.set(reg, out);
+                Ok(())
+            }
+            Op::DPPS | Op::DPPD => {
+                let src = self.sse_read_rm(f, Arg::Wx, false)?;
+                let dst = self.state.sse.get(reg);
+                let (out, flags) = dot(op, dst, src, imm, self.state.sse.env());
+                self.sse_raise(flags)?;
+                self.state.sse.set(reg, out);
+                Ok(())
+            }
+
+            // -- Everything else is exact lane arithmetic -----------------
+            _ => {
+                let src = self.sse_read_rm(f, f.insn.src, false)?;
+                let dst = self.state.sse.get(reg);
+                let mask = self.state.sse.get(0);
+                self.state.sse.set(reg, sse41(op, dst, src, mask, imm));
+                Ok(())
+            }
+        }
+    }
+
+    /// Read an Intel `Rd/Mb` or `Rd/Mw` operand: the low `bytes` of a whole
+    /// general register, or exactly `bytes` of memory.
+    fn read_narrow(&mut self, f: &Fields, bytes: u8) -> Ex<u64> {
+        let mask = (1u64 << (8 * u32::from(bytes))) - 1;
+        if f.modrm.is_some_and(ModRm::is_register) {
+            return Ok(self.state.regs.read(f.rm_num(), 4, f.has_rex()) & mask);
+        }
+        let (sr, off) = self.ea();
+        self.read_mem(sr, off, bytes)
+    }
+
+    /// Write one: a register gets the value zero-extended through a 32-bit
+    /// write — which clears the upper half of a 64-bit register, as the
+    /// architecture says it must — and memory gets exactly `bytes`.
+    fn write_narrow(&mut self, f: &Fields, bytes: u8, value: u64) -> Ex<()> {
+        if f.modrm.is_some_and(ModRm::is_register) {
+            self.state
+                .regs
+                .write(f.rm_num(), 4, f.has_rex(), value & 0xffff_ffff);
+            return Ok(());
+        }
+        let (sr, off) = self.ea();
+        self.write_mem(sr, off, bytes, value)
+    }
+}
+
+/// The rounding direction a `ROUND*` immediate selects.
+///
+/// `imm[2]` set means `MXCSR.RC`; clear, `imm[1:0]` names one directly —
+/// nearest, down, up, toward zero, the same order as `RC` itself. `imm[3]`
+/// is the precision-exception suppression bit and is the caller's business.
+/// *Intel SDM* volume 2, `ROUNDPD`: the immediate's layout and the rounding
+/// modes table on that page, which is the `RC` encoding of volume 1 §4.8.4.
+fn round_mode(imm: u8, mxcsr_round: Round) -> Round {
+    if imm & 4 != 0 {
+        return mxcsr_round;
+    }
+    match imm & 3 {
+        0 => Round::TiesEven,
+        1 => Round::TowardNegative,
+        2 => Round::TowardPositive,
+        _ => Round::TowardZero,
+    }
+}
+
+/// `ROUNDPS`, `ROUNDPD`, `ROUNDSS` and `ROUNDSD`: each lane to an integral
+/// value in its own format.
+///
+/// The exceptions are narrower than the arithmetic's: invalid only for a
+/// signalling NaN, precision only when `imm[3]` is clear, and **no**
+/// denormal-operand exception — but `MXCSR.DAZ` still turns a denormal source
+/// into a zero first. The scalar forms replace the low lane and keep the rest
+/// of the destination.
+pub(super) fn round(op: Op, dst: [u64; 2], src: [u64; 2], imm: u8, env: Env) -> ([u64; 2], Flags) {
+    let env = Env {
+        round: round_mode(imm, env.round),
+        subnormal_inputs: if env.subnormal_inputs.flushes() {
+            InputSubnormal::Flushed
+        } else {
+            InputSubnormal::Exact
+        },
+        ..env
+    };
+    let inexact = imm & 8 == 0;
+    let mut flags = Flags::NONE;
+    match op {
+        Op::ROUNDPS | Op::ROUNDSS => {
+            let s = singles(src);
+            let mut out = singles(dst);
+            let lanes = if op == Op::ROUNDSS { 1 } else { 4 };
+            for i in 0..lanes {
+                let (v, fl) = binary::round_to_integral::<B32>(s[i], env, inexact);
+                flags |= fl;
+                out[i] = v;
+            }
+            (of_singles(out), flags)
+        }
+        _ => {
+            let mut out = dst;
+            let lanes = if op == Op::ROUNDSD { 1 } else { 2 };
+            for i in 0..lanes {
+                let (v, fl) = binary::round_to_integral::<B64>(src[i], env, inexact);
+                flags |= fl;
+                out[i] = v;
+            }
+            (out, flags)
+        }
+    }
+}
+
+/// `DPPS` and `DPPD`: a dot product under two masks.
+///
+/// The high nibble of the immediate (`imm[5:4]` for doubles) picks which
+/// lane products take part — an unselected one is `+0.0` and its multiply is
+/// never performed, so it raises nothing — and the low nibble picks which
+/// result lanes receive the sum; the rest are `+0.0`. The sum is formed in
+/// the order the manual gives, `(p0 + p1) + (p2 + p3)`, each step rounded
+/// under `MXCSR`, and the flags are every step's together (*Intel SDM*
+/// volume 2, `DPPS`, the `DP_primitive` pseudo-code).
+pub(super) fn dot(op: Op, dst: [u64; 2], src: [u64; 2], imm: u8, env: Env) -> ([u64; 2], Flags) {
+    let mut flags = Flags::NONE;
+    let mut mul = |a: u64, b: u64, on: bool, single: bool| {
+        if !on {
+            return 0;
+        }
+        let (v, fl) = if single {
+            binary::mul::<B32>(a, b, env)
+        } else {
+            binary::mul::<B64>(a, b, env)
+        };
+        flags |= fl;
+        v
+    };
+    if op == Op::DPPS {
+        let (d, s) = (singles(dst), singles(src));
+        let mut p = [0u64; 4];
+        for i in 0..4 {
+            p[i] = mul(d[i], s[i], imm & (0x10 << i) != 0, true);
+        }
+        let (a, fa) = binary::add::<B32>(p[0], p[1], env);
+        let (b, fb) = binary::add::<B32>(p[2], p[3], env);
+        let (sum, fs) = binary::add::<B32>(a, b, env);
+        flags |= fa | fb | fs;
+        let mut out = [0u64; 4];
+        for (i, lane) in out.iter_mut().enumerate() {
+            if imm & (1 << i) != 0 {
+                *lane = sum;
+            }
+        }
+        (of_singles(out), flags)
+    } else {
+        let p0 = mul(dst[0], src[0], imm & 0x10 != 0, false);
+        let p1 = mul(dst[1], src[1], imm & 0x20 != 0, false);
+        let (sum, fs) = binary::add::<B64>(p0, p1, env);
+        flags |= fs;
+        let out = [
+            if imm & 1 != 0 { sum } else { 0 },
+            if imm & 2 != 0 { sum } else { 0 },
+        ];
+        (out, flags)
+    }
+}
+
+/// Widen the low lanes of `src` by sign or zero extension: `from` bytes each
+/// into `to` bytes each, as many as fit in sixteen bytes.
+fn widen(src: u64, from: u32, to: u32, signed: bool) -> [u64; 2] {
+    let mut out = [0u8; 16];
+    let lanes = 16 / to;
+    for i in 0..lanes {
+        let raw = (src >> (8 * from * i)) & ((1u64 << (8 * from)) - 1);
+        let value = if signed {
+            let shift = 64 - 8 * from;
+            (((raw << shift) as i64) >> shift) as u64
+        } else {
+            raw
+        };
+        let at = (i * to) as usize;
+        out[at..at + to as usize].copy_from_slice(&value.to_le_bytes()[..to as usize]);
+    }
+    of_bytes(out)
+}
+
+/// The rest of SSE4.1: exact integer arithmetic and lane selection, no
+/// `MXCSR` and no exception. `mask` is `XMM0`, which only the variable
+/// blends read.
+#[allow(clippy::too_many_lines)]
+pub(super) fn sse41(op: Op, dst: [u64; 2], src: [u64; 2], mask: [u64; 2], imm: u8) -> [u64; 2] {
+    let (d, s) = (bytes(dst), bytes(src));
+    let (dw, sw) = (words(dst), words(src));
+    let (dd, sd) = (dwords(dst), dwords(src));
+    match op {
+        // -- Blends: the source where the selector says, else the
+        //    destination ---------------------------------------------------
+        Op::PBLENDVB => {
+            let m = bytes(mask);
+            of_bytes(core::array::from_fn(|i| {
+                if m[i] & 0x80 != 0 { s[i] } else { d[i] }
+            }))
+        }
+        Op::BLENDVPS => {
+            let m = dwords(mask);
+            of_dwords(core::array::from_fn(
+                |i| if m[i] < 0 { sd[i] } else { dd[i] },
+            ))
+        }
+        Op::BLENDVPD => {
+            core::array::from_fn(|i| if (mask[i] as i64) < 0 { src[i] } else { dst[i] })
+        }
+        Op::BLENDPS => of_dwords(core::array::from_fn(|i| {
+            if imm & (1 << i) != 0 { sd[i] } else { dd[i] }
+        })),
+        Op::BLENDPD => core::array::from_fn(|i| if imm & (1 << i) != 0 { src[i] } else { dst[i] }),
+        Op::PBLENDW => of_words(core::array::from_fn(|i| {
+            if imm & (1 << i) != 0 { sw[i] } else { dw[i] }
+        })),
+
+        // -- Minimum and maximum, at the widths SSE2 left out ------------
+        Op::PMINSB | Op::PMAXSB => of_bytes(core::array::from_fn(|i| {
+            let (a, b) = (d[i] as i8, s[i] as i8);
+            (if op == Op::PMINSB { a.min(b) } else { a.max(b) }) as u8
+        })),
+        Op::PMINUW | Op::PMAXUW => of_words(core::array::from_fn(|i| {
+            let (a, b) = (dw[i] as u16, sw[i] as u16);
+            (if op == Op::PMINUW { a.min(b) } else { a.max(b) }) as i16
+        })),
+        Op::PMINSD | Op::PMAXSD => of_dwords(core::array::from_fn(|i| {
+            if op == Op::PMINSD {
+                dd[i].min(sd[i])
+            } else {
+                dd[i].max(sd[i])
+            }
+        })),
+        Op::PMINUD | Op::PMAXUD => of_dwords(core::array::from_fn(|i| {
+            let (a, b) = (dd[i] as u32, sd[i] as u32);
+            (if op == Op::PMINUD { a.min(b) } else { a.max(b) }) as i32
+        })),
+
+        // -- Multiplies and compares ---------------------------------------
+        // The even doublewords, signed, into full quadwords.
+        Op::PMULDQ => [
+            (i64::from(dd[0]) * i64::from(sd[0])) as u64,
+            (i64::from(dd[2]) * i64::from(sd[2])) as u64,
+        ],
+        Op::PMULLD => of_dwords(core::array::from_fn(|i| dd[i].wrapping_mul(sd[i]))),
+        Op::PCMPEQQ => core::array::from_fn(|i| if dst[i] == src[i] { u64::MAX } else { 0 }),
+        // Signed doublewords to unsigned words, destination low.
+        Op::PACKUSDW => of_words(core::array::from_fn(|i| {
+            let v = if i < 4 { dd[i] } else { sd[i - 4] };
+            v.clamp(0, 0xffff) as u16 as i16
+        })),
+
+        // -- The two that reduce ----------------------------------------
+        // The smallest unsigned word in bits 15:0, its index in bits 18:16
+        // — the lowest index on a tie — and zero above (*Intel SDM*
+        // volume 2, `PHMINPOSUW`).
+        Op::PHMINPOSUW => {
+            let mut best = 0usize;
+            for i in 1..8 {
+                if (sw[i] as u16) < (sw[best] as u16) {
+                    best = i;
+                }
+            }
+            [u64::from(sw[best] as u16) | ((best as u64) << 16), 0]
+        }
+        // Eight sums of four absolute byte differences. The destination
+        // block starts at byte `4 * imm[2]` and slides one byte per result;
+        // the source block is the fixed four bytes at `4 * imm[1:0]`
+        // (*Intel SDM* volume 2, `MPSADBW`).
+        Op::MPSADBW => {
+            let a = 4 * usize::from((imm >> 2) & 1);
+            let b = 4 * usize::from(imm & 3);
+            of_words(core::array::from_fn(|i| {
+                (0..4)
+                    .map(|j| u16::from(d[a + i + j].abs_diff(s[b + j])))
+                    .sum::<u16>() as i16
+            }))
+        }
+
+        // -- The widening moves --------------------------------------------
+        Op::PMOVSXBW => widen(src[0], 1, 2, true),
+        Op::PMOVSXBD => widen(src[0], 1, 4, true),
+        Op::PMOVSXBQ => widen(src[0], 1, 8, true),
+        Op::PMOVSXWD => widen(src[0], 2, 4, true),
+        Op::PMOVSXWQ => widen(src[0], 2, 8, true),
+        Op::PMOVSXDQ => widen(src[0], 4, 8, true),
+        Op::PMOVZXBW => widen(src[0], 1, 2, false),
+        Op::PMOVZXBD => widen(src[0], 1, 4, false),
+        Op::PMOVZXBQ => widen(src[0], 1, 8, false),
+        Op::PMOVZXWD => widen(src[0], 2, 4, false),
+        Op::PMOVZXWQ => widen(src[0], 2, 8, false),
+        Op::PMOVZXDQ => widen(src[0], 4, 8, false),
+        _ => dst,
     }
 }
 
@@ -541,6 +956,168 @@ mod tests {
             dwords(ssse3(Op::PSIGND, of_dwords([9, 9, 9, 9]), s, 16, 0)),
             [-9, -9, 9, 0]
         );
+    }
+
+    #[test]
+    fn the_widening_moves_extend_exactly_the_lanes_they_read() {
+        let src = 0x8877_6655_4433_2211;
+        // Bytes 0x11, 0x22, ... widened to words: positive, so the same
+        // either way, until 0x88, which is negative.
+        assert_eq!(
+            words(widen(src, 1, 2, true)),
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, -0x78]
+        );
+        assert_eq!(words(widen(src, 1, 2, false))[7], 0x88);
+        // Two words of 0xfffe, 0x8001 sign-extended to quadwords.
+        assert_eq!(
+            widen(0x8001_fffe, 2, 8, true),
+            [0xffff_ffff_ffff_fffe, 0xffff_ffff_ffff_8001]
+        );
+        assert_eq!(widen(0x8001_fffe, 2, 8, false), [0xfffe, 0x8001]);
+        // Two bytes to quadwords reads only two bytes.
+        assert_eq!(widen(0xffff_ff80, 1, 8, true), [u64::MAX - 0x7f, u64::MAX]);
+        assert_eq!(
+            widen(0x8000_0000_7fff_ffff, 4, 8, true),
+            [0x7fff_ffff, 0xffff_ffff_8000_0000]
+        );
+    }
+
+    #[test]
+    fn the_integer_gaps_sse2_left() {
+        let none = [0, 0];
+        // PACKUSDW saturates signed doublewords to unsigned words.
+        let d = of_dwords([-1, 0x1_0000, 0x1234, 0xffff]);
+        let s = of_dwords([i32::MIN, i32::MAX, 0, 1]);
+        assert_eq!(
+            words(sse41(Op::PACKUSDW, d, s, none, 0)).map(|w| w as u16),
+            [0, 0xffff, 0x1234, 0xffff, 0, 0xffff, 0, 1]
+        );
+        // PMULDQ: the even signed doublewords, to quadwords.
+        let d = of_dwords([-2, 99, 3, 99]);
+        let s = of_dwords([5, 99, -7, 99]);
+        assert_eq!(
+            sse41(Op::PMULDQ, d, s, none, 0),
+            [-10i64 as u64, -21i64 as u64]
+        );
+        assert_eq!(
+            dwords(sse41(Op::PMULLD, d, s, none, 0)),
+            [-10, 9801, -21, 9801]
+        );
+        // The four new widths of minimum and maximum.
+        let d = of_dwords([-1, 5, 0, 7]);
+        let s = of_dwords([1, -5, 0, 8]);
+        assert_eq!(dwords(sse41(Op::PMINSD, d, s, none, 0)), [-1, -5, 0, 7]);
+        assert_eq!(dwords(sse41(Op::PMAXUD, d, s, none, 0)), [-1, -5, 0, 8]);
+        assert_eq!(dwords(sse41(Op::PMINUD, d, s, none, 0)), [1, 5, 0, 7]);
+        let d = of_words([-1, 2, 0, 0, 0, 0, 0, 0]);
+        let s = of_words([1, -2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&words(sse41(Op::PMINUW, d, s, none, 0))[..2], &[1, 2]);
+        assert_eq!(&words(sse41(Op::PMAXUW, d, s, none, 0))[..2], &[-1, -2]);
+        // PCMPEQQ.
+        assert_eq!(sse41(Op::PCMPEQQ, [1, 2], [1, 3], none, 0), [u64::MAX, 0]);
+    }
+
+    #[test]
+    fn phminposuw_finds_the_first_smallest_word() {
+        let s = of_words([5, 3, 9, 3, -1, 7, 8, 4]);
+        // 3 at index 1 beats the 3 at index 3; -1 is 0xffff, the largest.
+        assert_eq!(sse41(Op::PHMINPOSUW, [!0, !0], s, [0, 0], 0), [0x1_0003, 0]);
+    }
+
+    #[test]
+    fn mpsadbw_slides_the_destination_block_against_a_fixed_source_one() {
+        let d = of_bytes(core::array::from_fn(|i| i as u8));
+        let s = of_bytes([0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // imm 0: |i + j - 0| summed over j = 4i + 6.
+        let want: [i16; 8] = core::array::from_fn(|i| 4 * i as i16 + 6);
+        assert_eq!(words(sse41(Op::MPSADBW, d, s, [0, 0], 0)), want);
+        // imm 0b101: the destination from byte 4, the source block from
+        // byte 4 (all ones): |4 + i + j - 1| summed = 4i + 18.
+        let want: [i16; 8] = core::array::from_fn(|i| 4 * i as i16 + 18);
+        assert_eq!(words(sse41(Op::MPSADBW, d, s, [0, 0], 0b101)), want);
+    }
+
+    #[test]
+    fn the_blends_select_by_immediate_or_by_xmm0s_signs() {
+        let d = [0x1111_1111_1111_1111, 0x2222_2222_2222_2222];
+        let s = [0xaaaa_aaaa_aaaa_aaaa, 0xbbbb_bbbb_bbbb_bbbb];
+        assert_eq!(sse41(Op::BLENDPD, d, s, [0, 0], 0b10), [d[0], s[1]]);
+        assert_eq!(
+            sse41(Op::BLENDPS, d, s, [0, 0], 0b0110),
+            [0xaaaa_aaaa_1111_1111, 0x2222_2222_bbbb_bbbb]
+        );
+        assert_eq!(
+            sse41(Op::PBLENDW, d, s, [0, 0], 0b1000_0001),
+            [0x1111_1111_1111_aaaa, 0xbbbb_2222_2222_2222]
+        );
+        // Variable: only the top bit of each mask lane counts.
+        let mask = [0x0000_0000_8000_007f, 0x8000_0000_0000_0000];
+        assert_eq!(
+            sse41(Op::PBLENDVB, d, s, mask, 0),
+            [0x1111_1111_aa11_1111, 0xbb22_2222_2222_2222]
+        );
+        assert_eq!(
+            sse41(Op::BLENDVPS, d, s, mask, 0),
+            [0x1111_1111_aaaa_aaaa, 0xbbbb_bbbb_2222_2222]
+        );
+        assert_eq!(sse41(Op::BLENDVPD, d, s, mask, 0), [d[0], s[1]]);
+    }
+
+    #[test]
+    fn the_rounds_take_their_mode_from_the_immediate_or_from_mxcsr() {
+        // 2.5 and -2.5 under each of the four modes: nearest-even gives 2
+        // and -2, down 2 and -3, up 3 and -2, truncation 2 and -2.
+        let src = of_singles([0x4020_0000, 0xc020_0000, 0, 0]);
+        for (imm, want) in [
+            (0u8, [0x4000_0000, 0xc000_0000]),
+            (1, [0x4000_0000, 0xc040_0000]),
+            (2, [0x4040_0000, 0xc000_0000]),
+            (3, [0x4000_0000, 0xc000_0000]),
+        ] {
+            let (out, flags) = round(Op::ROUNDPS, [0, 0], src, imm, Env::X86_SSE);
+            assert_eq!(&singles(out)[..2], &want, "imm {imm}");
+            assert!(flags.contains(Flags::INEXACT), "imm {imm}");
+        }
+        // imm[2]: MXCSR's mode — here toward positive — whatever imm[1:0]
+        // says; and imm[3] suppresses the precision exception.
+        let up = Env::X86_SSE.round(Round::TowardPositive);
+        let (out, flags) = round(Op::ROUNDPS, [0, 0], src, 0b1100, up);
+        assert_eq!(&singles(out)[..2], &[0x4040_0000, 0xc000_0000]);
+        assert_eq!(flags, Flags::NONE);
+        // The scalar double form keeps the destination's high lane.
+        let (out, _) = round(
+            Op::ROUNDSD,
+            [7, 0x1234],
+            [0x3ff8_0000_0000_0000, 0],
+            3,
+            Env::X86_SSE,
+        );
+        assert_eq!(out, [0x3ff0_0000_0000_0000, 0x1234]);
+        // A signalling NaN is invalid; a denormal is *not* a denormal
+        // exception, which the arithmetic would raise.
+        let (_, flags) = round(Op::ROUNDSS, [0, 0], [0x7fa0_0000, 0], 0, Env::X86_SSE);
+        assert!(flags.contains(Flags::INVALID));
+        let (out, flags) = round(Op::ROUNDSS, [0, 0], [1, 0], 8, Env::X86_SSE);
+        assert_eq!(out, [0, 0]);
+        assert_eq!(flags, Flags::NONE);
+    }
+
+    #[test]
+    fn the_dot_products_select_inputs_and_broadcast_the_sum() {
+        let d = of_singles([ONE, TWO, THREE, FOUR]);
+        let s = of_singles([FIVE, 0x40c0_0000, SEVEN, 0x4100_0000]); // 5 6 7 8
+        // All four products, the sum in lane 0: 5 + 12 + 21 + 32 = 70.
+        let (out, flags) = dot(Op::DPPS, d, s, 0xf1, Env::X86_SSE);
+        assert_eq!(singles(out), [0x428c_0000, 0, 0, 0]);
+        assert_eq!(flags, Flags::NONE);
+        // Only the low two products, broadcast everywhere: 17.
+        let (out, _) = dot(Op::DPPS, d, s, 0x3f, Env::X86_SSE);
+        assert_eq!(singles(out), [0x4188_0000; 4]);
+        // DPPD: 1.5 * 2 + 2 * 4 = 11 into the high lane only.
+        let d = [0x3ff8_0000_0000_0000, 0x4000_0000_0000_0000];
+        let s = [0x4000_0000_0000_0000, 0x4010_0000_0000_0000];
+        let (out, _) = dot(Op::DPPD, d, s, 0x32, Env::X86_SSE);
+        assert_eq!(out, [0, 0x4026_0000_0000_0000]);
     }
 
     #[test]
