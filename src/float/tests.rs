@@ -186,6 +186,48 @@ fn fused_multiply_add_rounds_once() {
 }
 
 #[test]
+fn fused_multiply_add_is_single_rounded_in_binary32_and_under_mxcsr() {
+    let x86 = Env::X86_SSE;
+    // The binary32 twin of the case above: (1 + 2^-23)(1 - 2^-23) - 1 is
+    // exactly -2^-46, which a separately rounded product loses entirely.
+    let a = s(1.0) + 1;
+    let b = s(1.0) - 2;
+    assert_eq!(fma::<B32>(a, b, s(-1.0), x86), (0xa880_0000, Flags::NONE));
+    let (v, _) = fma::<B32>(a, b, s(-1.0), x86.round(Round::TowardZero));
+    assert_eq!(v, 0xa880_0000, "directed rounding sees the exact sum too");
+    // (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24: rounded alone it is a tie, and goes
+    // to the even 1 + 2^-11, so subtracting 1 afterwards gives 2^-11. Fused,
+    // the 2^-24 survives: 2^-11 (1 + 2^-13).
+    let x = 0x3f80_0800;
+    assert_eq!(fma::<B32>(x, x, s(-1.0), x86), (0x3a00_0400, Flags::NONE));
+    let (p, _) = mul::<B32>(x, x, x86);
+    assert_eq!(add::<B32>(p, s(-1.0), x86).0, 0x3a00_0000);
+    // A tie that only the addend creates still goes to even: 1 + 2^-24.
+    assert_eq!(
+        fma::<B32>(s(1.0), 0x3380_0000, s(1.0), x86),
+        (s(1.0), Flags::INEXACT)
+    );
+    // `MXCSR.DAZ` reads a subnormal operand as zero and reports nothing;
+    // without it the operand is exact and `#D` is reported.
+    let sub = 0x0000_0001; // 2^-149
+    let big = 0x4b00_0000; // 2^23
+    assert_eq!(fma::<B32>(sub, big, 0, x86), (0x0080_0000, Flags::DENORMAL));
+    assert_eq!(fma::<B32>(sub, big, 0, x86.daz(true)), (0, Flags::NONE));
+    // `MXCSR.FTZ` flushes a tiny result and reports underflow and inexact.
+    assert_eq!(
+        fma::<B32>(0x0080_0000, s(0.5), 0, x86.ftz(true)),
+        (0, Flags::UNDERFLOW | Flags::INEXACT)
+    );
+    // An infinite product beside an infinite addend of the other sign is
+    // invalid, and gives x86's negative default NaN.
+    let inf = 0x7f80_0000;
+    assert_eq!(
+        fma::<B32>(inf, s(1.0), inf | 0x8000_0000, x86),
+        (0xffc0_0000, Flags::INVALID)
+    );
+}
+
+#[test]
 fn comparisons_distinguish_quiet_from_signaling() {
     let qnan = B64::QUIET_NAN;
     let snan = B64::INF | 1;
