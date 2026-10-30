@@ -338,6 +338,7 @@
 //! that people reach for when x86 gets hard and records that all three are
 //! forbidden.
 
+mod avx;
 pub mod disasm;
 mod exec;
 

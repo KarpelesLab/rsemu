@@ -4018,6 +4018,14 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
     if f.lock || (!long && f.has_rex()) {
         return None;
     }
+    // Every VEX-encoded instruction is the interpreter's. Outside 64-bit mode
+    // the same lead bytes are `LES` and `LDS`, which are the interpreter's
+    // too, so the decoder's choice between the two never reaches a plan; in
+    // 64-bit mode the prefix sets `Fields::rex`, which is the other reason
+    // this test comes first.
+    if f.is_vex() {
+        return None;
+    }
     if f.rep.is_some() && !matches!(insn.op, Op::NOP | Op::NOPR) {
         return None;
     }

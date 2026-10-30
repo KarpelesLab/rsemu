@@ -1574,7 +1574,9 @@ impl Exec<'_> {
         match arg {
             Arg::Ww => Ok([self.read_mem(sr, off, 2)?, 0]),
             Arg::Wd => Ok([self.read_mem(sr, off, 4)?, 0]),
-            Arg::Wq | Arg::Mq => Ok([self.read_mem(sr, off, 8)?, 0]),
+            // `Wh` and `Wqx` are a quadword at the only length a legacy
+            // encoding has.
+            Arg::Wq | Arg::Mq | Arg::Wh | Arg::Wqx => Ok([self.read_mem(sr, off, 8)?, 0]),
             _ => self.read_xmm_mem(sr, off),
         }
     }

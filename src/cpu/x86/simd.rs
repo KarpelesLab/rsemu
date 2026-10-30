@@ -43,6 +43,8 @@ impl Exec<'_> {
             Some(Extension::Popcnt) => features.popcnt,
             Some(Extension::Lzcnt) => features.lzcnt,
             Some(Extension::Movbe) => features.movbe,
+            // Not yet executed: every VEX encoding is `#UD` for now.
+            Some(Extension::Avx) => false,
         }
     }
 

@@ -2359,6 +2359,11 @@ impl<'a> Exec<'a> {
         // between them, every one of which needs the same gating checks first,
         // and threading that through the integer match would put the check in
         // a hundred and sixty places.
+        // Every VEX encoding goes to one dispatcher, ahead of the rest: its
+        // gates are AVX's rather than SSE's, whatever the operation.
+        if f.is_vex() {
+            return self.vex_instruction(f);
+        }
         if insn.op.is_x87() {
             return self.x87_instruction(f);
         }

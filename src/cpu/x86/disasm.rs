@@ -219,6 +219,12 @@ const fn fixes_size(arg: Arg) -> bool {
             | Arg::Ww
             | Arg::RdMb
             | Arg::RdMw
+            | Arg::Hx
+            | Arg::Lx
+            | Arg::Wh
+            | Arg::Wqx
+            | Arg::Vdq
+            | Arg::Wdq
     )
 }
 
@@ -253,6 +259,14 @@ impl fmt::Display for Disassembled {
             write!(f, "{}: ", seg::name(sr))?;
         }
 
+        // A VEX encoding of a legacy instruction is spelt with a `v` in front
+        // — `vaddps`, `vmovdqu` — which is the assembler's only way of telling
+        // the two encodings apart. The operations that exist only VEX-encoded
+        // carry the `v` in their own names.
+        if fields.is_vex() && insn.op != Op::UD && insn.op.extension() != Some(isa::Extension::Avx)
+        {
+            f.write_str("v")?;
+        }
         f.write_str(self.mnemonic())?;
 
         let show_size = self.needs_size_hint();
@@ -261,7 +275,7 @@ impl fmt::Display for Disassembled {
         // filled them: `enter 0x10, 0x0` has two, and printing both from the
         // first slot is how a listing quietly lies about the second.
         let mut slot = 0u8;
-        for arg in [insn.dst, insn.src, insn.aux] {
+        for arg in fields.operands() {
             if arg == Arg::None {
                 continue;
             }
@@ -343,6 +357,9 @@ impl Disassembled {
             match arg {
                 Arg::Eb | Arg::Ev | Arg::Ew | Arg::Ed if modrm_mem => return true,
                 Arg::Wx
+                | Arg::Wh
+                | Arg::Wqx
+                | Arg::Wdq
                 | Arg::Wq
                 | Arg::Wd
                 | Arg::Ww
@@ -514,9 +531,19 @@ impl Disassembled {
                 self.write_mem(f, modrm, size, true)
             }
 
-            // The SSE operands.
-            Arg::Vx => write!(f, "xmm{}", fields.reg_num()),
-            Arg::Ux => write!(f, "xmm{}", fields.rm_num()),
+            // The SSE operands, which are `YMM` registers in a `VEX.256`
+            // encoding.
+            Arg::Vx => write!(f, "{}{}", self.vector_reg(), fields.reg_num()),
+            Arg::Ux => write!(f, "{}{}", self.vector_reg(), fields.rm_num()),
+            Arg::Hx => write!(f, "{}{}", self.vector_reg(), fields.vvvv()),
+            Arg::Lx => {
+                // `imm8[7:4]`, of which only three bits reach a register
+                // outside 64-bit mode (*Intel SDM* volume 2 §2.3.5).
+                let n = (imm as u8) >> 4;
+                let n = if fields.bits.is_64() { n } else { n & 7 };
+                write!(f, "{}{n}", self.vector_reg())
+            }
+            Arg::Vdq => write!(f, "xmm{}", fields.reg_num()),
             Arg::Xmm0 => f.write_str("xmm0"),
             // A general register named whole, whatever width the memory form
             // would have: `pextrb eax, xmm1, 3`.
@@ -529,12 +556,20 @@ impl Disassembled {
                     self.write_mem(f, modrm, size, true)
                 }
             }
-            Arg::Wx | Arg::Wq | Arg::Wd | Arg::Ww => {
+            Arg::Wx | Arg::Wqx | Arg::Wh | Arg::Wdq | Arg::Wq | Arg::Wd | Arg::Ww => {
                 let modrm = fields.modrm.unwrap_or(ModRm::new(0));
                 if modrm.is_register() {
-                    write!(f, "xmm{}", fields.rm_num())
+                    // Only the full-length kinds name a `YMM` register; the
+                    // half and the scalar ones name an `XMM` one at any
+                    // length.
+                    let name = if matches!(arg, Arg::Wx | Arg::Wqx) {
+                        self.vector_reg()
+                    } else {
+                        "xmm"
+                    };
+                    write!(f, "{name}{}", fields.rm_num())
                 } else {
-                    let size = arg.fp_bytes(osz).unwrap_or(0);
+                    let size = fields.mem_bytes(arg).unwrap_or(0);
                     self.write_mem(f, modrm, size, true)
                 }
             }
@@ -569,6 +604,16 @@ impl Disassembled {
                     self.write_mem(f, modrm, size, true)
                 }
             }
+        }
+    }
+
+    /// The register-file prefix for a full-length vector operand: `ymm` in a
+    /// `VEX.256` encoding, `xmm` otherwise.
+    fn vector_reg(&self) -> &'static str {
+        if self.fields.vector_bytes() == 32 {
+            "ymm"
+        } else {
+            "xmm"
         }
     }
 
@@ -651,6 +696,7 @@ const fn size_hint(size: u8) -> &'static str {
         // — ten bytes, "ten byte" — and every other assembler followed.
         10 => "tbyte ",
         16 => "xmmword ",
+        32 => "ymmword ",
         // The two x87 save areas, whose size follows the operand size. No
         // assembler names them, so the operand is printed bare.
         _ => "",
@@ -929,6 +975,108 @@ mod tests {
             text64(&[0x66, 0x0f, 0x3a, 0x16, 0xc9, 0x03]),
             "pextrd ecx, xmm1, 0x3"
         );
+    }
+
+    #[test]
+    fn vex_encodings_list_with_a_v_three_operands_and_their_length() {
+        // The three maps, both lengths, and every place `vvvv` can go.
+        assert_eq!(text32(&[0xc5, 0xe8, 0x58, 0xcb]), "vaddps xmm1, xmm2, xmm3");
+        assert_eq!(text32(&[0xc5, 0xec, 0x58, 0xcb]), "vaddps ymm1, ymm2, ymm3");
+        assert_eq!(
+            text32(&[0xc5, 0xfc, 0x10, 0x00]),
+            "vmovups ymm0, ymmword [ds:eax]"
+        );
+        assert_eq!(
+            text32(&[0xc5, 0xec, 0xc2, 0xcb, 0x1f]),
+            "vcmpps ymm1, ymm2, ymm3, 0x1f"
+        );
+        // `VMOVSS`: three operands in the register form, two in the load.
+        assert_eq!(text32(&[0xc5, 0xea, 0x10, 0xcb]), "vmovss xmm1, xmm2, xmm3");
+        assert_eq!(
+            text32(&[0xc5, 0xfa, 0x10, 0x08]),
+            "vmovss xmm1, dword [ds:eax]"
+        );
+        // A scalar row is an `XMM` row whatever `VEX.L` says.
+        assert_eq!(text32(&[0xc5, 0xee, 0x58, 0xcb]), "vaddss xmm1, xmm2, xmm3");
+        // `NDD`: the shift-by-immediate groups write `vvvv`.
+        assert_eq!(
+            text32(&[0xc5, 0xe9, 0x71, 0xd3, 0x04]),
+            "vpsrlw xmm2, xmm3, 0x4"
+        );
+        // The conversions whose two sides differ in length.
+        assert_eq!(
+            text32(&[0xc5, 0xfd, 0x5a, 0x00]),
+            "vcvtpd2ps xmm0, ymmword [ds:eax]"
+        );
+        assert_eq!(
+            text32(&[0xc5, 0xfc, 0x5a, 0x00]),
+            "vcvtps2pd ymm0, xmmword [ds:eax]"
+        );
+        assert_eq!(
+            text32(&[0xc5, 0xf8, 0x5a, 0x00]),
+            "vcvtps2pd xmm0, qword [ds:eax]"
+        );
+        assert_eq!(
+            text32(&[0xc5, 0xff, 0x12, 0x00]),
+            "vmovddup ymm0, ymmword [ds:eax]"
+        );
+        assert_eq!(
+            text32(&[0xc5, 0xfb, 0x12, 0x00]),
+            "vmovddup xmm0, qword [ds:eax]"
+        );
+        // The `0F 38` and `0F 3A` maps, reached through `mmmmm`.
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x6d, 0x0c, 0xcb]),
+            "vpermilps ymm1, ymm2, ymm3"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x7d, 0x18, 0x00]),
+            "vbroadcastss ymm0, dword [ds:eax]"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x75, 0x2e, 0x10]),
+            "vmaskmovps ymmword [ds:eax], ymm1, ymm2"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe3, 0x69, 0x4a, 0xcb, 0x40]),
+            "vblendvps xmm1, xmm2, xmm3, xmm4"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe3, 0x6d, 0x18, 0xcb, 0x01]),
+            "vinsertf128 ymm1, ymm2, xmm3, 0x1"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe3, 0x7d, 0x19, 0xcb, 0x01]),
+            "vextractf128 xmm3, ymm1, 0x1"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe3, 0x79, 0x14, 0xc8, 0x0d]),
+            "vpextrb eax, xmm1, 0xd"
+        );
+        assert_eq!(
+            text32(&[0xc5, 0xf9, 0xc5, 0xc1, 0x03]),
+            "vpextrw eax, xmm1, 0x3"
+        );
+        assert_eq!(text32(&[0xc5, 0xf8, 0x77]), "vzeroupper");
+        assert_eq!(text32(&[0xc5, 0xfc, 0x77]), "vzeroall");
+        assert_eq!(text32(&[0xc5, 0xf8, 0xae, 0x10]), "vldmxcsr dword [ds:eax]");
+        assert_eq!(text32(&[0xc5, 0xf9, 0x6e, 0xc0]), "vmovd xmm0, eax");
+        // In 64-bit mode `VEX.W` renames as `REX.W` does, and `R̄X̄B̄` reach
+        // the upper eight registers.
+        let text64 = |b: &[u8]| format!("{}", disassemble_as(Gen::I386, Bits::B64, 0, 0x100, b));
+        assert_eq!(text64(&[0xc4, 0xe1, 0xf9, 0x6e, 0xc0]), "vmovq xmm0, rax");
+        assert_eq!(
+            text64(&[0xc4, 0x41, 0x2c, 0x58, 0xcb]),
+            "vaddps ymm9, ymm10, ymm11"
+        );
+        assert_eq!(
+            text64(&[0xc5, 0x78, 0x58, 0x08]),
+            "vaddps xmm9, xmm0, xmmword [ds:rax]"
+        );
+        // Outside 64-bit mode a memory-mode byte after `C4` is `LES`.
+        assert_eq!(text32(&[0xc4, 0x06]), "les eax, [ds:esi]");
+        let d = disassemble_as(Gen::I386, Bits::B32, 0, 0x100, &[0xc4, 0x06, 0x90]);
+        assert_eq!(d.len, 2);
     }
 
     #[test]

@@ -51,8 +51,34 @@
 //!
 //! Beyond those, `0F 38` and `0F 3A` escape to two **three-byte maps**
 //! ([`OpMap`], [`decode_map`]), each with its own mandatory-prefix columns:
-//! SSSE3 and SSE4 live there, and so will VEX, which names the same maps by
-//! number.
+//! SSSE3 and SSE4 live there.
+//!
+//! # VEX: one row, two encodings
+//!
+//! A VEX prefix (`C4` or `C5`, *Intel SDM* volume 2 §2.3) names the same
+//! three escape maps by number and the same four mandatory-prefix columns by
+//! its `pp` field, so it reaches **the same rows** as the legacy encoding —
+//! and it is described on those rows rather than in a second set of tables.
+//! That is how Intel's own opcode map does it: appendix A writes one cell,
+//! `vaddps Vps,Hps,Wps`, and marks it `v` ("has a VEX form") or `v1`
+//! ("VEX.128 only"); the legacy instruction is the same cell with the `v` and
+//! the `H` taken away. Here the mark is [`Insn::vex`] ([`Vex`]): what
+//! `VEX.vvvv` is ([`VexForm`] — a second source, a destination, or unused),
+//! which lengths exist ([`VexLen`]), whether `VEX.W` must be zero, and
+//! whether the row exists *only* VEX-encoded (`VBROADCASTSS` and the rest of
+//! AVX's own). A separate VEX table would have repeated ~250 rows' operand
+//! descriptions to add four facts to each, and two descriptions of `ADDPS`
+//! are two places for its operands to disagree.
+//!
+//! The decoder applies every one of those facts ([`decode_stream_as`]): a VEX
+//! encoding that breaks one — `VEX.L = 1` on a 128-bit-only row, `vvvv` not
+//! `1111b` where nothing reads it — decodes as [`Op::UD`], so neither the
+//! executor nor the disassembler sees it as an instruction. The `H` operand
+//! appears in [`Fields::operands`], placed where the row's form says, and the
+//! vector length scales the `x`-suffixed operand kinds ([`Fields::mem_bytes`]).
+//! One cell differs in kind rather than in form — `0F 77` is `EMMS` legacy
+//! and `VZEROUPPER`/`VZEROALL` VEX-encoded — and says so with
+//! [`VexForm::Alt`].
 //!
 //! # Why there is no cycle column
 //!
@@ -372,6 +398,42 @@ pub enum Arg {
     /// A general register or a **word** of memory — Intel's `Rd/Mw`, the
     /// destination of the `0F 3A 15` form of `PEXTRW`.
     RdMw,
+
+    // ---- AVX -----------------------------------------------------------
+    //
+    // Where a VEX encoding is concerned the vector operands above scale with
+    // `VEX.L`: `Vx`, `Wx` and `Ux` name an `XMM` register or sixteen bytes
+    // at `L = 0` and a `YMM` register or thirty-two at `L = 1` — Intel's own
+    // `x` suffix, "dq or qq based on the operand-size attribute" (*Intel SDM*
+    // volume 2 §A.2.2). The kinds below are the ones that do *not* simply
+    // scale, and the two registers a VEX prefix can name outside ModRM.
+    /// The register `VEX.vvvv` names, at the vector length — Intel's `Hx`.
+    ///
+    /// Never written in a row: whether and where an encoding has one is the
+    /// row's [`VexForm`], so the legacy row and its VEX form stay one row.
+    Hx,
+    /// The register `imm8[7:4]` names, at the vector length — Intel's `Lx`,
+    /// the fourth operand of `VBLENDVPS` and its siblings. Consumes the
+    /// immediate byte.
+    Lx,
+    /// An `XMM` register or a memory operand of **half** the vector length:
+    /// eight bytes at 128 bits and sixteen at 256. The source of the
+    /// widening conversions `CVTPS2PD` and `CVTDQ2PD`, whose legacy form is
+    /// a quadword; the register form is always an `XMM` register.
+    Wh,
+    /// An `XMM` or `YMM` register, or a memory operand of eight bytes at
+    /// 128 bits and thirty-two at 256: `MOVDDUP`, which duplicates one double
+    /// per 128-bit lane and so reads one per lane.
+    Wqx,
+    /// An `XMM` register from ModRM `reg`, **always** 128 bits: the
+    /// destination of the narrowing conversions (`CVTPD2PS`, `CVTPD2DQ`,
+    /// `CVTTPD2DQ`) whose `VEX.256` form reads a `YMM` register and writes an
+    /// `XMM` one — Intel's `Vdq` against the source's `Wpd`.
+    Vdq,
+    /// An `XMM` register or sixteen bytes of memory, **always** 128 bits:
+    /// one half of a `YMM` register, as `VINSERTF128` reads it and
+    /// `VEXTRACTF128` writes it.
+    Wdq,
 }
 
 impl Arg {
@@ -441,7 +503,13 @@ impl Arg {
             | Arg::Xmm0
             | Arg::Ww
             | Arg::RdMb
-            | Arg::RdMw => None,
+            | Arg::RdMw
+            | Arg::Hx
+            | Arg::Lx
+            | Arg::Wh
+            | Arg::Wqx
+            | Arg::Vdq
+            | Arg::Wdq => None,
         }
     }
 
@@ -458,11 +526,14 @@ impl Arg {
     pub const fn fp_bytes(self, osz: u8) -> Option<u8> {
         match self {
             Arg::Mf32 | Arg::Mi32 | Arg::Wd | Arg::Qd => Some(4),
-            Arg::Mf64 | Arg::Mi64 | Arg::Wq | Arg::Mq | Arg::Qq => Some(8),
+            // `Wh` and `Wqx` are a quadword at 128 bits, which is the only
+            // length a legacy encoding has; [`Fields::mem_bytes`] answers
+            // for the 256-bit forms.
+            Arg::Mf64 | Arg::Mi64 | Arg::Wq | Arg::Mq | Arg::Qq | Arg::Wh | Arg::Wqx => Some(8),
             Arg::Mf80 => Some(10),
             Arg::Mi16 | Arg::Ww | Arg::RdMw => Some(2),
             Arg::RdMb => Some(1),
-            Arg::Wx => Some(16),
+            Arg::Wx | Arg::Wdq => Some(16),
             Arg::Mfenv => Some(if osz == 2 { 14 } else { 28 }),
             Arg::Mfsave => Some(if osz == 2 { 94 } else { 108 }),
             _ => None,
@@ -514,6 +585,10 @@ impl Arg {
                 | Arg::Ww
                 | Arg::RdMb
                 | Arg::RdMw
+                | Arg::Wh
+                | Arg::Wqx
+                | Arg::Vdq
+                | Arg::Wdq
         )
     }
 
@@ -538,7 +613,7 @@ impl Arg {
     #[must_use]
     pub const fn immediate_bytes(self, osz: u8, asz: u8) -> u8 {
         match self {
-            Arg::Ib | Arg::Ibs | Arg::Jb => 1,
+            Arg::Ib | Arg::Ibs | Arg::Jb | Arg::Lx => 1,
             Arg::Iw => 2,
             Arg::Iv => osz,
             // `Iz` and `Jz`: two bytes at a 16-bit operand size, four at
@@ -1296,6 +1371,20 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("POPCNT", "popcnt"),
     ("LZCNT", "lzcnt"),
     ("MOVBE", "movbe"),
+    ("VBROADCASTSS", "vbroadcastss"),
+    ("VBROADCASTSD", "vbroadcastsd"),
+    ("VBROADCASTF128", "vbroadcastf128"),
+    ("VEXTRACTF128", "vextractf128"),
+    ("VINSERTF128", "vinsertf128"),
+    ("VMASKMOVPD", "vmaskmovpd"),
+    ("VMASKMOVPS", "vmaskmovps"),
+    ("VPERM2F128", "vperm2f128"),
+    ("VPERMILPD", "vpermilpd"),
+    ("VPERMILPS", "vpermilps"),
+    ("VTESTPD", "vtestpd"),
+    ("VTESTPS", "vtestps"),
+    ("VZEROALL", "vzeroall"),
+    ("VZEROUPPER", "vzeroupper"),
 ];
 
 define_ops! {
@@ -1885,6 +1974,21 @@ define_ops! {
 
     // ---- MOVBE -----------------------------------------------------------
     MOVBE = "move with the bytes reversed (memory forms only)",
+    // ---- AVX: the instructions that exist only VEX-encoded ----------------
+    VBROADCASTSS = "replicate a single from memory into every lane",
+    VBROADCASTSD = "replicate a double from memory into every lane of a YMM register",
+    VBROADCASTF128 = "replicate sixteen bytes of memory into both halves of a YMM register",
+    VEXTRACTF128 = "extract the 128-bit half of a YMM register the immediate names",
+    VINSERTF128 = "replace the 128-bit half of a YMM register the immediate names",
+    VMASKMOVPD = "load or store the doubles whose mask lane has its sign bit set",
+    VMASKMOVPS = "load or store the singles whose mask lane has its sign bit set",
+    VPERM2F128 = "select each 128-bit half of the result from either source, or zero",
+    VPERMILPD = "permute the doubles within each 128-bit lane, by an immediate or a vector",
+    VPERMILPS = "permute the singles within each 128-bit lane, by an immediate or a vector",
+    VTESTPD = "set ZF and CF from the sign bits of the AND and the AND NOT of two vectors of doubles",
+    VTESTPS = "set ZF and CF from the sign bits of the AND and the AND NOT of two vectors of singles",
+    VZEROALL = "zero every YMM register",
+    VZEROUPPER = "zero bits 255:128 of every YMM register",
 }
 
 impl Op {
@@ -2565,6 +2669,20 @@ impl Op {
             Op::POPCNT => Extension::Popcnt,
             Op::LZCNT => Extension::Lzcnt,
             Op::MOVBE => Extension::Movbe,
+            Op::VBROADCASTSS
+            | Op::VBROADCASTSD
+            | Op::VBROADCASTF128
+            | Op::VEXTRACTF128
+            | Op::VINSERTF128
+            | Op::VMASKMOVPD
+            | Op::VMASKMOVPS
+            | Op::VPERM2F128
+            | Op::VPERMILPD
+            | Op::VPERMILPS
+            | Op::VTESTPD
+            | Op::VTESTPS
+            | Op::VZEROALL
+            | Op::VZEROUPPER => Extension::Avx,
             _ => return None,
         };
         Some(ext)
@@ -2741,6 +2859,11 @@ pub enum Extension {
     Lzcnt,
     /// `MOVBE`: `CPUID.01H:ECX[22]`.
     Movbe,
+    /// AVX: `CPUID.01H:ECX[28]`. Only the instructions that exist *solely*
+    /// VEX-encoded answer this — `VBROADCASTSS`, `VPERM2F128` and the rest.
+    /// The VEX forms of older instructions keep their own extension, and the
+    /// VEX prefix itself is what is gated on AVX.
+    Avx,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -2769,6 +2892,126 @@ pub struct Insn {
     /// `ROADMAP.md` §6.1.1's "decode is gated per entry", applied to a mode
     /// rather than an extension. [`Insn::in_long`] is the only reader.
     pub long: L64,
+    /// Whether, and how, this row is reached through a VEX prefix.
+    ///
+    /// Beside the legacy row for the reason [`Insn::long`] is: Intel's own
+    /// opcode map describes the two encodings in one cell (*Intel SDM*
+    /// volume 2 appendix A, the `v` and `v1` superscripts), and a VEX form is
+    /// the legacy instruction with a third operand and a vector length rather
+    /// than a different instruction. See [`Vex`].
+    pub vex: Vex,
+}
+
+/// How one row is reached through a VEX prefix.
+///
+/// The attribute appendix A of the *Intel SDM* volume 2 writes as a
+/// superscript — `v` for "has a VEX form", `v1` for "VEX.128 only" — plus the
+/// three facts each instruction page's encoding line adds: what `VEX.vvvv`
+/// is, which `VEX.L` values exist, and whether `VEX.W` must be zero.
+/// [`decode_stream_as`] applies every one of them, so a VEX encoding that
+/// breaks one decodes as [`Op::UD`] and the executor never sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Vex {
+    /// What `VEX.vvvv` is, or that there is no VEX form at all.
+    pub form: VexForm,
+    /// Which vector lengths exist.
+    pub len: VexLen,
+    /// The row exists **only** VEX-encoded: its legacy encoding is `#UD`.
+    pub only: bool,
+    /// `VEX.W` must be 0, and is `#UD` otherwise (the instruction page's
+    /// `W0`, against `WIG` for "ignored").
+    pub w0: bool,
+}
+
+/// What `VEX.vvvv` means for one row.
+///
+/// Intel's encoding lines call the second source "NDS" and a vvvv
+/// destination "NDD" (*Intel SDM* volume 2 §2.3.6); an encoding that uses
+/// neither requires the field to be `1111b` and raises `#UD` otherwise
+/// (§2.3.6, and each instruction's exception class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VexForm {
+    /// No VEX form: `#UD` with a VEX prefix. Every row that does not say
+    /// otherwise.
+    None,
+    /// The legacy operands unchanged, and `VEX.vvvv` unused — so it must be
+    /// `1111b`. Moves, unary operations, conversions, extractions.
+    Plain,
+    /// `VEX.vvvv` is a source register written after the destination: the
+    /// destructive `op dst, src` becomes the non-destructive
+    /// `op dst, src1, src2`, with `src1` taking the place the old
+    /// destination's value held.
+    Nds,
+    /// [`VexForm::Nds`] for the register form and [`VexForm::Plain`] for the
+    /// memory form: `VMOVSS` and `VMOVSD`, whose register form merges and
+    /// whose load zeroes.
+    NdsReg,
+    /// `VEX.vvvv` is the **destination** and the row's operands are the
+    /// sources: the shift-by-immediate groups 12, 13 and 14, whose ModRM
+    /// `reg` field is an opcode extension and so cannot name one.
+    Ndd,
+    /// The VEX encoding is a different, operand-less instruction — `0F 77`,
+    /// `EMMS` without and `VZEROUPPER` (or, with `VEX.L`, `VZEROALL`) with.
+    Alt(Op),
+}
+
+/// Which `VEX.L` values one row accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VexLen {
+    /// `VEX.128` and `VEX.256`, each a different vector length.
+    Any,
+    /// `VEX.128` only: `VEX.L = 1` is `#UD`. Every AVX1 integer instruction
+    /// — the 256-bit integer forms are AVX2's — and the scalar-to-register
+    /// transfers. Intel's `v1`, and `LZ`.
+    L128,
+    /// `VEX.256` only: `VEX.L = 0` is `#UD` — the 128-bit-lane operations
+    /// (`VPERM2F128`, `VINSERTF128`, `VEXTRACTF128`, `VBROADCASTSD`,
+    /// `VBROADCASTF128`) that mean nothing with one lane.
+    L256,
+    /// `VEX.L` ignored: the scalar instructions, which read and write one
+    /// lane whatever it says. Intel's `LIG`.
+    Ignored,
+}
+
+impl Vex {
+    /// No VEX form.
+    pub const NONE: Vex = Vex {
+        form: VexForm::None,
+        len: VexLen::Any,
+        only: false,
+        w0: false,
+    };
+
+    /// A VEX form with this `vvvv` use and these lengths.
+    #[must_use]
+    pub const fn new(form: VexForm, len: VexLen) -> Vex {
+        Vex {
+            form,
+            len,
+            only: false,
+            w0: false,
+        }
+    }
+
+    /// The same, existing only VEX-encoded.
+    #[must_use]
+    pub const fn only(mut self) -> Vex {
+        self.only = true;
+        self
+    }
+
+    /// The same, with `VEX.W` required to be 0.
+    #[must_use]
+    pub const fn w0(mut self) -> Vex {
+        self.w0 = true;
+        self
+    }
+
+    /// Whether there is any VEX form.
+    #[must_use]
+    pub const fn exists(self) -> bool {
+        !matches!(self.form, VexForm::None)
+    }
 }
 
 /// What one encoding becomes in 64-bit mode.
@@ -2799,7 +3042,14 @@ impl Insn {
             group,
             class,
             long: L64::Same,
+            vex: Vex::NONE,
         }
+    }
+
+    /// The same row with a VEX form.
+    const fn with_vex(mut self, vex: Vex) -> Insn {
+        self.vex = vex;
+        self
     }
 
     /// The same row with a third operand.
@@ -2839,6 +3089,7 @@ impl Insn {
                     _ => self.class,
                 },
                 long: L64::Same,
+                vex: Vex::NONE,
             },
         }
     }
@@ -2922,7 +3173,8 @@ macro_rules! opmap {
     (
         base $base:expr;
         $($opcode:literal $op:ident $dst:ident $src:ident $(+ $aux:ident)? $group:ident $class:ident
-          $(=> ($($long:tt)+))? ;)*
+          $(=> ($($long:tt)+))?
+          $(| $vform:ident $(($valt:ident))? $vlen:ident $($vflag:ident)*)? ;)*
     ) => {{
         let mut t: [Insn; 256] = $base;
         let mut listed = [false; 256];
@@ -2930,11 +3182,27 @@ macro_rules! opmap {
             t[$opcode as usize] =
                 Insn::new(Op::$op, Arg::$dst, Arg::$src, Grp::$group, Class::$class)
                 $(.with_aux(Arg::$aux))?
-                $(.with_long(long_spec!($($long)+)))?;
+                $(.with_long(long_spec!($($long)+)))?
+                $(.with_vex(vex_spec!($vform $(($valt))? $vlen $($vflag)*)))?;
             listed[$opcode as usize] = true;
         )*
         (t, listed)
     }};
+}
+
+/// The `| …` column of a row: its VEX form, as [`Vex`] describes it.
+///
+/// `| Nds Any` reads "VEX form with an `NDS` source, at either length";
+/// `| Plain L128` "VEX.128 only, `vvvv` unused". The flags after the length
+/// are `only` (no legacy encoding) and `w0` (`VEX.W1` is `#UD`).
+/// `| Alt(OP) Any` is the one cell whose VEX encoding is another operation.
+macro_rules! vex_spec {
+    (Alt($op:ident) $len:ident $($flag:ident)*) => {
+        Vex::new(VexForm::Alt(Op::$op), VexLen::$len)$(.$flag())*
+    };
+    ($form:ident $len:ident $($flag:ident)*) => {
+        Vex::new(VexForm::$form, VexLen::$len)$(.$flag())*
+    };
 }
 
 /// The `=> (…)` column of a row: what the encoding becomes in 64-bit mode.
@@ -3380,44 +3648,44 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     // SSE, with no mandatory prefix: the packed-single half. Every one of
     // these is a different instruction under `66`, `F3` or `F2` — see
     // [`TABLE_0F_66`] and its two siblings.
-    0x10 MOVUPS   Vx Wx None   Documented;
-    0x11 MOVUPS   Wx Vx None   Documented;
-    0x12 MOVLPS   Vx Mq ModAlt Documented;
-    0x13 MOVLPS   Mq Vx ModAlt Documented;
-    0x14 UNPCKLPS Vx Wx None   Documented;
-    0x15 UNPCKHPS Vx Wx None   Documented;
-    0x16 MOVHPS   Vx Mq ModAlt Documented;
-    0x17 MOVHPS   Mq Vx ModAlt Documented;
-    0x28 MOVAPS   Vx Wx None   Documented;
-    0x29 MOVAPS   Wx Vx None   Documented;
+    0x10 MOVUPS   Vx Wx None   Documented | Plain Any;
+    0x11 MOVUPS   Wx Vx None   Documented | Plain Any;
+    0x12 MOVLPS   Vx Mq ModAlt Documented | Nds L128;
+    0x13 MOVLPS   Mq Vx ModAlt Documented | Plain L128;
+    0x14 UNPCKLPS Vx Wx None   Documented | Nds Any;
+    0x15 UNPCKHPS Vx Wx None   Documented | Nds Any;
+    0x16 MOVHPS   Vx Mq ModAlt Documented | Nds L128;
+    0x17 MOVHPS   Mq Vx ModAlt Documented | Plain L128;
+    0x28 MOVAPS   Vx Wx None   Documented | Plain Any;
+    0x29 MOVAPS   Wx Vx None   Documented | Plain Any;
     // The non-temporal stores are ordinary aligned stores here, for the reason
     // given at `66 0F E7`; like `MOVAPS` they refuse a misaligned address, and
     // they have no register form.
-    0x2b MOVNTPS  Wx Vx None   Documented;
-    0x2e UCOMISS  Vx Wd None   Documented;
-    0x2f COMISS   Vx Wd None   Documented;
-    0x50 MOVMSKPS Gy Ux None   Documented;
-    0x51 SQRTPS   Vx Wx None   Documented;
+    0x2b MOVNTPS  Wx Vx None   Documented | Plain Any;
+    0x2e UCOMISS  Vx Wd None   Documented | Plain Ignored;
+    0x2f COMISS   Vx Wd None   Documented | Plain Ignored;
+    0x50 MOVMSKPS Gy Ux None   Documented | Plain Any;
+    0x51 SQRTPS   Vx Wx None   Documented | Plain Any;
     // The two approximations. The architecture bounds their error rather than
     // fixing their result; see `fpexec`'s `approximate` for the answer chosen.
-    0x52 RSQRTPS  Vx Wx None   Documented;
-    0x53 RCPPS    Vx Wx None   Documented;
-    0x54 ANDPS    Vx Wx None   Documented;
-    0x55 ANDNPS   Vx Wx None   Documented;
-    0x56 ORPS     Vx Wx None   Documented;
-    0x57 XORPS    Vx Wx None   Documented;
-    0x58 ADDPS    Vx Wx None   Documented;
-    0x59 MULPS    Vx Wx None   Documented;
+    0x52 RSQRTPS  Vx Wx None   Documented | Plain Any;
+    0x53 RCPPS    Vx Wx None   Documented | Plain Any;
+    0x54 ANDPS    Vx Wx None   Documented | Nds Any;
+    0x55 ANDNPS   Vx Wx None   Documented | Nds Any;
+    0x56 ORPS     Vx Wx None   Documented | Nds Any;
+    0x57 XORPS    Vx Wx None   Documented | Nds Any;
+    0x58 ADDPS    Vx Wx None   Documented | Nds Any;
+    0x59 MULPS    Vx Wx None   Documented | Nds Any;
     // The source is two singles, so it is a *quadword* even though the
     // destination is a full register.
-    0x5a CVTPS2PD Vx Wq None   Documented;
+    0x5a CVTPS2PD Vx Wh None   Documented | Plain Any;
     // SSE2, despite sitting in the no-prefix map: the packed-integer lanes it
     // reads are SSE2's.
-    0x5b CVTDQ2PS Vx Wx None   Documented;
-    0x5c SUBPS    Vx Wx None   Documented;
-    0x5d MINPS    Vx Wx None   Documented;
-    0x5e DIVPS    Vx Wx None   Documented;
-    0x5f MAXPS    Vx Wx None   Documented;
+    0x5b CVTDQ2PS Vx Wx None   Documented | Plain Any;
+    0x5c SUBPS    Vx Wx None   Documented | Nds Any;
+    0x5d MINPS    Vx Wx None   Documented | Nds Any;
+    0x5e DIVPS    Vx Wx None   Documented | Nds Any;
+    0x5f MAXPS    Vx Wx None   Documented | Nds Any;
 
     0x20 MOV   Rd   Cd   None   Documented;
     0x21 MOV   Rd   Dd   None   Documented;
@@ -3529,17 +3797,17 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     // Intel's group 15: the two save/restore instructions, the two `MXCSR`
     // moves, and the three fences — which share the opcode and are told apart
     // by the ModRM *mode* field rather than by `reg` alone.
-    0xae FXSAVE Mfx None Grp15  Documented;
+    0xae FXSAVE Mfx None Grp15  Documented | Plain L128;
 
     0xc0 XADD  Eb   Gb   None   Documented;
     0xc1 XADD  Ev   Gv   None   Documented;
-    0xc2 CMPPS Vx   Wx  +Ib     None   Documented;
+    0xc2 CMPPS Vx   Wx  +Ib     None   Documented | Nds Any;
     // SSE2's one general-register instruction: a plain `MOV` store at four or
     // eight bytes by `REX.W`, memory only. Gated by `Features::sse2` and by
     // nothing in `CR0` or `CR4`, because it touches no SIMD state (*Intel SDM*
     // volume 2, `MOVNTI`).
     0xc3 MOVNTI Ey  Gy   None   Documented;
-    0xc6 SHUFPS Vx  Wx  +Ib     None   Documented;
+    0xc6 SHUFPS Vx  Wx  +Ib     None   Documented | Nds Any;
     // Intel's group 9: the only member is the 64-bit compare-and-exchange,
     // which becomes the 128-bit one under `REX.W`.
     0xc7 CMPXCHG8B M None Grp9  Documented;
@@ -3589,7 +3857,7 @@ const SECONDARY: ([Insn; 256], [bool; 256]) = opmap! {
     0x74 PCMPEQB   Pq  Qq  None   Documented;
     0x75 PCMPEQW   Pq  Qq  None   Documented;
     0x76 PCMPEQD   Pq  Qq  None   Documented;
-    0x77 EMMS      None None None Documented;
+    0x77 EMMS      None None None Documented | Alt(VZEROUPPER) Any;
     0x7e MOVD      Ey  Pq  None   Documented;
     0x7f MOVQ      Qq  Pq  None   Documented;
     0xc4 PINSRW    Pq  Ew +Ib None Documented;
@@ -3686,132 +3954,132 @@ pub static LISTED_0F: [bool; 256] = SECONDARY.1;
 const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     base without_mmx(SECONDARY.0);
 
-    0x10 MOVUPD   Vx Wx None   Documented;
-    0x11 MOVUPD   Wx Vx None   Documented;
-    0x12 MOVLPD   Vx Mq ModAlt Documented;
-    0x13 MOVLPD   Mq Vx ModAlt Documented;
-    0x14 UNPCKLPD Vx Wx None   Documented;
-    0x15 UNPCKHPD Vx Wx None   Documented;
-    0x16 MOVHPD   Vx Mq ModAlt Documented;
-    0x17 MOVHPD   Mq Vx ModAlt Documented;
-    0x28 MOVAPD   Vx Wx None   Documented;
-    0x29 MOVAPD   Wx Vx None   Documented;
-    0x2b MOVNTPD  Wx Vx None   Documented;
+    0x10 MOVUPD   Vx Wx None   Documented | Plain Any;
+    0x11 MOVUPD   Wx Vx None   Documented | Plain Any;
+    0x12 MOVLPD   Vx Mq ModAlt Documented | Nds L128;
+    0x13 MOVLPD   Mq Vx ModAlt Documented | Plain L128;
+    0x14 UNPCKLPD Vx Wx None   Documented | Nds Any;
+    0x15 UNPCKHPD Vx Wx None   Documented | Nds Any;
+    0x16 MOVHPD   Vx Mq ModAlt Documented | Nds L128;
+    0x17 MOVHPD   Mq Vx ModAlt Documented | Plain L128;
+    0x28 MOVAPD   Vx Wx None   Documented | Plain Any;
+    0x29 MOVAPD   Wx Vx None   Documented | Plain Any;
+    0x2b MOVNTPD  Wx Vx None   Documented | Plain Any;
     // SSE2's conversions between packed doubles and `MM` doublewords. The
     // double side is a full register, so its memory form is sixteen aligned
     // bytes; the `MM` side is a quadword.
     0x2a CVTPI2PD  Vx Qq None  Documented;
     0x2c CVTTPD2PI Pq Wx None  Documented;
     0x2d CVTPD2PI  Pq Wx None  Documented;
-    0x2e UCOMISD  Vx Wq None   Documented;
-    0x2f COMISD   Vx Wq None   Documented;
-    0x50 MOVMSKPD Gy Ux None   Documented;
-    0x51 SQRTPD   Vx Wx None   Documented;
+    0x2e UCOMISD  Vx Wq None   Documented | Plain Ignored;
+    0x2f COMISD   Vx Wq None   Documented | Plain Ignored;
+    0x50 MOVMSKPD Gy Ux None   Documented | Plain Any;
+    0x51 SQRTPD   Vx Wx None   Documented | Plain Any;
     // There is no double-precision approximation before AVX-512, and the
     // encodings a prefix does not name are `#UD` rather than the no-prefix row.
     0x52 UD       None None None Undefined;
     0x53 UD       None None None Undefined;
-    0x54 ANDPD    Vx Wx None   Documented;
-    0x55 ANDNPD   Vx Wx None   Documented;
-    0x56 ORPD     Vx Wx None   Documented;
-    0x57 XORPD    Vx Wx None   Documented;
-    0x58 ADDPD    Vx Wx None   Documented;
-    0x59 MULPD    Vx Wx None   Documented;
-    0x5a CVTPD2PS Vx Wx None   Documented;
-    0x5b CVTPS2DQ Vx Wx None   Documented;
-    0x5c SUBPD    Vx Wx None   Documented;
-    0x5d MINPD    Vx Wx None   Documented;
-    0x5e DIVPD    Vx Wx None   Documented;
-    0x5f MAXPD    Vx Wx None   Documented;
-    0x60 PUNPCKLBW  Vx Wx None   Documented;
-    0x61 PUNPCKLWD  Vx Wx None   Documented;
-    0x62 PUNPCKLDQ  Vx Wx None   Documented;
-    0x63 PACKSSWB   Vx Wx None   Documented;
-    0x64 PCMPGTB    Vx Wx None   Documented;
-    0x65 PCMPGTW    Vx Wx None   Documented;
-    0x66 PCMPGTD    Vx Wx None   Documented;
-    0x67 PACKUSWB   Vx Wx None   Documented;
-    0x68 PUNPCKHBW  Vx Wx None   Documented;
-    0x69 PUNPCKHWD  Vx Wx None   Documented;
-    0x6a PUNPCKHDQ  Vx Wx None   Documented;
-    0x6b PACKSSDW   Vx Wx None   Documented;
-    0x6c PUNPCKLQDQ Vx Wx None   Documented;
-    0x6d PUNPCKHQDQ Vx Wx None   Documented;
-    0x6e MOVD     Vx Ey None   Documented;
-    0x6f MOVDQA   Vx Wx None   Documented;
-    0x70 PSHUFD     Vx Wx +Ib None Documented;
+    0x54 ANDPD    Vx Wx None   Documented | Nds Any;
+    0x55 ANDNPD   Vx Wx None   Documented | Nds Any;
+    0x56 ORPD     Vx Wx None   Documented | Nds Any;
+    0x57 XORPD    Vx Wx None   Documented | Nds Any;
+    0x58 ADDPD    Vx Wx None   Documented | Nds Any;
+    0x59 MULPD    Vx Wx None   Documented | Nds Any;
+    0x5a CVTPD2PS Vdq Wx None  Documented | Plain Any;
+    0x5b CVTPS2DQ Vx Wx None   Documented | Plain Any;
+    0x5c SUBPD    Vx Wx None   Documented | Nds Any;
+    0x5d MINPD    Vx Wx None   Documented | Nds Any;
+    0x5e DIVPD    Vx Wx None   Documented | Nds Any;
+    0x5f MAXPD    Vx Wx None   Documented | Nds Any;
+    0x60 PUNPCKLBW  Vx Wx None   Documented | Nds L128;
+    0x61 PUNPCKLWD  Vx Wx None   Documented | Nds L128;
+    0x62 PUNPCKLDQ  Vx Wx None   Documented | Nds L128;
+    0x63 PACKSSWB   Vx Wx None   Documented | Nds L128;
+    0x64 PCMPGTB    Vx Wx None   Documented | Nds L128;
+    0x65 PCMPGTW    Vx Wx None   Documented | Nds L128;
+    0x66 PCMPGTD    Vx Wx None   Documented | Nds L128;
+    0x67 PACKUSWB   Vx Wx None   Documented | Nds L128;
+    0x68 PUNPCKHBW  Vx Wx None   Documented | Nds L128;
+    0x69 PUNPCKHWD  Vx Wx None   Documented | Nds L128;
+    0x6a PUNPCKHDQ  Vx Wx None   Documented | Nds L128;
+    0x6b PACKSSDW   Vx Wx None   Documented | Nds L128;
+    0x6c PUNPCKLQDQ Vx Wx None   Documented | Nds L128;
+    0x6d PUNPCKHQDQ Vx Wx None   Documented | Nds L128;
+    0x6e MOVD     Vx Ey None   Documented | Plain L128;
+    0x6f MOVDQA   Vx Wx None   Documented | Plain Any;
+    0x70 PSHUFD     Vx Wx +Ib None Documented | Plain L128;
     // The three shift-by-immediate groups. Every one of them is a register
     // form only: the count is the immediate and there is nowhere for a memory
     // operand to go, which is why `mod != 11` is not an encoding.
-    0x71 PSRLW      Ux Ib  Grp12  Documented;
-    0x72 PSRLD      Ux Ib  Grp13  Documented;
-    0x73 PSRLQ      Ux Ib  Grp14  Documented;
-    0x74 PCMPEQB    Vx Wx None   Documented;
-    0x75 PCMPEQW    Vx Wx None   Documented;
-    0x76 PCMPEQD    Vx Wx None   Documented;
-    0x7e MOVD     Ey Vx None   Documented;
-    0x7f MOVDQA   Wx Vx None   Documented;
+    0x71 PSRLW      Ux Ib  Grp12  Documented | Ndd L128;
+    0x72 PSRLD      Ux Ib  Grp13  Documented | Ndd L128;
+    0x73 PSRLQ      Ux Ib  Grp14  Documented | Ndd L128;
+    0x74 PCMPEQB    Vx Wx None   Documented | Nds L128;
+    0x75 PCMPEQW    Vx Wx None   Documented | Nds L128;
+    0x76 PCMPEQD    Vx Wx None   Documented | Nds L128;
+    0x7e MOVD     Ey Vx None   Documented | Plain L128;
+    0x7f MOVDQA   Wx Vx None   Documented | Plain Any;
     // SSE3's packed-double half.
-    0x7c HADDPD   Vx Wx None   Documented;
-    0x7d HSUBPD   Vx Wx None   Documented;
-    0xd0 ADDSUBPD Vx Wx None   Documented;
-    0xc2 CMPPD    Vx Wx +Ib None Documented;
+    0x7c HADDPD   Vx Wx None   Documented | Nds Any;
+    0x7d HSUBPD   Vx Wx None   Documented | Nds Any;
+    0xd0 ADDSUBPD Vx Wx None   Documented | Nds Any;
+    0xc2 CMPPD    Vx Wx +Ib None Documented | Nds Any;
     // `MOVNTI` is an `NP` encoding: a mandatory-prefix byte in front of it
     // makes it invalid (*Intel SDM* volume 2 §3.1.1.1).
     0xc3 UD       None None None Undefined;
-    0xc4 PINSRW     Vx Ew +Ib None Documented;
-    0xc5 PEXTRW     Gy Ux +Ib None Documented;
-    0xc6 SHUFPD   Vx Wx +Ib None Documented;
-    0xd1 PSRLW      Vx Wx None   Documented;
-    0xd2 PSRLD      Vx Wx None   Documented;
-    0xd3 PSRLQ      Vx Wx None   Documented;
-    0xd4 PADDQ      Vx Wx None   Documented;
-    0xd5 PMULLW     Vx Wx None   Documented;
-    0xd6 MOVQ     Wq Vx None   Documented;
-    0xd7 PMOVMSKB   Gy Ux None   Documented;
-    0xd8 PSUBUSB    Vx Wx None   Documented;
-    0xd9 PSUBUSW    Vx Wx None   Documented;
-    0xda PMINUB     Vx Wx None   Documented;
-    0xdb PAND     Vx Wx None   Documented;
-    0xdc PADDUSB    Vx Wx None   Documented;
-    0xdd PADDUSW    Vx Wx None   Documented;
-    0xde PMAXUB     Vx Wx None   Documented;
-    0xdf PANDN    Vx Wx None   Documented;
-    0xe0 PAVGB      Vx Wx None   Documented;
-    0xe1 PSRAW      Vx Wx None   Documented;
-    0xe2 PSRAD      Vx Wx None   Documented;
-    0xe3 PAVGW      Vx Wx None   Documented;
-    0xe4 PMULHUW    Vx Wx None   Documented;
-    0xe5 PMULHW     Vx Wx None   Documented;
-    0xe6 CVTTPD2DQ  Vx Wx None   Documented;
+    0xc4 PINSRW     Vx Ew +Ib None Documented | Nds L128;
+    0xc5 PEXTRW     Gy Ux +Ib None Documented | Plain L128;
+    0xc6 SHUFPD   Vx Wx +Ib None Documented | Nds Any;
+    0xd1 PSRLW      Vx Wx None   Documented | Nds L128;
+    0xd2 PSRLD      Vx Wx None   Documented | Nds L128;
+    0xd3 PSRLQ      Vx Wx None   Documented | Nds L128;
+    0xd4 PADDQ      Vx Wx None   Documented | Nds L128;
+    0xd5 PMULLW     Vx Wx None   Documented | Nds L128;
+    0xd6 MOVQ     Wq Vx None   Documented | Plain L128;
+    0xd7 PMOVMSKB   Gy Ux None   Documented | Plain L128;
+    0xd8 PSUBUSB    Vx Wx None   Documented | Nds L128;
+    0xd9 PSUBUSW    Vx Wx None   Documented | Nds L128;
+    0xda PMINUB     Vx Wx None   Documented | Nds L128;
+    0xdb PAND     Vx Wx None   Documented | Nds L128;
+    0xdc PADDUSB    Vx Wx None   Documented | Nds L128;
+    0xdd PADDUSW    Vx Wx None   Documented | Nds L128;
+    0xde PMAXUB     Vx Wx None   Documented | Nds L128;
+    0xdf PANDN    Vx Wx None   Documented | Nds L128;
+    0xe0 PAVGB      Vx Wx None   Documented | Nds L128;
+    0xe1 PSRAW      Vx Wx None   Documented | Nds L128;
+    0xe2 PSRAD      Vx Wx None   Documented | Nds L128;
+    0xe3 PAVGW      Vx Wx None   Documented | Nds L128;
+    0xe4 PMULHUW    Vx Wx None   Documented | Nds L128;
+    0xe5 PMULHW     Vx Wx None   Documented | Nds L128;
+    0xe6 CVTTPD2DQ  Vdq Wx None  Documented | Plain Any;
     // A non-temporal store is an ordinary one here: there is no cache to
     // bypass, and the architecture guarantees only weaker ordering, which a
     // single-bus core already satisfies.
-    0xe7 MOVNTDQ    Wx Vx None   Documented;
-    0xe8 PSUBSB     Vx Wx None   Documented;
-    0xe9 PSUBSW     Vx Wx None   Documented;
-    0xea PMINSW     Vx Wx None   Documented;
-    0xeb POR      Vx Wx None   Documented;
-    0xec PADDSB     Vx Wx None   Documented;
-    0xed PADDSW     Vx Wx None   Documented;
-    0xee PMAXSW     Vx Wx None   Documented;
-    0xef PXOR     Vx Wx None   Documented;
-    0xf1 PSLLW      Vx Wx None   Documented;
-    0xf2 PSLLD      Vx Wx None   Documented;
-    0xf3 PSLLQ      Vx Wx None   Documented;
-    0xf4 PMULUDQ    Vx Wx None   Documented;
-    0xf5 PMADDWD    Vx Wx None   Documented;
-    0xf6 PSADBW     Vx Wx None   Documented;
+    0xe7 MOVNTDQ    Wx Vx None   Documented | Plain Any;
+    0xe8 PSUBSB     Vx Wx None   Documented | Nds L128;
+    0xe9 PSUBSW     Vx Wx None   Documented | Nds L128;
+    0xea PMINSW     Vx Wx None   Documented | Nds L128;
+    0xeb POR      Vx Wx None   Documented | Nds L128;
+    0xec PADDSB     Vx Wx None   Documented | Nds L128;
+    0xed PADDSW     Vx Wx None   Documented | Nds L128;
+    0xee PMAXSW     Vx Wx None   Documented | Nds L128;
+    0xef PXOR     Vx Wx None   Documented | Nds L128;
+    0xf1 PSLLW      Vx Wx None   Documented | Nds L128;
+    0xf2 PSLLD      Vx Wx None   Documented | Nds L128;
+    0xf3 PSLLQ      Vx Wx None   Documented | Nds L128;
+    0xf4 PMULUDQ    Vx Wx None   Documented | Nds L128;
+    0xf5 PMADDWD    Vx Wx None   Documented | Nds L128;
+    0xf6 PSADBW     Vx Wx None   Documented | Nds L128;
     // The source is `reg` and the mask is `r/m`, register only; the address
     // is implicit, `[DS:rDI]`.
-    0xf7 MASKMOVDQU Vx Ux None   Documented;
-    0xf8 PSUBB      Vx Wx None   Documented;
-    0xf9 PSUBW      Vx Wx None   Documented;
-    0xfa PSUBD      Vx Wx None   Documented;
-    0xfb PSUBQ      Vx Wx None   Documented;
-    0xfc PADDB      Vx Wx None   Documented;
-    0xfd PADDW      Vx Wx None   Documented;
-    0xfe PADDD      Vx Wx None   Documented;
+    0xf7 MASKMOVDQU Vx Ux None   Documented | Plain L128;
+    0xf8 PSUBB      Vx Wx None   Documented | Nds L128;
+    0xf9 PSUBW      Vx Wx None   Documented | Nds L128;
+    0xfa PSUBD      Vx Wx None   Documented | Nds L128;
+    0xfb PSUBQ      Vx Wx None   Documented | Nds L128;
+    0xfc PADDB      Vx Wx None   Documented | Nds L128;
+    0xfd PADDW      Vx Wx None   Documented | Nds L128;
+    0xfe PADDD      Vx Wx None   Documented | Nds L128;
 };
 
 /// The two-byte map with a `66` mandatory prefix.
@@ -3824,35 +4092,35 @@ pub static CHANGED_0F_66: [bool; 256] = SECONDARY_66.1;
 const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     base without_mmx(SECONDARY.0);
 
-    0x10 MOVSS     Vx Wd None Documented;
-    0x11 MOVSS     Wd Vx None Documented;
+    0x10 MOVSS     Vx Wd None Documented | NdsReg Ignored;
+    0x11 MOVSS     Wd Vx None Documented | NdsReg Ignored;
     // SSE3's two duplicating loads. A full register in, so no `ModAlt`: the
     // register form is the same instruction, not `MOVHLPS`.
-    0x12 MOVSLDUP  Vx Wx None Documented;
-    0x16 MOVSHDUP  Vx Wx None Documented;
-    0x2a CVTSI2SS  Vx Ey None Documented;
+    0x12 MOVSLDUP  Vx Wx None Documented | Plain Any;
+    0x16 MOVSHDUP  Vx Wx None Documented | Plain Any;
+    0x2a CVTSI2SS  Vx Ey None Documented | Nds Ignored;
     0x2b UD        None None None Undefined;
-    0x2c CVTTSS2SI Gy Wd None Documented;
-    0x2d CVTSS2SI  Gy Wd None Documented;
-    0x51 SQRTSS    Vx Wd None Documented;
-    0x52 RSQRTSS   Vx Wd None Documented;
-    0x53 RCPSS     Vx Wd None Documented;
-    0x58 ADDSS     Vx Wd None Documented;
-    0x59 MULSS     Vx Wd None Documented;
-    0x5a CVTSS2SD  Vx Wd None Documented;
-    0x5b CVTTPS2DQ Vx Wx None Documented;
-    0x5c SUBSS     Vx Wd None Documented;
-    0x5d MINSS     Vx Wd None Documented;
-    0x5e DIVSS     Vx Wd None Documented;
-    0x5f MAXSS     Vx Wd None Documented;
-    0x6f MOVDQU    Vx Wx None Documented;
-    0x70 PSHUFHW   Vx Wx +Ib None Documented;
+    0x2c CVTTSS2SI Gy Wd None Documented | Plain Ignored;
+    0x2d CVTSS2SI  Gy Wd None Documented | Plain Ignored;
+    0x51 SQRTSS    Vx Wd None Documented | Nds Ignored;
+    0x52 RSQRTSS   Vx Wd None Documented | Nds Ignored;
+    0x53 RCPSS     Vx Wd None Documented | Nds Ignored;
+    0x58 ADDSS     Vx Wd None Documented | Nds Ignored;
+    0x59 MULSS     Vx Wd None Documented | Nds Ignored;
+    0x5a CVTSS2SD  Vx Wd None Documented | Nds Ignored;
+    0x5b CVTTPS2DQ Vx Wx None Documented | Plain Any;
+    0x5c SUBSS     Vx Wd None Documented | Nds Ignored;
+    0x5d MINSS     Vx Wd None Documented | Nds Ignored;
+    0x5e DIVSS     Vx Wd None Documented | Nds Ignored;
+    0x5f MAXSS     Vx Wd None Documented | Nds Ignored;
+    0x6f MOVDQU    Vx Wx None Documented | Plain Any;
+    0x70 PSHUFHW   Vx Wx +Ib None Documented | Plain L128;
     // `F3 0F 7E` reads a quadword and **zeroes the upper half** of the
     // destination, which is what makes it different from `66 0F D6` writing
     // the same quadword the other way.
-    0x7e MOVQ      Vx Wq None Documented;
-    0x7f MOVDQU    Wx Vx None Documented;
-    0xc2 CMPSS     Vx Wd +Ib None Documented;
+    0x7e MOVQ      Vx Wq None Documented | Plain L128;
+    0x7f MOVDQU    Wx Vx None Documented | Plain Any;
+    0xc2 CMPSS     Vx Wd +Ib None Documented | Nds Ignored;
     0xc3 UD        None None None Undefined;
     // Between the two register files: an `MM` register into the low
     // quadword of an `XMM` one. Register form only.
@@ -3866,7 +4134,7 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     // table, decides which it is (*Intel SDM* volume 2, `LZCNT`).
     0xbd LZCNT     Gv Ev None Documented;
     // Two doublewords in, so the memory form is a quadword.
-    0xe6 CVTDQ2PD  Vx Wq None Documented;
+    0xe6 CVTDQ2PD  Vx Wh None Documented | Plain Any;
 };
 
 /// The two-byte map with an `F3` mandatory prefix.
@@ -3879,38 +4147,38 @@ pub static CHANGED_0F_F3: [bool; 256] = SECONDARY_F3.1;
 const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
     base without_mmx(SECONDARY.0);
 
-    0x10 MOVSD     Vx Wq None Documented;
-    0x11 MOVSD     Wq Vx None Documented;
+    0x10 MOVSD     Vx Wq None Documented | NdsReg Ignored;
+    0x11 MOVSD     Wq Vx None Documented | NdsReg Ignored;
     // SSE3. `MOVDDUP` reads one double, so its memory form is a quadword.
-    0x12 MOVDDUP   Vx Wq None Documented;
-    0x7c HADDPS    Vx Wx None Documented;
-    0x7d HSUBPS    Vx Wx None Documented;
-    0xd0 ADDSUBPS  Vx Wx None Documented;
+    0x12 MOVDDUP   Vx Wqx None Documented | Plain Any;
+    0x7c HADDPS    Vx Wx None Documented | Nds Any;
+    0x7d HSUBPS    Vx Wx None Documented | Nds Any;
+    0xd0 ADDSUBPS  Vx Wx None Documented | Nds Any;
     // Intel writes the source `Mx`: memory only, and unaligned by design —
     // it is the load for data that straddles a cache line. `Wx` so the
     // register form decodes to something the executor refuses with `#UD`.
-    0xf0 LDDQU     Vx Wx None Documented;
-    0x2a CVTSI2SD  Vx Ey None Documented;
+    0xf0 LDDQU     Vx Wx None Documented | Plain Any;
+    0x2a CVTSI2SD  Vx Ey None Documented | Nds Ignored;
     0x2b UD        None None None Undefined;
-    0x2c CVTTSD2SI Gy Wq None Documented;
-    0x2d CVTSD2SI  Gy Wq None Documented;
-    0x51 SQRTSD    Vx Wq None Documented;
+    0x2c CVTTSD2SI Gy Wq None Documented | Plain Ignored;
+    0x2d CVTSD2SI  Gy Wq None Documented | Plain Ignored;
+    0x51 SQRTSD    Vx Wq None Documented | Nds Ignored;
     0x52 UD        None None None Undefined;
     0x53 UD        None None None Undefined;
-    0x58 ADDSD     Vx Wq None Documented;
-    0x59 MULSD     Vx Wq None Documented;
-    0x5a CVTSD2SS  Vx Wq None Documented;
+    0x58 ADDSD     Vx Wq None Documented | Nds Ignored;
+    0x59 MULSD     Vx Wq None Documented | Nds Ignored;
+    0x5a CVTSD2SS  Vx Wq None Documented | Nds Ignored;
     0x5b UD        None None None Undefined;
-    0x5c SUBSD     Vx Wq None Documented;
-    0x5d MINSD     Vx Wq None Documented;
-    0x5e DIVSD     Vx Wq None Documented;
-    0x5f MAXSD     Vx Wq None Documented;
-    0x70 PSHUFLW   Vx Wx +Ib None Documented;
-    0xc2 CMPSD     Vx Wq +Ib None Documented;
+    0x5c SUBSD     Vx Wq None Documented | Nds Ignored;
+    0x5d MINSD     Vx Wq None Documented | Nds Ignored;
+    0x5e DIVSD     Vx Wq None Documented | Nds Ignored;
+    0x5f MAXSD     Vx Wq None Documented | Nds Ignored;
+    0x70 PSHUFLW   Vx Wx +Ib None Documented | Plain L128;
+    0xc2 CMPSD     Vx Wq +Ib None Documented | Nds Ignored;
     0xc3 UD        None None None Undefined;
     // `MOVQ2DQ`'s converse. Register form only.
     0xd6 MOVDQ2Q   Pq Ux None Documented;
-    0xe6 CVTPD2DQ  Vx Wx None Documented;
+    0xe6 CVTPD2DQ  Vdq Wx None Documented | Plain Any;
 };
 
 /// The two-byte map with an `F2` mandatory prefix.
@@ -4031,21 +4299,21 @@ pub static TABLE_0F38: [Insn; 256] = THREE_38.0;
 const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     base [UNASSIGNED; 256];
 
-    0x00 PSHUFB    Vx Wx None Documented;
-    0x01 PHADDW    Vx Wx None Documented;
-    0x02 PHADDD    Vx Wx None Documented;
-    0x03 PHADDSW   Vx Wx None Documented;
-    0x04 PMADDUBSW Vx Wx None Documented;
-    0x05 PHSUBW    Vx Wx None Documented;
-    0x06 PHSUBD    Vx Wx None Documented;
-    0x07 PHSUBSW   Vx Wx None Documented;
-    0x08 PSIGNB    Vx Wx None Documented;
-    0x09 PSIGNW    Vx Wx None Documented;
-    0x0a PSIGND    Vx Wx None Documented;
-    0x0b PMULHRSW  Vx Wx None Documented;
-    0x1c PABSB     Vx Wx None Documented;
-    0x1d PABSW     Vx Wx None Documented;
-    0x1e PABSD     Vx Wx None Documented;
+    0x00 PSHUFB    Vx Wx None Documented | Nds L128;
+    0x01 PHADDW    Vx Wx None Documented | Nds L128;
+    0x02 PHADDD    Vx Wx None Documented | Nds L128;
+    0x03 PHADDSW   Vx Wx None Documented | Nds L128;
+    0x04 PMADDUBSW Vx Wx None Documented | Nds L128;
+    0x05 PHSUBW    Vx Wx None Documented | Nds L128;
+    0x06 PHSUBD    Vx Wx None Documented | Nds L128;
+    0x07 PHSUBSW   Vx Wx None Documented | Nds L128;
+    0x08 PSIGNB    Vx Wx None Documented | Nds L128;
+    0x09 PSIGNW    Vx Wx None Documented | Nds L128;
+    0x0a PSIGND    Vx Wx None Documented | Nds L128;
+    0x0b PMULHRSW  Vx Wx None Documented | Nds L128;
+    0x1c PABSB     Vx Wx None Documented | Plain L128;
+    0x1d PABSW     Vx Wx None Documented | Plain L128;
+    0x1e PABSD     Vx Wx None Documented | Plain L128;
 
     // SSE4.1. The variable blends take their mask from `XMM0`, which no
     // field names — Intel writes it `<XMM0>` — so it is a third operand
@@ -4053,38 +4321,38 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x10 PBLENDVB  Vx Wx +Xmm0 None Documented;
     0x14 BLENDVPS  Vx Wx +Xmm0 None Documented;
     0x15 BLENDVPD  Vx Wx +Xmm0 None Documented;
-    0x17 PTEST     Vx Wx None Documented;
+    0x17 PTEST     Vx Wx None Documented | Plain Any;
     // The widening moves read exactly the lanes they widen, so the memory
     // form's width is the result's lane count times the source lane:
     // eight, four or two bytes.
-    0x20 PMOVSXBW  Vx Wq None Documented;
-    0x21 PMOVSXBD  Vx Wd None Documented;
-    0x22 PMOVSXBQ  Vx Ww None Documented;
-    0x23 PMOVSXWD  Vx Wq None Documented;
-    0x24 PMOVSXWQ  Vx Wd None Documented;
-    0x25 PMOVSXDQ  Vx Wq None Documented;
-    0x28 PMULDQ    Vx Wx None Documented;
-    0x29 PCMPEQQ   Vx Wx None Documented;
+    0x20 PMOVSXBW  Vx Wq None Documented | Plain L128;
+    0x21 PMOVSXBD  Vx Wd None Documented | Plain L128;
+    0x22 PMOVSXBQ  Vx Ww None Documented | Plain L128;
+    0x23 PMOVSXWD  Vx Wq None Documented | Plain L128;
+    0x24 PMOVSXWQ  Vx Wd None Documented | Plain L128;
+    0x25 PMOVSXDQ  Vx Wq None Documented | Plain L128;
+    0x28 PMULDQ    Vx Wx None Documented | Nds L128;
+    0x29 PCMPEQQ   Vx Wx None Documented | Nds L128;
     // Memory only (Intel's `Mx`); `Wx` so the register form decodes to
     // something the executor refuses.
-    0x2a MOVNTDQA  Vx Wx None Documented;
-    0x2b PACKUSDW  Vx Wx None Documented;
-    0x30 PMOVZXBW  Vx Wq None Documented;
-    0x31 PMOVZXBD  Vx Wd None Documented;
-    0x32 PMOVZXBQ  Vx Ww None Documented;
-    0x33 PMOVZXWD  Vx Wq None Documented;
-    0x34 PMOVZXWQ  Vx Wd None Documented;
-    0x35 PMOVZXDQ  Vx Wq None Documented;
-    0x38 PMINSB    Vx Wx None Documented;
-    0x39 PMINSD    Vx Wx None Documented;
-    0x3a PMINUW    Vx Wx None Documented;
-    0x3b PMINUD    Vx Wx None Documented;
-    0x3c PMAXSB    Vx Wx None Documented;
-    0x3d PMAXSD    Vx Wx None Documented;
-    0x3e PMAXUW    Vx Wx None Documented;
-    0x3f PMAXUD    Vx Wx None Documented;
-    0x40 PMULLD    Vx Wx None Documented;
-    0x41 PHMINPOSUW Vx Wx None Documented;
+    0x2a MOVNTDQA  Vx Wx None Documented | Plain L128;
+    0x2b PACKUSDW  Vx Wx None Documented | Nds L128;
+    0x30 PMOVZXBW  Vx Wq None Documented | Plain L128;
+    0x31 PMOVZXBD  Vx Wd None Documented | Plain L128;
+    0x32 PMOVZXBQ  Vx Ww None Documented | Plain L128;
+    0x33 PMOVZXWD  Vx Wq None Documented | Plain L128;
+    0x34 PMOVZXWQ  Vx Wd None Documented | Plain L128;
+    0x35 PMOVZXDQ  Vx Wq None Documented | Plain L128;
+    0x38 PMINSB    Vx Wx None Documented | Nds L128;
+    0x39 PMINSD    Vx Wx None Documented | Nds L128;
+    0x3a PMINUW    Vx Wx None Documented | Nds L128;
+    0x3b PMINUD    Vx Wx None Documented | Nds L128;
+    0x3c PMAXSB    Vx Wx None Documented | Nds L128;
+    0x3d PMAXSD    Vx Wx None Documented | Nds L128;
+    0x3e PMAXUW    Vx Wx None Documented | Nds L128;
+    0x3f PMAXUD    Vx Wx None Documented | Nds L128;
+    0x40 PMULLD    Vx Wx None Documented | Nds L128;
+    0x41 PHMINPOSUW Vx Wx None Documented | Plain L128;
 
     // SSE4.2.
     0x37 PCMPGTQ   Vx Wx None Documented;
@@ -4093,6 +4361,30 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     // own, and the instruction is the 16-bit one.
     0xf0 MOVBE     Gv Ev None Documented;
     0xf1 MOVBE     Ev Gv None Documented;
+    0x37 PCMPGTQ   Vx Wx None Documented | Nds L128;
+
+    // AVX's own, which have no legacy encoding at all (*Intel SDM* volume 2
+    // table A-4, the `VEX.66.0F38` column). Every one is `VEX.W0`.
+    //
+    // The variable in-lane permutes: the data is `vvvv`, the control vector
+    // is ModRM r/m.
+    0x0c VPERMILPS Vx Wx None Documented | Nds Any only w0;
+    0x0d VPERMILPD Vx Wx None Documented | Nds Any only w0;
+    0x0e VTESTPS   Vx Wx None Documented | Plain Any only w0;
+    0x0f VTESTPD   Vx Wx None Documented | Plain Any only w0;
+    // The broadcasts take a memory operand and nothing else in AVX — the
+    // register forms are AVX2's — so the executor refuses `mod == 11`. The
+    // double and the 128-bit forms exist only at 256 bits, where there is
+    // more than one lane to fill.
+    0x18 VBROADCASTSS   Vx Wd  None Documented | Plain Any only w0;
+    0x19 VBROADCASTSD   Vx Wq  None Documented | Plain L256 only w0;
+    0x1a VBROADCASTF128 Vx Wdq None Documented | Plain L256 only w0;
+    // The masked moves: `vvvv` is the mask, ModRM r/m is memory and only
+    // memory, and the direction is the opcode's low two bits.
+    0x2c VMASKMOVPS Vx Wx None Documented | Nds Any only w0;
+    0x2d VMASKMOVPD Vx Wx None Documented | Nds Any only w0;
+    0x2e VMASKMOVPS Wx Vx None Documented | Nds Any only w0;
+    0x2f VMASKMOVPD Wx Vx None Documented | Nds Any only w0;
 };
 
 /// The `0F 38` map with a `66` prefix.
@@ -4131,39 +4423,54 @@ pub static TABLE_0F3A: [Insn; 256] = THREE_3A.0;
 const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
     base [UNASSIGNED; 256];
 
-    0x0f PALIGNR   Vx Wx +Ib None Documented;
+    0x0f PALIGNR   Vx Wx +Ib None Documented | Nds L128;
 
     // SSE4.1. The scalar rounds read one lane, so their memory forms are
     // four and eight bytes.
-    0x08 ROUNDPS   Vx Wx +Ib None Documented;
-    0x09 ROUNDPD   Vx Wx +Ib None Documented;
-    0x0a ROUNDSS   Vx Wd +Ib None Documented;
-    0x0b ROUNDSD   Vx Wq +Ib None Documented;
-    0x0c BLENDPS   Vx Wx +Ib None Documented;
-    0x0d BLENDPD   Vx Wx +Ib None Documented;
-    0x0e PBLENDW   Vx Wx +Ib None Documented;
+    0x08 ROUNDPS   Vx Wx +Ib None Documented | Plain Any;
+    0x09 ROUNDPD   Vx Wx +Ib None Documented | Plain Any;
+    0x0a ROUNDSS   Vx Wd +Ib None Documented | Nds Ignored;
+    0x0b ROUNDSD   Vx Wq +Ib None Documented | Nds Ignored;
+    0x0c BLENDPS   Vx Wx +Ib None Documented | Nds Any;
+    0x0d BLENDPD   Vx Wx +Ib None Documented | Nds Any;
+    0x0e PBLENDW   Vx Wx +Ib None Documented | Nds L128;
     // The extractions name a whole general register, or exactly the bytes
     // they extract in memory. `PEXTRD` is `PEXTRQ` with `REX.W`, the way
     // `MOVD` is `MOVQ`; `EXTRACTPS` ignores `REX.W` and writes four bytes.
-    0x14 PEXTRB    RdMb Vx +Ib None Documented;
-    0x15 PEXTRW    RdMw Vx +Ib None Documented;
-    0x16 PEXTRD    Ey   Vx +Ib None Documented;
-    0x17 EXTRACTPS Ed   Vx +Ib None Documented;
-    0x20 PINSRB    Vx RdMb +Ib None Documented;
+    0x14 PEXTRB    RdMb Vx +Ib None Documented | Plain L128;
+    0x15 PEXTRW    RdMw Vx +Ib None Documented | Plain L128;
+    0x16 PEXTRD    Ey   Vx +Ib None Documented | Plain L128;
+    0x17 EXTRACTPS Ed   Vx +Ib None Documented | Plain L128;
+    0x20 PINSRB    Vx RdMb +Ib None Documented | Nds L128;
     // `INSERTPS` reads a lane of a register or four bytes of memory.
-    0x21 INSERTPS  Vx Wd +Ib None Documented;
-    0x22 PINSRD    Vx Ey +Ib None Documented;
-    0x40 DPPS      Vx Wx +Ib None Documented;
-    0x41 DPPD      Vx Wx +Ib None Documented;
-    0x42 MPSADBW   Vx Wx +Ib None Documented;
+    0x21 INSERTPS  Vx Wd +Ib None Documented | Nds L128;
+    0x22 PINSRD    Vx Ey +Ib None Documented | Nds L128;
+    0x40 DPPS      Vx Wx +Ib None Documented | Nds Any;
+    0x41 DPPD      Vx Wx +Ib None Documented | Nds L128;
+    0x42 MPSADBW   Vx Wx +Ib None Documented | Nds L128;
 
     // SSE4.2's string compares. The immediate is the whole instruction —
     // element format, aggregation, polarity and output selection — and see
     // `simd::pcmpstr` for what each field does.
-    0x60 PCMPESTRM Vx Wx +Ib None Documented;
-    0x61 PCMPESTRI Vx Wx +Ib None Documented;
-    0x62 PCMPISTRM Vx Wx +Ib None Documented;
-    0x63 PCMPISTRI Vx Wx +Ib None Documented;
+    0x60 PCMPESTRM Vx Wx +Ib None Documented | Plain L128;
+    0x61 PCMPESTRI Vx Wx +Ib None Documented | Plain L128;
+    0x62 PCMPISTRM Vx Wx +Ib None Documented | Plain L128;
+    0x63 PCMPISTRI Vx Wx +Ib None Documented | Plain L128;
+
+    // AVX's own (*Intel SDM* volume 2 table A-5, `VEX.66.0F3A`), every one
+    // `VEX.W0`. The immediate permutes read their data from ModRM r/m.
+    0x04 VPERMILPS    Vx  Wx  +Ib None Documented | Plain Any only w0;
+    0x05 VPERMILPD    Vx  Wx  +Ib None Documented | Plain Any only w0;
+    0x06 VPERM2F128   Vx  Wx  +Ib None Documented | Nds L256 only w0;
+    0x18 VINSERTF128  Vx  Wdq +Ib None Documented | Nds L256 only w0;
+    0x19 VEXTRACTF128 Wdq Vx  +Ib None Documented | Plain L256 only w0;
+    // The variable blends, which take their mask from a fourth *register*
+    // named by the immediate's high nibble rather than from `XMM0`. The
+    // same operations as SSE4.1's, at a different opcode: `66 0F 38 14` has
+    // no VEX form, and this has no legacy one.
+    0x4a BLENDVPS Vx Wx +Lx None Documented | Nds Any only w0;
+    0x4b BLENDVPD Vx Wx +Lx None Documented | Nds Any only w0;
+    0x4c PBLENDVB Vx Wx +Lx None Documented | Nds L128 only w0;
 };
 
 /// The `0F 3A` map with a `66` prefix.
@@ -4409,18 +4716,24 @@ pub static GROUP9: [Insn; 8] = {
 /// instructions.
 pub static GROUP12: [Insn; 8] = {
     let mut t = [UNASSIGNED; 8];
-    t[2] = Insn::new(Op::PSRLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
-    t[4] = Insn::new(Op::PSRAW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
-    t[6] = Insn::new(Op::PSLLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[2] = Insn::new(Op::PSRLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t[4] = Insn::new(Op::PSRAW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t[6] = Insn::new(Op::PSLLW, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
     t
 };
 
 /// `66 0F 72`: Intel's group 13 — the doubleword shifts by an immediate.
 pub static GROUP13: [Insn; 8] = {
     let mut t = [UNASSIGNED; 8];
-    t[2] = Insn::new(Op::PSRLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
-    t[4] = Insn::new(Op::PSRAD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
-    t[6] = Insn::new(Op::PSLLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[2] = Insn::new(Op::PSRLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t[4] = Insn::new(Op::PSRAD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t[6] = Insn::new(Op::PSLLD, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
     t
 };
 
@@ -4432,10 +4745,14 @@ pub static GROUP13: [Insn; 8] = {
 /// this group has four assigned extensions where the other two have three.
 pub static GROUP14: [Insn; 8] = {
     let mut t = [UNASSIGNED; 8];
-    t[2] = Insn::new(Op::PSRLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
-    t[3] = Insn::new(Op::PSRLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
-    t[6] = Insn::new(Op::PSLLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
-    t[7] = Insn::new(Op::PSLLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented);
+    t[2] = Insn::new(Op::PSRLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t[3] = Insn::new(Op::PSRLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t[6] = Insn::new(Op::PSLLQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t[7] = Insn::new(Op::PSLLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
+        .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
     t
 };
 
@@ -4455,20 +4772,24 @@ pub static GROUP15: [Insn; 8] = [
         Grp::None,
         Class::Documented,
     ),
+    // `VLDMXCSR` and `VSTMXCSR` are the only members with a VEX form, and
+    // only at `VEX.L = 0` (Intel's `LZ`).
     Insn::new(
         Op::LDMXCSR,
         Arg::None,
         Arg::Ed,
         Grp::None,
         Class::Documented,
-    ),
+    )
+    .with_vex(Vex::new(VexForm::Plain, VexLen::L128)),
     Insn::new(
         Op::STMXCSR,
         Arg::Ed,
         Arg::None,
         Grp::None,
         Class::Documented,
-    ),
+    )
+    .with_vex(Vex::new(VexForm::Plain, VexLen::L128)),
     // The XSAVE feature set's three, each over an area whose length is
     // decided at run time by `XCR0` and `EDX:EAX` — so a bare [`Arg::M`], an
     // address and nothing more (*Intel SDM* volume 2 table A-6, group 15).
@@ -4576,6 +4897,7 @@ pub const fn resolve_modrm(map: Gen, insn: Insn, opcode: u8, two_byte: bool, mod
                 }
                 return Insn {
                     dst: Arg::Nq,
+                    vex: Vex::NONE,
                     ..row
                 };
             }
@@ -4596,11 +4918,14 @@ pub const fn resolve_modrm(map: Gen, insn: Insn, opcode: u8, two_byte: bool, mod
             // memory operand — and neither packed-double form has one in
             // either direction.
             match (insn.op, insn.dst) {
+                // Their VEX forms are the load's: three operands, 128 bits.
                 (Op::MOVLPS, Arg::Vx) => {
                     Insn::new(Op::MOVHLPS, Arg::Vx, Arg::Ux, Grp::None, Class::Documented)
+                        .with_vex(insn.vex)
                 }
                 (Op::MOVHPS, Arg::Vx) => {
                     Insn::new(Op::MOVLHPS, Arg::Vx, Arg::Ux, Grp::None, Class::Documented)
+                        .with_vex(insn.vex)
                 }
                 _ => UNASSIGNED,
             }
@@ -5279,6 +5604,45 @@ pub struct Fields {
     pub len: u8,
     /// Whether the stream ran out before the instruction was complete.
     pub truncated: bool,
+    /// The VEX prefix, where the instruction had one.
+    ///
+    /// Its `R̄`, `X̄`, `B̄` and `W` bits are *also* folded into [`Fields::rex`]
+    /// in 64-bit mode, un-inverted, exactly where a `REX` prefix would have
+    /// put them — they mean the same thing, and every register-numbering
+    /// helper here then works unchanged. Outside 64-bit mode they are not:
+    /// `R̄` and `X̄` are 1 by construction (it is what told the encoding apart
+    /// from `LES`/`LDS`), `B̄` is ignored, and `VEX.W1` is ignored where it
+    /// would select a 64-bit operand (*Intel SDM* volume 2 §2.3.5, §2.3.6).
+    pub vex: Option<VexPrefix>,
+}
+
+/// What a VEX prefix said, beyond what [`Fields::rex`] and
+/// [`Fields::mandatory`] carry.
+///
+/// The prefix is `C5` with one payload byte or `C4` with two (*Intel SDM*
+/// volume 2 §2.3.5, figure 2-9):
+///
+/// | byte | bits |
+/// | --- | --- |
+/// | `C5` + 1 | `R̄` · `v̄v̄v̄v̄` · `L` · `pp` |
+/// | `C4` + 1 | `R̄` · `X̄` · `B̄` · `mmmmm` |
+/// | `C4` + 2 | `W` · `v̄v̄v̄v̄` · `L` · `pp` |
+///
+/// `mmmmm` picks the opcode map ([`OpMap::from_vex`]; `C5` implies `0F`) and
+/// `pp` the mandatory prefix (none, `66`, `F3`, `F2`), so both land in the
+/// ordinary [`Fields::escape`] and [`Fields::mandatory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VexPrefix {
+    /// The register `VEX.vvvv` names, already un-inverted. Only three bits of
+    /// it reach a register outside 64-bit mode, where `vvvv[3]` is ignored.
+    pub vvvv: u8,
+    /// `VEX.L`: 256-bit vectors. Raw — a row whose length is
+    /// [`VexLen::Ignored`] ignores it, which [`Fields::vector_bytes`] applies.
+    pub l: bool,
+    /// `VEX.W`, as encoded, in every mode.
+    pub w: bool,
+    /// Whether this was the three-byte `C4` form.
+    pub three_byte: bool,
 }
 
 impl Fields {
@@ -5389,6 +5753,89 @@ impl Fields {
         }
     }
 
+    /// Whether the instruction was VEX-encoded.
+    #[inline]
+    #[must_use]
+    pub const fn is_vex(&self) -> bool {
+        self.vex.is_some()
+    }
+
+    /// The register `VEX.vvvv` names, or 0 without a VEX prefix.
+    #[inline]
+    #[must_use]
+    pub const fn vvvv(&self) -> u8 {
+        match self.vex {
+            Some(v) => v.vvvv,
+            None => 0,
+        }
+    }
+
+    /// The vector length in bytes: 32 for a `VEX.256` encoding of a row that
+    /// has one, 16 for everything else — legacy SSE, `VEX.128`, and the
+    /// scalar rows that ignore `VEX.L`.
+    #[inline]
+    #[must_use]
+    pub const fn vector_bytes(&self) -> u8 {
+        match self.vex {
+            Some(v) if v.l && !matches!(self.insn.vex.len, VexLen::Ignored) => 32,
+            _ => 16,
+        }
+    }
+
+    /// Whether `VEX.vvvv` is a **source** here — the `H` operand, written
+    /// after the destination: an [`VexForm::Nds`] row, or the register form
+    /// of an [`VexForm::NdsReg`] one.
+    #[inline]
+    #[must_use]
+    pub const fn vvvv_is_source(&self) -> bool {
+        if self.vex.is_none() {
+            return false;
+        }
+        match self.insn.vex.form {
+            VexForm::Nds => true,
+            VexForm::NdsReg => match self.modrm {
+                Some(m) => m.is_register(),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The operands in the order they are written, `VEX.vvvv` included where
+    /// the row's [`VexForm`] places it.
+    ///
+    /// Legacy rows have at most three ([`Insn::dst`], [`Insn::src`],
+    /// [`Insn::aux`]); a VEX form adds [`Arg::Hx`] after the destination
+    /// (`NDS`) or in front of everything (`NDD`), so this is the one place
+    /// that knows where, and the disassembler prints what it returns.
+    #[must_use]
+    pub const fn operands(&self) -> [Arg; 4] {
+        let i = self.insn;
+        if self.vvvv_is_source() {
+            [i.dst, Arg::Hx, i.src, i.aux]
+        } else if self.vex.is_some() && matches!(i.vex.form, VexForm::Ndd) {
+            [Arg::Hx, i.dst, i.src, i.aux]
+        } else {
+            [i.dst, i.src, i.aux, Arg::None]
+        }
+    }
+
+    /// How many bytes a memory operand of kind `arg` occupies in this
+    /// encoding, where the kind fixes it.
+    ///
+    /// [`Arg::fp_bytes`] with the vector length applied: `Wx` is sixteen or
+    /// thirty-two bytes, `Wh` half that, `Wqx` eight or thirty-two.
+    #[must_use]
+    pub const fn mem_bytes(&self, arg: Arg) -> Option<u8> {
+        let v = self.vector_bytes();
+        match arg {
+            Arg::Wx | Arg::Vx | Arg::Ux | Arg::Hx | Arg::Lx => Some(v),
+            Arg::Wh => Some(v / 2),
+            Arg::Wqx => Some(if v == 32 { 32 } else { 8 }),
+            _ => arg.fp_bytes(self.opsize),
+        }
+    }
+
     /// The segment half of a far-pointer immediate (`Ap`).
     #[inline]
     #[must_use]
@@ -5494,6 +5941,7 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
         imm2: 0,
         len: 0,
         truncated: false,
+        vex: None,
     };
 
     let mut take = |f: &mut Fields| -> u8 {
@@ -5567,11 +6015,38 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
         f.rex = 0;
     };
 
+    // `C4` and `C5` are `LES` and `LDS` — or the two VEX prefixes. Outside
+    // 64-bit mode the byte after them decides: `LES`/`LDS` need a memory
+    // operand, so a ModRM byte whose mode field is `11` is no instruction of
+    // theirs, and VEX spends exactly that encoding — its `R̄` and `X̄` bits sit
+    // where the mode field would, and must both be 1. In 64-bit mode
+    // `LES`/`LDS` do not exist and the bytes are always VEX (*Intel SDM*
+    // volume 2 §2.3.5). An 8086 has no VEX at all.
+    //
+    // A byte read to decide and found to be a ModRM byte is kept for the
+    // ModRM step rather than re-read.
+    //
     // `0F` is `POP CS` on an 8086 and the escape to the second map from the
     // 80286 on, which is why the generation has to be known before the byte
     // can be looked up at all.
+    let mut pending_modrm: Option<u8> = None;
     let mut insn;
-    if matches!(map, Gen::I386) && opcode == 0x0f {
+    if matches!(map, Gen::I386) && matches!(opcode, 0xc4 | 0xc5) {
+        let first = take(&mut f);
+        if f.truncated {
+            return f;
+        }
+        if bits.is_64() || first >> 6 == 3 {
+            insn = decode_vex(&mut f, opcode, first, &mut take);
+            if f.truncated {
+                return f;
+            }
+        } else {
+            pending_modrm = Some(first);
+            f.opcode = opcode;
+            insn = decode_as(map, opcode);
+        }
+    } else if matches!(map, Gen::I386) && opcode == 0x0f {
         f.two_byte = true;
         let mut second = take(&mut f);
         if f.truncated {
@@ -5606,6 +6081,11 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
             (None, false) => Mandatory::None,
         };
         insn = decode_map(escape, f.mandatory, second);
+        // A row that exists only VEX-encoded is no instruction without the
+        // prefix.
+        if insn.vex.only {
+            insn = UNASSIGNED;
+        }
     } else {
         f.opcode = opcode;
         insn = decode_as(map, opcode);
@@ -5615,12 +6095,18 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
     }
 
     if insn.needs_modrm() {
-        let byte = take(&mut f);
+        let byte = match pending_modrm {
+            Some(b) => b,
+            None => take(&mut f),
+        };
         let modrm = ModRm::new(byte);
         f.modrm = Some(modrm);
         insn = resolve_modrm(map, insn, f.opcode, f.two_byte, modrm);
         if bits.is_64() {
             insn = insn.in_long();
+        }
+        if let Some(v) = f.vex {
+            insn = vex_valid(insn, v, modrm);
         }
         // The control-, debug- and test-register moves ignore the mode field
         // entirely: there is no memory form, so there is no displacement
@@ -5681,6 +6167,9 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
         // The direct-offset moves have no ModRM byte; their address is the
         // immediate, and it is always in the data segment unless overridden.
         f.mem_seg = seg::DS;
+    } else if let Some(v) = f.vex {
+        // `VZEROUPPER` and `VZEROALL`, the VEX rows with no ModRM byte.
+        insn = vex_valid(insn, v, ModRm::new(0xc0));
     }
     f.insn = insn;
 
@@ -5751,6 +6240,111 @@ pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u
         }
     }
     f
+}
+
+/// Read the rest of a VEX prefix and the opcode after it, and look the opcode
+/// up.
+///
+/// `lead` is `C4` or `C5` and `first` the byte after it, already read. Fills
+/// in [`Fields::vex`], [`Fields::rex`] (64-bit mode), [`Fields::mandatory`],
+/// [`Fields::escape`] and [`Fields::opcode`], and returns the row — already
+/// [`Op::UD`] for the encodings that are invalid before the ModRM byte is
+/// seen: a reserved `mmmmm`, a VEX prefix after `66`, `F2`, `F3`, `REX` or
+/// `LOCK` (*Intel SDM* volume 2 §2.3.2 — each would contradict a field the
+/// prefix itself carries), and a row with no VEX form.
+fn decode_vex(
+    f: &mut Fields,
+    lead: u8,
+    first: u8,
+    take: &mut dyn FnMut(&mut Fields) -> u8,
+) -> Insn {
+    let bits = f.bits;
+    let (r, x, b, mmmmm, payload) = if lead == 0xc5 {
+        (first & 0x80 == 0, false, false, 1, first)
+    } else {
+        let second = take(f);
+        (
+            first & 0x80 == 0,
+            first & 0x40 == 0,
+            first & 0x20 == 0,
+            first & 0x1f,
+            second,
+        )
+    };
+    let w = lead == 0xc4 && payload & 0x80 != 0;
+    let l = payload & 0x04 != 0;
+    let vvvv = !(payload >> 3) & if bits.is_64() { 15 } else { 7 };
+    let illegal = f.prefix66 || f.rep.is_some() || f.lock || f.rex != 0;
+    f.rex = if bits.is_64() {
+        0x40 | (u8::from(w) << 3) | (u8::from(r) << 2) | (u8::from(x) << 1) | u8::from(b)
+    } else {
+        0
+    };
+    f.vex = Some(VexPrefix {
+        vvvv,
+        l,
+        w,
+        three_byte: lead == 0xc4,
+    });
+    f.two_byte = true;
+    f.mandatory = match payload & 3 {
+        0 => Mandatory::None,
+        1 => Mandatory::P66,
+        2 => Mandatory::PF3,
+        _ => Mandatory::PF2,
+    };
+    let opcode = take(f);
+    f.opcode = opcode;
+    let Some(m) = OpMap::from_vex(mmmmm) else {
+        return UNASSIGNED;
+    };
+    f.escape = Some(m);
+    if illegal {
+        return UNASSIGNED;
+    }
+    let row = decode_map(m, f.mandatory, opcode);
+    match row.vex.form {
+        VexForm::None => UNASSIGNED,
+        // `0F 77`: the one cell whose VEX encoding is a different operation,
+        // and the one whose operation `VEX.L` picks.
+        VexForm::Alt(op) => {
+            let op = if matches!(op, Op::VZEROUPPER) && l {
+                Op::VZEROALL
+            } else {
+                op
+            };
+            Insn::new(op, Arg::None, Arg::None, Grp::None, Class::Documented)
+                .with_vex(Vex::new(VexForm::Plain, row.vex.len))
+        }
+        _ => row,
+    }
+}
+
+/// Apply a resolved row's VEX constraints, or answer [`Op::UD`].
+///
+/// The checks every instruction page's exception section lists under `#UD`
+/// for the encoding itself (*Intel SDM* volume 2 §2.4 onward): the row has a
+/// VEX form at all — group members and the register forms `resolve_modrm`
+/// picks are checked here, after resolution — `VEX.L` is a length it has,
+/// `VEX.vvvv` is `1111b` where nothing reads it, and `VEX.W` is 0 where it
+/// must be.
+const fn vex_valid(insn: Insn, v: VexPrefix, modrm: ModRm) -> Insn {
+    let rule = insn.vex;
+    let uses_vvvv = match rule.form {
+        VexForm::None => return UNASSIGNED,
+        VexForm::Nds | VexForm::Ndd => true,
+        VexForm::NdsReg => modrm.is_register(),
+        VexForm::Plain | VexForm::Alt(_) => false,
+    };
+    let length_ok = match rule.len {
+        VexLen::Any | VexLen::Ignored => true,
+        VexLen::L128 => !v.l,
+        VexLen::L256 => v.l,
+    };
+    if !length_ok || (!uses_vvvv && v.vvvv != 0) || (rule.w0 && v.w) {
+        return UNASSIGNED;
+    }
+    insn
 }
 
 #[cfg(test)]
@@ -5830,6 +6424,10 @@ mod tests {
                 // `0F 16` mean when the ModRM *mode* field says a register,
                 // and [`resolve_modrm`] is where that is decided.
                 || matches!(op, Op::MOVHLPS | Op::MOVLHPS)
+                // `VZEROUPPER` and `VZEROALL` are `0F 77`'s VEX encoding,
+                // which `VEX.L` divides between them.
+                || (matches!(op, Op::VZEROUPPER | Op::VZEROALL)
+                    && TABLE_0F[0x77].vex.form == VexForm::Alt(Op::VZEROUPPER))
         };
         for op in Op::ALL {
             // `SWAPGS` is the one operation with no row of its own, and it is
@@ -6061,6 +6659,161 @@ mod tests {
                 assert_eq!(imm, 0, "0F 38 {opcode:02x} ({:?})", insn.op);
             }
         }
+    }
+
+    /// Decode from a slice in 64-bit mode.
+    fn decode64(bytes: &[u8]) -> Fields {
+        let mut at = 0usize;
+        decode_stream_as(Gen::I386, Bits::B64, &mut || {
+            let b = bytes.get(at).copied();
+            at += 1;
+            b
+        })
+    }
+
+    #[test]
+    fn c4_and_c5_are_les_and_lds_unless_the_next_byte_has_mode_11() {
+        // les eax, [esi] and lds eax, [eax]: a ModRM byte with a memory mode.
+        for (bytes, op) in [([0xc4, 0x06], Op::LES), ([0xc5, 0x00], Op::LDS)] {
+            let f = decode32(&bytes);
+            assert_eq!(f.insn.op, op);
+            assert!(f.vex.is_none());
+            assert_eq!(f.len, 2, "the deciding byte is the ModRM byte, read once");
+            assert_eq!(f.modrm, Some(ModRm::new(bytes[1])));
+        }
+        // les with a displacement still finds it after the reused ModRM byte.
+        let f = decode32(&[0xc4, 0x46, 0x10]);
+        assert_eq!((f.insn.op, f.disp, f.len), (Op::LES, 0x10, 3));
+        // Mode 11: VEX. `vaddps xmm1, xmm2, xmm3`.
+        let f = decode32(&[0xc5, 0xe8, 0x58, 0xcb]);
+        assert_eq!(f.insn.op, Op::ADDPS);
+        let v = f.vex.expect("a VEX prefix");
+        assert_eq!((v.vvvv, v.l, v.w, v.three_byte), (2, false, false, false));
+        assert_eq!((f.reg_num(), f.rm_num(), f.len), (1, 3, 4));
+        // The same in a 16-bit code segment, which protected mode allows.
+        let mut at = 0usize;
+        let bytes = [0xc5, 0xe8, 0x58, 0xcb];
+        let f = decode_stream_as(Gen::I386, Bits::B16, &mut || {
+            let b = bytes.get(at).copied();
+            at += 1;
+            b
+        });
+        assert_eq!(f.insn.op, Op::ADDPS);
+        // An 8086 has no VEX: `C5 E8` is an `LDS` with a register operand.
+        assert_eq!(decode_bytes(&[0xc5, 0xe8]).insn.op, Op::LDS);
+    }
+
+    #[test]
+    fn in_64_bit_mode_c4_and_c5_are_always_vex() {
+        // `C5 78 58 08`: the byte after `C5` has mode `01`, which would be an
+        // `LDS` anywhere else. Here it is `vaddps xmm9, xmm0, [rax]`: `R̄`
+        // clear names register 9.
+        let f = decode64(&[0xc5, 0x78, 0x58, 0x08]);
+        assert_eq!(f.insn.op, Op::ADDPS);
+        assert_eq!((f.reg_num(), f.vvvv(), f.len), (9, 0, 4));
+        // The three-byte form's `R̄X̄B̄` reach the register numbers through the
+        // same `REX` bits a `REX` prefix sets: `vaddps ymm9, ymm10, ymm11`.
+        let f = decode64(&[0xc4, 0x41, 0x2c, 0x58, 0xcb]);
+        assert_eq!((f.reg_num(), f.vvvv(), f.rm_num()), (9, 10, 11));
+        assert_eq!(f.vector_bytes(), 32);
+        assert!(!f.rex_w());
+        // `VEX.W` is `REX.W` in 64-bit mode: `vmovq xmm0, rax`.
+        let f = decode64(&[0xc4, 0xe1, 0xf9, 0x6e, 0xc0]);
+        assert_eq!(f.insn.op, Op::MOVD);
+        assert!(f.rex_w());
+        // And it is ignored for the operand outside 64-bit mode, where the
+        // same bytes are `vmovd xmm0, eax`.
+        assert!(!decode32(&[0xc4, 0xe1, 0xf9, 0x6e, 0xc0]).rex_w());
+    }
+
+    #[test]
+    fn a_vex_prefix_after_a_legacy_prefix_is_invalid() {
+        // *Intel SDM* volume 2 §2.3.2: `66`, `F2`, `F3`, `LOCK` or `REX` in
+        // front of a VEX prefix is `#UD`.
+        for prefix in [0x66, 0xf2, 0xf3, 0xf0] {
+            let f = decode32(&[prefix, 0xc5, 0xe8, 0x58, 0xcb]);
+            assert_eq!(f.insn.op, Op::UD, "{prefix:02x}");
+            assert!(f.vex.is_some());
+        }
+        assert_eq!(decode64(&[0x40, 0xc5, 0xe8, 0x58, 0xcb]).insn.op, Op::UD);
+        assert_eq!(
+            decode64(&[0x48, 0xc4, 0xe1, 0x78, 0x58, 0xcb]).insn.op,
+            Op::UD
+        );
+        // A segment override or an address-size prefix is not one of them.
+        assert_eq!(decode32(&[0x2e, 0xc5, 0xe8, 0x58, 0xcb]).insn.op, Op::ADDPS);
+        assert_eq!(decode32(&[0x67, 0xc5, 0xe8, 0x58, 0xcb]).insn.op, Op::ADDPS);
+    }
+
+    #[test]
+    fn the_rows_vex_constraints_decide_validity() {
+        // `mmmmm` 0 is reserved.
+        assert_eq!(decode32(&[0xc4, 0xe0, 0x78, 0x58, 0xcb]).insn.op, Op::UD);
+        // A row with no VEX form: `0F A2` is `CPUID`.
+        assert_eq!(decode32(&[0xc5, 0xf8, 0xa2]).insn.op, Op::UD);
+        // `vvvv` must be `1111b` where nothing reads it: `vmovups` is a
+        // two-operand move.
+        assert_eq!(decode32(&[0xc5, 0xfc, 0x10, 0x00]).insn.op, Op::MOVUPS);
+        assert_eq!(decode32(&[0xc5, 0xf4, 0x10, 0x00]).insn.op, Op::UD);
+        // `VEX.L = 1` on a 128-bit-only row: `vpaddb` is AVX2's at 256.
+        assert_eq!(decode32(&[0xc5, 0xe9, 0xfc, 0xcb]).insn.op, Op::PADDB);
+        assert_eq!(decode32(&[0xc5, 0xed, 0xfc, 0xcb]).insn.op, Op::UD);
+        // `VEX.L = 0` on a 256-bit-only row: `vbroadcastsd`.
+        assert_eq!(
+            decode32(&[0xc4, 0xe2, 0x7d, 0x19, 0x00]).insn.op,
+            Op::VBROADCASTSD
+        );
+        assert_eq!(decode32(&[0xc4, 0xe2, 0x79, 0x19, 0x00]).insn.op, Op::UD);
+        // `VEX.W1` on a `W0` row.
+        assert_eq!(decode32(&[0xc4, 0xe2, 0xfd, 0x18, 0x00]).insn.op, Op::UD);
+        // `VMOVSS`: `vvvv` is a source in the register form and must be
+        // `1111b` in the memory one.
+        assert_eq!(decode32(&[0xc5, 0xea, 0x10, 0xcb]).insn.op, Op::MOVSS);
+        assert_eq!(decode32(&[0xc5, 0xfa, 0x10, 0x08]).insn.op, Op::MOVSS);
+        assert_eq!(decode32(&[0xc5, 0xea, 0x10, 0x08]).insn.op, Op::UD);
+        // A scalar row ignores `VEX.L`, and so does its vector length.
+        let f = decode32(&[0xc5, 0xee, 0x58, 0xcb]);
+        assert_eq!((f.insn.op, f.vector_bytes()), (Op::ADDSS, 16));
+        // The groups are checked after resolution: `66 0F 71 /2` has a VEX
+        // form, `/1` does not, and the `MM` row has none at all.
+        assert_eq!(decode32(&[0xc5, 0xe9, 0x71, 0xd3, 0x04]).insn.op, Op::PSRLW);
+        assert_eq!(decode32(&[0xc5, 0xe9, 0x71, 0xcb, 0x04]).insn.op, Op::UD);
+        assert_eq!(decode32(&[0xc5, 0xe8, 0x71, 0xd3, 0x04]).insn.op, Op::UD);
+        // Group 15: `vldmxcsr` yes, `fxsave` no.
+        assert_eq!(decode32(&[0xc5, 0xf8, 0xae, 0x10]).insn.op, Op::LDMXCSR);
+        assert_eq!(decode32(&[0xc5, 0xf8, 0xae, 0x00]).insn.op, Op::UD);
+        // `0F 77` is `VZEROUPPER`, or `VZEROALL` with `VEX.L`.
+        assert_eq!(decode32(&[0xc5, 0xf8, 0x77]).insn.op, Op::VZEROUPPER);
+        assert_eq!(decode32(&[0xc5, 0xfc, 0x77]).insn.op, Op::VZEROALL);
+        assert_eq!(decode32(&[0xc5, 0xf8, 0x77]).len, 3);
+        assert_eq!(decode32(&[0xc5, 0xf0, 0x77]).insn.op, Op::UD, "vvvv");
+        // The rows that exist only VEX-encoded are nothing without it.
+        assert_eq!(decode32(&[0x66, 0x0f, 0x38, 0x18, 0x00]).insn.op, Op::UD);
+        assert_eq!(
+            decode32(&[0x66, 0x0f, 0x3a, 0x4a, 0xcb, 0x40]).insn.op,
+            Op::UD
+        );
+        // And the legacy rows that have no VEX form keep their legacy one.
+        assert_eq!(
+            decode32(&[0x66, 0x0f, 0x38, 0x14, 0xc1]).insn.op,
+            Op::BLENDVPS
+        );
+    }
+
+    #[test]
+    fn vex_lengths_count_the_prefix_the_modrm_and_the_immediate() {
+        // vblendvps xmm1, xmm2, xmm3, xmm4: the register is the immediate.
+        let f = decode32(&[0xc4, 0xe3, 0x69, 0x4a, 0xcb, 0x40]);
+        assert_eq!((f.insn.op, f.len, f.imm), (Op::BLENDVPS, 6, 0x40));
+        // vinsertf128 ymm1, ymm2, [eax+0x10], 1.
+        let f = decode32(&[0xc4, 0xe3, 0x6d, 0x18, 0x48, 0x10, 0x01]);
+        assert_eq!(
+            (f.insn.op, f.len, f.disp, f.imm),
+            (Op::VINSERTF128, 7, 0x10, 1)
+        );
+        // A stream that ends inside the prefix says so.
+        assert!(decode32(&[0xc4, 0xe2]).truncated);
+        assert!(decode32(&[0xc5]).truncated);
     }
 
     #[test]
