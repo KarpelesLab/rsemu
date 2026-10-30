@@ -42,6 +42,7 @@ impl Exec<'_> {
             Some(Extension::Sse42) => features.sse42,
             Some(Extension::Popcnt) => features.popcnt,
             Some(Extension::Lzcnt) => features.lzcnt,
+            Some(Extension::Movbe) => features.movbe,
         }
     }
 
@@ -86,6 +87,26 @@ impl Exec<'_> {
         self.set_flag(flags::CF, value == 0);
         self.set_flag(flags::ZF, count == 0);
         Ok(())
+    }
+
+    /// `MOVBE`: a load or a store with the operand's bytes reversed.
+    ///
+    /// 16, 32 or 64 bits by the operand size; a 16-bit load leaves the rest
+    /// of the register alone, like any 16-bit write. No flags. The decoder
+    /// has already made the register form unassigned, and the check here is
+    /// the same rule stated where it is enforced (*Intel SDM* volume 2,
+    /// `MOVBE`).
+    pub(super) fn movbe(&mut self, f: &Fields, size: u8) -> Ex<()> {
+        if !self.has_extension(f.insn) || f.modrm.is_some_and(|m| m.is_register()) {
+            return Err(Fault::bare(VEC_UD));
+        }
+        let value = self.read_arg(f, f.insn.src, size)?;
+        let swapped = match size {
+            2 => u64::from((value as u16).swap_bytes()),
+            4 => u64::from((value as u32).swap_bytes()),
+            _ => value.swap_bytes(),
+        };
+        self.write_arg(f, f.insn.dst, size, swapped)
     }
 
     /// `CRC32`: accumulate a CRC-32C over the source into the destination.

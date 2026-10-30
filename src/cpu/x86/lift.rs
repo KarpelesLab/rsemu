@@ -4956,6 +4956,7 @@ mod tests {
             // does not know which part it is — so the `F3` form is never
             // lifted as the `BSR` that is.
             (&[0xf3, 0x0f, 0xbd, 0xc1], "lzcnt"),
+            (&[0x0f, 0x38, 0xf0, 0x01], "movbe"),
         ] {
             let mut code = alloc::vec![0x40];
             code.extend_from_slice(bytes);

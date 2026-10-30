@@ -2725,6 +2725,7 @@ impl<'a> Exec<'a> {
             Op::CRC32 => self.crc32(f)?,
             Op::POPCNT => self.popcnt(f, size)?,
             Op::LZCNT => self.lzcnt(f, size)?,
+            Op::MOVBE => self.movbe(f, size)?,
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
@@ -4192,6 +4193,9 @@ impl<'a> Exec<'a> {
         }
         if features.popcnt {
             ecx1 |= 1 << 23; // POPCNT
+        }
+        if features.movbe {
+            ecx1 |= 1 << 22; // MOVBE
         }
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers

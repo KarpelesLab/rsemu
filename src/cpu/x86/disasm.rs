@@ -988,6 +988,21 @@ mod tests {
     }
 
     #[test]
+    fn movbe_lists_its_memory_forms_and_not_its_register_ones() {
+        assert_eq!(text32(&[0x0f, 0x38, 0xf0, 0x03]), "movbe eax, [ds:ebx]");
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x38, 0xf1, 0x03]),
+            "movbe [ds:ebx], ax"
+        );
+        assert!(!text32(&[0x0f, 0x38, 0xf0, 0xc1]).starts_with("movbe"));
+        // The same bytes behind an `F2` are `CRC32`, which outranks the `66`.
+        assert_eq!(
+            text32(&[0x66, 0xf2, 0x0f, 0x38, 0xf1, 0xc1]),
+            "crc32 eax, cx"
+        );
+    }
+
+    #[test]
     fn sse3_lists_without_a_repeat_prefix() {
         // The `F2`/`F3` are mandatory prefixes, part of the opcode.
         assert_eq!(text32(&[0xf2, 0x0f, 0x7c, 0xc1]), "haddps xmm0, xmm1");

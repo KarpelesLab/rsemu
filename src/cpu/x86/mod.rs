@@ -166,7 +166,8 @@
 //!   [`Features::sse42`]), and so is `POPCNT` ([`Features::popcnt`]) —
 //!   with `CMPXCHG16B` and 64-bit `LAHF`/`SAHF`, the whole x86-64-v2 level
 //!   ([`Features::X86_64_V2`]). `LZCNT` is here too ([`Features::lzcnt`],
-//!   in no preset); without it `F3 0F BD` executes as `BSR`. No AVX.
+//!   in no preset); without it `F3 0F BD` executes as `BSR`. So is
+//!   `MOVBE` ([`Features::movbe`], in no preset either). No AVX.
 //! - **The legacy-SSE alignment rule is partial.** A 128-bit memory operand
 //!   must be sixteen-byte aligned; the instructions that exist to assert it
 //!   (`MOVAPS`, `MOVDQA`, the non-temporal moves, `MOVNTDQA`, `CMPXCHG16B`)
@@ -698,6 +699,12 @@ pub struct Features {
     /// it is an extended leaf this core answers only for a long-mode part,
     /// and every part that had it had long mode.
     pub lzcnt: bool,
+    /// `MOVBE` (`0F 38 F0`/`F1`, memory forms only), and
+    /// `CPUID.01H:ECX[22]`. Requires [`extras_486`](Features::extras_486):
+    /// it is `BSWAP` fused with a load or a store, and its bit is reported
+    /// by `CPUID`. Not [`long`](Features::long) — the first parts with it
+    /// were 32-bit Atoms.
+    pub movbe: bool,
 }
 
 impl Features {
@@ -729,6 +736,7 @@ impl Features {
         cx16: false,
         lahf_lm: false,
         lzcnt: false,
+        movbe: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -785,6 +793,7 @@ impl Features {
         cx16: false,
         lahf_lm: false,
         lzcnt: false,
+        movbe: false,
     };
 
     /// The x86-64-v2 micro-architecture level: the baseline plus
@@ -877,6 +886,9 @@ impl Features {
         }
         if self.lzcnt && !self.long {
             return missing("long", "lzcnt");
+        }
+        if self.movbe && !self.extras_486 {
+            return missing("extras_486", "movbe");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2637,7 +2649,7 @@ impl X86 {
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
             "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
-            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt",
+            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt", "movbe",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2668,7 +2680,8 @@ impl X86 {
                 "popcnt" => features.popcnt = on,
                 "cx16" => features.cx16 = on,
                 "lahf_lm" => features.lahf_lm = on,
-                _ => features.lzcnt = on,
+                "lzcnt" => features.lzcnt = on,
+                _ => features.movbe = on,
             }
         }
         features.validate()?;
@@ -3959,6 +3972,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: LZCNT (without it, F3 0F BD is BSR)",
+        },
+        PropertySpec {
+            name: "movbe",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: MOVBE",
         },
         PropertySpec {
             name: "model",

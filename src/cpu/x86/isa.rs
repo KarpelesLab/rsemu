@@ -1295,6 +1295,7 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("PCMPISTRM", "pcmpistrm"),
     ("POPCNT", "popcnt"),
     ("LZCNT", "lzcnt"),
+    ("MOVBE", "movbe"),
 ];
 
 define_ops! {
@@ -1881,6 +1882,9 @@ define_ops! {
 
     // ---- LZCNT -----------------------------------------------------------
     LZCNT = "count the leading zero bits",
+
+    // ---- MOVBE -----------------------------------------------------------
+    MOVBE = "move with the bytes reversed (memory forms only)",
 }
 
 impl Op {
@@ -2457,15 +2461,15 @@ impl Op {
     }
 
     /// Whether this is one of the general-purpose instructions that arrived
-    /// with an extension's `CPUID` bit — `CRC32`, `POPCNT` and `LZCNT` — and
-    /// so is gated by the bit alone: none touches SIMD state, so `CR0.EM`,
+    /// with an extension's `CPUID` bit — `CRC32`, `POPCNT`, `LZCNT` and
+    /// `MOVBE` — and so is gated by the bit alone: none touches SIMD state, so `CR0.EM`,
     /// `CR0.TS` and `CR4.OSFXSR` mean nothing to them (*Intel SDM* volume 2,
     /// `CRC32` and `POPCNT`, "Protected Mode Exceptions": `#UD` for the
     /// `CPUID` bit and for `LOCK`, and no `#NM`). `LZCNT` without its bit is
     /// `BSR` rather than `#UD`.
     #[must_use]
     pub const fn is_general_extension(self) -> bool {
-        matches!(self, Op::CRC32 | Op::POPCNT | Op::LZCNT)
+        matches!(self, Op::CRC32 | Op::POPCNT | Op::LZCNT | Op::MOVBE)
     }
 
     /// Which post-SSE2 extension this operation arrived with, if any.
@@ -2560,6 +2564,7 @@ impl Op {
             | Op::PCMPISTRM => Extension::Sse42,
             Op::POPCNT => Extension::Popcnt,
             Op::LZCNT => Extension::Lzcnt,
+            Op::MOVBE => Extension::Movbe,
             _ => return None,
         };
         Some(ext)
@@ -2734,6 +2739,8 @@ pub enum Extension {
     /// `LZCNT`: `CPUID.80000001H:ECX[5]`, AMD's `ABM`. Unlike the others
     /// its absence is not `#UD`: the encoding executes as `BSR`.
     Lzcnt,
+    /// `MOVBE`: `CPUID.01H:ECX[22]`.
+    Movbe,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -4010,6 +4017,11 @@ const THREE_38: ([Insn; 256], [bool; 256]) = opmap! {
     0x1c PABSB     Pq Qq None Documented;
     0x1d PABSW     Pq Qq None Documented;
     0x1e PABSD     Pq Qq None Documented;
+    // `MOVBE`, a general-purpose load and store with the bytes reversed.
+    // Memory forms only: [`resolve_modrm`] makes `mod == 11` unassigned.
+    // With an `F2` these two are `CRC32`, in their own map.
+    0xf0 MOVBE     Gv Ev None Documented;
+    0xf1 MOVBE     Ev Gv None Documented;
 };
 
 /// The `0F 38` map with no mandatory prefix.
@@ -4076,6 +4088,11 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
 
     // SSE4.2.
     0x37 PCMPGTQ   Vx Wx None Documented;
+
+    // `MOVBE` again: here the `66` is an operand size, not a column of its
+    // own, and the instruction is the 16-bit one.
+    0xf0 MOVBE     Gv Ev None Documented;
+    0xf1 MOVBE     Ev Gv None Documented;
 };
 
 /// The `0F 38` map with a `66` prefix.
@@ -4564,6 +4581,10 @@ pub const fn resolve_modrm(map: Gen, insn: Insn, opcode: u8, two_byte: bool, mod
             }
             row
         }
+        // `MOVBE` exists for its memory operand: a register-to-register byte
+        // swap is `BSWAP`, and `mod == 11` is `#UD` (*Intel SDM* volume 2,
+        // `MOVBE`, "Protected Mode Exceptions").
+        Grp::None if matches!(insn.op, Op::MOVBE) && modrm.md == 3 => UNASSIGNED,
         Grp::ModAlt => {
             if modrm.md != 3 {
                 return insn;

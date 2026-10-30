@@ -4481,6 +4481,91 @@ mod long_mode {
         assert!(impossible.validate().is_err());
     }
 
+    fn with_movbe() -> Features {
+        Features {
+            movbe: true,
+            ..Features::X86_64
+        }
+    }
+
+    /// `bytes` followed by a ModRM and SIB naming `reg` and the absolute
+    /// address `addr` — not `RIP`-relative, which `mod == 00`, `r/m == 101`
+    /// is in 64-bit mode.
+    fn abs(bytes: &[u8], reg: u8, addr: u64) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        out.extend_from_slice(&[(reg << 3) | 0b100, 0x25]);
+        out.extend_from_slice(&(addr as u32).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn movbe_loads_and_stores_reversed_at_every_width() {
+        // *Intel SDM* volume 2, `MOVBE`: `0F 38 F0` loads, `F1` stores, the
+        // operand size picks 16, 32 or 64 bits.
+        let mut code = alloc::vec![0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff]; // mov rcx, -1
+        code.extend_from_slice(&[0x48, 0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff]); // mov rdx, -1
+        code.extend(abs(&[0x48, 0x0f, 0x38, 0xf0], 0, la::MARK)); // movbe rax, [MARK]
+        code.extend(abs(&[0x0f, 0x38, 0xf0], 1, la::MARK)); // movbe ecx, [MARK]
+        code.extend(abs(&[0x66, 0x0f, 0x38, 0xf0], 2, la::MARK)); // movbe dx, [MARK]
+        code.extend_from_slice(&[0x48, 0xbb]); // mov rbx, imm64
+        code.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        code.extend(abs(&[0x48, 0x0f, 0x38, 0xf1], 3, la::MARK + 8)); // movbe [MARK+8], rbx
+        code.extend(abs(&[0x0f, 0x38, 0xf1], 3, la::MARK + 16)); // movbe [MARK+16], ebx
+        code.extend(abs(&[0x66, 0x0f, 0x38, 0xf1], 3, la::MARK + 24)); // movbe [MARK+24], bx
+        code.push(0xf4);
+        let pc = Pc::with_features(Variant::X86_64, with_movbe());
+        pc.write64(la::MARK, 0x0102_0304_0506_0708);
+        for at in [8, 16, 24] {
+            pc.write64(la::MARK + at, u64::MAX);
+        }
+        let pc = run64_on(pc, 0, &code);
+        let r = pc.regs();
+        assert_eq!(r.rax, 0x0807_0605_0403_0201);
+        assert_eq!(r.rcx, 0x0807_0605, "a 32-bit load zero-extends");
+        assert_eq!(r.rdx, 0xffff_ffff_ffff_0807, "a 16-bit load merges");
+        assert_eq!(pc.read64(la::MARK + 8), 0x8877_6655_4433_2211);
+        assert_eq!(pc.read64(la::MARK + 16), 0xffff_ffff_8877_6655);
+        assert_eq!(pc.read64(la::MARK + 24), 0xffff_ffff_ffff_8877);
+    }
+
+    #[test]
+    fn movbe_has_no_register_form_and_needs_its_bit() {
+        // movbe eax, ecx and movbe ecx, eax: `mod == 11` is `#UD`.
+        faults64(with_movbe(), 6, &[0x0f, 0x38, 0xf0, 0xc1]);
+        faults64(with_movbe(), 6, &[0x0f, 0x38, 0xf1, 0xc1]);
+        // The memory form on a part without the feature.
+        faults64(Features::X86_64, 6, &abs(&[0x0f, 0x38, 0xf0], 0, la::MARK));
+        // `F2` in front is still `CRC32`, which v2 has: crc32 eax, ecx.
+        let pc = run64_on(
+            Pc::with_features(Variant::X86_64, Features::X86_64_V2),
+            0,
+            &[
+                0x31, 0xc0, 0xb9, 0x01, 0, 0, 0, 0xf2, 0x0f, 0x38, 0xf1, 0xc1, 0xf4,
+            ],
+        );
+        assert_ne!(pc.regs().rax, 0, "a CRC, not a byte swap");
+    }
+
+    #[test]
+    fn cpuid_reports_movbe_in_leaf_1() {
+        let ecx = |features| cpuid64(features, 1, 0).2;
+        assert_eq!(ecx(Features::X86_64) & (1 << 22), 0);
+        assert_eq!(ecx(Features::X86_64_V2) & (1 << 22), 0, "not a v2 bit");
+        assert_ne!(ecx(with_movbe()) & (1 << 22), 0, "CPUID.01H:ECX.MOVBE");
+        // A 32-bit part may have it — the first ones did — but not one
+        // without `CPUID` to say so.
+        let atomish = Features {
+            movbe: true,
+            ..Features::I80486
+        };
+        assert!(atomish.validate().is_ok());
+        let impossible = Features {
+            movbe: true,
+            ..Features::NONE
+        };
+        assert!(impossible.validate().is_err());
+    }
+
     #[test]
     fn movnti_with_rex_w_stores_all_eight_bytes() {
         // mov rax, imm64 ; movnti [MARK], rax ; movnti [MARK+8], eax ; hlt
