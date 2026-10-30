@@ -43,9 +43,11 @@
 //!   and become *part of the opcode*. [`TABLE_0F_66`], [`TABLE_0F_F3`] and
 //!   [`TABLE_0F_F2`] are deltas on [`TABLE_0F`], for the same reason
 //!   [`TABLE_386`] is a delta on [`TABLE`]: `66 0F B6` is still `MOVZX`.
-//! - **Group 15 and `0F 12`/`0F 16`**, where the ModRM *mode* field picks
-//!   between a memory instruction and an entirely different register one.
-//!   [`resolve_modrm`] is the single place all three are applied.
+//! - **Group 15, group 7's `/2`, and `0F 12`/`0F 16`**, where the ModRM
+//!   *mode* field picks between a memory instruction and an entirely
+//!   different register one — `LGDT` against `XGETBV`/`XSETBV`, which are
+//!   then told apart by the r/m field ([`GROUP7_XCR`]). [`resolve_modrm`] is
+//!   the single place all of them are applied.
 //!
 //! # Why there is no cycle column
 //!
@@ -906,6 +908,12 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("SYSENTER", "sysenter"),
     ("WRMSR", "wrmsr"),
     ("CMPXCHG8B", "cmpxchg8b"),
+    ("XGETBV", "xgetbv"),
+    ("XRSTOR", "xrstor"),
+    ("XSAVE", "xsave"),
+    ("XSAVEC", "xsavec"),
+    ("XSAVEOPT", "xsaveopt"),
+    ("XSETBV", "xsetbv"),
     // The x87 unit.
     ("F2XM1", "f2xm1"),
     ("FABS", "fabs"),
@@ -1383,6 +1391,14 @@ define_ops! {
 
     // ---- Pentium: the 64-bit compare and exchange ------------------------
     CMPXCHG8B = "compare EDX:EAX with a 64-bit memory operand and exchange (CMPXCHG16B with REX.W)",
+
+    // ---- The XSAVE feature set -------------------------------------------
+    XGETBV = "read the extended control register ECX names into EDX:EAX",
+    XRSTOR = "restore the state components EDX:EAX selects from an XSAVE area",
+    XSAVE = "save the state components EDX:EAX selects to an XSAVE area",
+    XSAVEC = "save the selected state components in the compacted format",
+    XSAVEOPT = "save the selected state components, skipping any known unmodified",
+    XSETBV = "write EDX:EAX to the extended control register ECX names (XCR0)",
 
     // ---- x87 -------------------------------------------------------------
     F2XM1 = "replace ST(0) with 2 to the ST(0), minus one",
@@ -2356,6 +2372,7 @@ impl Op {
             Op::SQRTSS | Op::SQRTPS => 28,
             Op::SQRTSD | Op::SQRTPD => 57,
             Op::FXSAVE | Op::FXRSTOR => 100,
+            Op::XSAVE | Op::XSAVEOPT | Op::XSAVEC | Op::XRSTOR => 100,
             // An undefined encoding costs nothing: it raises #UD instead of
             // executing, and the exception sequence charges its own clocks.
             Op::UD => 0,
@@ -3675,6 +3692,34 @@ pub static GROUP7: [Insn; 8] = [
     Insn::new(Op::INVLPG, Arg::M, Arg::None, Grp::None, Class::Documented),
 ];
 
+/// `0F 01 /2` with `mod == 11`, indexed by the ModRM **r/m** field: the two
+/// extended-control-register instructions.
+///
+/// `LGDT` has no register form, so the register encodings of its extension
+/// were free, and the XSAVE feature set took two of them — `0F 01 D0` is
+/// `XGETBV` and `0F 01 D1` is `XSETBV` (*Intel SDM* volume 2 table A-6,
+/// group 7). The other six (`VMFUNC`, the transactional-memory probes) are
+/// extensions this core does not have and stay undefined. [`resolve_modrm`]
+/// is where the mode field sends a decode here.
+pub static GROUP7_XCR: [Insn; 8] = {
+    let mut t = [UNASSIGNED; 8];
+    t[0] = Insn::new(
+        Op::XGETBV,
+        Arg::None,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    );
+    t[1] = Insn::new(
+        Op::XSETBV,
+        Arg::None,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    );
+    t
+};
+
 /// `0F BA`: Intel's group 8, the bit tests with an immediate bit number.
 ///
 /// Extensions 0-3 are unassigned, which is why the group exists at all: the
@@ -3690,12 +3735,18 @@ pub static GROUP8: [Insn; 8] = [
     Insn::new(Op::BTC, Arg::Ev, Arg::Ib, Grp::None, Class::Documented),
 ];
 
-/// `0F C7`: Intel's group 9. Only extension 1 is assigned.
+/// `0F C7`: Intel's group 9 — `CMPXCHG8B` at extension 1 and `XSAVEC` at
+/// extension 4.
 ///
 /// The operand is written as [`Arg::M`] rather than a sized one because the
 /// width is not the effective operand size and not a mandatory prefix's
 /// business either: it is eight bytes, or sixteen with `REX.W`, and the
-/// interpreter reads it as two halves regardless.
+/// interpreter reads it as two halves regardless. `XSAVEC`'s area is however
+/// long the requested components make it.
+///
+/// Extensions 3 and 5 are `XRSTORS` and `XSAVES`, which are deliberately
+/// absent: they exist to save *supervisor* state components selected by
+/// `IA32_XSS`, and this core has none to save (`docs/cpu/x86.md`).
 pub static GROUP9: [Insn; 8] = {
     let mut t = [UNASSIGNED; 8];
     t[1] = Insn::new(
@@ -3705,6 +3756,7 @@ pub static GROUP9: [Insn; 8] = {
         Grp::None,
         Class::Documented,
     );
+    t[4] = Insn::new(Op::XSAVEC, Arg::M, Arg::None, Grp::None, Class::Documented);
     t
 };
 
@@ -3776,9 +3828,19 @@ pub static GROUP15: [Insn; 8] = [
         Grp::None,
         Class::Documented,
     ),
-    UNASSIGNED,
-    UNASSIGNED,
-    UNASSIGNED,
+    // The XSAVE feature set's three, each over an area whose length is
+    // decided at run time by `XCR0` and `EDX:EAX` — so a bare [`Arg::M`], an
+    // address and nothing more (*Intel SDM* volume 2 table A-6, group 15).
+    Insn::new(Op::XSAVE, Arg::M, Arg::None, Grp::None, Class::Documented),
+    Insn::new(Op::XRSTOR, Arg::None, Arg::M, Grp::None, Class::Documented),
+    Insn::new(
+        Op::XSAVEOPT,
+        Arg::M,
+        Arg::None,
+        Grp::None,
+        Class::Documented,
+    ),
+    // `CLFLUSH`, which this core does not have.
     UNASSIGNED,
 ];
 
@@ -3849,6 +3911,9 @@ pub const fn resolve_modrm(map: Gen, insn: Insn, opcode: u8, two_byte: bool, mod
                 GROUP15[idx]
             }
         }
+        // `LGDT` has no register form, and its register encodings are
+        // `XGETBV` and `XSETBV`; see [`GROUP7_XCR`].
+        Grp::Grp7 if modrm.md == 3 && idx == 2 => GROUP7_XCR[(modrm.rm & 7) as usize],
         // The three shift-by-immediate groups have no memory form: the shifted
         // operand is the destination and the count is the immediate, so a
         // `mod != 11` encoding names an address nothing would read.
@@ -5079,6 +5144,7 @@ mod tests {
                 || GROUP9.iter().any(|i| i.op == op)
                 || GROUP15.iter().any(|i| i.op == op)
                 || GROUP15_REG.iter().any(|i| i.op == op)
+                || GROUP7_XCR.iter().any(|i| i.op == op)
                 || GROUP12.iter().any(|i| i.op == op)
                 || GROUP13.iter().any(|i| i.op == op)
                 || GROUP14.iter().any(|i| i.op == op)

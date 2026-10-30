@@ -78,7 +78,7 @@ use crate::float::{B32, B64, Category, Env, Flags, Round, binary};
 
 use super::exec::{Ex, Exec, Fault, VEC_MF, VEC_NM, VEC_UD, VEC_XM};
 use super::flags;
-use super::fpu::{cw, mxcsr, sw};
+use super::fpu::{X87, cw, mxcsr, sw};
 use super::isa::{Arg, Fields, Op, seg};
 use super::prot::{cr0, cr4};
 
@@ -519,7 +519,7 @@ impl Exec<'_> {
     /// instruction take `#MF`. A latched `ES` would need both of those written
     /// as special cases, and would leave `FLDENV` able to restore a summary
     /// bit that disagrees with the flags beside it.
-    fn x87_resummarise(&mut self) {
+    pub(super) fn x87_resummarise(&mut self) {
         let x = &mut self.state.x87;
         let live = x.status & sw::EXCEPTIONS & x.unmasked();
         if live != 0 {
@@ -2339,12 +2339,50 @@ impl Exec<'_> {
     /// happen: the tag word is **abridged** to one bit per register, and the
     /// instruction and data pointers are eight bytes each with `REX.W` and
     /// four bytes plus a selector without it.
+    ///
+    /// The image is written in three pieces because the XSAVE feature set
+    /// writes the same 512 bytes as two separately requested state components
+    /// plus `MXCSR`, whose rule is neither's (*Intel SDM* volume 1 §13.5.1,
+    /// §13.5.2); `xsave.rs` calls the pieces one at a time and this calls all
+    /// three, so the two images cannot disagree about a byte.
     fn fxsave(&mut self, f: &Fields) -> Ex<()> {
         let (sr, off) = self.ea();
         // The area must be sixteen-byte aligned, for the same reason
         // `MOVAPS`'s operand must be.
         self.require_aligned(off)?;
-        let wide = f.rex_w();
+        self.store_x87_image(sr, off, f.rex_w())?;
+        self.store_mxcsr_image(sr, off)?;
+        // All sixteen `XMM` registers, even outside 64-bit mode, where the top
+        // eight are inaccessible: the area is 512 bytes either way, and a
+        // partial write would leave a restore reading whatever was there.
+        self.store_xmm_image(sr, off, 16)
+    }
+
+    /// `FXRSTOR`.
+    ///
+    /// Every byte is read before anything is committed, so a fault part-way
+    /// through the area — a page boundary, a reserved `MXCSR` bit — leaves the
+    /// unit exactly as it was and the instruction restartable.
+    fn fxrstor(&mut self, f: &Fields) -> Ex<()> {
+        let (sr, off) = self.ea();
+        self.require_aligned(off)?;
+        let x87 = self.load_x87_image(sr, off, f.rex_w())?;
+        let mxcsr_value = self.load_mxcsr_image(sr, off)?;
+        let xmm = self.load_xmm_image(sr, off, 16)?;
+        self.state.x87 = x87;
+        self.state.sse.mxcsr = mxcsr_value;
+        self.state.sse.xmm = xmm;
+        self.x87_resummarise();
+        Ok(())
+    }
+
+    /// Write the x87 part of an `FXSAVE` image: bytes 0-23 and the eight
+    /// registers at 32-159. Bytes 24-31 (`MXCSR` and its mask) belong to
+    /// [`store_mxcsr_image`](Exec::store_mxcsr_image).
+    ///
+    /// `wide` is `REX.W`: the instruction and data pointers as eight bytes
+    /// each rather than four plus a selector.
+    pub(super) fn store_x87_image(&mut self, sr: u8, off: u64, wide: bool) -> Ex<()> {
         let x = self.state.x87;
         self.write_mem(sr, off, 2, u64::from(x.control))?;
         self.write_mem(sr, off.wrapping_add(2), 2, u64::from(x.status))?;
@@ -2362,22 +2400,28 @@ impl Exec<'_> {
             self.write_mem(sr, off.wrapping_add(20), 2, u64::from(x.last_ds))?;
             self.write_mem(sr, off.wrapping_add(22), 2, 0)?;
         }
-        self.write_mem(sr, off.wrapping_add(24), 4, u64::from(self.state.sse.mxcsr))?;
-        self.write_mem(sr, off.wrapping_add(28), 4, u64::from(mxcsr::SUPPORTED))?;
         // The eight registers, in stack order, each padded from ten bytes to
         // sixteen.
         for i in 0..8u8 {
             let at = off.wrapping_add(32) + u64::from(i) * 16;
-            let value = self.state.x87.raw(i);
+            let value = x.raw(i);
             self.write_f80(sr, at, value)?;
             self.write_mem(sr, at.wrapping_add(10), 2, 0)?;
             self.write_mem(sr, at.wrapping_add(12), 4, 0)?;
         }
-        // The sixteen `XMM` registers. All sixteen are written even outside
-        // 64-bit mode, where the top eight are inaccessible: the area is 512
-        // bytes either way, and a partial write would leave a restore reading
-        // whatever was there.
-        for i in 0..16u8 {
+        Ok(())
+    }
+
+    /// Write `MXCSR` and `MXCSR_MASK`, bytes 24-31 of the image.
+    pub(super) fn store_mxcsr_image(&mut self, sr: u8, off: u64) -> Ex<()> {
+        let value = u64::from(self.state.sse.mxcsr);
+        self.write_mem(sr, off.wrapping_add(24), 4, value)?;
+        self.write_mem(sr, off.wrapping_add(28), 4, u64::from(mxcsr::SUPPORTED))
+    }
+
+    /// Write `XMM0` through `XMM(count - 1)` from byte 160.
+    pub(super) fn store_xmm_image(&mut self, sr: u8, off: u64, count: u8) -> Ex<()> {
+        for i in 0..count {
             let at = off.wrapping_add(160) + u64::from(i) * 16;
             let v = self.state.sse.get(i);
             self.write_xmm_mem(sr, at, v)?;
@@ -2385,11 +2429,9 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// `FXRSTOR`.
-    fn fxrstor(&mut self, f: &Fields) -> Ex<()> {
-        let (sr, off) = self.ea();
-        self.require_aligned(off)?;
-        let wide = f.rex_w();
+    /// Read the x87 part of an image back into a unit, **without** installing
+    /// it — the caller commits once every other read has succeeded.
+    pub(super) fn load_x87_image(&mut self, sr: u8, off: u64, wide: bool) -> Ex<X87> {
         let control = self.read_mem(sr, off, 2)? as u16;
         let status = self.read_mem(sr, off.wrapping_add(2), 2)? as u16;
         let tag = self.read_mem(sr, off.wrapping_add(4), 1)? as u8;
@@ -2405,22 +2447,13 @@ impl Exec<'_> {
             let ds = self.read_mem(sr, off.wrapping_add(20), 2)? as u16;
             (ip, cs, dp, ds)
         };
-        let mxcsr_value = self.read_mem(sr, off.wrapping_add(24), 4)? as u32;
-        if mxcsr_value & !mxcsr::WRITABLE != 0 {
-            // The same rule `LDMXCSR` follows: a reserved bit is a `#GP`,
-            // because a restore that quietly dropped it would hide the bug in
-            // whatever wrote the area.
-            return Err(Fault::gp(0));
-        }
         let mut regs = [F80::ZERO; 8];
         for (i, slot) in regs.iter_mut().enumerate() {
             *slot = self.read_f80(sr, off.wrapping_add(32) + (i as u64) * 16)?;
         }
-        let mut xmm = [[0u64; 2]; 16];
-        for (i, slot) in xmm.iter_mut().enumerate() {
-            *slot = self.read_xmm_mem(sr, off.wrapping_add(160) + (i as u64) * 16)?;
-        }
-        let x = &mut self.state.x87;
+        // Every field is overwritten below; the starting value is only a
+        // well-formed unit to write into.
+        let mut x = X87::new();
         x.control = control;
         x.status = status;
         x.last_op = last_op;
@@ -2440,10 +2473,29 @@ impl Exec<'_> {
         // status word and the register images are back, because bit `i`
         // describes `ST(i)` and `TOP` decides which register that is.
         x.set_abridged_tag(tag);
-        self.state.sse.mxcsr = mxcsr_value;
-        self.state.sse.xmm = xmm;
-        self.x87_resummarise();
-        Ok(())
+        Ok(x)
+    }
+
+    /// Read `MXCSR` from byte 24, refusing a reserved bit.
+    pub(super) fn load_mxcsr_image(&mut self, sr: u8, off: u64) -> Ex<u32> {
+        let value = self.read_mem(sr, off.wrapping_add(24), 4)? as u32;
+        if value & !mxcsr::WRITABLE != 0 {
+            // The same rule `LDMXCSR` follows: a reserved bit is a `#GP`,
+            // because a restore that quietly dropped it would hide the bug in
+            // whatever wrote the area.
+            return Err(Fault::gp(0));
+        }
+        Ok(value)
+    }
+
+    /// Read `XMM0` through `XMM(count - 1)` from byte 160 into a copy of the
+    /// register file, leaving the rest as they are.
+    pub(super) fn load_xmm_image(&mut self, sr: u8, off: u64, count: u8) -> Ex<[[u64; 2]; 16]> {
+        let mut xmm = self.state.sse.xmm;
+        for (i, slot) in xmm.iter_mut().enumerate().take(usize::from(count)) {
+            *slot = self.read_xmm_mem(sr, off.wrapping_add(160) + (i as u64) * 16)?;
+        }
+        Ok(xmm)
     }
 
     // -----------------------------------------------------------------

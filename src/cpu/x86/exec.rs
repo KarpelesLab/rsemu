@@ -2712,6 +2712,9 @@ impl<'a> Exec<'a> {
             }
             Op::LOCK | Op::REP | Op::REPNE | Op::SEG => {}
             Op::CMPXCHG8B => self.cmpxchg8b(f)?,
+            Op::XSAVE | Op::XSAVEOPT | Op::XSAVEC | Op::XRSTOR => self.xsave_instruction(f)?,
+            Op::XGETBV => self.xgetbv()?,
+            Op::XSETBV => self.xsetbv()?,
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
@@ -4078,8 +4081,11 @@ impl<'a> Exec<'a> {
     ///
     /// Conspicuously absent, and absent on purpose: **`TSC`'s companion
     /// `RDTSC`** is claimed because the counter exists, but no
-    /// performance-monitoring leaf is; and every bit above leaf 1, which is
-    /// why leaf 0 reports a maximum of one.
+    /// performance-monitoring leaf is; and every leaf above 1, which is why
+    /// leaf 0 reports a maximum of one — except on a part with
+    /// [`Features::xsave`](super::Features::xsave), whose leaf `0Dh` is the
+    /// only place the XSAVE area's layout is described, so the maximum rises
+    /// to `0Dh` and the leaves in between answer "nothing here".
     ///
     /// The one thing said about that counter beyond its existence is the
     /// **invariant-TSC bit** in leaf `8000_0007`, and it is said for the same
@@ -4153,10 +4159,29 @@ impl<'a> Exec<'a> {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers
         }
 
+        // Leaf 1's second feature doubleword. `OSXSAVE` is not a property of
+        // the part but a live echo of `CR4.OSXSAVE`, which is how software
+        // that cannot read `CR4` — anything outside ring 0 — learns whether
+        // the operating system has turned the XSAVE feature set on (*Intel
+        // SDM* volume 1 §13.2).
+        let mut ecx1: u32 = 0;
+        if features.xsave {
+            ecx1 |= 1 << 26; // XSAVE: XSAVE/XRSTOR, XSETBV/XGETBV and XCR0
+            if self.state.sys.cr4 & super::prot::cr4::OSXSAVE != 0 {
+                ecx1 |= 1 << 27; // OSXSAVE
+            }
+        }
+
         let xd_enabled = self.state.sys.misc_enable & super::prot::misc_enable::XD_DISABLE == 0;
         let signature = self.cfg.variant.reset_signature();
-        let max_basic: u32 = 1;
+        // Leaf `0Dh` is where the XSAVE feature set describes itself, and a
+        // leaf above the maximum is not one software may read — so a part with
+        // XSAVE reports thirteen, and every leaf between 2 and `0Ch` answers
+        // below with what it means when this core has nothing to say.
+        let max_basic: u32 = if features.xsave { 0xd } else { 1 };
         let leaf = self.state.regs.rax as u32;
+        let subleaf = self.state.regs.rcx as u32;
+        let xsave_leaf = self.cpuid_xsave(subleaf);
         let regs = &mut self.state.regs;
         let mut set = |a: u32, b: u32, c: u32, d: u32| {
             // Each half is a 32-bit write, so each zero-extends.
@@ -4174,7 +4199,16 @@ impl<'a> Exec<'a> {
                 u32::from_le_bytes(*b"ntel"),
                 u32::from_le_bytes(*b"ineI"),
             ),
-            1 => set(signature, 0, 0, edx1),
+            1 => set(signature, 0, ecx1, edx1),
+            // Leaf 2, the cache and TLB descriptors: `AL` is architecturally
+            // 01h ("execute once") and every other byte is the null
+            // descriptor, which is a well-formed answer meaning "nothing to
+            // report" rather than a malformed one.
+            2 if leaf <= max_basic => set(1, 0, 0, 0),
+            0xd if leaf <= max_basic => {
+                let (a, b, c, d) = xsave_leaf;
+                set(a, b, c, d);
+            }
             // The extended leaves. Their existence is announced by leaf
             // `8000_0000` returning a value above itself, which is how a guest
             // that predates them avoids reading garbage.
@@ -4229,6 +4263,18 @@ impl<'a> Exec<'a> {
             // An unimplemented leaf returns zero rather than the highest one,
             // which is what a guest probing for a feature has to be able to
             // tell apart from a real answer.
+            //
+            // That includes the basic leaves between 2 and `0Dh` a part with
+            // XSAVE has to answer. All zero is what each of them says on a
+            // part without the feature it describes: 4's cache type 0 is "no
+            // more caches", 5 advertises no `MONITOR` line size, 6 no thermal
+            // or power features, 7 sub-leaf 0 a maximum sub-leaf of zero and
+            // no structured extended features, `0Ah` architectural
+            // performance monitoring version 0 (none), and `0Bh` an `EBX` of
+            // zero, which is the SDM's own test for "leaf `0Bh` not
+            // supported" — so topology enumeration falls back to leaves 1 and
+            // 4 rather than reading a level type. 3, 8, 9 and `0Ch` are
+            // reserved or describe absent features.
             _ => set(0, 0, 0, 0),
         }
         Ok(())

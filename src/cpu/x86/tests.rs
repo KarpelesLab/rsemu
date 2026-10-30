@@ -5700,6 +5700,649 @@ mod long_mode {
             }
         }
     }
+
+    /// The XSAVE feature set, as a guest drives it.
+    ///
+    /// Every expectation is from the *Intel SDM* volume 1 chapter 13 or the
+    /// volume 2 instruction pages, named on each test.
+    mod xsave {
+        use super::*;
+        use crate::cpu::x86::fpu::{Sse, X87, mxcsr};
+        use crate::cpu::x86::prot::xcr0;
+
+        /// `0x48`, `REX.W`.
+        const REX_W: u8 = 0x48;
+        /// A 64-byte-aligned area, and a second for comparisons.
+        const AREA: u64 = 0xd000;
+        const AREA2: u64 = 0xe000;
+        /// Where vector `v`'s handler — a lone `hlt` — sits.
+        const HANDLERS: u64 = 0x3800;
+
+        /// An x86-64 part with the XSAVE feature set.
+        fn features() -> Features {
+            Features {
+                xsave: true,
+                ..Features::X86_64
+            }
+        }
+
+        /// That part in flat 32-bit protected mode, with `CR4.OSFXSR` and
+        /// `CR4.OSXSAVE` set as an operating system would, and a handler for
+        /// each of `#UD`, `#NM` and `#GP` so a test can see which it took.
+        fn xpc() -> Pc {
+            xpc_with(features())
+        }
+
+        fn xpc_with(features: Features) -> Pc {
+            let pc = Pc::with_features(Variant::X86_64, features);
+            pc.start_protected();
+            let mut sys = pc.cpu.sys();
+            sys.cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+            if features.xsave {
+                sys.cr4 |= cr4::OSXSAVE;
+            }
+            pc.cpu.set_sys(sys);
+            for v in [6u64, 7, 13] {
+                let at = HANDLERS + v * 16;
+                pc.idt(v, gate(0x08, at as u32, sys_type::INT_GATE32, 0));
+                pc.write(at, &[0xf4]);
+            }
+            pc
+        }
+
+        /// Run `code` (a `hlt` is appended) from `at::CODE0`, and say which
+        /// exception it ended in, if any.
+        fn exec(pc: &Pc, code: &[u8]) -> Option<u64> {
+            let mut code = code.to_vec();
+            code.push(0xf4);
+            pc.write(at::CODE0, &code);
+            let mut regs = pc.regs();
+            regs.rip = at::CODE0;
+            pc.cpu.set_regs(regs);
+            pc.cpu.session.lock().state.halted = false;
+            assert!(pc.run(200) < 200, "the program halted");
+            let rip = pc.regs().rip;
+            [6u64, 7, 13]
+                .into_iter()
+                .find(|v| rip == HANDLERS + v * 16 + 1)
+        }
+
+        /// `mov r32, imm32` for register number `r`.
+        fn mov(r: u8, imm: u32) -> Vec<u8> {
+            let mut out = alloc::vec![0xb8 + r];
+            out.extend_from_slice(&imm.to_le_bytes());
+            out
+        }
+
+        /// `EDX:EAX = mask` and `ECX = ecx`.
+        fn args(mask: u64, ecx: u32) -> Vec<u8> {
+            let mut out = mov(0, mask as u32);
+            out.extend(mov(2, (mask >> 32) as u32));
+            out.extend(mov(1, ecx));
+            out
+        }
+
+        /// A two-byte-opcode instruction with a `disp32` memory operand —
+        /// the 32-bit absolute form.
+        fn mem32(op: [u8; 2], reg: u8, addr: u64) -> Vec<u8> {
+            let mut out = alloc::vec![op[0], op[1], (reg << 3) | 0b101];
+            out.extend_from_slice(&(addr as u32).to_le_bytes());
+            out
+        }
+
+        /// The same in 64-bit mode, where `mod == 00, r/m == 101` is
+        /// `RIP`-relative and absolute takes a SIB byte; `rex` prefixed if
+        /// given.
+        fn mem64(rex: Option<u8>, op: [u8; 2], reg: u8, addr: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend(rex);
+            out.extend_from_slice(&[op[0], op[1], (reg << 3) | 0b100, 0x25]);
+            out.extend_from_slice(&(addr as u32).to_le_bytes());
+            out
+        }
+
+        const GRP15: [u8; 2] = [0x0f, 0xae];
+        const GRP9: [u8; 2] = [0x0f, 0xc7];
+        const XGETBV: [u8; 3] = [0x0f, 0x01, 0xd0];
+        const XSETBV: [u8; 3] = [0x0f, 0x01, 0xd1];
+
+        fn xsetbv(mask: u64) -> Vec<u8> {
+            let mut out = args(mask, 0);
+            out.extend_from_slice(&XSETBV);
+            out
+        }
+
+        fn bytes(pc: &Pc, addr: u64, len: u64) -> Vec<u8> {
+            (0..len)
+                .map(|i| pc.ram.read_u8(addr + i).unwrap())
+                .collect()
+        }
+
+        /// A state with something distinctive in every part of both legacy
+        /// components: two x87 registers, all sixteen `XMM` registers, and a
+        /// non-default `MXCSR`.
+        fn distinctive(pc: &Pc) {
+            let mut sse = Sse::new();
+            for i in 0..16u8 {
+                let n = u64::from(i) + 1;
+                sse.set(i, [n * 0x0101_0101_0101_0101, !n]);
+            }
+            sse.mxcsr = mxcsr::RESET | mxcsr::FTZ;
+            pc.cpu.set_sse(sse);
+        }
+
+        /// `fninit ; fld1 ; fldpi`.
+        const X87_CODE: [u8; 6] = [0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xeb];
+
+        #[test]
+        fn without_osxsave_every_instruction_is_an_invalid_opcode() {
+            // *Intel SDM* volume 2, `XGETBV`/`XSETBV`/`XSAVE`: `#UD` if
+            // `CR4.OSXSAVE[bit 18] = 0`.
+            let pc = xpc();
+            let mut sys = pc.cpu.sys();
+            sys.cr4 &= !cr4::OSXSAVE;
+            pc.cpu.set_sys(sys);
+            let mut getbv = args(0, 0);
+            getbv.extend_from_slice(&XGETBV);
+            assert_eq!(exec(&pc, &getbv), Some(6));
+            assert_eq!(exec(&pc, &xsetbv(3)), Some(6));
+            assert_eq!(exec(&pc, &mem32(GRP15, 4, AREA)), Some(6));
+            assert_eq!(exec(&pc, &mem32(GRP15, 5, AREA)), Some(6));
+        }
+
+        #[test]
+        fn a_part_without_the_feature_answers_invalid_opcode_and_refuses_osxsave() {
+            let pc = xpc_with(Features::X86_64);
+            let mut getbv = args(0, 0);
+            getbv.extend_from_slice(&XGETBV);
+            assert_eq!(exec(&pc, &getbv), Some(6));
+            assert_eq!(exec(&pc, &mem32(GRP15, 4, AREA)), Some(6));
+            assert_eq!(exec(&pc, &mem32(GRP9, 4, AREA)), Some(6));
+            // mov eax, cr4 ; or eax, OSXSAVE ; mov cr4, eax — a reserved bit
+            // on this part, so `#GP(0)` (*Intel SDM* volume 3 §2.5).
+            let mut code = alloc::vec![0x0f, 0x20, 0xe0, 0x0d];
+            code.extend_from_slice(&(cr4::OSXSAVE as u32).to_le_bytes());
+            code.extend_from_slice(&[0x0f, 0x22, 0xe0]);
+            assert_eq!(exec(&pc, &code), Some(13));
+            assert_eq!(pc.cpu.sys().cr4 & cr4::OSXSAVE, 0);
+            // And the part with it takes the same write.
+            let pc = xpc();
+            let mut sys = pc.cpu.sys();
+            sys.cr4 &= !cr4::OSXSAVE;
+            pc.cpu.set_sys(sys);
+            assert_eq!(exec(&pc, &code), None);
+            assert_ne!(pc.cpu.sys().cr4 & cr4::OSXSAVE, 0);
+        }
+
+        #[test]
+        fn xsetbv_writes_xcr0_and_xgetbv_reads_it_back() {
+            let pc = xpc();
+            assert_eq!(pc.cpu.sys().xcr0, xcr0::RESET, "x87 alone out of reset");
+            let mut code = xsetbv(3);
+            code.extend(args(u64::MAX, 0));
+            code.extend_from_slice(&XGETBV);
+            assert_eq!(exec(&pc, &code), None);
+            let regs = pc.regs();
+            assert_eq!((regs.rax, regs.rdx), (3, 0));
+            assert_eq!(pc.cpu.sys().xcr0, xcr0::X87 | xcr0::SSE);
+        }
+
+        #[test]
+        fn xsetbv_refuses_a_value_no_processor_could_hold() {
+            // *Intel SDM* volume 2, `XSETBV`: `#GP(0)` for an unsupported
+            // bit, for bit 0 clear, for bit 2 without bit 1, and for an `ECX`
+            // other than zero — `XCR0` is the only one that is writable.
+            let pc = xpc();
+            for bad in [
+                0,              // no x87
+                xcr0::SSE,      // still no x87
+                0b111,          // AVX, which this part does not have
+                0b101,          // AVX without SSE
+                1 << 32 | 0b11, // a bit in EDX
+            ] {
+                assert_eq!(exec(&pc, &xsetbv(bad)), Some(13), "{bad:#x}");
+                assert_eq!(pc.cpu.sys().xcr0, xcr0::RESET);
+            }
+            let mut code = args(0b11, 1);
+            code.extend_from_slice(&XSETBV);
+            assert_eq!(exec(&pc, &code), Some(13), "XINUSE is read-only");
+            let mut code = args(0, 2);
+            code.extend_from_slice(&XGETBV);
+            assert_eq!(exec(&pc, &code), Some(13), "and there is no XCR2");
+        }
+
+        #[test]
+        fn xsetbv_is_ring_zero_only_and_xgetbv_is_not() {
+            // The `a_ring_three_program_may_not_touch_the_privileged_
+            // instructions` bring-up, then `xsetbv` in ring 3.
+            let pc = xpc();
+            pc.gdt(3, descriptor(0, 0xffff_ffff, rights::CODE32 | rights::DPL3));
+            pc.gdt(4, descriptor(0, 0xffff_ffff, rights::DATA32 | rights::DPL3));
+            pc.gdt(
+                5,
+                descriptor(
+                    at::TSS,
+                    0x67,
+                    ar::PRESENT | (u32::from(sys_type::TSS32_AVAIL) << 8),
+                ),
+            );
+            pc.write32(at::TSS + tss32::ESP0, at::STACK0);
+            pc.write32(at::TSS + tss32::SS0, 0x10);
+            pc.write(
+                at::CODE0,
+                &[
+                    0xb8, 0x28, 0x00, 0x00, 0x00, 0x0f, 0x00, 0xd8, // ltr 0x28
+                    0x6a, 0x23, 0x68, 0x00, 0xa0, 0x00, 0x00, 0x6a, 0x02, 0x6a, 0x1b, 0x68, 0x00,
+                    0x40, 0x00, 0x00, 0xcf,
+                ],
+            );
+            // Ring 3: xgetbv(0) is fine; xsetbv is #GP(0).
+            let mut ring3 = args(0, 0);
+            ring3.extend_from_slice(&XGETBV);
+            ring3.extend_from_slice(&[0x89, 0xc3]); // mov ebx, eax
+            ring3.extend(xsetbv(3));
+            ring3.push(0xf4);
+            pc.write(at::CODE3, &ring3);
+            assert!(pc.run(200) < 200);
+            assert_eq!(pc.regs().rip, HANDLERS + 13 * 16 + 1, "#GP");
+            assert_eq!(pc.regs().rbx, 1, "XGETBV ran at CPL 3 and read XCR0");
+            assert_eq!(pc.cpu.sys().xcr0, xcr0::RESET);
+        }
+
+        #[test]
+        fn xgetbv_one_reports_which_components_are_not_in_their_init_state() {
+            // *Intel SDM* volume 1 §13.6: `XGETBV` with `ECX = 1` returns
+            // `XCR0 & XINUSE`. This core's `XINUSE` is "differs from the init
+            // configuration", so it is exact.
+            let pc = xpc();
+            let xinuse = |pc: &Pc, prefix: &[u8]| {
+                let mut code = prefix.to_vec();
+                code.extend(args(0, 1));
+                code.extend_from_slice(&XGETBV);
+                assert_eq!(exec(pc, &code), None);
+                pc.regs().rax
+            };
+            assert_eq!(xinuse(&pc, &xsetbv(3)), 0, "nothing used out of reset");
+            assert_eq!(xinuse(&pc, &[0xd9, 0xe8]), 1, "fld1 uses the x87 unit");
+            // pcmpeqd xmm5, xmm5 — all ones.
+            assert_eq!(xinuse(&pc, &[0x66, 0x0f, 0x76, 0xed]), 3);
+            // fninit leaves the registers' contents, so still in use; but
+            // `MXCSR` alone does not count (§13.6).
+            let mut x = X87::new();
+            pc.cpu.set_x87(x);
+            pc.cpu.set_sse(Sse {
+                mxcsr: mxcsr::RESET | mxcsr::FTZ,
+                ..Sse::new()
+            });
+            assert_eq!(xinuse(&pc, &[]), 0);
+            x.control = 0x27f;
+            pc.cpu.set_x87(x);
+            assert_eq!(xinuse(&pc, &[]), 1, "a changed control word is use");
+            // And only the enabled components are reported.
+            assert_eq!(xinuse(&pc, &xsetbv(1)), 1);
+        }
+
+        #[test]
+        fn cpuid_describes_the_feature_set_and_echoes_cr4() {
+            // *Intel SDM* volume 2 `CPUID`: leaf 1 `ECX[26]` XSAVE and
+            // `ECX[27]` OSXSAVE, the latter a copy of `CR4.OSXSAVE`; leaf
+            // `0Dh` the components and sizes.
+            let cpuid = |pc: &Pc, leaf: u32, sub: u32| {
+                let mut code = mov(0, leaf);
+                code.extend(mov(1, sub));
+                code.extend_from_slice(&[0x0f, 0xa2]);
+                assert_eq!(exec(pc, &code), None);
+                let r = pc.regs();
+                (r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32)
+            };
+            let pc = xpc();
+            assert_eq!(cpuid(&pc, 0, 0).0, 0xd, "leaf 0Dh is reachable");
+            let ecx = cpuid(&pc, 1, 0).2;
+            assert_eq!(ecx & (3 << 26), 3 << 26, "XSAVE and OSXSAVE");
+            let mut sys = pc.cpu.sys();
+            sys.cr4 &= !cr4::OSXSAVE;
+            pc.cpu.set_sys(sys);
+            assert_eq!(cpuid(&pc, 1, 0).2 & (3 << 26), 1 << 26, "OSXSAVE is live");
+            sys.cr4 |= cr4::OSXSAVE;
+            pc.cpu.set_sys(sys);
+
+            // Sub-leaf 0: XCR0 may hold x87|SSE; the area for XCR0 = x87 alone
+            // and for everything is the legacy region plus the header.
+            assert_eq!(cpuid(&pc, 0xd, 0), (3, 576, 576, 0));
+            // Sub-leaf 1: XSAVEOPT, XSAVEC and XGETBV(1), not XSAVES.
+            assert_eq!(cpuid(&pc, 0xd, 1), (0b111, 576, 0, 0));
+            // No extended component yet, and 0/1 describe the legacy region.
+            assert_eq!(cpuid(&pc, 0xd, 2), (0, 0, 0, 0));
+            assert_eq!(cpuid(&pc, 0xd, 63), (0, 0, 0, 0));
+            // The leaves between say nothing, with leaf 2's architectural
+            // `AL = 01h`.
+            assert_eq!(cpuid(&pc, 2, 0), (1, 0, 0, 0));
+            for leaf in [3, 4, 7, 0xb, 0xc] {
+                assert_eq!(cpuid(&pc, leaf, 0), (0, 0, 0, 0), "leaf {leaf:#x}");
+            }
+
+            // A part without the feature still stops at leaf 1.
+            let pc = xpc_with(Features::X86_64);
+            assert_eq!(cpuid(&pc, 0, 0).0, 1);
+            assert_eq!(cpuid(&pc, 1, 0).2 & (3 << 26), 0);
+            assert_eq!(cpuid(&pc, 0xd, 0), (0, 0, 0, 0));
+        }
+
+        #[test]
+        fn xsave_and_xrstor_carry_the_x87_and_sse_state_through_memory() {
+            let pc = xpc();
+            distinctive(&pc);
+            let mut code = xsetbv(3);
+            code.extend_from_slice(&X87_CODE);
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP15, 4, AREA)); // xsave
+            assert_eq!(exec(&pc, &code), None);
+            let x87 = pc.cpu.x87();
+            let sse = pc.cpu.sse();
+            assert_eq!(
+                bytes(&pc, AREA + 512, 8),
+                [3, 0, 0, 0, 0, 0, 0, 0],
+                "XSTATE_BV: both in use"
+            );
+            // Wreck both, then restore.
+            pc.cpu.set_x87(X87::new());
+            pc.cpu.set_sse(Sse::new());
+            let mut code = args(u64::MAX, 0);
+            code.extend(mem32(GRP15, 5, AREA)); // xrstor
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(pc.cpu.x87(), x87);
+            let back = pc.cpu.sse();
+            assert_eq!(back.mxcsr, sse.mxcsr);
+            assert_eq!(back.xmm[..8], sse.xmm[..8]);
+        }
+
+        #[test]
+        fn the_legacy_region_is_fxsaves_image_byte_for_byte() {
+            // *Intel SDM* volume 1 §13.4.1: the legacy region "has the same
+            // format as the FXSAVE area". Outside 64-bit mode the SSE
+            // component is `XMM0`-`XMM7` (§13.5.2), so the image agrees up to
+            // byte 288 and `XSAVE` leaves the rest of it alone where `FXSAVE`
+            // writes all sixteen.
+            let pc = xpc();
+            distinctive(&pc);
+            pc.write(AREA2, &[0xaa; 576]);
+            let mut code = xsetbv(3);
+            code.extend_from_slice(&X87_CODE);
+            code.extend(mem32(GRP15, 0, AREA)); // fxsave
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP15, 4, AREA2)); // xsave
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(bytes(&pc, AREA, 288), bytes(&pc, AREA2, 288));
+            assert!(bytes(&pc, AREA2 + 288, 224).iter().all(|&b| b == 0xaa));
+        }
+
+        /// Bring the XSAVE part up into 64-bit mode and run `code` there.
+        fn run64x(pc: &Pc, code: &[u8]) {
+            pc.prepare_long();
+            pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+            pc.write(la::CODE64, code);
+            assert!(pc.run(300) < 300, "the 64-bit program halted");
+            assert!(pc.cpu.sys().sixty_four(), "and did so in 64-bit mode");
+        }
+
+        #[test]
+        fn in_64_bit_mode_both_forms_match_fxsave_and_rex_w_widens_the_pointers() {
+            // `XSAVE64` is `XSAVE` with `REX.W`, and like `FXSAVE64` it writes
+            // the x87 instruction and data pointers as eight bytes each
+            // (*Intel SDM* volume 2, `XSAVE`). Sixteen `XMM` registers here.
+            for rex in [None, Some(REX_W)] {
+                let pc = xpc();
+                distinctive(&pc);
+                // Software zeroes the header before the first save into an
+                // area; a stray bit there would make the restore below #GP.
+                pc.write(AREA2, &[0xaa; 512]);
+                pc.write(AREA2 + 512, &[0; 64]);
+                let mut code = xsetbv(3);
+                code.extend_from_slice(&X87_CODE);
+                code.extend(mem64(rex, GRP15, 0, AREA));
+                code.extend(args(u64::MAX, 0));
+                code.extend(mem64(rex, GRP15, 4, AREA2));
+                // Restore from the XSAVE image into a wrecked unit.
+                code.extend_from_slice(&[0xdb, 0xe3, 0x0f, 0x57, 0xc0]); // fninit ; xorps xmm0
+                code.extend(mem64(rex, GRP15, 5, AREA2));
+                code.push(0xf4);
+                let before_sse = pc.cpu.sse();
+                run64x(&pc, &code);
+                assert_eq!(bytes(&pc, AREA, 416), bytes(&pc, AREA2, 416), "{rex:?}");
+                assert_eq!(pc.cpu.sse().xmm, before_sse.xmm, "all sixteen came back");
+                assert_eq!(
+                    pc.cpu.x87().raw(0),
+                    crate::float::x87::F80::new(0x4000, 0xc90f_daa2_2168_c235)
+                );
+            }
+        }
+
+        #[test]
+        fn a_clear_xstate_bv_bit_restores_the_component_to_its_init_state() {
+            // *Intel SDM* volume 1 §13.8.1: with `RFBM[i] = 1` and
+            // `XSTATE_BV[i] = 0`, `XRSTOR` initialises component `i` and does
+            // not read it from the area. `MXCSR` is loaded from the area in
+            // the standard form whatever `XSTATE_BV` says.
+            let pc = xpc();
+            distinctive(&pc);
+            pc.write(AREA, &[0x55; 576]);
+            pc.write(AREA + 512, &[0; 64]);
+            pc.write32(AREA + 24, u64::from(mxcsr::RESET | mxcsr::DAZ));
+            let mut code = xsetbv(3);
+            code.extend_from_slice(&X87_CODE);
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP15, 5, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(pc.cpu.x87(), X87::new(), "x87 in its init configuration");
+            let sse = pc.cpu.sse();
+            assert!(sse.xmm[..8].iter().all(|r| *r == [0, 0]), "XMM0-7 zero");
+            assert_eq!(sse.mxcsr, mxcsr::RESET | mxcsr::DAZ);
+        }
+
+        #[test]
+        fn rfbm_is_xcr0_and_edx_eax_and_only_its_components_are_touched() {
+            // *Intel SDM* volume 1 §13.7: XSAVE writes component `i` only if
+            // `RFBM[i]`, and `XSTATE_BV` becomes
+            // `(old & !RFBM) | (XINUSE & RFBM)`.
+            let pc = xpc();
+            distinctive(&pc);
+            pc.write(AREA, &[0xaa; 512]);
+            pc.write(AREA + 512, &[0; 64]);
+            pc.write(AREA + 512, &[0x02]); // an old XSTATE_BV naming SSE
+            let mut code = xsetbv(3);
+            code.extend_from_slice(&X87_CODE);
+            code.extend(args(1, 0)); // x87 only
+            code.extend(mem32(GRP15, 4, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            assert_ne!(bytes(&pc, AREA, 2), [0xaa, 0xaa], "FCW written");
+            assert_eq!(bytes(&pc, AREA + 24, 8), [0xaa; 8], "MXCSR not");
+            assert_eq!(bytes(&pc, AREA + 160, 128), [0xaa; 128], "XMM not");
+            assert_eq!(bytes(&pc, AREA + 512, 1), [0x03], "old SSE bit kept");
+
+            // `XCR0` masks too: with x87 alone enabled, asking for everything
+            // gets x87 alone.
+            let pc = xpc();
+            distinctive(&pc);
+            pc.write(AREA, &[0xaa; 576]);
+            let mut code = X87_CODE.to_vec();
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP15, 4, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(bytes(&pc, AREA + 160, 16), [0xaa; 16]);
+            assert_eq!(bytes(&pc, AREA + 512, 1), [0xab], "0xaa & !1 | 1");
+        }
+
+        #[test]
+        fn a_misaligned_area_and_a_reserved_header_bit_are_general_protection() {
+            let pc = xpc();
+            let mut code = xsetbv(3);
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP15, 4, AREA + 16));
+            assert_eq!(exec(&pc, &code), Some(13), "XSAVE: 64-byte alignment");
+            let mut code = args(u64::MAX, 0);
+            code.extend(mem32(GRP15, 5, AREA + 32));
+            assert_eq!(exec(&pc, &code), Some(13), "XRSTOR too");
+
+            // §13.8.1's standard-form checks: XSTATE_BV naming a component
+            // XCR0 does not enable, or bytes 8-23 of the header not zero.
+            distinctive(&pc);
+            let before = (pc.cpu.x87(), pc.cpu.sse());
+            for (at, value) in [(0u64, 0b100u64), (8, 1), (16, 1)] {
+                pc.write(AREA, &[0; 576]);
+                pc.write32(AREA + 24, u64::from(mxcsr::RESET));
+                pc.write32(AREA + 512 + at, value);
+                let mut code = args(u64::MAX, 0);
+                code.extend(mem32(GRP15, 5, AREA));
+                assert_eq!(exec(&pc, &code), Some(13), "header byte {at}");
+                assert_eq!((pc.cpu.x87(), pc.cpu.sse()), before, "nothing restored");
+            }
+            // Bytes 24-63 are not checked in the standard form.
+            pc.write(AREA, &[0; 576]);
+            pc.write32(AREA + 24, u64::from(mxcsr::RESET));
+            pc.write32(AREA + 512 + 40, 0xffff);
+            let mut code = args(u64::MAX, 0);
+            code.extend(mem32(GRP15, 5, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            // A reserved MXCSR bit about to be loaded is #GP(0), as FXRSTOR.
+            pc.write32(AREA + 24, 1 << 31);
+            assert_eq!(exec(&pc, &code), Some(13));
+        }
+
+        #[test]
+        fn a_set_task_switched_flag_makes_them_device_not_available() {
+            // `#NM` with `CR0.TS` set, which is how a lazy context switch
+            // catches the first save or restore.
+            let pc = xpc();
+            let mut sys = pc.cpu.sys();
+            sys.cr0 |= cr0::TS;
+            pc.cpu.set_sys(sys);
+            let mut code = args(u64::MAX, 0);
+            code.extend(mem32(GRP15, 4, AREA));
+            assert_eq!(exec(&pc, &code), Some(7));
+            // XGETBV is not a state instruction and does not care.
+            let mut code = args(0, 0);
+            code.extend_from_slice(&XGETBV);
+            assert_eq!(exec(&pc, &code), None);
+        }
+
+        #[test]
+        fn xsaveopt_saves_exactly_what_xsave_does() {
+            let pc = xpc();
+            distinctive(&pc);
+            let mut code = xsetbv(3);
+            code.extend_from_slice(&X87_CODE);
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP15, 4, AREA));
+            code.extend(mem32(GRP15, 6, AREA2)); // xsaveopt
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(bytes(&pc, AREA, 576), bytes(&pc, AREA2, 576));
+        }
+
+        #[test]
+        fn xsavec_writes_the_compacted_header_and_skips_what_is_unused() {
+            // *Intel SDM* volume 1 §13.10: `XCOMP_BV = RFBM | 1 << 63`,
+            // `XSTATE_BV = RFBM & XINUSE` — with `MXCSR` off its default
+            // counting as SSE in use — and only those components written.
+            let pc = xpc();
+            pc.write(AREA, &[0xaa; 512]);
+            pc.write(AREA + 512, &[0; 64]);
+            let mut code = xsetbv(3);
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP9, 4, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(bytes(&pc, AREA, 512), [0xaa; 512], "nothing in use");
+            let header = bytes(&pc, AREA + 512, 16);
+            assert_eq!(header[..8], [0; 8]);
+            assert_eq!(header[8..], [3, 0, 0, 0, 0, 0, 0, 0x80]);
+
+            // Now with state, and back through XRSTOR's compacted form.
+            distinctive(&pc);
+            let mut code = X87_CODE.to_vec();
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP9, 4, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(bytes(&pc, AREA + 512, 1), [3]);
+            let (x87, sse) = (pc.cpu.x87(), pc.cpu.sse());
+            pc.cpu.set_x87(X87::new());
+            pc.cpu.set_sse(Sse::new());
+            let mut code = args(u64::MAX, 0);
+            code.extend(mem32(GRP15, 5, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(pc.cpu.x87(), x87);
+            assert_eq!(pc.cpu.sse().mxcsr, sse.mxcsr);
+            assert_eq!(pc.cpu.sse().xmm[..8], sse.xmm[..8]);
+
+            // A compacted XSTATE_BV bit that XCOMP_BV does not name, or a
+            // reserved header byte past 16, is #GP(0) (§13.8.2).
+            pc.write(AREA + 520, &[1, 0, 0, 0, 0, 0, 0, 0x80]);
+            assert_eq!(exec(&pc, &code), Some(13));
+            pc.write(AREA + 520, &[3, 0, 0, 0, 0, 0, 0, 0x80]);
+            pc.write(AREA + 560, &[1]);
+            assert_eq!(exec(&pc, &code), Some(13));
+            pc.write(AREA + 560, &[0]);
+            // With XSTATE_BV clear the compacted form resets MXCSR too.
+            pc.write(AREA + 512, &[0]);
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(pc.cpu.sse().mxcsr, mxcsr::RESET);
+            assert_eq!(pc.cpu.x87(), X87::new());
+        }
+
+        #[test]
+        fn xcr0_survives_a_snapshot() {
+            let pc = xpc();
+            assert_eq!(exec(&pc, &xsetbv(3)), None);
+            let sys_before = pc.cpu.sys();
+            assert_eq!(sys_before.xcr0, 3);
+
+            let mut shape = MachineShape::new();
+            shape.add_device("/cpu0", "cpu.x86").unwrap();
+            let mut writer = StateWriter::new(shape);
+            {
+                let mut chunk = writer
+                    .chunk("/cpu0", "cpu.x86", super::super::super::CLASS.version)
+                    .unwrap();
+                pc.cpu.save(&mut chunk).unwrap();
+            }
+            let bytes = writer.to_vec().unwrap();
+            pc.cpu.reset(ResetKind::Cold);
+            assert_eq!(
+                pc.cpu.sys().xcr0,
+                xcr0::RESET,
+                "a reset puts x87 alone back"
+            );
+
+            let reader = StateReader::new(&bytes).unwrap();
+            let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+            let mut chunk = ChunkReader::new(data);
+            pc.cpu.load(&mut chunk).unwrap();
+            chunk.end().unwrap();
+            assert_eq!(pc.cpu.sys(), sys_before);
+        }
+
+        #[test]
+        fn the_disassembler_names_every_form() {
+            let text = |bytes: &[u8]| {
+                let mut b = bytes.to_vec();
+                b.resize(16, 0);
+                let d = crate::cpu::x86::disasm::disassemble_as(
+                    isa::Gen::I386,
+                    isa::Bits::B64,
+                    0,
+                    0,
+                    &b,
+                );
+                alloc::format!("{d}")
+            };
+            assert_eq!(text(&XGETBV), "xgetbv");
+            assert_eq!(text(&XSETBV), "xsetbv");
+            assert!(text(&[0x0f, 0xae, 0x20]).starts_with("xsave "));
+            assert!(text(&[0x48, 0x0f, 0xae, 0x28]).starts_with("xrstor64 "));
+            assert!(text(&[0x0f, 0xae, 0x30]).starts_with("xsaveopt "));
+            assert!(text(&[0x48, 0x0f, 0xc7, 0x20]).starts_with("xsavec64 "));
+            // The rest of `0F 01 /2`'s register forms are not instructions.
+            assert!(!text(&[0x0f, 0x01, 0xd2]).starts_with("lgdt"));
+        }
+    }
 }
 
 /// The x87 unit and the SSE registers, executed as a guest sees them.

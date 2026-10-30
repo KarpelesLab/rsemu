@@ -316,6 +316,10 @@ impl Disassembled {
             // 64-bit image, which has its own mnemonic.
             (Op::FXSAVE, _) if self.fields.rex_w() => "fxsave64",
             (Op::FXRSTOR, _) if self.fields.rex_w() => "fxrstor64",
+            (Op::XSAVE, _) if self.fields.rex_w() => "xsave64",
+            (Op::XRSTOR, _) if self.fields.rex_w() => "xrstor64",
+            (Op::XSAVEOPT, _) if self.fields.rex_w() => "xsaveopt64",
+            (Op::XSAVEC, _) if self.fields.rex_w() => "xsavec64",
             // `0F C7 /1` is `CMPXCHG8B` until `REX.W` doubles every field of
             // it.
             (Op::CMPXCHG8B, _) if self.fields.rex_w() => "cmpxchg16b",

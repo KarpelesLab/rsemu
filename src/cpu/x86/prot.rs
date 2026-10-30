@@ -618,6 +618,39 @@ pub mod cr4 {
     pub const OSFXSR: u64 = 1 << 9;
     /// Unmasked SIMD floating-point exceptions. Storage only, same reason.
     pub const OSXMMEXCPT: u64 = 1 << 10;
+    /// The operating system manages processor state with the XSAVE feature
+    /// set: `XGETBV`, `XSETBV` and the `XSAVE` family are `#UD` without it,
+    /// and `CPUID` leaf 1's `OSXSAVE` bit reads it back live.
+    ///
+    /// Settable only on a part with [`Features::xsave`](crate::cpu::x86::Features::xsave)
+    /// — a write that sets it on any other is `#GP(0)` (*Intel SDM* volume 3
+    /// §2.5 and §2.6), because an operating system reads the bit back through
+    /// `CPUID` and would otherwise be told it has enabled something that does
+    /// not exist.
+    pub const OSXSAVE: u64 = 1 << 18;
+}
+
+/// The bits of `XCR0`, the extended control register that says which state
+/// components the XSAVE feature set manages.
+///
+/// The bit number *is* the state-component number: bit 0 is the x87 state,
+/// bit 1 the SSE state, bit 2 the upper halves of the `YMM` registers, and so
+/// on through the AVX-512 and supervisor components. Only the ones this core
+/// has are named here. *Intel SDM* volume 1 §13.1 and §13.3.
+pub mod xcr0 {
+    /// State component 0: the x87 unit. Architecturally always set — `XSETBV`
+    /// refuses a value with it clear.
+    pub const X87: u64 = 1 << 0;
+    /// State component 1: the `XMM` registers. (`MXCSR` belongs to it too,
+    /// with the twist the `XSAVE` instruction pages spell out: it is saved
+    /// when either this bit or [`AVX`] is requested.)
+    pub const SSE: u64 = 1 << 1;
+    /// State component 2: the upper 128 bits of the sixteen `YMM` registers.
+    /// Named so the `XSETBV` rule that it needs [`SSE`] can be written down;
+    /// no part here has it yet, so setting it is `#GP(0)`.
+    pub const AVX: u64 = 1 << 2;
+    /// What a processor reset leaves in `XCR0`: the x87 state alone.
+    pub const RESET: u64 = X87;
 }
 
 /// The bits of `IA32_EFER`, the register long mode is armed from.
@@ -1020,6 +1053,14 @@ pub struct Sys {
     pub cstar: u64,
     /// `IA32_FMASK`: the flags `SYSCALL` clears.
     pub sfmask: u64,
+    /// `XCR0`: which state components the XSAVE feature set manages. See
+    /// [`xcr0`] for its bits.
+    ///
+    /// Here rather than with the floating-point state because it is a
+    /// *control* register — written only at `CPL` 0 by `XSETBV`, and part of
+    /// what a reset puts back — and it has the value [`xcr0::RESET`] on every
+    /// part, including those without the feature, where nothing can read it.
+    pub xcr0: u64,
     /// The eight variable memory-type ranges, as base/mask **pairs** in the
     /// order the model-specific registers appear: index `2n` is range `n`'s
     /// `PHYSBASE` and `2n + 1` its `PHYSMASK`.
@@ -1086,6 +1127,7 @@ impl Sys {
             lstar: 0,
             cstar: 0,
             sfmask: 0,
+            xcr0: xcr0::RESET,
             // The variable and fixed ranges are architecturally *undefined*
             // out of reset and `IA32_MTRR_DEF_TYPE` is not: its enable bit is
             // clear, which is what makes the undefined ranges harmless and
@@ -3287,7 +3329,15 @@ impl Exec<'_> {
                     | cr4::PGE
                     | cr4::PCE
                     | cr4::OSFXSR
-                    | cr4::OSXMMEXCPT;
+                    | cr4::OSXMMEXCPT
+                    | cr4::OSXSAVE;
+                // Unlike the bits above, `OSXSAVE` on a part without the XSAVE
+                // feature set is refused rather than dropped: it is a reserved
+                // bit there, and a reserved `CR4` bit is `#GP(0)` (*Intel SDM*
+                // volume 3 §2.5).
+                if value & cr4::OSXSAVE != 0 && !self.cfg.features.xsave {
+                    return Err(Fault::gp(0));
+                }
                 let new = value & valid;
                 // `CR4.PAE` cannot be cleared while long mode is active: the
                 // page tables under the processor's feet would change shape.

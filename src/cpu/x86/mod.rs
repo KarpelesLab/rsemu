@@ -88,6 +88,14 @@
 //! an SSE instruction is `#UD`, and without the second an unmasked SIMD
 //! exception is `#UD` rather than `#XM`.
 //!
+//! **The XSAVE feature set** (`xsave`, off in every preset): `XCR0` with
+//! `XGETBV`/`XSETBV`, `CR4.OSXSAVE` and its live echo in `CPUID` leaf 1, leaf
+//! `0Dh`'s enumeration, and `XSAVE`, `XSAVEOPT`, `XSAVEC` and `XRSTOR` (both
+//! formats) over the x87 and SSE components, with the header rules and the
+//! init optimisation. `XGETBV` with `ECX = 1` reports an exact `XINUSE`.
+//! The components above the legacy region are one table, which is where AVX's
+//! `YMM` upper halves will go. See `xsave.rs`.
+//!
 //! **MMX** (`mmx`): the eight `MM` registers, which are the significands of
 //! the eight x87 registers rather than storage of their own, with the
 //! architectural side effects of that aliasing — every MMX instruction sets
@@ -153,8 +161,10 @@
 //!   the chipset to IRQ 13, and no wire models that, so the exception stays
 //!   pending instead of being delivered down a path that does not exist.
 //! - **No SSE3 beyond `FISTTP`**, which [`Features::sse3`] admits without
-//!   `CPUID` claiming the extension; no SSSE3 or later, no AVX, and no
-//!   `XSAVE`.
+//!   `CPUID` claiming the extension; no SSSE3 or later, and no AVX.
+//! - **No `XSAVES`/`XRSTORS`**, and so no `IA32_XSS`: they exist for
+//!   supervisor state components, and there are none to save. `CPUID` leaf
+//!   `0Dh` says so.
 //! - **No hardware task switching in long mode**, which is the architecture:
 //!   a far transfer to a task gate or a task state segment is `#GP` there, and
 //!   the 64-bit task state segment is read only for its stack pointers.
@@ -343,6 +353,7 @@ pub mod isa;
 mod mmx;
 pub mod paging;
 pub mod prot;
+mod xsave;
 
 #[cfg(test)]
 mod tests;
@@ -631,6 +642,16 @@ pub struct Features {
     /// as the architecture says rather than executing an instruction it never
     /// had.
     pub sse3: bool,
+    /// The XSAVE feature set: `XCR0`, `CR4.OSXSAVE`, `XGETBV`/`XSETBV`, and
+    /// `XSAVE`, `XSAVEOPT`, `XSAVEC` and `XRSTOR` over the state components
+    /// `XCR0` enables (*Intel SDM* volume 1 chapter 13).
+    ///
+    /// Requires [`sse`](Features::sse) — the area's first 512 bytes *are*
+    /// `FXSAVE`'s image, x87 and SSE state together — and
+    /// [`cr4`](Features::cr4), where `OSXSAVE` lives. Off in
+    /// [`X86_64`](Features::X86_64) because the AMD64 baseline predates it by
+    /// years; it is the prerequisite AVX is built on.
+    pub xsave: bool,
 }
 
 impl Features {
@@ -654,6 +675,7 @@ impl Features {
         sse2: false,
         mmx: false,
         sse3: false,
+        xsave: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -702,6 +724,7 @@ impl Features {
         sse2: true,
         mmx: true,
         sse3: false,
+        xsave: false,
     };
 
     /// Whether this combination describes a part that could exist.
@@ -774,6 +797,13 @@ impl Features {
         }
         if self.fxsr && !self.cr4 {
             return missing("cr4", "fxsr");
+        }
+        if self.xsave && !self.sse {
+            // The XSAVE area's legacy region is `FXSAVE`'s image, and `XCR0`
+            // bit 1 — which every operating system that turns on `OSXSAVE`
+            // sets — names the `XMM` registers. (`cr4` follows through `sse`,
+            // and `sse` brings `fxsr`.)
+            return missing("sse", "xsave");
         }
         if self.long && !self.sse2 {
             // Not an implementation limit: every x86-64 part has SSE2, the
@@ -2478,7 +2508,7 @@ impl X86 {
         let mut features = variant.features();
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
-            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3",
+            "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "xsave",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2501,6 +2531,7 @@ impl X86 {
                 "sse" => features.sse = on,
                 "mmx" => features.mmx = on,
                 "sse2" => features.sse2 = on,
+                "xsave" => features.xsave = on,
                 _ => features.sse3 = on,
             }
         }
@@ -3617,7 +3648,9 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    variable base/mask pairs and the eleven fixed ranges. Guest-visible
     //    because a guest reads back what it wrote, and appended, so every
     //    offset below it is unchanged.
-    version: 8,
+    // 9: `XCR0`, appended. Guest-visible through `XGETBV` and through the
+    //    size `CPUID` leaf `0Dh` reports.
+    version: 9,
     summary: "Intel x86 CPU core: 8086/8088 real mode, 80386/80486 protected mode, or x86-64",
     properties: &[
         PropertySpec {
@@ -3721,6 +3754,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: the double-precision and packed-integer SIMD",
+        },
+        PropertySpec {
+            name: "xsave",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: XSAVE/XRSTOR, XGETBV/XSETBV, XCR0 and CR4.OSXSAVE",
         },
         PropertySpec {
             name: "model",
@@ -4097,6 +4136,10 @@ impl Device for X86 {
         for value in state.sys.mtrr_fix {
             w.write_u64(value)?;
         }
+        // `XCR0`, appended for the same reason again, and written whatever
+        // `Features::xsave` says: on a part without the feature it holds its
+        // reset value and nothing can change it.
+        w.write_u64(state.sys.xcr0)?;
         Ok(())
     }
 
@@ -4263,6 +4306,7 @@ impl Device for X86 {
         for i in 0..state.sys.mtrr_fix.len() {
             state.sys.mtrr_fix[i] = r.read_u64()?;
         }
+        state.sys.xcr0 = r.read_u64()?;
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been
