@@ -53,9 +53,17 @@
 //! `Exec::xmm_src1`, and then have the upper half cleared here.
 //!
 //! What crosses lanes is written here: the length-changing conversions
-//! (`VCVTPS2PD ymm, xmm/m128` and its converses), the broadcasts,
-//! `VINSERTF128`, `VEXTRACTF128`, `VPERM2F128`, the masked moves, and the
-//! flag-setting tests.
+//! (`VCVTPS2PD ymm, xmm/m128` and its converses, F16C's two), the
+//! broadcasts, the 128-bit inserts, extracts and permutes, AVX2's
+//! `VPERMD`/`VPERMQ` family, the masked moves, the gathers, `VPMOVMSKB`,
+//! and the flag-setting tests. AVX2's 256-bit integer forms and the FMA
+//! family are lane-wise and go through [`lane_op`]; the few lane-wise
+//! operations whose upper lane needs a different second source — a shift
+//! count, a widening move's next elements — get it from [`Exec::vex_lanes`].
+//!
+//! The AVX2, FMA and F16C instructions are gated on their own bits before
+//! AVX's gate is asked, and AVX2 twice: by the instructions it added and by
+//! the `VEX.256` forms of the integer ones (`VexLen::Avx2`).
 //!
 //! # Sources
 //!
