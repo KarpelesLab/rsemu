@@ -4349,6 +4349,48 @@ mod long_mode {
         assert_ne!(ecx8 & 1, 0, "CPUID.80000001H:ECX.LAHF-SAHF");
     }
 
+    /// `CPUID` with `EAX = leaf` and `ECX = sub` on a part with `features`,
+    /// in 64-bit mode: `(EAX, EBX, ECX, EDX)`.
+    fn cpuid64(features: Features, leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
+        let mut code = alloc::vec![0xb8];
+        code.extend_from_slice(&leaf.to_le_bytes());
+        code.push(0xb9);
+        code.extend_from_slice(&sub.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0xa2, 0xf4]);
+        let pc = run64_on(Pc::with_features(Variant::X86_64, features), 0, &code);
+        let r = pc.regs();
+        (r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32)
+    }
+
+    #[test]
+    fn leaf_7_is_reachable_exactly_when_something_needs_it() {
+        use crate::cpu::x86::exec::structured_extended;
+        // *Intel SDM* volume 2, `CPUID`, table 3-8, leaf 07H: sub-leaf 0's
+        // `EAX` is the highest sub-leaf, and `EBX`/`ECX`/`EDX` the feature
+        // bits, built from the lattice by one function the maximum asks too.
+        let v2 = Features::X86_64_V2;
+        let xsave = Features { xsave: true, ..v2 };
+        for features in [Features::X86_64, v2, xsave] {
+            let (b, c, d) = structured_extended(features);
+            let max = cpuid64(features, 0, 0).0;
+            let expected = if features.xsave {
+                0xd
+            } else if (b, c, d) != (0, 0, 0) {
+                7
+            } else {
+                1
+            };
+            assert_eq!(max, expected, "{features:?}");
+            let leaf7 = if max >= 7 { (0, b, c, d) } else { (0, 0, 0, 0) };
+            assert_eq!(cpuid64(features, 7, 0), leaf7);
+            // Sub-leaf 1 is past the maximum sub-leaf and says nothing.
+            assert_eq!(cpuid64(features, 7, 1), (0, 0, 0, 0));
+        }
+        // No extension in this core lives in leaf 7 yet, so no part raises
+        // the maximum for it: the baseline and v2 still stop at leaf 1.
+        assert_eq!(cpuid64(v2, 0, 0).0, 1);
+    }
+
     #[test]
     fn movnti_with_rex_w_stores_all_eight_bytes() {
         // mov rax, imm64 ; movnti [MARK], rax ; movnti [MARK+8], eax ; hlt

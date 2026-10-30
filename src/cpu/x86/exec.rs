@@ -4205,9 +4205,19 @@ impl<'a> Exec<'a> {
         // leaf above the maximum is not one software may read — so a part with
         // XSAVE reports thirteen, and every leaf between 2 and `0Ch` answers
         // below with what it means when this core has nothing to say.
-        let max_basic: u32 = if features.xsave { 0xd } else { 1 };
+        //
+        // Without XSAVE the maximum is the highest leaf that has something to
+        // say: 7 when any structured extended feature is present, 1 otherwise.
         let leaf = self.state.regs.rax as u32;
         let subleaf = self.state.regs.rcx as u32;
+        let leaf7 = structured_extended(features);
+        let max_basic: u32 = if features.xsave {
+            0xd
+        } else if leaf7 != (0, 0, 0) {
+            7
+        } else {
+            1
+        };
         let xsave_leaf = self.cpuid_xsave(subleaf);
         let regs = &mut self.state.regs;
         let mut set = |a: u32, b: u32, c: u32, d: u32| {
@@ -4232,6 +4242,18 @@ impl<'a> Exec<'a> {
             // descriptor, which is a well-formed answer meaning "nothing to
             // report" rather than a malformed one.
             2 if leaf <= max_basic => set(1, 0, 0, 0),
+            // Leaf 7, the structured extended features. `ECX` selects the
+            // sub-leaf; sub-leaf 0's `EAX` is the highest sub-leaf, and with
+            // that zero every other sub-leaf is reserved and answers zero
+            // (*Intel SDM* volume 2, `CPUID`, table 3-8, leaf 07H).
+            7 if leaf <= max_basic => {
+                if subleaf == 0 {
+                    let (b, c, d) = leaf7;
+                    set(0, b, c, d);
+                } else {
+                    set(0, 0, 0, 0);
+                }
+            }
             0xd if leaf <= max_basic => {
                 let (a, b, c, d) = xsave_leaf;
                 set(a, b, c, d);
@@ -4297,8 +4319,7 @@ impl<'a> Exec<'a> {
             // XSAVE has to answer. All zero is what each of them says on a
             // part without the feature it describes: 4's cache type 0 is "no
             // more caches", 5 advertises no `MONITOR` line size, 6 no thermal
-            // or power features, 7 sub-leaf 0 a maximum sub-leaf of zero and
-            // no structured extended features, `0Ah` architectural
+            // or power features, `0Ah` architectural
             // performance monitoring version 0 (none), and `0Bh` an `EBX` of
             // zero, which is the SDM's own test for "leaf `0Bh` not
             // supported" — so topology enumeration falls back to leaves 1 and
@@ -4308,4 +4329,25 @@ impl<'a> Exec<'a> {
         }
         Ok(())
     }
+}
+
+/// `CPUID` leaf 7 sub-leaf 0's feature registers, `(EBX, ECX, EDX)`,
+/// assembled from the lattice one bit at a time.
+///
+/// The leaf where the extensions after SSE4.2 announce themselves (*Intel
+/// SDM* volume 2, `CPUID`, table 3-8, "Structured Extended Feature Flags
+/// Enumeration Leaf"). It is a function of [`Features`](super::Features) alone
+/// so that the maximum basic leaf can ask whether there is anything to say:
+/// a leaf that would answer all zero is not worth raising the maximum for.
+/// Each extension that lives here adds its line — `BMI1` is `EBX[3]`, `AVX2`
+/// `EBX[5]`, `BMI2` `EBX[8]` — and none of them is implemented yet, so
+/// nothing sets a bit today. (`MOVBE` and `LZCNT` are older and live in
+/// leaves 1 and `8000_0001`.)
+pub(super) fn structured_extended(features: super::Features) -> (u32, u32, u32) {
+    let ebx: u32 = 0;
+    let ecx: u32 = 0;
+    let edx: u32 = 0;
+    // Read by the lines above once there are any.
+    let _ = features;
+    (ebx, ecx, edx)
 }
