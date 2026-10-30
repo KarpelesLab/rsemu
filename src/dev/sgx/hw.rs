@@ -232,6 +232,8 @@ struct Poll {
 #[derive(Debug, Default)]
 struct Diag {
     launches: u64,
+    /// Timer events, logged apart so that they do not drown the rest.
+    timers: u64,
     stops: u64,
     regs: BTreeSet<(bool, u32)>,
     forced: BTreeSet<u32>,
@@ -546,10 +548,17 @@ impl Engine {
                 let busy = self.cores.iter().filter(|c| !c.idle()).count();
                 shared.note(&format!("sgx: soft reset ({busy} busy cores dropped)\n"));
             }
-            *self = Engine {
+            // The attribute stores survive: a warm restart skips reloading
+            // the secondary attributes (`EVENTS.md` §2) \[G\].
+            let mut fresh = Engine {
                 diag: core::mem::take(&mut self.diag),
                 ..Engine::default()
             };
+            for (new, old) in fresh.cores.iter_mut().zip(&mut self.cores) {
+                new.sa = core::mem::take(&mut old.sa);
+                new.persist = old.persist;
+            }
+            *self = fresh;
         }
         let (directory, codebases, timer_on) = {
             let s = shared.state.lock();
@@ -764,7 +773,12 @@ impl Engine {
         let (tasks, lost) = (core::mem::take(&mut ctx.tasks), ctx.lost);
         c.persist[0].copy_from_slice(&pds.ds[0][pds::PERSISTENT..]);
         c.persist[1].copy_from_slice(&pds.ds[1][pds::PERSISTENT..]);
-        if shared.log.is_some() && Diag::thin(&mut self.diag.launches) {
+        let counter = if launch.ir == [IR0_TIMER, 0, 0] {
+            &mut self.diag.timers
+        } else {
+            &mut self.diag.launches
+        };
+        if shared.log.is_some() && Diag::thin(counter) {
             let entries: Vec<String> = tasks
                 .iter()
                 .map(|t| format!("{:#010x}", t.usse.address_of(t.usse.pc)))

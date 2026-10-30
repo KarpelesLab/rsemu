@@ -33,7 +33,8 @@
 //! Migrations are for snapshots that exist, and writing one costs more than it
 //! looks. Of the 97 classes an all-features build registers, **eighteen ship
 //! above v1 with no step behind them** — 35 single-version hops, the deepest
-//! being `cpu.x86` at v8 and `cpu.i8086` at v6, then `cpu.mos6502` and
+//! being `cpu.x86` at v8 (the count when this was written; its v8 → v10
+//! hops since have steps, under the rule below) and `cpu.i8086` at v6, then `cpu.mos6502` and
 //! `nes.ppu` at v4. Writing those 35 is not the obvious good it sounds like.
 //!
 //! Two things have to be true before a step is worth having, and the second is
@@ -106,6 +107,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::dev::apu::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::migrations(&mut migrations)?;
+    #[cfg(feature = "cpu-x86")]
+    crate::cpu::x86::migrations(&mut migrations)?;
     Ok(migrations)
 }
 
@@ -125,6 +128,8 @@ mod tests {
         crate::dev::stm32::octospi::CLASS_NAME,
         #[cfg(feature = "cpu-arm-aprofile")]
         "cpu.arm",
+        #[cfg(feature = "cpu-x86")]
+        "cpu.x86",
     ];
 
     #[test]

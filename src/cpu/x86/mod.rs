@@ -4224,6 +4224,41 @@ pub fn register(reg: &mut Registry) -> Result<()> {
     reg.add(&I8086_CLASS)
 }
 
+/// The steps that carry an older `cpu.x86` chunk to this one.
+///
+/// Both hops so far only *appended*, which is why they can be written
+/// faithfully rather than reconstructed: the old body is the new body's
+/// prefix, byte for byte, and each step adds what the field it introduced
+/// holds on a part that never touched it.
+///
+/// - **v8 → v9**, the XSAVE feature set: `XCR0`, at its reset value of 1
+///   (x87 enabled, nothing else — *Intel SDM* volume 1 §13.3). A v8 snapshot
+///   came from a build with no `XSETBV`, so nothing could have changed it.
+/// - **v9 → v10**, AVX: the sixteen `YMM` upper halves, zero. A v9 build had
+///   no VEX encoding, so no instruction could have written them.
+///
+/// `cpu.i8086` shares the encoding but is not bumped alongside, as it was
+/// not for the `MTRR` appends before these; it has no step here.
+///
+/// # Errors
+///
+/// If a step is already registered for this class.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS.name, 8, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_u64(prot::xcr0::X87)
+    })?;
+    migrations.register(CLASS.name, 9, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        for _ in 0..32 {
+            out.write_u64(0)?;
+        }
+        Ok(())
+    })
+}
+
 impl Device for X86 {
     fn class(&self) -> &'static DeviceClass {
         self.class

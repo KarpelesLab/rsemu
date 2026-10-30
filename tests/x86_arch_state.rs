@@ -712,9 +712,11 @@ fn the_chunk_is_the_same_bytes_whichever_engine_wrote_it() {
 /// an AVX register file is new chunk bytes.
 #[test]
 fn the_processors_chunk_version_is_unchanged_by_the_widened_model() {
+    // v9 (`XCR0`) and v10 (the `YMM` upper halves) came with XSAVE and AVX,
+    // as predicted above, each with its step in `cpu::x86::migrations`.
     assert_eq!(
         rsemu::cpu::x86::CLASS.version,
-        8,
+        10,
         "the cpu.x86 chunk grew. `CLAUDE.md` and `src/machine/migrate.rs`: bump \
          the class version *and* register the migration step in the same commit, \
          and add it to `default_migrations`"

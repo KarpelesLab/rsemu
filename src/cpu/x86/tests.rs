@@ -1122,6 +1122,49 @@ fn a_machine_file_names_the_core_gives_it_two_spaces_and_it_runs() {
     );
 }
 
+/// A `cpu.x86` chunk from before XSAVE (v8) and from before AVX (v9)
+/// migrates to exactly what this build writes for the same processor.
+///
+/// Both hops appended to the end of the chunk, so the older encodings are this
+/// one's prefix — which is what makes the fixture honest rather than a second
+/// reading of the same belief: v9 is the v10 bytes less the `YMM` upper halves,
+/// v8 those less `XCR0`, and the steps must put back exactly what a processor
+/// that never had the instructions would hold.
+#[test]
+fn an_older_chunk_migrates_to_what_this_build_writes() {
+    use crate::core::state::StateReader;
+    use alloc::borrow::Cow;
+    let m = machine();
+    m.set_regs(|r| {
+        r.rax = 0x1234;
+        r.rbx = 0x5678;
+    });
+    let mut shape = MachineShape::new();
+    shape.add_device("/cpu0", "cpu.x86").unwrap();
+    let mut writer = StateWriter::new(shape);
+    {
+        let mut chunk = writer
+            .chunk("/cpu0", "cpu.x86", super::CLASS.version)
+            .unwrap();
+        m.cpu.save(&mut chunk).unwrap();
+    }
+    let bytes = writer.to_vec().unwrap();
+    let reader = StateReader::new(&bytes).unwrap();
+    let (_, version, v10) = reader.load_raw("/cpu0").unwrap();
+    assert_eq!(version, 10);
+    let v9 = &v10[..v10.len() - 16 * 16];
+    let v8 = &v9[..v9.len() - 8];
+
+    let table = crate::machine::default_migrations().unwrap();
+    assert_eq!(table.steps_for("cpu.x86"), alloc::vec![8, 9]);
+    for (from, old) in [(8, v8), (9, v9)] {
+        let up = table
+            .upgrade("cpu.x86", from, 10, Cow::Borrowed(old))
+            .unwrap_or_else(|e| panic!("v{from} does not upgrade: {e}"));
+        assert_eq!(&*up, v10, "v{from} migrates to this build's bytes");
+    }
+}
+
 #[test]
 fn state_round_trips_through_a_snapshot() {
     let m = machine();
