@@ -160,8 +160,9 @@
 //!   with `CR0.NE` set; with it clear a real PC routes the exception through
 //!   the chipset to IRQ 13, and no wire models that, so the exception stays
 //!   pending instead of being delivered down a path that does not exist.
-//! - **No SSE3 beyond `FISTTP`**, which [`Features::sse3`] admits without
-//!   `CPUID` claiming the extension; no SSSE3 or later, and no AVX.
+//! - **No `MONITOR`/`MWAIT`**: SSE3 is here otherwise ([`Features::sse3`]),
+//!   and those two raise `#UD` with their own `CPUID` bit clear. No SSSE3 or
+//!   later, and no AVX.
 //! - **No `XSAVES`/`XRSTORS`**, and so no `IA32_XSS`: they exist for
 //!   supervisor state components, and there are none to save. `CPUID` leaf
 //!   `0Dh` says so.
@@ -353,6 +354,7 @@ pub mod isa;
 mod mmx;
 pub mod paging;
 pub mod prot;
+mod simd;
 mod xsave;
 
 #[cfg(test)]
@@ -630,17 +632,15 @@ pub struct Features {
     /// SSE without MMX. A Pentium MMX, a Pentium II and everything later has
     /// it; a Pentium Pro and everything earlier does not.
     pub mmx: bool,
-    /// SSE3 — of which only `FISTTP`, the truncating x87 integer store, is
-    /// implemented. Requires [`sse2`](Features::sse2).
+    /// SSE3: the horizontal and alternating arithmetic (`HADDPS`, `HSUBPD`,
+    /// `ADDSUBPS` and their siblings), the duplicating loads (`MOVDDUP`,
+    /// `MOVSLDUP`, `MOVSHDUP`), `LDDQU`, and `FISTTP`, the truncating x87
+    /// integer store. `CPUID.01H:ECX[0]`. Requires [`sse2`](Features::sse2).
     ///
-    /// Off in every preset, and **not** reported by `CPUID` even when on:
-    /// leaf 1's `ECX.SSE3` promises the whole extension — `HADDPS`,
-    /// `MOVDDUP`, `LDDQU`, `MONITOR`/`MWAIT` and the rest — and a guest that
-    /// read the bit would use them. The flag exists so a machine description
-    /// can admit `FISTTP` for software that executes it unconditionally (or
-    /// that probed a different part), and so a part without it raises `#UD`
-    /// as the architecture says rather than executing an instruction it never
-    /// had.
+    /// `MONITOR` and `MWAIT` are SSE3's too and are **not** here: they raise
+    /// `#UD`, and the separate bit that announces them, `CPUID.01H:ECX[3]`,
+    /// stays clear — a guest asks that bit rather than the SSE3 one before
+    /// using them (*Intel SDM* volume 2, `MONITOR`).
     pub sse3: bool,
     /// The XSAVE feature set: `XCR0`, `CR4.OSXSAVE`, `XGETBV`/`XSETBV`, and
     /// `XSAVE`, `XSAVEOPT`, `XSAVEC` and `XRSTOR` over the state components

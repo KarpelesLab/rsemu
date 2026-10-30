@@ -1215,6 +1215,16 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("MOVNTQ", "movntq"),
     ("MOVQ2DQ", "movq2dq"),
     ("PSHUFW", "pshufw"),
+    ("ADDSUBPD", "addsubpd"),
+    ("ADDSUBPS", "addsubps"),
+    ("HADDPD", "haddpd"),
+    ("HADDPS", "haddps"),
+    ("HSUBPD", "hsubpd"),
+    ("HSUBPS", "hsubps"),
+    ("LDDQU", "lddqu"),
+    ("MOVDDUP", "movddup"),
+    ("MOVSHDUP", "movshdup"),
+    ("MOVSLDUP", "movsldup"),
 ];
 
 define_ops! {
@@ -1709,6 +1719,18 @@ define_ops! {
     MOVNTQ = "store an MM register bypassing the cache",
     MOVQ2DQ = "move an MM register to the low quadword of an XMM register, zeroing the rest",
     PSHUFW = "permute four words under an immediate",
+
+    // ---- SSE3 ------------------------------------------------------------
+    ADDSUBPD = "subtract the low doubles and add the high ones",
+    ADDSUBPS = "subtract the even singles and add the odd ones",
+    HADDPD = "add the two doubles within each operand",
+    HADDPS = "add adjacent pairs of singles within each operand",
+    HSUBPD = "subtract the high double from the low within each operand",
+    HSUBPS = "subtract each odd single from the even one below it, within each operand",
+    LDDQU = "load an unaligned double quadword (memory only)",
+    MOVDDUP = "load one double into both halves",
+    MOVSHDUP = "duplicate the odd singles into the even lanes below them",
+    MOVSLDUP = "duplicate the even singles into the odd lanes above them",
 }
 
 impl Op {
@@ -2270,6 +2292,10 @@ impl Op {
     /// [`Op::is_sse`] plus the five that share its opcode group without being
     /// SSE arithmetic: the two save/restore instructions and the three fences,
     /// each of which has its own gating rule.
+    ///
+    /// The SIMD members of the later extensions ([`Op::extension`]) are here
+    /// too: they are SSE instructions in everything but their `CPUID` bit,
+    /// with the same `CR0`/`CR4` gates and the same `MXCSR`.
     #[must_use]
     pub const fn is_simd(self) -> bool {
         self.is_sse()
@@ -2277,6 +2303,34 @@ impl Op {
                 self,
                 Op::FXSAVE | Op::FXRSTOR | Op::LFENCE | Op::MFENCE | Op::SFENCE
             )
+            || (self.extension().is_some() && !self.is_x87())
+    }
+
+    /// Which post-SSE2 extension this operation arrived with, if any.
+    ///
+    /// The gate for everything SSE3 and later is one `CPUID` bit per
+    /// extension and a `#UD` without it (*Intel SDM* volume 2, each
+    /// instruction's "CPUID Feature Flag" column), so the extension is a
+    /// property of the operation, listed once, and the executor asks this
+    /// rather than keeping lists of its own. `FISTTP` is SSE3's despite being
+    /// an x87 store, which is why [`Op::is_simd`] excludes the x87 members.
+    #[must_use]
+    pub const fn extension(self) -> Option<Extension> {
+        let ext = match self {
+            Op::FISTTP
+            | Op::ADDSUBPD
+            | Op::ADDSUBPS
+            | Op::HADDPD
+            | Op::HADDPS
+            | Op::HSUBPD
+            | Op::HSUBPS
+            | Op::LDDQU
+            | Op::MOVDDUP
+            | Op::MOVSHDUP
+            | Op::MOVSLDUP => Extension::Sse3,
+            _ => return None,
+        };
+        Some(ext)
     }
 
     /// Internal execution clocks, excluding every bus transfer.
@@ -2424,6 +2478,18 @@ impl fmt::Display for Op {
     }
 }
 
+/// An instruction-set extension past SSE2, each with its own `CPUID` bit.
+///
+/// What [`Op::extension`] answers. The earlier extensions are `Features`
+/// fields with gating of their own that predates this list — MMX, SSE and
+/// SSE2 are threaded through the decoder's operand kinds — and stay that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Extension {
+    /// SSE3: `CPUID.01H:ECX[0]`.
+    Sse3,
+}
+
 /// One row of the instruction description: everything known about an encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Insn {
@@ -2545,6 +2611,15 @@ impl Insn {
             Some(w) => Some(w),
             None => self.src.width_bytes(osz),
         }
+    }
+
+    /// Which post-SSE2 extension this row belongs to, if any.
+    ///
+    /// [`Op::extension`], asked of the row because the answer can depend on
+    /// the encoding as well as the operation.
+    #[must_use]
+    pub const fn extension(self) -> Option<Extension> {
+        self.op.extension()
     }
 
     /// Whether this encoding is a prefix rather than an instruction.
@@ -3417,6 +3492,10 @@ const SECONDARY_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x76 PCMPEQD    Vx Wx None   Documented;
     0x7e MOVD     Ey Vx None   Documented;
     0x7f MOVDQA   Wx Vx None   Documented;
+    // SSE3's packed-double half.
+    0x7c HADDPD   Vx Wx None   Documented;
+    0x7d HSUBPD   Vx Wx None   Documented;
+    0xd0 ADDSUBPD Vx Wx None   Documented;
     0xc2 CMPPD    Vx Wx +Ib None Documented;
     // `MOVNTI` is an `NP` encoding: a mandatory-prefix byte in front of it
     // makes it invalid (*Intel SDM* volume 2 §3.1.1.1).
@@ -3488,6 +3567,10 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
 
     0x10 MOVSS     Vx Wd None Documented;
     0x11 MOVSS     Wd Vx None Documented;
+    // SSE3's two duplicating loads. A full register in, so no `ModAlt`: the
+    // register form is the same instruction, not `MOVHLPS`.
+    0x12 MOVSLDUP  Vx Wx None Documented;
+    0x16 MOVSHDUP  Vx Wx None Documented;
     0x2a CVTSI2SS  Vx Ey None Documented;
     0x2b UD        None None None Undefined;
     0x2c CVTTSS2SI Gy Wd None Documented;
@@ -3531,6 +3614,15 @@ const SECONDARY_F2: ([Insn; 256], [bool; 256]) = opmap! {
 
     0x10 MOVSD     Vx Wq None Documented;
     0x11 MOVSD     Wq Vx None Documented;
+    // SSE3. `MOVDDUP` reads one double, so its memory form is a quadword.
+    0x12 MOVDDUP   Vx Wq None Documented;
+    0x7c HADDPS    Vx Wx None Documented;
+    0x7d HSUBPS    Vx Wx None Documented;
+    0xd0 ADDSUBPS  Vx Wx None Documented;
+    // Intel writes the source `Mx`: memory only, and unaligned by design —
+    // it is the load for data that straddles a cache line. `Wx` so the
+    // register form decodes to something the executor refuses with `#UD`.
+    0xf0 LDDQU     Vx Wx None Documented;
     0x2a CVTSI2SD  Vx Ey None Documented;
     0x2b UD        None None None Undefined;
     0x2c CVTTSD2SI Gy Wq None Documented;

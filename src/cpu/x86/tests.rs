@@ -7009,7 +7009,8 @@ mod fp {
         }
     }
 
-    /// A long-mode-class part with `Features::sse3` on, in protected mode.
+    /// A long-mode-class part with `Features::sse3` on, in protected mode
+    /// with `CR4.OSFXSR` set.
     fn sse3pc() -> Pc {
         let pc = Pc::with_features(
             Variant::X86_64,
@@ -7019,6 +7020,9 @@ mod fp {
             },
         );
         pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+        pc.cpu.set_sys(sys);
         pc
     }
 
@@ -7066,7 +7070,7 @@ mod fp {
     }
 
     #[test]
-    fn fisttp_is_undefined_without_sse3_and_sse3_is_not_advertised() {
+    fn fisttp_is_undefined_without_sse3_and_cpuid_reports_sse3_with_it() {
         // A 486 has no SSE3: `DB /1` raises #UD, and before `CR0.TS` or a
         // pending exception would have been looked at.
         let pc = x87pc();
@@ -7078,11 +7082,13 @@ mod fp {
         run(&pc, &code);
         assert_eq!(pc.regs().rip, HANDLED, "#UD for FISTTP");
 
-        // With the flag on, CPUID still does not claim the extension, of
-        // which FISTTP is the only part implemented.
+        // With the flag on, CPUID claims the extension, which is all here
+        // but MONITOR/MWAIT — and those have their own bit, which stays
+        // clear.
         let pc = sse3pc();
         run(&pc, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0xf4]);
-        assert_eq!(pc.regs().rcx & 1, 0, "CPUID.1:ECX.SSE3 stays clear");
+        assert_eq!(pc.regs().rcx & 1, 1, "CPUID.1:ECX.SSE3");
+        assert_eq!(pc.regs().rcx & (1 << 3), 0, "CPUID.1:ECX.MONITOR");
 
         // An SSE3 flag needs SSE2 under it.
         let impossible = Features {
@@ -7090,6 +7096,161 @@ mod fp {
             ..Features::I80486
         };
         assert!(impossible.validate().is_err());
+    }
+
+    /// Store sixteen bytes as two little-endian quadwords.
+    fn write128(pc: &Pc, addr: u64, v: [u64; 2]) {
+        write64(pc, addr, v[0]);
+        write64(pc, addr + 8, v[1]);
+    }
+
+    fn read128(pc: &Pc, addr: u64) -> [u64; 2] {
+        [read64(pc, addr), read64(pc, addr + 8)]
+    }
+
+    /// `movdqu xmm<reg>, [addr]`.
+    fn load_xmm(code: &mut Vec<u8>, reg: u8, addr: u64) {
+        code.extend_from_slice(&[0xf3, 0x0f, 0x6f]);
+        code.extend_from_slice(&disp32(reg, addr));
+    }
+
+    /// `movdqu [addr], xmm<reg>`.
+    fn store_xmm(code: &mut Vec<u8>, reg: u8, addr: u64) {
+        code.extend_from_slice(&[0xf3, 0x0f, 0x7f]);
+        code.extend_from_slice(&disp32(reg, addr));
+    }
+
+    #[test]
+    fn haddps_and_hsubpd_reach_memory_and_mxcsr() {
+        // haddps xmm0, [DATA+16] with xmm0 = [1, 2, 3, 4] and the memory
+        // [10, 20, 30, 40]: [3, 7, 30, 70] (*Intel SDM* volume 2, `HADDPS`).
+        let singles = |l: [u32; 4]| {
+            [
+                u64::from(l[0]) | (u64::from(l[1]) << 32),
+                u64::from(l[2]) | (u64::from(l[3]) << 32),
+            ]
+        };
+        let pc = sse3pc();
+        write128(
+            &pc,
+            fpat::DATA,
+            singles([0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000]),
+        );
+        write128(
+            &pc,
+            fpat::DATA + 16,
+            singles([0x4120_0000, 0x41a0_0000, 0x41f0_0000, 0x4220_0000]),
+        );
+        let mut code = Vec::new();
+        load_xmm(&mut code, 0, fpat::DATA);
+        code.extend_from_slice(&[0xf2, 0x0f, 0x7c]);
+        code.extend_from_slice(&disp32(0, fpat::DATA + 16));
+        store_xmm(&mut code, 0, fpat::OUT);
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(
+            read128(&pc, fpat::OUT),
+            singles([0x4040_0000, 0x40e0_0000, 0x41f0_0000, 0x428c_0000])
+        );
+
+        // hsubpd xmm0, xmm1 rounds under MXCSR: 1 - 2^-60 is 1 to nearest
+        // and the double below 1 toward negative infinity.
+        for (rc, want) in [(0u32, 0x3ff0_0000_0000_0000u64), (1, 0x3fef_ffff_ffff_ffff)] {
+            let pc = sse3pc();
+            write64(
+                &pc,
+                fpat::SAVE,
+                u64::from(mxcsr::RESET | (rc << mxcsr::RC_SHIFT)),
+            );
+            write128(
+                &pc,
+                fpat::DATA,
+                [0x3ff0_0000_0000_0000, 0x3c30_0000_0000_0000],
+            );
+            let mut code = alloc::vec![0x0f, 0xae];
+            code.extend_from_slice(&disp32(2, fpat::SAVE)); // ldmxcsr
+            load_xmm(&mut code, 0, fpat::DATA);
+            code.extend_from_slice(&[0x66, 0x0f, 0x7d, 0xc0]); // hsubpd xmm0, xmm0
+            store_xmm(&mut code, 0, fpat::OUT);
+            code.push(0xf4);
+            run(&pc, &code);
+            assert_eq!(read128(&pc, fpat::OUT), [want, want], "RC {rc}");
+            assert_ne!(pc.cpu.sse().mxcsr & mxcsr::PE, 0, "inexact");
+        }
+    }
+
+    #[test]
+    fn the_duplicating_loads_copy_the_lanes_the_manual_names() {
+        let pc = sse3pc();
+        write128(
+            &pc,
+            fpat::DATA,
+            [0x2222_2222_1111_1111, 0x4444_4444_3333_3333],
+        );
+        let mut code = Vec::new();
+        // movddup xmm1, [DATA] ; movsldup xmm2, [DATA] ; movshdup xmm3, [DATA]
+        code.extend_from_slice(&[0xf2, 0x0f, 0x12]);
+        code.extend_from_slice(&disp32(1, fpat::DATA));
+        code.extend_from_slice(&[0xf3, 0x0f, 0x12]);
+        code.extend_from_slice(&disp32(2, fpat::DATA));
+        code.extend_from_slice(&[0xf3, 0x0f, 0x16]);
+        code.extend_from_slice(&disp32(3, fpat::DATA));
+        // The register forms are the same instructions — not MOVHLPS:
+        // load xmm4, then movddup xmm5, xmm4.
+        load_xmm(&mut code, 4, fpat::DATA);
+        code.extend_from_slice(&[0xf2, 0x0f, 0x12, 0xec]);
+        code.push(0xf4);
+        run(&pc, &code);
+        let sse = pc.cpu.sse();
+        let lo = 0x2222_2222_1111_1111;
+        assert_eq!(sse.get(1), [lo, lo]);
+        assert_eq!(sse.get(2), [0x1111_1111_1111_1111, 0x3333_3333_3333_3333]);
+        assert_eq!(sse.get(3), [0x2222_2222_2222_2222, 0x4444_4444_4444_4444]);
+        assert_eq!(sse.get(5), [lo, lo]);
+    }
+
+    #[test]
+    fn lddqu_loads_misaligned_memory_and_has_no_register_form() {
+        let pc = sse3pc();
+        write128(
+            &pc,
+            fpat::ODD,
+            [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908],
+        );
+        let mut code = alloc::vec![0xf2, 0x0f, 0xf0];
+        code.extend_from_slice(&disp32(6, fpat::ODD));
+        code.push(0xf4);
+        run(&pc, &code);
+        assert_eq!(
+            pc.cpu.sse().get(6),
+            [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908]
+        );
+
+        let pc = sse3pc();
+        pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        run(&pc, &[0xf2, 0x0f, 0xf0, 0xc1, 0xf4]); // lddqu xmm0, xmm1
+        assert_eq!(pc.regs().rip, HANDLED, "#UD for a register LDDQU");
+    }
+
+    #[test]
+    fn sse3_is_undefined_on_a_part_without_it() {
+        // The x86-64 baseline has SSE2 and not SSE3.
+        for code in [
+            &[0xf2u8, 0x0f, 0x7c, 0xc1, 0xf4][..], // haddps xmm0, xmm1
+            &[0xf2, 0x0f, 0x12, 0xc1, 0xf4],       // movddup xmm0, xmm1
+            &[0x66, 0x0f, 0xd0, 0xc1, 0xf4],       // addsubpd xmm0, xmm1
+        ] {
+            let pc = ssepc();
+            pc.idt(6, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+            pc.write(HANDLER, &[0xf4]);
+            run(&pc, code);
+            assert_eq!(pc.regs().rip, HANDLED, "#UD for {code:02x?}");
+        }
+        // And CPUID says so.
+        let pc = ssepc();
+        run(&pc, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2, 0xf4]);
+        assert_eq!(pc.regs().rcx & 1, 0);
     }
 
     #[test]

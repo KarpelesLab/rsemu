@@ -4092,8 +4092,9 @@ impl<'a> Exec<'a> {
     /// reason as everything else here: the counter runs at the board's rate
     /// whatever state the processor is in, `HLT` included.
     ///
-    /// `FPU`, `MMX`, `FXSR`, `SSE`, `SSE2` and `CX8` **are** reported now, and
-    /// each is reported because the instructions behind it execute. They follow
+    /// `FPU`, `MMX`, `FXSR`, `SSE`, `SSE2` and `CX8` **are** reported now, as
+    /// are the leaf-1 `ECX` extensions from `SSE3` on, and each is reported
+    /// because the instructions behind it execute. They follow
     /// [`Features`](super::Features) rather than the variant, so an instance
     /// configured as a 486SX answers `FPU` clear and one configured without
     /// `sse2` answers a 64-bit Linux honestly enough for it to refuse to boot
@@ -4152,19 +4153,21 @@ impl<'a> Exec<'a> {
         if features.sse2 {
             edx1 |= 1 << 26; // SSE2
         }
-        // `ECX.SSE3` (bit 0) stays clear even with `Features::sse3` set: only
-        // `FISTTP` of that extension is implemented, and the bit promises the
-        // rest. See the field's documentation.
+        // Leaf 1's second feature doubleword, the post-SSE2 extensions.
+        // `MONITOR`/`MWAIT` (bit 3) stays clear: they are not implemented and
+        // raise `#UD`, and the bit is what tells a guest not to use them.
+        let mut ecx1: u32 = 0;
+        if features.sse3 {
+            ecx1 |= 1 << 0; // SSE3
+        }
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers
         }
 
-        // Leaf 1's second feature doubleword. `OSXSAVE` is not a property of
-        // the part but a live echo of `CR4.OSXSAVE`, which is how software
-        // that cannot read `CR4` — anything outside ring 0 — learns whether
-        // the operating system has turned the XSAVE feature set on (*Intel
-        // SDM* volume 1 §13.2).
-        let mut ecx1: u32 = 0;
+        // `OSXSAVE` is not a property of the part but a live echo of
+        // `CR4.OSXSAVE`, which is how software that cannot read `CR4` —
+        // anything outside ring 0 — learns whether the operating system has
+        // turned the XSAVE feature set on (*Intel SDM* volume 1 §13.2).
         if features.xsave {
             ecx1 |= 1 << 26; // XSAVE: XSAVE/XRSTOR, XSETBV/XGETBV and XCR0
             if self.state.sys.cr4 & super::prot::cr4::OSXSAVE != 0 {

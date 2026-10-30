@@ -843,6 +843,28 @@ mod tests {
         format!("{}", disassemble(0, 0x100, bytes))
     }
 
+    /// The same, as a 32-bit protected-mode part decodes it.
+    fn text32(bytes: &[u8]) -> String {
+        format!("{}", disassemble_as(Gen::I386, Bits::B32, 0, 0x100, bytes))
+    }
+
+    #[test]
+    fn sse3_lists_without_a_repeat_prefix() {
+        // The `F2`/`F3` are mandatory prefixes, part of the opcode.
+        assert_eq!(text32(&[0xf2, 0x0f, 0x7c, 0xc1]), "haddps xmm0, xmm1");
+        assert_eq!(text32(&[0x66, 0x0f, 0x7d, 0xd3]), "hsubpd xmm2, xmm3");
+        assert_eq!(text32(&[0x66, 0x0f, 0xd0, 0xc1]), "addsubpd xmm0, xmm1");
+        assert_eq!(
+            text32(&[0xf2, 0x0f, 0x12, 0x03]),
+            "movddup xmm0, qword [ds:ebx]"
+        );
+        assert_eq!(text32(&[0xf3, 0x0f, 0x16, 0xc1]), "movshdup xmm0, xmm1");
+        assert_eq!(
+            text32(&[0xf2, 0x0f, 0xf0, 0x06]),
+            "lddqu xmm0, xmmword [ds:esi]"
+        );
+    }
+
     #[test]
     fn the_alu_group_prints_in_intel_order() {
         assert_eq!(text(&[0x00, 0xc1]), "add cl, al");

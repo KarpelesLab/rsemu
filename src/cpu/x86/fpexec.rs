@@ -1503,6 +1503,13 @@ impl Exec<'_> {
     /// Execute one SSE, `FXSAVE`-family or fence instruction.
     pub(super) fn sse_instruction(&mut self, f: &Fields) -> Ex<()> {
         let op = f.insn.op;
+        // SSE3 and later answer to one `CPUID` bit each on top of SSE's own
+        // gates, and a part without the bit has no such instruction: `#UD`,
+        // like the other three `#UD` gates, so the order among them is
+        // invisible.
+        if !self.has_extension(f.insn) {
+            return Err(Fault::bare(VEC_UD));
+        }
         self.sse_gate(op)?;
         match op {
             // One host fence per guest barrier. `MFENCE` is the one that
@@ -1545,6 +1552,7 @@ impl Exec<'_> {
                 let value = u64::from(self.state.sse.mxcsr);
                 self.write_arg(f, Arg::Ed, 4, value)
             }
+            _ if f.insn.extension().is_some() => self.simd_extension(f),
             _ => self.sse_data(f),
         }
     }
