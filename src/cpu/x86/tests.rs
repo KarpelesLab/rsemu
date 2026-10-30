@@ -4125,7 +4125,7 @@ mod long_mode {
         run64_on(pc, cr4::OSFXSR | cr4::OSXMMEXCPT, code)
     }
 
-    fn run64_on(pc: Pc, cr4_bits: u64, code: &[u8]) -> Pc {
+    pub(super) fn run64_on(pc: Pc, cr4_bits: u64, code: &[u8]) -> Pc {
         pc.start_protected();
         let mut sys = pc.cpu.sys();
         sys.cr4 |= cr4_bits;
@@ -4203,7 +4203,7 @@ mod long_mode {
 
     /// Run `code` in 64-bit mode on a part with `features` and require that
     /// it raises `vector`, taken by a handler that halts.
-    fn faults64(features: Features, vector: u64, code: &[u8]) {
+    pub(super) fn faults64(features: Features, vector: u64, code: &[u8]) {
         let pc = Pc::with_features(Variant::X86_64, features);
         pc.idt64(vector, 0x18, la::HANDLER);
         pc.write(la::HANDLER, &[0xf4]);
@@ -4353,7 +4353,7 @@ mod long_mode {
 
     /// `CPUID` with `EAX = leaf` and `ECX = sub` on a part with `features`,
     /// in 64-bit mode: `(EAX, EBX, ECX, EDX)`.
-    fn cpuid64(features: Features, leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
+    pub(super) fn cpuid64(features: Features, leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
         let mut code = alloc::vec![0xb8];
         code.extend_from_slice(&leaf.to_le_bytes());
         code.push(0xb9);
@@ -4372,7 +4372,8 @@ mod long_mode {
         // bits, built from the lattice by one function the maximum asks too.
         let v2 = Features::X86_64_V2;
         let xsave = Features { xsave: true, ..v2 };
-        for features in [Features::X86_64, v2, xsave] {
+        let bmi = Features { bmi1: true, ..v2 };
+        for features in [Features::X86_64, v2, xsave, bmi] {
             let (b, c, d) = structured_extended(features);
             let max = cpuid64(features, 0, 0).0;
             let expected = if features.xsave {
@@ -4388,9 +4389,10 @@ mod long_mode {
             // Sub-leaf 1 is past the maximum sub-leaf and says nothing.
             assert_eq!(cpuid64(features, 7, 1), (0, 0, 0, 0));
         }
-        // No extension in this core lives in leaf 7 yet, so no part raises
-        // the maximum for it: the baseline and v2 still stop at leaf 1.
+        // Neither the baseline nor v2 has anything in leaf 7, so both still
+        // stop at leaf 1; BMI1 alone raises the maximum to 7.
         assert_eq!(cpuid64(v2, 0, 0).0, 1);
+        assert_eq!(cpuid64(bmi, 0, 0).0, 7);
     }
 
     /// `mov rcx, src ; mov rax, PATTERN ; <insn> ; pushfq ; pop rdx ; hlt`
@@ -4479,6 +4481,72 @@ mod long_mode {
             ..Features::I80486
         };
         assert!(impossible.validate().is_err());
+    }
+
+    fn with_bmi1() -> Features {
+        Features {
+            bmi1: true,
+            ..Features::X86_64
+        }
+    }
+
+    #[test]
+    fn tzcnt_counts_at_every_width_and_says_zero_in_cf() {
+        // *Intel SDM* volume 2, `TZCNT`: a zero source gives the operand
+        // width and `CF`; a set bottom bit gives zero and `ZF`.
+        let cf_zf = |flags: u64| {
+            (
+                flags & u64::from(flags::CF) != 0,
+                flags & u64::from(flags::ZF) != 0,
+            )
+        };
+        // tzcnt ax, cx ; tzcnt eax, ecx ; tzcnt rax, rcx
+        let forms: [(&[u8], u64, u64); 3] = [
+            (&[0x66, 0xf3, 0x0f, 0xbc, 0xc1], 16, 0xffff),
+            (&[0xf3, 0x0f, 0xbc, 0xc1], 32, 0xffff_ffff),
+            (&[0xf3, 0x48, 0x0f, 0xbc, 0xc1], 64, u64::MAX),
+        ];
+        let merge = |width: u64, value: u64| match width {
+            16 => (PATTERN & !0xffff) | value,
+            _ => value,
+        };
+        for (insn, width, ones) in forms {
+            // Bits above the operand are not part of the source.
+            let above = !ones;
+            let (rax, fl) = count64(with_bmi1(), insn, above);
+            assert_eq!(rax, merge(width, width), "{width}: zero is the width");
+            assert_eq!(cf_zf(fl), (true, false), "{width}: CF for a zero source");
+            let (rax, fl) = count64(with_bmi1(), insn, ones);
+            assert_eq!(rax, merge(width, 0), "{width}: all ones");
+            assert_eq!(cf_zf(fl), (false, true), "{width}: ZF for a zero count");
+            let top = (ones >> 1) + 1;
+            let (rax, fl) = count64(with_bmi1(), insn, above | top);
+            assert_eq!(rax, merge(width, width - 1), "{width}: the top bit");
+            assert_eq!(cf_zf(fl), (false, false), "{width}");
+        }
+    }
+
+    #[test]
+    fn tzcnt_without_bmi1_is_bsf() {
+        // *Intel SDM* volume 2, `TZCNT`: on a part without it the encoding
+        // executes as `BSF`, the `F3` ignored — so the same answer for a
+        // non-zero source, and `BSF`'s for a zero one.
+        let tzcnt = [0xf3, 0x0f, 0xbc, 0xc1];
+        let (rax, fl) = count64(Features::X86_64, &tzcnt, 0x10);
+        assert_eq!(rax, 4);
+        assert_eq!(fl & u64::from(flags::ZF), 0);
+        let (rax, fl) = count64(Features::X86_64, &tzcnt, 0);
+        assert_eq!(rax, PATTERN, "BSF leaves the destination");
+        assert_ne!(fl & u64::from(flags::ZF), 0);
+        let (rax, fl) = count64(with_bmi1(), &tzcnt, 0);
+        assert_eq!(rax, 32);
+        assert_eq!(fl & u64::from(flags::ZF), 0);
+        // BMI2 alone is not enough: the bit is BMI1's.
+        let bmi2 = Features {
+            bmi2: true,
+            ..Features::X86_64
+        };
+        assert_eq!(count64(bmi2, &tzcnt, 0).0, PATTERN);
     }
 
     fn with_movbe() -> Features {
@@ -12346,3 +12414,6 @@ mod v2 {
 
 /// AVX, in its own file: `tests/avx.rs`.
 mod avx;
+
+/// BMI1 and BMI2, in their own file: `tests/bmi.rs`.
+mod bmi;

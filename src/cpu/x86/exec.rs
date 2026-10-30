@@ -2234,6 +2234,7 @@ impl<'a> Exec<'a> {
                 }
             },
             Arg::Gb | Arg::Gv | Arg::Gw | Arg::Gy => regs.read(f.reg_num(), size, rex),
+            Arg::By => regs.read(f.vvvv(), size, rex),
             Arg::Rd => regs.read(f.rm_num(), self.system_reg_size(), rex),
             Arg::Cd => self.read_control(f.reg_num())?,
             Arg::Dd => self.read_debug(f.reg_num())?,
@@ -2305,6 +2306,7 @@ impl<'a> Exec<'a> {
             Arg::Gb | Arg::Gv | Arg::Gw | Arg::Gy => {
                 self.state.regs.write(f.reg_num(), size, rex, value);
             }
+            Arg::By => self.state.regs.write(f.vvvv(), size, rex, value),
             Arg::Rd => {
                 let width = self.system_reg_size();
                 self.state.regs.write(f.rm_num(), width, rex, value);
@@ -2361,7 +2363,13 @@ impl<'a> Exec<'a> {
         // a hundred and sixty places.
         // Every VEX encoding goes to one dispatcher, ahead of the rest: its
         // gates are AVX's rather than SSE's, whatever the operation.
+        //
+        // BMI1 and BMI2 borrow the encoding and nothing else: theirs is the
+        // general-register gate, in `bmi`.
         if f.is_vex() {
+            if insn.op.is_bmi() {
+                return self.bmi(f);
+            }
             return self.vex_instruction(f);
         }
         if insn.op.is_x87() {
@@ -2730,6 +2738,7 @@ impl<'a> Exec<'a> {
             Op::CRC32 => self.crc32(f)?,
             Op::POPCNT => self.popcnt(f, size)?,
             Op::LZCNT => self.lzcnt(f, size)?,
+            Op::TZCNT => self.tzcnt(f, size)?,
             Op::MOVBE => self.movbe(f, size)?,
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
@@ -4368,10 +4377,14 @@ impl<'a> Exec<'a> {
 /// nothing sets a bit today. (`MOVBE` and `LZCNT` are older and live in
 /// leaves 1 and `8000_0001`.)
 pub(super) fn structured_extended(features: super::Features) -> (u32, u32, u32) {
-    let ebx: u32 = 0;
+    let mut ebx: u32 = 0;
     let ecx: u32 = 0;
     let edx: u32 = 0;
-    // Read by the lines above once there are any.
-    let _ = features;
+    if features.bmi1 {
+        ebx |= 1 << 3; // BMI1
+    }
+    if features.bmi2 {
+        ebx |= 1 << 8; // BMI2
+    }
     (ebx, ecx, edx)
 }

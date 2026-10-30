@@ -434,6 +434,12 @@ pub enum Arg {
     /// one half of a `YMM` register, as `VINSERTF128` reads it and
     /// `VEXTRACTF128` writes it.
     Wdq,
+    /// The **general** register `VEX.vvvv` names, at `Gy`'s width: thirty-two
+    /// bits, or sixty-four with `VEX.W` in 64-bit mode — Intel's `By`, the
+    /// BMI1/BMI2 operand. Never written in a row, like [`Arg::Hx`]: the
+    /// row's [`VexForm`] places it, and a row whose destination is `Gy` or
+    /// `Ey` gets this rather than a vector register.
+    By,
 }
 
 impl Arg {
@@ -509,7 +515,8 @@ impl Arg {
             | Arg::Wh
             | Arg::Wqx
             | Arg::Vdq
-            | Arg::Wdq => None,
+            | Arg::Wdq
+            | Arg::By => None,
         }
     }
 
@@ -742,6 +749,10 @@ pub enum Grp {
     /// [`resolve_x87`] instead, from inside the stream decoder where both are
     /// in hand.
     X87,
+    /// `VEX.NP.0F38 F3`: Intel's group 17 — `BLSR`, `BLSMSK` and `BLSI`, the
+    /// BMI1 lowest-set-bit operations, at extensions 1, 2 and 3. Exists only
+    /// VEX-encoded; the destination is `VEX.vvvv`.
+    Grp17,
 }
 
 /// Declare the operation enum, its mnemonics and its summaries in one list.
@@ -1371,6 +1382,20 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("POPCNT", "popcnt"),
     ("LZCNT", "lzcnt"),
     ("MOVBE", "movbe"),
+    ("ANDN", "andn"),
+    ("BEXTR", "bextr"),
+    ("BLSI", "blsi"),
+    ("BLSMSK", "blsmsk"),
+    ("BLSR", "blsr"),
+    ("TZCNT", "tzcnt"),
+    ("BZHI", "bzhi"),
+    ("MULX", "mulx"),
+    ("PDEP", "pdep"),
+    ("PEXT", "pext"),
+    ("RORX", "rorx"),
+    ("SARX", "sarx"),
+    ("SHLX", "shlx"),
+    ("SHRX", "shrx"),
     ("VBROADCASTSS", "vbroadcastss"),
     ("VBROADCASTSD", "vbroadcastsd"),
     ("VBROADCASTF128", "vbroadcastf128"),
@@ -1974,6 +1999,22 @@ define_ops! {
 
     // ---- MOVBE -----------------------------------------------------------
     MOVBE = "move with the bytes reversed (memory forms only)",
+
+    // ---- BMI1 and BMI2: general-register instructions, VEX-encoded -------
+    ANDN = "AND the inverted first source with the second",
+    BEXTR = "extract a bit field, its start and length from a register",
+    BLSI = "isolate the lowest set bit",
+    BLSMSK = "mask up to and including the lowest set bit",
+    BLSR = "clear the lowest set bit",
+    TZCNT = "count the trailing zero bits",
+    BZHI = "zero the bits from an index upward",
+    MULX = "unsigned multiply by EDX/RDX without touching the flags",
+    PDEP = "deposit the low bits of the source at the mask's set bits",
+    PEXT = "extract the source's bits at the mask's set bits into the low bits",
+    RORX = "rotate right by an immediate without touching the flags",
+    SARX = "shift arithmetic right by a register count without touching the flags",
+    SHLX = "shift left by a register count without touching the flags",
+    SHRX = "shift logical right by a register count without touching the flags",
     // ---- AVX: the instructions that exist only VEX-encoded ----------------
     VBROADCASTSS = "replicate a single from memory into every lane",
     VBROADCASTSD = "replicate a double from memory into every lane of a YMM register",
@@ -2573,7 +2614,37 @@ impl Op {
     /// `BSR` rather than `#UD`.
     #[must_use]
     pub const fn is_general_extension(self) -> bool {
-        matches!(self, Op::CRC32 | Op::POPCNT | Op::LZCNT | Op::MOVBE)
+        matches!(self, Op::CRC32 | Op::POPCNT | Op::LZCNT | Op::MOVBE) || self.is_bmi()
+    }
+
+    /// Whether this is one of BMI1's or BMI2's instructions — general
+    /// registers, flags and nothing else, though all but `TZCNT` are
+    /// VEX-encoded.
+    ///
+    /// The VEX prefix is the only thing they share with AVX: they are gated
+    /// by their own `CPUID` bit, `VEX.L` and the real- and virtual-8086-mode
+    /// rule that VEX is no prefix there, and **not** by `CR4.OSXSAVE`,
+    /// `XCR0` or `CR0.TS` (*Intel SDM* volume 2 §2.5.1, table 2-29, the
+    /// type 13 exception class, which every one of them names).
+    #[must_use]
+    pub const fn is_bmi(self) -> bool {
+        matches!(
+            self,
+            Op::ANDN
+                | Op::BEXTR
+                | Op::BLSI
+                | Op::BLSMSK
+                | Op::BLSR
+                | Op::TZCNT
+                | Op::BZHI
+                | Op::MULX
+                | Op::PDEP
+                | Op::PEXT
+                | Op::RORX
+                | Op::SARX
+                | Op::SHLX
+                | Op::SHRX
+        )
     }
 
     /// Which post-SSE2 extension this operation arrived with, if any.
@@ -2669,6 +2740,15 @@ impl Op {
             Op::POPCNT => Extension::Popcnt,
             Op::LZCNT => Extension::Lzcnt,
             Op::MOVBE => Extension::Movbe,
+            Op::ANDN | Op::BEXTR | Op::BLSI | Op::BLSMSK | Op::BLSR | Op::TZCNT => Extension::Bmi1,
+            Op::BZHI
+            | Op::MULX
+            | Op::PDEP
+            | Op::PEXT
+            | Op::RORX
+            | Op::SARX
+            | Op::SHLX
+            | Op::SHRX => Extension::Bmi2,
             Op::VBROADCASTSS
             | Op::VBROADCASTSD
             | Op::VBROADCASTF128
@@ -2859,6 +2939,13 @@ pub enum Extension {
     Lzcnt,
     /// `MOVBE`: `CPUID.01H:ECX[22]`.
     Movbe,
+    /// BMI1: `CPUID.(EAX=07H,ECX=0):EBX[3]` — `ANDN`, `BEXTR`, `BLSI`,
+    /// `BLSMSK`, `BLSR` and `TZCNT`. Like `LZCNT`, `TZCNT`'s absence is not
+    /// `#UD`: the encoding executes as `BSF`.
+    Bmi1,
+    /// BMI2: `CPUID.(EAX=07H,ECX=0):EBX[8]` — `BZHI`, `MULX`, `PDEP`,
+    /// `PEXT`, `RORX`, `SARX`, `SHLX` and `SHRX`.
+    Bmi2,
     /// AVX: `CPUID.01H:ECX[28]`. Only the instructions that exist *solely*
     /// VEX-encoded answer this — `VBROADCASTSS`, `VPERM2F128` and the rest.
     /// The VEX forms of older instructions keep their own extension, and the
@@ -2948,8 +3035,15 @@ pub enum VexForm {
     NdsReg,
     /// `VEX.vvvv` is the **destination** and the row's operands are the
     /// sources: the shift-by-immediate groups 12, 13 and 14, whose ModRM
-    /// `reg` field is an opcode extension and so cannot name one.
+    /// `reg` field is an opcode extension and so cannot name one — and
+    /// BMI1's group 17, for the same reason.
     Ndd,
+    /// `VEX.vvvv` is a source written **last**, after ModRM r/m: the BMI
+    /// instructions whose `vvvv` operand is a control rather than data —
+    /// `BEXTR`'s start and length, `BZHI`'s index, the count of `SHLX`,
+    /// `SHRX` and `SARX` (*Intel SDM* volume 2, each page's operand-encoding
+    /// table: `ModRM:reg (w)`, `ModRM:r/m (r)`, `VEX.vvvv (r)`).
+    NdsLast,
     /// The VEX encoding is a different, operand-less instruction — `0F 77`,
     /// `EMMS` without and `VZEROUPPER` (or, with `VEX.L`, `VZEROALL`) with.
     Alt(Op),
@@ -4133,6 +4227,9 @@ const SECONDARY_F3: ([Insn; 256], [bool; 256]) = opmap! {
     // ignores — so this row is `BSR` there, and the executor, not the
     // table, decides which it is (*Intel SDM* volume 2, `LZCNT`).
     0xbd LZCNT     Gv Ev None Documented;
+    // `TZCNT` is `BSF` with an `F3`, the same arrangement: a part without
+    // BMI1 executes `BSF` (*Intel SDM* volume 2, `TZCNT`).
+    0xbc TZCNT     Gv Ev None Documented;
     // Two doublewords in, so the memory form is a quadword.
     0xe6 CVTDQ2PD  Vx Wh None Documented | Plain Any;
 };
@@ -4290,6 +4387,17 @@ const THREE_38: ([Insn; 256], [bool; 256]) = opmap! {
     // With an `F2` these two are `CRC32`, in their own map.
     0xf0 MOVBE     Gv Ev None Documented;
     0xf1 MOVBE     Ev Gv None Documented;
+
+    // BMI1 and BMI2, which exist only VEX-encoded and only at `VEX.L = 0`
+    // (Intel's `LZ`): general registers, `Gy`/`Ey` — `VEX.W` is `REX.W` —
+    // and `VEX.vvvv` a third general register (*Intel SDM* volume 2 table
+    // A-4, `VEX.NP.0F38`). Legacy-encoded, these cells are `#UD`, and the
+    // `only` is what keeps `0F 38 F2` from being an `ANDN` with no `vvvv`.
+    0xf2 ANDN      Gy Ey None  Documented | Nds L128 only;
+    // Group 17: the row the decoder resolves through ModRM `reg`.
+    0xf3 BLSR      Ey None Grp17 Documented | Ndd L128 only;
+    0xf5 BZHI      Gy Ey None  Documented | NdsLast L128 only;
+    0xf7 BEXTR     Gy Ey None  Documented | NdsLast L128 only;
 };
 
 /// The `0F 38` map with no mandatory prefix.
@@ -4385,6 +4493,10 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x2d VMASKMOVPD Vx Wx None Documented | Nds Any only w0;
     0x2e VMASKMOVPS Wx Vx None Documented | Nds Any only w0;
     0x2f VMASKMOVPD Wx Vx None Documented | Nds Any only w0;
+
+    // BMI2's left shift by a register count (`VEX.LZ.66.0F38 F7`), the
+    // count in `VEX.vvvv`. Legacy `66 0F 38 F7` is nothing.
+    0xf7 SHLX      Gy Ey None Documented | NdsLast L128 only;
 };
 
 /// The `0F 38` map with a `66` prefix.
@@ -4403,7 +4515,27 @@ const THREE_38_F2: ([Insn; 256], [bool; 256]) = opmap! {
 
     0xf0 CRC32     Gy Eb None Documented;
     0xf1 CRC32     Gy Ev None Documented;
+
+    // BMI2 (`VEX.LZ.F2.0F38`). `MULX`'s `vvvv` is the low half of the
+    // product and ModRM `reg` the high; its other factor is `EDX`/`RDX`,
+    // named by no field.
+    0xf5 PDEP      Gy Ey None Documented | Nds L128 only;
+    0xf6 MULX      Gy Ey None Documented | Nds L128 only;
+    0xf7 SHRX      Gy Ey None Documented | NdsLast L128 only;
 };
+
+/// The `0F 38` map with an `F3` prefix: BMI2's `PEXT` and `SARX`, which
+/// exist only VEX-encoded (`VEX.LZ.F3.0F38`). No legacy `F3 0F 38`
+/// encoding is assigned.
+const THREE_38_F3: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0xf5 PEXT      Gy Ey None Documented | Nds L128 only;
+    0xf7 SARX      Gy Ey None Documented | NdsLast L128 only;
+};
+
+/// The `0F 38` map with an `F3` prefix.
+pub static TABLE_0F38_F3: [Insn; 256] = THREE_38_F3.0;
 
 /// The `0F 38` map with an `F2` prefix.
 pub static TABLE_0F38_F2: [Insn; 256] = THREE_38_F2.0;
@@ -4476,6 +4608,17 @@ const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
 /// The `0F 3A` map with a `66` prefix.
 pub static TABLE_0F3A_66: [Insn; 256] = THREE_3A_66.0;
 
+/// The `0F 3A` map with an `F2` prefix: BMI2's `RORX` (`VEX.LZ.F2.0F3A F0
+/// /r ib`), which exists only VEX-encoded.
+const THREE_3A_F2: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0xf0 RORX      Gy Ey +Ib None Documented | Plain L128 only;
+};
+
+/// The `0F 3A` map with an `F2` prefix.
+pub static TABLE_0F3A_F2: [Insn; 256] = THREE_3A_F2.0;
+
 /// Decode one opcode byte of an escape map under a mandatory prefix.
 ///
 /// The seam the legacy decoder and a VEX decoder share: the escape bytes or
@@ -4483,8 +4626,8 @@ pub static TABLE_0F3A_66: [Insn; 256] = THREE_3A_66.0;
 /// two-byte map, the three-byte maps are **not** deltas of one another — the
 /// no-prefix `0F 38` rows are `MM`-register forms and the `66` rows are `XMM`
 /// ones, and an unlisted prefix is `#UD` rather than the unprefixed
-/// instruction — so each column is its own table, and the two columns no
-/// x86-64-v2 instruction uses are simply unassigned.
+/// instruction — so each column is its own table. `F3 0F 3A` alone is
+/// unassigned in every encoding.
 #[inline]
 #[must_use]
 pub const fn decode_map(map: OpMap, prefix: Mandatory, opcode: u8) -> Insn {
@@ -4494,9 +4637,11 @@ pub const fn decode_map(map: OpMap, prefix: Mandatory, opcode: u8) -> Insn {
         (OpMap::M0F38, Mandatory::None) => TABLE_0F38[i],
         (OpMap::M0F38, Mandatory::P66) => TABLE_0F38_66[i],
         (OpMap::M0F38, Mandatory::PF2) => TABLE_0F38_F2[i],
+        (OpMap::M0F38, Mandatory::PF3) => TABLE_0F38_F3[i],
         (OpMap::M0F3A, Mandatory::None) => TABLE_0F3A[i],
         (OpMap::M0F3A, Mandatory::P66) => TABLE_0F3A_66[i],
-        (OpMap::M0F38 | OpMap::M0F3A, _) => UNASSIGNED,
+        (OpMap::M0F3A, Mandatory::PF2) => TABLE_0F3A_F2[i],
+        (OpMap::M0F3A, Mandatory::PF3) => UNASSIGNED,
     }
 }
 
@@ -4753,6 +4898,20 @@ pub static GROUP14: [Insn; 8] = {
         .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
     t[7] = Insn::new(Op::PSLLDQ, Arg::Ux, Arg::Ib, Grp::None, Class::Documented)
         .with_vex(Vex::new(VexForm::Ndd, VexLen::L128));
+    t
+};
+
+/// `VEX.LZ.NP.0F38 F3`: Intel's group 17 — BMI1's lowest-set-bit
+/// operations, each `By, Ey`: the destination is `VEX.vvvv`, because the
+/// ModRM `reg` field is the extension (*Intel SDM* volume 2 table A-6, and
+/// the `BLSR`, `BLSMSK` and `BLSI` pages). Register and memory sources
+/// alike; `VEX.W` is the operand size; `VEX.L = 1` is `#UD`.
+pub static GROUP17: [Insn; 8] = {
+    let vex = Vex::new(VexForm::Ndd, VexLen::L128).only();
+    let mut t = [UNASSIGNED; 8];
+    t[1] = Insn::new(Op::BLSR, Arg::Ey, Arg::None, Grp::None, Class::Documented).with_vex(vex);
+    t[2] = Insn::new(Op::BLSMSK, Arg::Ey, Arg::None, Grp::None, Class::Documented).with_vex(vex);
+    t[3] = Insn::new(Op::BLSI, Arg::Ey, Arg::None, Grp::None, Class::Documented).with_vex(vex);
     t
 };
 
@@ -5292,6 +5451,7 @@ pub const fn resolve_as(map: Gen, insn: Insn, reg: u8) -> Insn {
         // Likewise: these three are register-only, so the mode field decides
         // whether the encoding exists at all and [`resolve_modrm`] answers.
         Grp::Grp12 | Grp::Grp13 | Grp::Grp14 => insn,
+        Grp::Grp17 => GROUP17[idx],
     }
 }
 
@@ -5811,10 +5971,20 @@ impl Fields {
     #[must_use]
     pub const fn operands(&self) -> [Arg; 4] {
         let i = self.insn;
+        // A row on general registers names a general register in `vvvv`
+        // too: BMI1 and BMI2, whose destination is `Gy`, or `Ey` for
+        // group 17.
+        let h = if matches!(i.dst, Arg::Gy | Arg::Ey) {
+            Arg::By
+        } else {
+            Arg::Hx
+        };
         if self.vvvv_is_source() {
-            [i.dst, Arg::Hx, i.src, i.aux]
+            [i.dst, h, i.src, i.aux]
         } else if self.vex.is_some() && matches!(i.vex.form, VexForm::Ndd) {
-            [Arg::Hx, i.dst, i.src, i.aux]
+            [h, i.dst, i.src, i.aux]
+        } else if self.vex.is_some() && matches!(i.vex.form, VexForm::NdsLast) {
+            [i.dst, i.src, h, i.aux]
         } else {
             [i.dst, i.src, i.aux, Arg::None]
         }
@@ -6332,7 +6502,7 @@ const fn vex_valid(insn: Insn, v: VexPrefix, modrm: ModRm) -> Insn {
     let rule = insn.vex;
     let uses_vvvv = match rule.form {
         VexForm::None => return UNASSIGNED,
-        VexForm::Nds | VexForm::Ndd => true,
+        VexForm::Nds | VexForm::Ndd | VexForm::NdsLast => true,
         VexForm::NdsReg => modrm.is_register(),
         VexForm::Plain | VexForm::Alt(_) => false,
     };
@@ -6415,8 +6585,11 @@ mod tests {
                 || TABLE_0F38.iter().any(|i| i.op == op)
                 || TABLE_0F38_66.iter().any(|i| i.op == op)
                 || TABLE_0F38_F2.iter().any(|i| i.op == op)
+                || TABLE_0F38_F3.iter().any(|i| i.op == op)
                 || TABLE_0F3A.iter().any(|i| i.op == op)
                 || TABLE_0F3A_66.iter().any(|i| i.op == op)
+                || TABLE_0F3A_F2.iter().any(|i| i.op == op)
+                || GROUP17.iter().any(|i| i.op == op)
                 || X87_MEM.iter().flatten().any(|i| i.op == op)
                 || X87_REG.iter().flatten().any(|i| i.op == op)
                 // `MOVHLPS` and `MOVLHPS` have no row of their own for the
@@ -6637,7 +6810,7 @@ mod tests {
     fn every_0f3a_row_takes_an_immediate_byte() {
         // The escape byte is a promise to a length decoder, so a row that
         // broke it would desynchronise every instruction after it.
-        for table in [&TABLE_0F3A, &TABLE_0F3A_66] {
+        for table in [&TABLE_0F3A, &TABLE_0F3A_66, &TABLE_0F3A_F2] {
             for (opcode, insn) in table.iter().enumerate() {
                 if insn.op == Op::UD {
                     continue;
@@ -6650,7 +6823,7 @@ mod tests {
             }
         }
         // And no `0F 38` row takes one.
-        for table in [&TABLE_0F38, &TABLE_0F38_66, &TABLE_0F38_F2] {
+        for table in [&TABLE_0F38, &TABLE_0F38_66, &TABLE_0F38_F2, &TABLE_0F38_F3] {
             for (opcode, insn) in table.iter().enumerate() {
                 let imm: u8 = [insn.dst, insn.src, insn.aux]
                     .iter()
@@ -6669,6 +6842,45 @@ mod tests {
             at += 1;
             b
         })
+    }
+
+    #[test]
+    fn the_bmi_rows_share_their_cells_with_the_legacy_ones_by_encoding() {
+        // `0F 38 F0`/`F1` are `MOVBE` and, with `F2`, `CRC32`; the cells
+        // beside them are BMI's, VEX-only — and neither kind is reachable
+        // through the other encoding.
+        assert_eq!(decode32(&[0x0f, 0x38, 0xf0, 0x00]).insn.op, Op::MOVBE);
+        assert_eq!(decode32(&[0xf2, 0x0f, 0x38, 0xf0, 0xc1]).insn.op, Op::CRC32);
+        assert_eq!(decode32(&[0x0f, 0x38, 0xf2, 0xc1]).insn.op, Op::UD);
+        assert_eq!(decode32(&[0xf2, 0x0f, 0x38, 0xf6, 0xc1]).insn.op, Op::UD);
+        // VEX.NP.0F38 F0 and VEX.F2.0F38 F0: no VEX form.
+        assert_eq!(decode32(&[0xc4, 0xe2, 0x78, 0xf0, 0x00]).insn.op, Op::UD);
+        assert_eq!(decode32(&[0xc4, 0xe2, 0x7b, 0xf0, 0xc1]).insn.op, Op::UD);
+        // The columns, by `pp`: `F7` is four instructions.
+        for (pp, op) in [(0, Op::BEXTR), (1, Op::SHLX), (2, Op::SARX), (3, Op::SHRX)] {
+            let f = decode32(&[0xc4, 0xe2, 0x70 | pp, 0xf7, 0xc3]);
+            assert_eq!((f.insn.op, f.len), (op, 5));
+            assert_eq!(f.operands(), [Arg::Gy, Arg::Ey, Arg::By, Arg::None]);
+        }
+        let f = decode32(&[0xc4, 0xe2, 0x73, 0xf6, 0xc3]);
+        assert_eq!(f.insn.op, Op::MULX);
+        assert_eq!(f.operands(), [Arg::Gy, Arg::By, Arg::Ey, Arg::None]);
+        // Group 17 resolves through `reg`, its destination `vvvv`, and a
+        // memory form takes its displacement.
+        let f = decode32(&[0xc4, 0xe2, 0x78, 0xf3, 0x1d, 0, 0x10, 0, 0]);
+        assert_eq!((f.insn.op, f.len), (Op::BLSI, 9));
+        assert_eq!(f.operands(), [Arg::By, Arg::Ey, Arg::None, Arg::None]);
+        assert_eq!(decode32(&[0xc4, 0xe2, 0x78, 0xf3, 0xc3]).insn.op, Op::UD);
+        // `RORX` takes its immediate; `F3 0F 3A` is nothing.
+        let f = decode32(&[0xc4, 0xe3, 0x7b, 0xf0, 0xc3, 0x05]);
+        assert_eq!((f.insn.op, f.len, f.imm), (Op::RORX, 6, 5));
+        assert_eq!(
+            decode32(&[0xc4, 0xe3, 0x7a, 0xf0, 0xc3, 0x05]).insn.op,
+            Op::UD
+        );
+        // `TZCNT` is the `F3` column of `BSF`.
+        assert_eq!(decode32(&[0xf3, 0x0f, 0xbc, 0xc1]).insn.op, Op::TZCNT);
+        assert_eq!(decode32(&[0x0f, 0xbc, 0xc1]).insn.op, Op::BSF);
     }
 
     #[test]

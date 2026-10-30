@@ -201,6 +201,7 @@ const fn fixes_size(arg: Arg) -> bool {
             | Arg::Wd
             | Arg::Gy
             | Arg::Ey
+            | Arg::By
             | Arg::Mf32
             | Arg::Mf64
             | Arg::Mf80
@@ -262,8 +263,13 @@ impl fmt::Display for Disassembled {
         // A VEX encoding of a legacy instruction is spelt with a `v` in front
         // — `vaddps`, `vmovdqu` — which is the assembler's only way of telling
         // the two encodings apart. The operations that exist only VEX-encoded
-        // carry the `v` in their own names.
-        if fields.is_vex() && insn.op != Op::UD && insn.op.extension() != Some(isa::Extension::Avx)
+        // carry the `v` in their own names, and so do the general-register
+        // ones, BMI1's and BMI2's, which have no legacy encoding to tell
+        // apart from.
+        if fields.is_vex()
+            && insn.op != Op::UD
+            && insn.op.extension() != Some(isa::Extension::Avx)
+            && !insn.op.is_bmi()
         {
             f.write_str("v")?;
         }
@@ -588,6 +594,10 @@ impl Disassembled {
             Arg::Gy => {
                 let width = if fields.rex_w() { 8 } else { 4 };
                 f.write_str(regs_for(width, rex)[fields.reg_num() as usize])
+            }
+            Arg::By => {
+                let width = if fields.rex_w() { 8 } else { 4 };
+                f.write_str(regs_for(width, rex)[fields.vvvv() as usize])
             }
 
             // The MMX operands. Three bits name an `MM` register whatever
@@ -1120,6 +1130,67 @@ mod tests {
             text32(&[0x66, 0xf3, 0x0f, 0xb8, 0x03]),
             "popcnt ax, [ds:ebx]"
         );
+    }
+
+    #[test]
+    fn bmi_lists_without_a_v_and_with_general_registers() {
+        // The operand orders are each page's operand-encoding table: `vvvv`
+        // second for `ANDN`, `PDEP`, `PEXT` and `MULX`, last for the ones it
+        // controls, first (the destination) for group 17.
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x70, 0xf2, 0xc2]),
+            "andn eax, ecx, edx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x70, 0xf7, 0xc3]),
+            "bextr eax, ebx, ecx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x70, 0xf5, 0xc3]),
+            "bzhi eax, ebx, ecx"
+        );
+        assert_eq!(text32(&[0xc4, 0xe2, 0x78, 0xf3, 0xcb]), "blsr eax, ebx");
+        assert_eq!(text32(&[0xc4, 0xe2, 0x78, 0xf3, 0xd3]), "blsmsk eax, ebx");
+        assert_eq!(text32(&[0xc4, 0xe2, 0x78, 0xf3, 0xdb]), "blsi eax, ebx");
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x73, 0xf5, 0xc2]),
+            "pdep eax, ecx, edx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x72, 0xf5, 0xc2]),
+            "pext eax, ecx, edx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x73, 0xf6, 0xc3]),
+            "mulx eax, ecx, ebx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x71, 0xf7, 0xc3]),
+            "shlx eax, ebx, ecx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x73, 0xf7, 0xc3]),
+            "shrx eax, ebx, ecx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x72, 0xf7, 0xc3]),
+            "sarx eax, ebx, ecx"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe3, 0x7b, 0xf0, 0xc3, 0x05]),
+            "rorx eax, ebx, 0x5"
+        );
+        assert_eq!(
+            text32(&[0xc4, 0xe2, 0x78, 0xf3, 0x1d, 0x00, 0x10, 0, 0]),
+            "blsi eax, dword [ds:0x1000]"
+        );
+        assert_eq!(text32(&[0xf3, 0x0f, 0xbc, 0xc1]), "tzcnt eax, ecx");
+        // `VEX.W1` in 64-bit mode, and every register reachable.
+        let text64 = |b: &[u8]| format!("{}", disassemble_as(Gen::I386, Bits::B64, 0, 0x100, b));
+        assert_eq!(text64(&[0xc4, 0x42, 0x80, 0xf2, 0xca]), "andn r9, r15, r10");
+        assert_eq!(text64(&[0xc4, 0xc2, 0x38, 0xf3, 0xcb]), "blsr r8d, r11d");
+        // An encoding the row refuses, `VEX.L = 1`, is no instruction.
+        assert_eq!(text32(&[0xc4, 0xe2, 0x74, 0xf2, 0xc2]), "ud");
     }
 
     #[test]

@@ -184,10 +184,12 @@
 //!   in no preset); without it `F3 0F BD` executes as `BSR`. So is
 //!   `MOVBE` ([`Features::movbe`], in no preset either).
 //!   AVX is here too ([`Features::avx`]: the VEX
-//!   encoding, the `YMM` registers, XSAVE component 2); **nothing after it
-//!   is** — AVX2, FMA, F16C and the VEX-encoded general-register
-//!   instructions (BMI1/BMI2) decode as `#UD`, and so do the 256-bit integer
-//!   forms AVX2 adds and the register forms of the broadcasts.
+//!   encoding, the `YMM` registers, XSAVE component 2), and so are the
+//!   VEX-encoded general-register instructions, BMI1 and BMI2
+//!   ([`Features::bmi1`], [`Features::bmi2`], with `TZCNT`); **nothing
+//!   else after AVX is** — AVX2, FMA and F16C decode as `#UD`, and so do the
+//!   256-bit integer forms AVX2 adds and the register forms of the
+//!   broadcasts.
 //! - **The legacy-SSE alignment rule is partial.** A 128-bit memory operand
 //!   must be sixteen-byte aligned; the instructions that exist to assert it
 //!   (`MOVAPS`, `MOVDQA`, the non-temporal moves, `MOVNTDQA`, `CMPXCHG16B`)
@@ -359,6 +361,7 @@
 //! forbidden.
 
 mod avx;
+mod bmi;
 pub mod disasm;
 mod exec;
 
@@ -743,6 +746,25 @@ pub struct Features {
     /// SSE4.2 would have the VEX form of an instruction it lacks. No such part
     /// shipped, and the System V ABI's x86-64-v3 level assumes the chain.
     pub avx: bool,
+    /// BMI1 — `ANDN`, `BEXTR`, `BLSI`, `BLSMSK`, `BLSR` and `TZCNT` — and
+    /// `CPUID.(EAX=07H,ECX=0):EBX[3]`.
+    ///
+    /// General-register instructions, VEX-encoded but for `TZCNT`, so the
+    /// gate is this bit, `VEX.L = 0`, and VEX's own rule that the prefix is
+    /// `#UD` in real-address and virtual-8086 mode — not `CR4.OSXSAVE`,
+    /// `XCR0` or `CR0.TS` (*Intel SDM* volume 2 §2.5.1, the type 13
+    /// exception class). Without it `F3 0F BC` is `BSF`, not `#UD`.
+    ///
+    /// Requires [`extras_486`](Features::extras_486), for `CPUID` to say so,
+    /// and nothing else: it does not need [`avx`](Features::avx) — parts
+    /// with AVX fused off still have BMI — nor [`long`](Features::long),
+    /// since every form but the `VEX.W1` ones exists in 32-bit mode.
+    pub bmi1: bool,
+    /// BMI2 — `BZHI`, `MULX`, `PDEP`, `PEXT`, `RORX`, `SARX`, `SHLX` and
+    /// `SHRX` — and `CPUID.(EAX=07H,ECX=0):EBX[8]`. Gated as
+    /// [`bmi1`](Features::bmi1) is, and independent of it: no instruction of
+    /// one uses the other, and they are separate bits.
+    pub bmi2: bool,
 }
 
 impl Features {
@@ -776,6 +798,8 @@ impl Features {
         lzcnt: false,
         movbe: false,
         avx: false,
+        bmi1: false,
+        bmi2: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -834,6 +858,8 @@ impl Features {
         lzcnt: false,
         movbe: false,
         avx: false,
+        bmi1: false,
+        bmi2: false,
     };
 
     /// The x86-64-v2 micro-architecture level: the baseline plus
@@ -938,6 +964,11 @@ impl Features {
         if self.avx && !self.sse42 {
             // See `Features::avx`: the VEX.128 forms of SSE4.2 are AVX's.
             return missing("sse42", "avx");
+        }
+        if (self.bmi1 || self.bmi2) && !self.extras_486 {
+            // Their bits are in `CPUID` leaf 7; see `Features::bmi1` for why
+            // that is the whole of it.
+            return missing("extras_486", "bmi1 or bmi2");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2698,7 +2729,7 @@ impl X86 {
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
             "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
-            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt", "movbe", "avx",
+            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt", "movbe", "avx", "bmi1", "bmi2",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2731,6 +2762,8 @@ impl X86 {
                 "avx" => features.avx = on,
                 "lahf_lm" => features.lahf_lm = on,
                 "lzcnt" => features.lzcnt = on,
+                "bmi1" => features.bmi1 = on,
+                "bmi2" => features.bmi2 = on,
                 _ => features.movbe = on,
             }
         }
@@ -4036,6 +4069,19 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: MOVBE",
+        },
+        PropertySpec {
+            name: "bmi1",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: BMI1 — ANDN, BEXTR, BLSI, BLSMSK, BLSR, TZCNT \
+                      (without it, F3 0F BC is BSF)",
+        },
+        PropertySpec {
+            name: "bmi2",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: BMI2 — BZHI, MULX, PDEP, PEXT, RORX, SARX, SHLX, SHRX",
         },
         PropertySpec {
             name: "model",

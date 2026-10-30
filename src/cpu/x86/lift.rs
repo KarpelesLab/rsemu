@@ -4964,6 +4964,8 @@ mod tests {
             // does not know which part it is — so the `F3` form is never
             // lifted as the `BSR` that is.
             (&[0xf3, 0x0f, 0xbd, 0xc1], "lzcnt"),
+            // `TZCNT` likewise is `BSF` without BMI1.
+            (&[0xf3, 0x0f, 0xbc, 0xc1], "tzcnt"),
             (&[0x0f, 0x38, 0xf0, 0x01], "movbe"),
         ] {
             let mut code = alloc::vec![0x40];

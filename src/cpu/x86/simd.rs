@@ -44,6 +44,8 @@ impl Exec<'_> {
             Some(Extension::Lzcnt) => features.lzcnt,
             Some(Extension::Movbe) => features.movbe,
             Some(Extension::Avx) => features.avx,
+            Some(Extension::Bmi1) => features.bmi1,
+            Some(Extension::Bmi2) => features.bmi2,
         }
     }
 
@@ -84,6 +86,26 @@ impl Exec<'_> {
         // The source is masked to the operand size, so the count from 64
         // overstates by the bits above the operand.
         let count = value.leading_zeros() - (64 - u32::from(size) * 8);
+        self.write_arg(f, f.insn.dst, size, u64::from(count))?;
+        self.set_flag(flags::CF, value == 0);
+        self.set_flag(flags::ZF, count == 0);
+        Ok(())
+    }
+
+    /// `TZCNT`: the number of zero bits below the least significant set one.
+    ///
+    /// [`Exec::lzcnt`] one opcode down: a part without BMI1 ignores the `F3`
+    /// and executes `BSF` (*Intel SDM* volume 2, `TZCNT`: "on processors
+    /// that do not support TZCNT, the instruction byte encoding is executed
+    /// as BSF"). `CF` says the source was zero — the result is then the
+    /// operand width — and `ZF` that the result is zero, the bottom bit set.
+    /// `OF`, `SF`, `AF` and `PF` are undefined and are left as they were.
+    pub(super) fn tzcnt(&mut self, f: &Fields, size: u8) -> Ex<()> {
+        if !self.has_extension(f.insn) {
+            return self.bit_scan(f, size, false);
+        }
+        let value = self.read_arg(f, f.insn.src, size)?;
+        let count = value.trailing_zeros().min(u32::from(size) * 8);
         self.write_arg(f, f.insn.dst, size, u64::from(count))?;
         self.set_flag(flags::CF, value == 0);
         self.set_flag(flags::ZF, count == 0);

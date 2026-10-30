@@ -714,6 +714,8 @@ mod tests {
             .flat_map(|t| t.iter().copied())
             .filter(|i| i.vex.exists() && !matches!(i.vex.form, VexForm::Alt(_)))
             .filter(|i| matches!(i.group, Grp::None | Grp::ModAlt))
+            // BMI2's `SHLX` shares the `66 0F38` column and is `bmi`'s.
+            .filter(|i| !i.op.is_bmi())
     }
 
     #[test]
