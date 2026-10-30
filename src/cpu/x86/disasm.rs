@@ -386,6 +386,12 @@ impl Disassembled {
         if insn.op.is_string() {
             return false;
         }
+        // `CRC32`'s register is `Gy`, which fixes *its* width and says
+        // nothing about the source's: `crc32 eax, [ebx]` could be any of
+        // three instructions.
+        if insn.op == Op::CRC32 {
+            return true;
+        }
         !fixes_size(insn.dst) && !fixes_size(insn.src)
     }
 
@@ -922,6 +928,40 @@ mod tests {
         assert_eq!(
             text64(&[0x66, 0x0f, 0x3a, 0x16, 0xc9, 0x03]),
             "pextrd ecx, xmm1, 0x3"
+        );
+    }
+
+    #[test]
+    fn crc32_lists_its_source_width_and_no_repne() {
+        assert_eq!(
+            text32(&[0xf2, 0x0f, 0x38, 0xf0, 0x03]),
+            "crc32 eax, byte [ds:ebx]"
+        );
+        assert_eq!(
+            text32(&[0xf2, 0x0f, 0x38, 0xf1, 0x03]),
+            "crc32 eax, dword [ds:ebx]"
+        );
+        // A `66` beside the mandatory `F2` is an operand-size prefix again.
+        assert_eq!(
+            text32(&[0x66, 0xf2, 0x0f, 0x38, 0xf1, 0xc1]),
+            "crc32 eax, cx"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                disassemble_as(
+                    Gen::I386,
+                    Bits::B64,
+                    0,
+                    0x100,
+                    &[0xf2, 0x48, 0x0f, 0x38, 0xf1, 0x03]
+                )
+            ),
+            "crc32 rax, qword [ds:rbx]"
+        );
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x3a, 0x63, 0xca, 0x0c]),
+            "pcmpistri xmm1, xmm2, 0xc"
         );
     }
 

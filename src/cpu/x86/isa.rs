@@ -1287,6 +1287,12 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("ROUNDPS", "roundps"),
     ("ROUNDSD", "roundsd"),
     ("ROUNDSS", "roundss"),
+    ("CRC32", "crc32"),
+    ("PCMPESTRI", "pcmpestri"),
+    ("PCMPESTRM", "pcmpestrm"),
+    ("PCMPGTQ", "pcmpgtq"),
+    ("PCMPISTRI", "pcmpistri"),
+    ("PCMPISTRM", "pcmpistrm"),
 ];
 
 define_ops! {
@@ -1859,6 +1865,14 @@ define_ops! {
     ROUNDPS = "round packed singles to integers under an immediate mode",
     ROUNDSD = "round the low double to an integer under an immediate mode",
     ROUNDSS = "round the low single to an integer under an immediate mode",
+
+    // ---- SSE4.2 ----------------------------------------------------------
+    CRC32 = "accumulate a CRC-32C (Castagnoli) over a byte, word, doubleword or quadword",
+    PCMPESTRI = "compare explicit-length strings under an immediate, the index into ECX",
+    PCMPESTRM = "compare explicit-length strings under an immediate, the mask into XMM0",
+    PCMPGTQ = "compare packed signed quadwords for greater than",
+    PCMPISTRI = "compare implicit-length strings under an immediate, the index into ECX",
+    PCMPISTRM = "compare implicit-length strings under an immediate, the mask into XMM0",
 }
 
 impl Op {
@@ -2431,7 +2445,18 @@ impl Op {
                 self,
                 Op::FXSAVE | Op::FXRSTOR | Op::LFENCE | Op::MFENCE | Op::SFENCE
             )
-            || (self.extension().is_some() && !self.is_x87())
+            || (self.extension().is_some() && !self.is_x87() && !self.is_general_extension())
+    }
+
+    /// Whether this is one of the general-purpose instructions that arrived
+    /// with a SIMD extension's `CPUID` bit — `CRC32` — and so is gated by
+    /// the bit alone: it touches no SIMD state, so `CR0.EM`, `CR0.TS` and
+    /// `CR4.OSFXSR` mean nothing to it (*Intel SDM* volume 2, `CRC32`,
+    /// "Protected Mode Exceptions": `#UD` for the `CPUID` bit and for
+    /// `LOCK`, and no `#NM`).
+    #[must_use]
+    pub const fn is_general_extension(self) -> bool {
+        matches!(self, Op::CRC32)
     }
 
     /// Which post-SSE2 extension this operation arrived with, if any.
@@ -2518,6 +2543,12 @@ impl Op {
             | Op::ROUNDPS
             | Op::ROUNDSD
             | Op::ROUNDSS => Extension::Sse41,
+            Op::CRC32
+            | Op::PCMPESTRI
+            | Op::PCMPESTRM
+            | Op::PCMPGTQ
+            | Op::PCMPISTRI
+            | Op::PCMPISTRM => Extension::Sse42,
             _ => return None,
         };
         Some(ext)
@@ -2683,6 +2714,9 @@ pub enum Extension {
     Ssse3,
     /// SSE4.1: `CPUID.01H:ECX[19]`.
     Sse41,
+    /// SSE4.2: `CPUID.01H:ECX[20]`. Its one general-purpose member,
+    /// `CRC32`, is gated by the bit and by nothing else.
+    Sse42,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -4014,13 +4048,31 @@ const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x3f PMAXUD    Vx Wx None Documented;
     0x40 PMULLD    Vx Wx None Documented;
     0x41 PHMINPOSUW Vx Wx None Documented;
+
+    // SSE4.2.
+    0x37 PCMPGTQ   Vx Wx None Documented;
 };
 
 /// The `0F 38` map with a `66` prefix.
 pub static TABLE_0F38_66: [Insn; 256] = THREE_38_66.0;
 
+/// The `0F 38` map with an `F2` prefix: `CRC32`.
+///
+/// A general-purpose instruction behind a mandatory prefix, which makes the
+/// operand size its own business: the destination is `Gy` — thirty-two
+/// bits, or sixty-four with `REX.W` — and the source of `F1` is `Ev`, so a
+/// `66` in front of the `F2` still narrows it to sixteen bits. `F2` outranks
+/// `66` in choosing the column, as it does in the two-byte map (*Intel SDM*
+/// volume 2 §2.1.1, `CRC32`).
+const THREE_38_F2: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0xf0 CRC32     Gy Eb None Documented;
+    0xf1 CRC32     Gy Ev None Documented;
+};
+
 /// The `0F 38` map with an `F2` prefix.
-pub static TABLE_0F38_F2: [Insn; 256] = [UNASSIGNED; 256];
+pub static TABLE_0F38_F2: [Insn; 256] = THREE_38_F2.0;
 
 /// The `0F 3A` map with no mandatory prefix: `PALIGNR` on `MM` registers.
 /// *Intel SDM* volume 2 appendix A, table A-5.
@@ -4062,6 +4114,14 @@ const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
     0x40 DPPS      Vx Wx +Ib None Documented;
     0x41 DPPD      Vx Wx +Ib None Documented;
     0x42 MPSADBW   Vx Wx +Ib None Documented;
+
+    // SSE4.2's string compares. The immediate is the whole instruction —
+    // element format, aggregation, polarity and output selection — and see
+    // `simd::pcmpstr` for what each field does.
+    0x60 PCMPESTRM Vx Wx +Ib None Documented;
+    0x61 PCMPESTRI Vx Wx +Ib None Documented;
+    0x62 PCMPISTRM Vx Wx +Ib None Documented;
+    0x63 PCMPISTRI Vx Wx +Ib None Documented;
 };
 
 /// The `0F 3A` map with a `66` prefix.

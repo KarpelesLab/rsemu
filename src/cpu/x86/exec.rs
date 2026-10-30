@@ -2715,6 +2715,7 @@ impl<'a> Exec<'a> {
             Op::XSAVE | Op::XSAVEOPT | Op::XSAVEC | Op::XRSTOR => self.xsave_instruction(f)?,
             Op::XGETBV => self.xgetbv()?,
             Op::XSETBV => self.xsetbv()?,
+            Op::CRC32 => self.crc32(f)?,
             Op::HLT => {
                 if self.protected() && self.cpl() != 0 {
                     return Err(Fault::gp(0));
@@ -4165,6 +4166,9 @@ impl<'a> Exec<'a> {
         }
         if features.sse41 {
             ecx1 |= 1 << 19; // SSE4.1
+        }
+        if features.sse42 {
+            ecx1 |= 1 << 20; // SSE4.2
         }
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers

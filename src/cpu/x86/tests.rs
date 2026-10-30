@@ -4104,6 +4104,39 @@ mod long_mode {
         assert_eq!(r.rdx, 0x88, "so does PEXTRB's");
     }
 
+    /// `[disp32]` with no base and no index, which in 64-bit mode needs a SIB
+    /// byte because `mod == 00`, `r/m == 101` is `RIP`-relative there.
+    fn abs32(reg: u8, addr: u64) -> Vec<u8> {
+        let mut out = alloc::vec![((reg & 7) << 3) | 0b100, 0x25];
+        out.extend_from_slice(&(addr as u32).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn crc32_with_rex_w_reads_a_quadword_and_writes_a_whole_register() {
+        // mov rax, -1 ; crc32 rax, qword [MARK] ; crc32 rax, byte [MARK+8]
+        // ; mov rbx, rax ; not eax — the CRC-32C check value of "123456789".
+        // `F2` has to come before `REX`, which must be the last prefix.
+        let pc = Pc::with_features(
+            Variant::X86_64,
+            Features {
+                sse42: true,
+                ..v2_features()
+            },
+        );
+        pc.write(la::MARK, b"123456789");
+        let mut code = alloc::vec![0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff];
+        code.extend_from_slice(&[0xf2, 0x48, 0x0f, 0x38, 0xf1]);
+        code.extend_from_slice(&abs32(0, la::MARK));
+        code.extend_from_slice(&[0xf2, 0x48, 0x0f, 0x38, 0xf0]);
+        code.extend_from_slice(&abs32(0, la::MARK + 8));
+        code.extend_from_slice(&[0x48, 0x89, 0xc3, 0xf7, 0xd0, 0xf4]);
+        let pc = run64_on(pc, cr4::OSFXSR, &code);
+        let r = pc.regs();
+        assert_eq!(r.rbx, u64::from(!0xe306_9283u32), "upper half cleared");
+        assert_eq!(r.rax, 0xe306_9283);
+    }
+
     #[test]
     fn movnti_with_rex_w_stores_all_eight_bytes() {
         // mov rax, imm64 ; movnti [MARK], rax ; movnti [MARK+8], eax ; hlt
@@ -11117,6 +11150,7 @@ mod v2 {
             sse3: true,
             ssse3: true,
             sse41: true,
+            sse42: true,
             ..Features::X86_64
         }
     }
@@ -11415,6 +11449,143 @@ mod v2 {
         let impossible = Features {
             sse3: true,
             sse41: true,
+            ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err());
+    }
+
+    // -- SSE4.2 ------------------------------------------------------------
+
+    /// `F2 0F 38 F1 /r`, or `F0` for a byte source, at `addr`, into `EAX`.
+    fn crc32_mem(code: &mut Vec<u8>, prefix66: bool, opcode: u8, addr: u64) {
+        if prefix66 {
+            code.push(0x66);
+        }
+        code.extend_from_slice(&mem(&[0xf2, 0x0f, 0x38, opcode], 0, addr));
+    }
+
+    #[test]
+    fn crc32_accumulates_castagnoli_in_every_width() {
+        // The CRC-32C check value: "123456789" with an all-ones start and a
+        // final inversion is 0xE3069283. Fed as two doublewords and a byte,
+        // and again as a word, a doubleword, a word and a byte.
+        for pieces in [
+            &[(false, 0xf1u8, 0u64), (false, 0xf1, 4), (false, 0xf0, 8)][..],
+            &[
+                (true, 0xf1, 0),
+                (false, 0xf1, 2),
+                (true, 0xf1, 6),
+                (false, 0xf0, 8),
+            ],
+        ] {
+            let pc = v2pc();
+            pc.write(DATA, b"123456789");
+            let mut code = alloc::vec![0xb8, 0xff, 0xff, 0xff, 0xff]; // mov eax, -1
+            for &(p66, opcode, at) in pieces {
+                crc32_mem(&mut code, p66, opcode, DATA + at);
+            }
+            code.extend_from_slice(&[0xf7, 0xd0]); // not eax
+            // The flags are not CRC32's business: set them all first.
+            set_regs(&pc, |r| r.eflags |= 0x8d5);
+            run(&pc, &code);
+            assert_eq!(pc.regs().rax, 0xe306_9283, "{pieces:x?}");
+            assert_eq!(pc.regs().eflags & 0x8d5, 0x8d5, "flags untouched");
+        }
+    }
+
+    #[test]
+    fn crc32_needs_only_its_cpuid_bit() {
+        // It touches no SIMD state, so CR4.OSFXSR clear and CR0.EM set are
+        // nothing to it.
+        let pc = Pc::with_features(Variant::X86_64, all());
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr0 |= cr0::EM | cr0::TS;
+        pc.cpu.set_sys(sys);
+        run(&pc, &[0xf2, 0x0f, 0x38, 0xf0, 0xc1]); // crc32 eax, cl
+        // And without the bit it is #UD.
+        let without = Features {
+            sse42: false,
+            ..all()
+        };
+        faults(&pc_with(without), 6, &[0xf2, 0x0f, 0x38, 0xf0, 0xc1]);
+    }
+
+    #[test]
+    fn pcmpistri_and_pcmpestrm_report_through_ecx_xmm0_and_the_flags() {
+        // pcmpistri xmm1, xmm2, 0: the first vowel of "Hello, world!".
+        let pc = v2pc();
+        let text = |s: &[u8]| {
+            let mut b = [0u8; 16];
+            b[..s.len()].copy_from_slice(s);
+            let mut lo = [0u8; 8];
+            let mut hi = [0u8; 8];
+            lo.copy_from_slice(&b[..8]);
+            hi.copy_from_slice(&b[8..]);
+            [u64::from_le_bytes(lo), u64::from_le_bytes(hi)]
+        };
+        set_xmm(&pc, &[(1, text(b"aeiou")), (2, text(b"Hello, world!"))]);
+        set_regs(&pc, |r| r.eflags |= flags::AF | flags::PF);
+        run(&pc, &[0x66, 0x0f, 0x3a, 0x63, 0xca, 0x00]);
+        let r = pc.regs();
+        assert_eq!(r.rcx, 1);
+        let f = r.eflags;
+        assert_ne!(f & flags::CF, 0, "a match");
+        assert_ne!(f & flags::ZF, 0, "the second string ends in the register");
+        assert_ne!(f & flags::SF, 0, "so does the first");
+        assert_eq!(f & (flags::OF | flags::AF | flags::PF), 0);
+        // imm[6]: the most significant match instead, the 'o' of "world".
+        let pc = v2pc();
+        set_xmm(&pc, &[(1, text(b"aeiou")), (2, text(b"Hello, world!"))]);
+        run(&pc, &[0x66, 0x0f, 0x3a, 0x63, 0xca, 0x40]);
+        assert_eq!(pc.regs().rcx, 8);
+
+        // pcmpestrm xmm1, xmm2, 0x0c with EAX = -2 (a length of two: the
+        // absolute value) and EDX = 16: "lo" as a substring, the mask in
+        // XMM0, zero-extended.
+        let pc = v2pc();
+        set_xmm(
+            &pc,
+            &[
+                (0, [!0, !0]),
+                (1, text(b"lo")),
+                (2, text(b"hello, worl lol")),
+            ],
+        );
+        set_regs(&pc, |r| {
+            r.rax = 0xffff_fffe;
+            r.rdx = 16;
+        });
+        run(&pc, &[0x66, 0x0f, 0x3a, 0x60, 0xca, 0x0c]);
+        // "hello, worl lol" is fifteen bytes and then a zero that EDX says
+        // is part of the string: "lo" at 3 and at 12, and the 'l' at 14 is
+        // followed by that zero, not by an 'o'.
+        assert_eq!(xmm(&pc, 0), [(1 << 3) | (1 << 12), 0]);
+        let f = pc.regs().eflags;
+        assert_eq!(f & flags::ZF, 0, "EDX is not below sixteen");
+        assert_ne!(f & flags::SF, 0, "|EAX| is");
+    }
+
+    #[test]
+    fn pcmpgtq_is_a_signed_quadword_compare() {
+        let pc = v2pc();
+        set_xmm(&pc, &[(1, [1, u64::MAX]), (2, [0, 0])]);
+        run(&pc, &[0x66, 0x0f, 0x38, 0x37, 0xca]);
+        assert_eq!(xmm(&pc, 1), [u64::MAX, 0], "1 > 0 and -1 < 0");
+    }
+
+    #[test]
+    fn sse42_is_undefined_without_it_and_cpuid_says_so() {
+        let without = Features {
+            sse42: false,
+            ..all()
+        };
+        faults(&pc_with(without), 6, &[0x66, 0x0f, 0x38, 0x37, 0xca]);
+        faults(&pc_with(without), 6, &[0x66, 0x0f, 0x3a, 0x63, 0xca, 0x00]);
+        assert_eq!(leaf1_ecx(without) & (1 << 20), 0);
+        assert_ne!(leaf1_ecx(all()) & (1 << 20), 0, "CPUID.01H:ECX.SSE4_2");
+        let impossible = Features {
+            sse42: true,
             ..Features::X86_64
         };
         assert!(impossible.validate().is_err());

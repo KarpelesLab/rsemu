@@ -1,4 +1,4 @@
-//! Executing the SIMD extensions past SSE2: SSE3, SSSE3 and SSE4.1.
+//! Executing the extensions past SSE2: SSE3, SSSE3, SSE4.1 and SSE4.2.
 //!
 //! Every one of these is an SSE instruction in everything but its `CPUID`
 //! bit — the same sixteen `XMM` registers, the same `MXCSR`, the same `CR0`
@@ -39,7 +39,28 @@ impl Exec<'_> {
             Some(Extension::Sse3) => features.sse3,
             Some(Extension::Ssse3) => features.ssse3,
             Some(Extension::Sse41) => features.sse41,
+            Some(Extension::Sse42) => features.sse42,
         }
+    }
+
+    /// `CRC32`: accumulate a CRC-32C over the source into the destination.
+    ///
+    /// A general-purpose instruction, so the only gate is its `CPUID` bit.
+    /// The source is a byte (`F0`) or the operand size (`F1`: a word with
+    /// `66`, a doubleword, or a quadword with `REX.W`); the destination is
+    /// the low thirty-two bits of `Gy`, and the result is written back at
+    /// `Gy`'s width — so the `REX.W` forms clear the upper half of the
+    /// 64-bit register (*Intel SDM* volume 2, `CRC32`). Flags are untouched.
+    pub(super) fn crc32(&mut self, f: &Fields) -> Ex<()> {
+        if !self.has_extension(f.insn) {
+            return Err(Fault::bare(VEC_UD));
+        }
+        let bytes = if f.insn.src == Arg::Eb { 1 } else { f.opsize };
+        let data = self.read_arg(f, f.insn.src, bytes)?;
+        let crc = self.read_arg(f, Arg::Gy, 4)? as u32;
+        let out = crc32c(crc, data, bytes);
+        let width = if f.rex_w() { 8 } else { 4 };
+        self.write_arg(f, Arg::Gy, width, u64::from(out))
     }
 
     /// Execute one SSE3-or-later instruction on `XMM` registers, its gates
@@ -95,6 +116,20 @@ impl Exec<'_> {
                 Ok(())
             }
             _ if f.insn.extension() == Some(Extension::Sse41) => self.sse41(f),
+            Op::PCMPGTQ => {
+                let src = self.sse_read_rm(f, Arg::Wx, false)?;
+                let dst = self.state.sse.get(reg);
+                let gt = |i: usize| {
+                    if (dst[i] as i64) > (src[i] as i64) {
+                        u64::MAX
+                    } else {
+                        0
+                    }
+                };
+                self.state.sse.set(reg, [gt(0), gt(1)]);
+                Ok(())
+            }
+            Op::PCMPESTRI | Op::PCMPESTRM | Op::PCMPISTRI | Op::PCMPISTRM => self.pcmpstr(f),
             // The table and this match are written together; a row that
             // reaches here unmatched is a decoder bug, and `#UD` is the
             // architecture's answer to an instruction a part does not have.
@@ -263,6 +298,215 @@ impl Exec<'_> {
         }
         let (sr, off) = self.ea();
         self.write_mem(sr, off, bytes, value)
+    }
+
+    /// The four SSE4.2 string compares.
+    ///
+    /// The first operand (`reg`) and the second (`r/m`) are each a string of
+    /// sixteen bytes or eight words. The *explicit*-length forms take the
+    /// lengths from `EAX` and `EDX` — `RAX` and `RDX` with `REX.W` — as
+    /// absolute values saturated to the element count; the *implicit* ones
+    /// end each string at its first zero element. [`pcmpstr`] does the
+    /// comparison; this reads the operands, writes `ECX` (the `I` forms, a
+    /// 32-bit write) or `XMM0` (the `M` forms), and sets the flags.
+    ///
+    /// The flags are the instruction's own and not an arithmetic result's:
+    /// `CF` says the result is non-zero, `ZF` that the second string is
+    /// shorter than a register and `SF` that the first is, `OF` is bit 0 of
+    /// the result, and `AF` and `PF` are cleared (*Intel SDM* volume 2, each
+    /// instruction's "Flags Affected"; the index and mask outputs are §4.1.5,
+    /// "Output Selection").
+    fn pcmpstr(&mut self, f: &Fields) -> Ex<()> {
+        let op = f.insn.op;
+        let imm = f.imm as u8;
+        let src = self.sse_read_rm(f, Arg::Wx, false)?;
+        let dst = self.state.sse.get(f.reg_num());
+        let words = imm & 1 != 0;
+        let n = if words { 8 } else { 16 };
+        let (la, lb) = if matches!(op, Op::PCMPESTRI | Op::PCMPESTRM) {
+            let regs = &self.state.regs;
+            let length = |v: u64| {
+                let magnitude = if f.rex_w() {
+                    (v as i64).unsigned_abs()
+                } else {
+                    u64::from((v as i32).unsigned_abs())
+                };
+                magnitude.min(n as u64) as usize
+            };
+            (length(regs.rax), length(regs.rdx))
+        } else {
+            (implicit_length(dst, words), implicit_length(src, words))
+        };
+        let result = pcmpstr(dst, src, la, lb, imm);
+        if matches!(op, Op::PCMPESTRI | Op::PCMPISTRI) {
+            let index = if result == 0 {
+                n as u32
+            } else if imm & 0x40 != 0 {
+                15 - result.leading_zeros()
+            } else {
+                result.trailing_zeros()
+            };
+            self.state.regs.set_dword(1, index);
+        } else {
+            let mask = if imm & 0x40 == 0 {
+                [u64::from(result), 0]
+            } else {
+                expand_mask(result, words)
+            };
+            self.state.sse.set(0, mask);
+        }
+        self.set_flag(flags::CF, result != 0);
+        self.set_flag(flags::ZF, lb < n);
+        self.set_flag(flags::SF, la < n);
+        self.set_flag(flags::OF, result & 1 != 0);
+        self.set_flag(flags::AF, false);
+        self.set_flag(flags::PF, false);
+        Ok(())
+    }
+}
+
+/// The CRC-32C (Castagnoli) table, one entry per byte value, for the
+/// bit-reflected polynomial `0x82F6_3B78`.
+///
+/// That is `0x1EDC_6F41`, the polynomial *Intel SDM* volume 2 names for
+/// `CRC32`, with its bits reversed — the instruction's pseudo-code reflects
+/// the operands, divides, and reflects the remainder back, which is the
+/// least-significant-bit-first form a table indexes directly. Computed here
+/// from the polynomial rather than written out.
+const CRC32C: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0x82f6_3b78
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
+/// Fold the low `bytes` of `data`, least significant first, into `crc`.
+///
+/// No initial or final inversion: the instruction leaves both to software,
+/// which is why the standard check value takes a `!0` in and a `!` out.
+pub(super) fn crc32c(mut crc: u32, data: u64, bytes: u8) -> u32 {
+    for i in 0..u32::from(bytes) {
+        let byte = (data >> (8 * i)) as u8;
+        crc = (crc >> 8) ^ CRC32C[usize::from((crc as u8) ^ byte)];
+    }
+    crc
+}
+
+/// The number of elements before the first zero one: an implicit length.
+fn implicit_length(v: [u64; 2], words: bool) -> usize {
+    if words {
+        let w = self::words(v);
+        w.iter().position(|&x| x == 0).unwrap_or(8)
+    } else {
+        bytes(v).iter().position(|&x| x == 0).unwrap_or(16)
+    }
+}
+
+/// A result bit per element, widened to an all-ones element per set bit.
+fn expand_mask(result: u16, words: bool) -> [u64; 2] {
+    if words {
+        of_words(core::array::from_fn(|i| -i16::from((result >> i) & 1 != 0)))
+    } else {
+        of_bytes(core::array::from_fn(|i| {
+            0u8.wrapping_sub(u8::from((result >> i) & 1 != 0))
+        }))
+    }
+}
+
+/// The comparison behind the SSE4.2 string instructions: `IntRes2`, one bit
+/// per element of the second operand.
+///
+/// `a` is the first operand (the register) with `la` valid elements and `b`
+/// the second (register or memory) with `lb`. The immediate, *Intel SDM*
+/// volume 2 §4.1 ("Imm8 Control Byte Operation for PCMPESTRI / PCMPESTRM /
+/// PCMPISTRI / PCMPISTRM"):
+///
+/// - `imm[1:0]`, the **element**: unsigned bytes, unsigned words, signed
+///   bytes, signed words.
+/// - `imm[3:2]`, the **aggregation** (§4.1.3, "Aggregation Operation"),
+///   producing `IntRes1`:
+///   - *equal any* — bit `j` if `b[j]` equals any element of `a`;
+///   - *ranges* — bit `j` if `a[i] <= b[j] <= a[i+1]` for some even `i`;
+///   - *equal each* — bit `i` if `a[i] == b[i]`;
+///   - *equal ordered* — bit `j` if `a` occurs in `b` starting at `j`, which
+///     is a substring search: the needle is the first operand.
+/// - `imm[5:4]`, the **polarity** (§4.1.4, "Polarity"), producing `IntRes2`: as is,
+///   negated, as is again ("masked +"), or negated only where `b` is valid
+///   ("masked −").
+///
+/// What an invalid element — past the end of its string — does is the
+/// override table of §4.1.6 ("Valid/Invalid Override of Comparisons"), and
+/// it is what makes the four aggregations
+/// useful on strings rather than registers: a comparison involving one is
+/// forced *false* for equal any and ranges; for equal each it is *true* when
+/// both are invalid (two strings that have both ended agree) and false when
+/// one is; for equal ordered it is *true* whenever the needle's element is
+/// invalid (the needle has ended, so it matched) and false when only the
+/// haystack's is. Equal ordered also compares only the needle elements that
+/// still fall inside the register (`i < n - j`), so a needle that runs off
+/// the end of the haystack register is a *partial* match at the tail — the
+/// architecture's way of letting a loop resume at the next block.
+pub(super) fn pcmpstr(a: [u64; 2], b: [u64; 2], la: usize, lb: usize, imm: u8) -> u16 {
+    let words = imm & 1 != 0;
+    let signed = imm & 2 != 0;
+    let n = if words { 8 } else { 16 };
+    let element = |v: [u64; 2], i: usize| -> i32 {
+        match (words, signed) {
+            (true, true) => i32::from(self::words(v)[i]),
+            (true, false) => i32::from(self::words(v)[i] as u16),
+            (false, true) => i32::from(bytes(v)[i] as i8),
+            (false, false) => i32::from(bytes(v)[i]),
+        }
+    };
+    let ea: [i32; 16] = core::array::from_fn(|i| if i < n { element(a, i) } else { 0 });
+    let eb: [i32; 16] = core::array::from_fn(|i| if i < n { element(b, i) } else { 0 });
+    let mut res1 = 0u16;
+    for j in 0..n {
+        let hit = match (imm >> 2) & 3 {
+            // Equal any.
+            0 => j < lb && (0..la).any(|i| ea[i] == eb[j]),
+            // Ranges: the pairs `a[0..1]`, `a[2..3]`, …, each wholly valid.
+            1 => j < lb && (0..la / 2).any(|p| ea[2 * p] <= eb[j] && eb[j] <= ea[2 * p + 1]),
+            // Equal each.
+            2 => match (j < la, j < lb) {
+                (true, true) => ea[j] == eb[j],
+                (false, false) => true,
+                _ => false,
+            },
+            // Equal ordered.
+            _ => (0..n - j).all(|i| {
+                if i >= la {
+                    true
+                } else if j + i >= lb {
+                    false
+                } else {
+                    ea[i] == eb[j + i]
+                }
+            }),
+        };
+        if hit {
+            res1 |= 1 << j;
+        }
+    }
+    let all = if words { 0xff } else { 0xffff };
+    let valid_b = ((1u32 << lb) - 1) as u16;
+    match (imm >> 4) & 3 {
+        1 => !res1 & all,
+        3 => res1 ^ valid_b,
+        _ => res1,
     }
 }
 
@@ -1118,6 +1362,98 @@ mod tests {
         let s = [0x4000_0000_0000_0000, 0x4010_0000_0000_0000];
         let (out, _) = dot(Op::DPPD, d, s, 0x32, Env::X86_SSE);
         assert_eq!(out, [0, 0x4026_0000_0000_0000]);
+    }
+
+    /// A string as a register, zero-padded.
+    fn text(s: &[u8]) -> [u64; 2] {
+        let mut b = [0u8; 16];
+        b[..s.len()].copy_from_slice(s);
+        of_bytes(b)
+    }
+
+    #[test]
+    fn crc32c_of_the_check_string_is_the_castagnoli_check_value() {
+        // The standard check: CRC-32C of "123456789", with the conventional
+        // all-ones start and final inversion, is 0xE3069283 — a property of
+        // the polynomial, which is iSCSI's (RFC 3720), and computable from it
+        // alone. Byte at a time and in wider pieces agree, because the
+        // instruction consumes its source least significant byte first.
+        let msg = b"123456789";
+        let bytewise = msg.iter().fold(!0u32, |c, &b| crc32c(c, u64::from(b), 1));
+        assert_eq!(!bytewise, 0xe306_9283);
+        let mut q = [0u8; 8];
+        q.copy_from_slice(&msg[..8]);
+        let wide = crc32c(!0, u64::from_le_bytes(q), 8);
+        assert_eq!(!crc32c(wide, u64::from(msg[8]), 1), 0xe306_9283);
+        let mut d = [0u8; 4];
+        d.copy_from_slice(&msg[..4]);
+        let c = crc32c(!0, u64::from(u32::from_le_bytes(d)), 4);
+        let c = crc32c(c, u64::from(u16::from_le_bytes([msg[4], msg[5]])), 2);
+        let c = crc32c(c, u64::from(u16::from_le_bytes([msg[6], msg[7]])), 2);
+        assert_eq!(!crc32c(c, u64::from(msg[8]), 1), 0xe306_9283);
+    }
+
+    #[test]
+    fn equal_any_finds_the_members_of_a_set() {
+        // strpbrk("Hello, world!", "aeiou"): 'e' at 1, 'o' at 4 and 8.
+        let set = text(b"aeiou");
+        let s = text(b"Hello, world!");
+        assert_eq!(pcmpstr(set, s, 5, 13, 0x00), 0b1_0001_0010);
+        // Negated: every *other* bit, invalid tail included.
+        assert_eq!(pcmpstr(set, s, 5, 13, 0x10), !0b1_0001_0010);
+        // Masked negative: negated only within the string.
+        assert_eq!(pcmpstr(set, s, 5, 13, 0x30), 0b1_1110_1110_1101);
+        assert_eq!(implicit_length(set, false), 5);
+        assert_eq!(implicit_length(s, false), 13);
+    }
+
+    #[test]
+    fn ranges_take_the_first_operand_in_pairs() {
+        // [a-z] over "Hello": the four lower-case letters.
+        let r = text(b"az");
+        assert_eq!(pcmpstr(r, text(b"Hello"), 2, 5, 0x04), 0b1_1110);
+        // An odd count leaves the last bound unpaired, and unused.
+        assert_eq!(pcmpstr(text(b"azH"), text(b"Hello"), 3, 5, 0x04), 0b1_1110);
+        // Signed words: [-10, 10] over [-20, -5, 0, 15].
+        let bounds = of_words([-10, 10, 0, 0, 0, 0, 0, 0]);
+        let v = of_words([-20, -5, 0, 15, 0, 0, 0, 0]);
+        assert_eq!(pcmpstr(bounds, v, 2, 4, 0x07), 0b0110);
+        // The same bits as unsigned words: 0xfff6..0x000a is an empty range.
+        assert_eq!(pcmpstr(bounds, v, 2, 4, 0x05), 0);
+    }
+
+    #[test]
+    fn equal_each_is_a_string_compare() {
+        // "hello" against "help!": the first difference is at 3, and past
+        // both ends the strings agree.
+        let r = pcmpstr(text(b"hello"), text(b"help!"), 5, 5, 0x08);
+        assert_eq!(r, 0xffe7);
+        // With negative polarity, the lowest set bit is the first mismatch.
+        assert_eq!(pcmpstr(text(b"hello"), text(b"help!"), 5, 5, 0x18), 0x0018);
+        // One string longer than the other: the extra element mismatches.
+        assert_eq!(pcmpstr(text(b"ab"), text(b"abc"), 2, 3, 0x08), 0xfffb);
+    }
+
+    #[test]
+    fn equal_ordered_is_a_substring_search_with_a_partial_tail() {
+        // strstr("hello world", "lo") is at 3, and only there.
+        assert_eq!(
+            pcmpstr(text(b"lo"), text(b"hello world"), 2, 11, 0x0c),
+            1 << 3
+        );
+        // A needle that runs off the end of the register matches as far as
+        // it goes: "lo" against sixteen bytes ending in 'l' reports 15.
+        let hay = text(b"xxxxxxxxxxxxxxxl");
+        assert_eq!(pcmpstr(text(b"lo"), hay, 2, 16, 0x0c), 1 << 15);
+        // But not when the haystack *string* has ended before the register:
+        // the needle's next element is valid and the haystack's is not.
+        assert_eq!(pcmpstr(text(b"lo"), text(b"hel"), 2, 3, 0x0c), 0);
+    }
+
+    #[test]
+    fn the_mask_output_widens_to_elements() {
+        assert_eq!(expand_mask(0b101, false), [0x0000_0000_00ff_00ff, 0]);
+        assert_eq!(expand_mask(0x81, true), [0xffff, 0xffff_0000_0000_0000]);
     }
 
     #[test]
