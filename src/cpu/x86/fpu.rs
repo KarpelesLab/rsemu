@@ -628,18 +628,28 @@ pub mod mxcsr {
     pub const SUPPORTED: u32 = WRITABLE;
 }
 
-/// The sixteen SSE registers and `MXCSR`.
+/// The sixteen SSE registers, their AVX upper halves, and `MXCSR`.
 ///
 /// A register is two `u64`s rather than a `u128` because every access to one
 /// is a pair of 64-bit bus transfers — guest memory is addressed by byte
 /// offset and transferred at a width the bus understands, and a 128-bit
 /// integer would only have to be taken apart again.
+///
+/// `YMMn` is `XMMn` with [`Sse::ymm_hi`]`[n]` above it. They are kept apart
+/// rather than as one 256-bit register because that is how the architecture
+/// treats them: the XSAVE feature set saves them as two state components
+/// (*Intel SDM* volume 1 §13.5.2, §13.5.3), and a legacy SSE instruction
+/// writes the low half and leaves the upper one exactly as it was, where a
+/// VEX-encoded one zeroes it (§14.1.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sse {
     /// `XMM0` through `XMM15`, each as `[low, high]`.
     pub xmm: [[u64; 2]; 16],
     /// The control and status register.
     pub mxcsr: u32,
+    /// Bits 255:128 of `YMM0` through `YMM15`, each as `[low, high]`. Zero
+    /// on a part without AVX, where nothing can write them.
+    pub ymm_hi: [[u64; 2]; 16],
 }
 
 impl Default for Sse {
@@ -655,7 +665,35 @@ impl Sse {
         Sse {
             xmm: [[0; 2]; 16],
             mxcsr: mxcsr::RESET,
+            ymm_hi: [[0; 2]; 16],
         }
+    }
+
+    /// Bits 255:128 of a `YMM` register.
+    #[inline]
+    #[must_use]
+    pub const fn hi(&self, index: u8) -> [u64; 2] {
+        self.ymm_hi[(index & 15) as usize]
+    }
+
+    /// Replace bits 255:128 of a `YMM` register.
+    #[inline]
+    pub const fn set_hi(&mut self, index: u8, value: [u64; 2]) {
+        self.ymm_hi[(index & 15) as usize] = value;
+    }
+
+    /// A whole `YMM` register, `[XMM half, upper half]`.
+    #[inline]
+    #[must_use]
+    pub const fn ymm(&self, index: u8) -> [[u64; 2]; 2] {
+        [self.get(index), self.hi(index)]
+    }
+
+    /// Replace a whole `YMM` register.
+    #[inline]
+    pub const fn set_ymm(&mut self, index: u8, value: [[u64; 2]; 2]) {
+        self.set(index, value[0]);
+        self.set_hi(index, value[1]);
     }
 
     /// The low 64 bits of a register.

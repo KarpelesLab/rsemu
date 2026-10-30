@@ -696,9 +696,12 @@ pub fn fpu_from_kvm(kvm: &KvmFpu, base: &X87) -> (X87, Sse) {
         };
         x87.tag |= tag.bits() << (2 * i);
     }
+    // The `YMM` upper halves are not in `kvm_fpu` — they travel in the
+    // XSAVE area, which this transfer does not carry — so they come back
+    // zero.
     let mut sse = Sse {
-        xmm: [[0; 2]; 16],
         mxcsr: kvm.mxcsr,
+        ..Sse::new()
     };
     for i in 0..16 {
         let mut lo = [0u8; 8];

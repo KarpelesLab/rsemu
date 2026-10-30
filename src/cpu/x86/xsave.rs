@@ -118,20 +118,58 @@ pub(super) struct Component {
     pub present: fn(Features) -> bool,
     /// Whether it differs from its initial configuration — `XINUSE[bit]`.
     pub in_use: fn(&State) -> bool,
-    /// Copy it out, `size / 8` quadwords in area order.
+    /// How many of its quadwords, from the start, are architectural state
+    /// when the mode has this many vector registers — sixteen in 64-bit mode
+    /// and eight elsewhere ([`Exec::xmm_count`]). The rest of the component's
+    /// bytes are neither written nor read, as for the `XMM` registers in the
+    /// legacy region (*Intel SDM* volume 1 §13.5.2, §13.5.3).
+    pub words: fn(u8) -> u32,
+    /// Copy it out into a slice of `words(count)` quadwords, in area order.
     pub save: fn(&State, &mut [u64]),
-    /// Copy it in from `size / 8` quadwords, or — given `None` — put it in its
-    /// initial configuration.
-    pub load: fn(&mut State, Option<&[u64]>),
+    /// Copy it in from `words(count)` quadwords, or — given `None` — put the
+    /// state those quadwords cover in its initial configuration. The `u8` is
+    /// the vector-register count, as for `words`.
+    pub load: fn(&mut State, u8, Option<&[u64]>),
 }
 
 /// The state components above the legacy region, in component order.
 ///
-/// Empty until AVX: components 0 and 1 are the legacy region, which has its
-/// own fixed layout and is handled apart. AVX's row is component 2, the
-/// upper 128 bits of the sixteen `YMM` registers — 256 bytes at offset 576,
-/// not 64-byte aligned when compacted (*Intel SDM* volume 1 §13.5.3).
-pub(super) static COMPONENTS: &[Component] = &[];
+/// Components 0 and 1 are the legacy region, which has its own fixed layout
+/// and is handled apart.
+pub(super) static COMPONENTS: &[Component] = &[
+    // AVX: bits 255:128 of the sixteen `YMM` registers, `YMM0_H` first, each
+    // as its low quadword then its high one — 256 bytes at offset 576, not
+    // 64-byte aligned when compacted (*Intel SDM* volume 1 §13.5.3; `CPUID`
+    // leaf `0Dh` sub-leaf 2). Outside 64-bit mode only `YMM0_H`-`YMM7_H` are
+    // state, so only the first 128 bytes move, as only `XMM0`-`XMM7` do in
+    // the legacy region.
+    Component {
+        bit: 2,
+        size: 256,
+        offset: 576,
+        align64: false,
+        present: |f| f.avx,
+        in_use: |s| s.sse.ymm_hi != [[0; 2]; 16],
+        words: |count| 2 * u32::from(count),
+        save: |s, out| {
+            for (i, word) in out.iter_mut().enumerate() {
+                *word = s.sse.ymm_hi[i / 2][i % 2];
+            }
+        },
+        load: |s, count, image| match image {
+            Some(words) => {
+                for (i, &word) in words.iter().enumerate() {
+                    s.sse.ymm_hi[i / 2][i % 2] = word;
+                }
+            }
+            None => {
+                for reg in s.sse.ymm_hi.iter_mut().take(usize::from(count)) {
+                    *reg = [0; 2];
+                }
+            }
+        },
+    },
+];
 
 /// The standard-format size of an area holding `mask`'s components.
 ///
@@ -376,7 +414,7 @@ impl Exec<'_> {
                 for c in COMPONENTS.iter().filter(|c| save & (1 << c.bit) != 0) {
                     extended.push((u64::from(c.offset), *c));
                 }
-                self.store_components(sr, off, &extended)?;
+                self.store_components(sr, off, count, &extended)?;
                 let bv = (old & !rfbm) | (inuse & rfbm);
                 self.write_mem(sr, header, 8, bv)?;
             }
@@ -398,7 +436,7 @@ impl Exec<'_> {
                     }
                     at += c.size;
                 }
-                self.store_components(sr, off, &extended)?;
+                self.store_components(sr, off, count, &extended)?;
                 self.write_mem(sr, header, 8, save)?;
                 self.write_mem(sr, header.wrapping_add(8), 8, rfbm | COMPACTED)?;
             }
@@ -406,10 +444,17 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// Write each `(offset, component)` from the processor into the area.
-    fn store_components(&mut self, sr: u8, off: u64, list: &[(u64, Component)]) -> Ex<()> {
+    /// Write each `(offset, component)` from the processor into the area,
+    /// as much of each as a mode with `count` vector registers has.
+    fn store_components(
+        &mut self,
+        sr: u8,
+        off: u64,
+        count: u8,
+        list: &[(u64, Component)],
+    ) -> Ex<()> {
         for &(at, c) in list {
-            let mut words = alloc::vec![0u64; (c.size / 8) as usize];
+            let mut words = alloc::vec![0u64; (c.words)(count) as usize];
             (c.save)(&*self.state, &mut words);
             for (i, word) in words.into_iter().enumerate() {
                 let to = off.wrapping_add(at).wrapping_add(8 * i as u64);
@@ -419,9 +464,16 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// Read one component's image out of the area.
-    fn load_component(&mut self, sr: u8, at: u64, c: Component) -> Ex<alloc::vec::Vec<u64>> {
-        let mut words = alloc::vec![0u64; (c.size / 8) as usize];
+    /// Read one component's image out of the area — as much of it as a mode
+    /// with `count` vector registers has.
+    fn load_component(
+        &mut self,
+        sr: u8,
+        at: u64,
+        count: u8,
+        c: Component,
+    ) -> Ex<alloc::vec::Vec<u64>> {
+        let mut words = alloc::vec![0u64; (c.words)(count) as usize];
         for (i, word) in words.iter_mut().enumerate() {
             *word = self.read_mem(sr, at.wrapping_add(8 * i as u64), 8)?;
         }
@@ -530,7 +582,7 @@ impl Exec<'_> {
             }
             let image = match place {
                 Some(pos) if xstate_bv & bit != 0 => {
-                    Some(self.load_component(sr, off.wrapping_add(u64::from(pos)), *c)?)
+                    Some(self.load_component(sr, off.wrapping_add(u64::from(pos)), count, *c)?)
                 }
                 _ => None,
             };
@@ -549,7 +601,7 @@ impl Exec<'_> {
             self.state.sse.mxcsr = value;
         }
         for (c, image) in extended {
-            (c.load)(&mut *self.state, image.as_deref());
+            (c.load)(&mut *self.state, count, image.as_deref());
         }
         Ok(())
     }

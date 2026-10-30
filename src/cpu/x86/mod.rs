@@ -706,6 +706,23 @@ pub struct Features {
     /// by `CPUID`. Not [`long`](Features::long) — the first parts with it
     /// were 32-bit Atoms.
     pub movbe: bool,
+    /// AVX: the VEX encoding, the `YMM` registers, and `CPUID.01H:ECX[28]`.
+    ///
+    /// Every floating-point SSE–SSE4.1 instruction at 128 and 256 bits with a
+    /// non-destructive third operand, the integer SSE2–SSE4.2 instructions at
+    /// 128 bits (the 256-bit integer forms are AVX2's), and AVX's own:
+    /// `VBROADCAST*`, `VINSERTF128`, `VEXTRACTF128`, `VPERM2F128`,
+    /// `VPERMILPS`/`PD`, `VMASKMOVPS`/`PD`, `VTESTPS`/`PD`, the is4
+    /// `VBLENDV*`, `VZEROUPPER` and `VZEROALL`. Their state is XSAVE
+    /// component 2, and an operating system enables them by setting
+    /// `XCR0[2:1]` with `XSETBV` (*Intel SDM* volume 1 §14.3).
+    ///
+    /// Requires [`xsave`](Features::xsave) — there is no other way to turn
+    /// it on — and [`sse42`](Features::sse42): every VEX.128 form of an SSE4.2
+    /// instruction is an AVX instruction, so a part with AVX and without
+    /// SSE4.2 would have the VEX form of an instruction it lacks. No such part
+    /// shipped, and the System V ABI's x86-64-v3 level assumes the chain.
+    pub avx: bool,
 }
 
 impl Features {
@@ -738,6 +755,7 @@ impl Features {
         lahf_lm: false,
         lzcnt: false,
         movbe: false,
+        avx: false,
     };
 
     /// What an 80486DX has: the 486 additions and an on-die x87 unit.
@@ -795,6 +813,7 @@ impl Features {
         lahf_lm: false,
         lzcnt: false,
         movbe: false,
+        avx: false,
     };
 
     /// The x86-64-v2 micro-architecture level: the baseline plus
@@ -890,6 +909,15 @@ impl Features {
         }
         if self.movbe && !self.extras_486 {
             return missing("extras_486", "movbe");
+        }
+        if self.avx && !self.xsave {
+            // `XCR0[2]` is how an operating system turns AVX on, and
+            // `XSETBV` is the only way to write it.
+            return missing("xsave", "avx");
+        }
+        if self.avx && !self.sse42 {
+            // See `Features::avx`: the VEX.128 forms of SSE4.2 are AVX's.
+            return missing("sse42", "avx");
         }
         if self.sse && !self.fxsr {
             // `CR4.OSFXSR` is how an operating system says it has somewhere to
@@ -2650,7 +2678,7 @@ impl X86 {
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
             "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
-            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt", "movbe",
+            "popcnt", "cx16", "lahf_lm", "xsave", "lzcnt", "movbe", "avx",
         ] {
             let Some(on) = r.optional::<bool>(name)? else {
                 continue;
@@ -2680,6 +2708,7 @@ impl X86 {
                 "sse42" => features.sse42 = on,
                 "popcnt" => features.popcnt = on,
                 "cx16" => features.cx16 = on,
+                "avx" => features.avx = on,
                 "lahf_lm" => features.lahf_lm = on,
                 "lzcnt" => features.lzcnt = on,
                 _ => features.movbe = on,
@@ -3800,7 +3829,8 @@ pub static CLASS: DeviceClass = DeviceClass {
     //    offset below it is unchanged.
     // 9: `XCR0`, appended. Guest-visible through `XGETBV` and through the
     //    size `CPUID` leaf `0Dh` reports.
-    version: 9,
+    // 10: bits 255:128 of the sixteen `YMM` registers, appended.
+    version: 10,
     summary: "Intel x86 CPU core: 8086/8088 real mode, 80386/80486 protected mode, or x86-64",
     properties: &[
         PropertySpec {
@@ -3918,6 +3948,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Bool,
             required: false,
             summary: "override the preset: XSAVE/XRSTOR, XGETBV/XSETBV, XCR0 and CR4.OSXSAVE",
+        },
+        PropertySpec {
+            name: "avx",
+            kind: ValueKind::Bool,
+            required: false,
+            summary: "override the preset: AVX — the VEX encoding and the YMM registers \
+                      (needs xsave and sse42)",
         },
         PropertySpec {
             name: "mmx",
@@ -4359,6 +4396,12 @@ impl Device for X86 {
         // `Features::xsave` says: on a part without the feature it holds its
         // reset value and nothing can change it.
         w.write_u64(state.sys.xcr0)?;
+        // The `YMM` upper halves, appended likewise and written whatever
+        // `Features::avx` says: without AVX they are zero for good.
+        for reg in state.sse.ymm_hi {
+            w.write_u64(reg[0])?;
+            w.write_u64(reg[1])?;
+        }
         Ok(())
     }
 
@@ -4526,6 +4569,11 @@ impl Device for X86 {
             state.sys.mtrr_fix[i] = r.read_u64()?;
         }
         state.sys.xcr0 = r.read_u64()?;
+        for i in 0..16 {
+            let lo = r.read_u64()?;
+            let hi = r.read_u64()?;
+            state.sse.ymm_hi[i] = [lo, hi];
+        }
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely
         // convenient, because the page tables it would cache have just been

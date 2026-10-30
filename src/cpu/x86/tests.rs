@@ -6823,6 +6823,177 @@ mod long_mode {
             assert_eq!(pc.cpu.sys(), sys_before);
         }
 
+        // -- AVX: component 2, the upper halves of the `YMM` registers ----
+
+        /// A part with AVX on top of the XSAVE feature set.
+        fn avx_features() -> Features {
+            Features {
+                xsave: true,
+                avx: true,
+                ..Features::X86_64_V2
+            }
+        }
+
+        /// Something distinctive in every `YMM` upper half.
+        fn distinctive_upper(pc: &Pc) {
+            let mut sse = pc.cpu.sse();
+            for i in 0..16u8 {
+                let n = u64::from(i) + 0x41;
+                sse.set_hi(i, [n * 0x0001_0001_0001_0001, !n << 8]);
+            }
+            pc.cpu.set_sse(sse);
+        }
+
+        fn read_u64(pc: &Pc, addr: u64) -> u64 {
+            u64::from_le_bytes(bytes(pc, addr, 8).try_into().unwrap())
+        }
+
+        #[test]
+        fn the_avx_component_is_described_by_cpuid_and_enabled_by_xsetbv() {
+            // *Intel SDM* volume 2 `CPUID` leaf `0Dh`: sub-leaf 2 is 256 bytes
+            // at offset 576, not aligned when compacted; the area for x87,
+            // SSE and AVX is 832 bytes. Volume 2 `XSETBV`: AVX without SSE is
+            // `#GP(0)`.
+            let cpuid = |pc: &Pc, leaf: u32, sub: u32| {
+                let mut code = mov(0, leaf);
+                code.extend(mov(1, sub));
+                code.extend_from_slice(&[0x0f, 0xa2]);
+                assert_eq!(exec(pc, &code), None);
+                let r = pc.regs();
+                (r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32)
+            };
+            let pc = xpc_with(avx_features());
+            assert_eq!(cpuid(&pc, 0xd, 0), (7, 576, 832, 0));
+            assert_eq!(cpuid(&pc, 0xd, 2), (256, 576, 0, 0));
+            assert_eq!(exec(&pc, &xsetbv(5)), Some(13), "AVX needs SSE");
+            assert_eq!(exec(&pc, &xsetbv(7)), None);
+            assert_eq!(pc.cpu.sys().xcr0, 7);
+            assert_eq!(cpuid(&pc, 0xd, 0), (7, 832, 832, 0));
+            assert_eq!(cpuid(&pc, 0xd, 1).1, 832, "compacted size, unaligned");
+            // Without AVX the component does not exist, and XCR0 cannot name
+            // it.
+            let pc = xpc();
+            assert_eq!(cpuid(&pc, 0xd, 2), (0, 0, 0, 0));
+            assert_eq!(exec(&pc, &xsetbv(7)), Some(13));
+        }
+
+        #[test]
+        fn xsave_and_xrstor_carry_the_ymm_upper_halves() {
+            // *Intel SDM* volume 1 §13.5.3: `YMM0_H`-`YMM15_H` at 576 in the
+            // standard form, sixteen bytes each — and outside 64-bit mode
+            // only the first eight are state, so only 128 bytes move.
+            let pc = xpc_with(avx_features());
+            distinctive_upper(&pc);
+            pc.write(AREA + 512, &[0; 64]);
+            pc.write(AREA + 576, &[0xaa; 256]);
+            let mut code = xsetbv(7);
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem32(GRP15, 4, AREA)); // xsave
+            assert_eq!(exec(&pc, &code), None);
+            let sse = pc.cpu.sse();
+            assert_eq!(read_u64(&pc, AREA + 512), 4, "XSTATE_BV: AVX in use");
+            for i in 0..8u64 {
+                let hi = sse.hi(i as u8);
+                assert_eq!(read_u64(&pc, AREA + 576 + 16 * i), hi[0]);
+                assert_eq!(read_u64(&pc, AREA + 584 + 16 * i), hi[1]);
+            }
+            assert_eq!(
+                bytes(&pc, AREA + 704, 128),
+                [0xaa; 128],
+                "YMM8_H on: untouched"
+            );
+
+            // Wreck the upper halves and restore them: eight come back, and
+            // the other eight are left as they are.
+            let mut wrecked = sse;
+            wrecked.ymm_hi = [[0x5a; 2]; 16];
+            pc.cpu.set_sse(wrecked);
+            let mut code = args(u64::MAX, 0);
+            code.extend(mem32(GRP15, 5, AREA)); // xrstor
+            assert_eq!(exec(&pc, &code), None);
+            let back = pc.cpu.sse();
+            assert_eq!(back.ymm_hi[..8], sse.ymm_hi[..8]);
+            assert_eq!(back.ymm_hi[8..], [[0x5a; 2]; 8]);
+
+            // A clear XSTATE_BV bit puts the component in its init state.
+            pc.write(AREA + 512, &[3]);
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(pc.cpu.sse().ymm_hi[..8], [[0; 2]; 8]);
+            // And XRSTOR without AVX in RFBM leaves it alone.
+            distinctive_upper(&pc);
+            let before = pc.cpu.sse().ymm_hi;
+            let mut code = args(3, 0);
+            code.extend(mem32(GRP15, 5, AREA));
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(pc.cpu.sse().ymm_hi, before);
+        }
+
+        #[test]
+        fn xinuse_and_xsavec_see_the_avx_component() {
+            // §13.6: in use when it differs from zero; §13.10: compacted, it
+            // follows the legacy region directly, at 576.
+            let pc = xpc_with(avx_features());
+            let xinuse = |pc: &Pc| {
+                let mut code = args(0, 1);
+                code.extend_from_slice(&XGETBV);
+                assert_eq!(exec(pc, &code), None);
+                pc.regs().rax
+            };
+            assert_eq!(exec(&pc, &xsetbv(7)), None);
+            assert_eq!(xinuse(&pc), 0);
+            distinctive_upper(&pc);
+            assert_eq!(xinuse(&pc), 4);
+            pc.write(AREA + 512, &[0; 64]);
+            let mut code = args(u64::MAX, 0);
+            code.extend(mem32(GRP9, 4, AREA)); // xsavec
+            assert_eq!(exec(&pc, &code), None);
+            assert_eq!(read_u64(&pc, AREA + 512), 4, "XSTATE_BV");
+            assert_eq!(read_u64(&pc, AREA + 520), 7 | 1 << 63, "XCOMP_BV");
+            assert_eq!(read_u64(&pc, AREA + 576), pc.cpu.sse().hi(0)[0]);
+        }
+
+        #[test]
+        fn in_64_bit_mode_all_sixteen_upper_halves_move() {
+            let pc = xpc_with(avx_features());
+            distinctive_upper(&pc);
+            pc.write(AREA + 512, &[0; 64]);
+            let mut code = xsetbv(7);
+            code.extend(args(u64::MAX, 0));
+            code.extend(mem64(None, GRP15, 4, AREA));
+            code.push(0xf4);
+            let sse = pc.cpu.sse();
+            run64x(&pc, &code);
+            for i in 0..16u64 {
+                assert_eq!(read_u64(&pc, AREA + 576 + 16 * i), sse.hi(i as u8)[0]);
+                assert_eq!(read_u64(&pc, AREA + 584 + 16 * i), sse.hi(i as u8)[1]);
+            }
+        }
+
+        #[test]
+        fn the_ymm_upper_halves_survive_a_snapshot() {
+            let pc = xpc_with(avx_features());
+            distinctive_upper(&pc);
+            let before = pc.cpu.sse();
+            let mut shape = MachineShape::new();
+            shape.add_device("/cpu0", "cpu.x86").unwrap();
+            let mut writer = StateWriter::new(shape);
+            {
+                let mut chunk = writer
+                    .chunk("/cpu0", "cpu.x86", super::super::super::CLASS.version)
+                    .unwrap();
+                pc.cpu.save(&mut chunk).unwrap();
+            }
+            let bytes = writer.to_vec().unwrap();
+            pc.cpu.reset(ResetKind::Cold);
+            assert_eq!(pc.cpu.sse().ymm_hi, [[0; 2]; 16], "a reset clears them");
+            let reader = StateReader::new(&bytes).unwrap();
+            let (_, _, data) = reader.load_raw("/cpu0").unwrap();
+            let mut chunk = ChunkReader::new(data);
+            pc.cpu.load(&mut chunk).unwrap();
+            chunk.end().unwrap();
+            assert_eq!(pc.cpu.sse(), before);
+        }
+
         #[test]
         fn the_disassembler_names_every_form() {
             let text = |bytes: &[u8]| {
