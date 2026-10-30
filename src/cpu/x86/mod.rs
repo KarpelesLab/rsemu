@@ -189,14 +189,14 @@
 //!   SSE4.1 and SSE4.2 are here ([`Features::ssse3`], [`Features::sse41`],
 //!   [`Features::sse42`]), and so is `POPCNT` ([`Features::popcnt`]) —
 //!   with `CMPXCHG16B` and 64-bit `LAHF`/`SAHF`, the whole x86-64-v2 level
-//!   ([`Features::X86_64_V2`]). `LZCNT` is here too ([`Features::lzcnt`],
-//!   in no preset); without it `F3 0F BD` executes as `BSR`. So is
-//!   `MOVBE` ([`Features::movbe`], in no preset either).
-//!   AVX is here too ([`Features::avx`]: the VEX
+//!   ([`Features::X86_64_V2`]). `LZCNT` is here too ([`Features::lzcnt`]);
+//!   without it `F3 0F BD` executes as `BSR`. So is `MOVBE`
+//!   ([`Features::movbe`]). AVX is here too ([`Features::avx`]: the VEX
 //!   encoding, the `YMM` registers, XSAVE component 2), and so are AVX2, FMA
 //!   and F16C ([`Features::avx2`], [`Features::fma`], [`Features::f16c`])
 //!   and the VEX-encoded general-register instructions, BMI1 and BMI2
-//!   ([`Features::bmi1`], [`Features::bmi2`], with `TZCNT`).
+//!   ([`Features::bmi1`], [`Features::bmi2`], with `TZCNT`) — the whole
+//!   x86-64-v3 level ([`Features::X86_64_V3`], `level = "v3"`).
 //! - **The legacy-SSE alignment rule is partial.** A 128-bit memory operand
 //!   must be sixteen-byte aligned; the instructions that exist to assert it
 //!   (`MOVAPS`, `MOVDQA`, the non-temporal moves, `MOVNTDQA`, `CMPXCHG16B`)
@@ -575,7 +575,8 @@ pub enum Variant {
     /// — and a name here would imply a fixed bundle of them. This is the
     /// baseline: the architecture AMD introduced, with the pieces every part
     /// implementing it has to have. [`Features::X86_64_V2`] — the `level =
-    /// "v2"` property — is the same part with the next level's extensions.
+    /// "v2"` property — is the same part with the next level's extensions, and
+    /// [`Features::X86_64_V3`] (`level = "v3"`) the level after that.
     X86_64,
 }
 
@@ -910,6 +911,27 @@ impl Features {
         cx16: true,
         lahf_lm: true,
         ..Features::X86_64
+    };
+
+    /// x86-64-v3: [`X86_64_V2`](Features::X86_64_V2) plus AVX, AVX2, BMI1,
+    /// BMI2, F16C, FMA, `LZCNT`, `MOVBE` and the XSAVE feature set that AVX
+    /// is enabled through (`OSXSAVE` in the ABI's list is the operating
+    /// system's half: `CR4.OSXSAVE`, which the guest sets).
+    ///
+    /// The same *System V AMD64 ABI* table as v2 — a Haswell-class part, and
+    /// what a `-march=x86-64-v3` binary assumes. A machine description
+    /// selects it with `level = "v3"`.
+    pub const X86_64_V3: Features = Features {
+        xsave: true,
+        avx: true,
+        avx2: true,
+        bmi1: true,
+        bmi2: true,
+        f16c: true,
+        fma: true,
+        lzcnt: true,
+        movbe: true,
+        ..Features::X86_64_V2
     };
 
     /// Whether this combination describes a part that could exist.
@@ -2558,8 +2580,9 @@ const ENGINES: &[&str] = &["interp", "jit", "jit-host"];
 
 /// The values a machine file's `level` property takes: the x86-64
 /// micro-architecture levels this core implements. `v1` is the baseline,
-/// [`Features::X86_64`]; `v2` is [`Features::X86_64_V2`].
-const LEVELS: &[&str] = &["v1", "v2"];
+/// [`Features::X86_64`]; `v2` is [`Features::X86_64_V2`]; `v3` is
+/// [`Features::X86_64_V3`].
+const LEVELS: &[&str] = &["v1", "v2", "v3"];
 
 /// Everything the interpreter needs to mutate, behind one lock.
 #[derive(Debug)]
@@ -2758,6 +2781,7 @@ impl X86 {
             }
             features = match level {
                 "v2" => Features::X86_64_V2,
+                "v3" => Features::X86_64_V3,
                 _ => Features::X86_64,
             };
         }
@@ -3937,7 +3961,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "with variant \"x86-64\": the micro-architecture level, \"v1\" (the \
                       baseline, the default) or \"v2\" (SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, \
-                      CMPXCHG16B and LAHF/SAHF in 64-bit mode); the overrides below apply on top",
+                      CMPXCHG16B and LAHF/SAHF in 64-bit mode) or \"v3\" (v2 plus XSAVE, AVX, AVX2, \
+                      FMA, F16C, BMI1, BMI2, LZCNT and MOVBE); the overrides below apply on top",
         },
         PropertySpec {
             name: "cpuid",

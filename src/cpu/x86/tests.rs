@@ -1017,9 +1017,17 @@ fn the_level_property_is_a_preset_the_overrides_refine() {
     assert!(!v.sse42 && v.sse41);
     // ...but not a link: SSE4.1 needs SSSE3.
     assert!(level(&[("ssse3", false)], "v2", "x86-64").is_err());
-    // A level is an x86-64 level, and only those two exist here.
+    // A level is an x86-64 level, and only those three exist here.
     assert!(level(&[], "v2", "80486").is_err());
-    assert!(level(&[], "v3", "x86-64").is_err());
+    assert!(level(&[], "v4", "x86-64").is_err());
+    // v3 is v2 plus the AVX2-era set, and every link of its chain holds.
+    let v3 = level(&[], "v3", "x86-64").unwrap();
+    assert_eq!(v3, Features::X86_64_V3);
+    assert!(v3.validate().is_ok());
+    assert!(v3.avx2 && v3.fma && v3.bmi2 && v3.movbe && v3.lzcnt && v3.xsave);
+    // FMA can go on its own; AVX cannot while AVX2 needs it.
+    assert!(!level(&[("fma", false)], "v3", "x86-64").unwrap().fma);
+    assert!(level(&[("avx", false)], "v3", "x86-64").is_err());
     // And v1 plus the right overrides is v2.
     let built = level(
         &[
@@ -4362,6 +4370,42 @@ mod long_mode {
         let pc = run64_on(Pc::with_features(Variant::X86_64, features), 0, &code);
         let r = pc.regs();
         (r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32)
+    }
+
+    /// `level = "v3"` reports the System V ABI's v3 list and nothing past it:
+    /// AVX, F16C, FMA, MOVBE, XSAVE in leaf 1; AVX2, BMI1 and BMI2 in leaf 7;
+    /// `LZCNT` in `8000_0001`. `OSXSAVE` stays clear until the guest sets
+    /// `CR4.OSXSAVE`, because it is the operating system's half of the bit.
+    #[test]
+    fn the_v3_preset_reports_the_v3_bits() {
+        let v3 = Features::X86_64_V3;
+        let max = cpuid64(v3, 0, 0).0;
+        let ecx1 = cpuid64(v3, 1, 0).2;
+        assert_eq!(max, 0xd, "XSAVE's leaf is the highest");
+        for (bit, name) in [
+            (0, "SSE3"),
+            (9, "SSSE3"),
+            (12, "FMA"),
+            (13, "CX16"),
+            (19, "SSE4.1"),
+            (20, "SSE4.2"),
+            (22, "MOVBE"),
+            (23, "POPCNT"),
+            (26, "XSAVE"),
+            (28, "AVX"),
+            (29, "F16C"),
+        ] {
+            assert_ne!(ecx1 & (1 << bit), 0, "CPUID.01H:ECX.{name}");
+        }
+        assert_eq!(
+            ecx1 & (1 << 27),
+            0,
+            "OSXSAVE is CR4's, and CR4 has it clear"
+        );
+        let (_, ebx7, _, _) = cpuid64(v3, 7, 0);
+        assert_eq!(ebx7, (1 << 3) | (1 << 5) | (1 << 8), "BMI1, AVX2, BMI2");
+        let (_, _, ecx8, _) = cpuid64(v3, 0x8000_0001, 0);
+        assert_eq!(ecx8 & 0b10_0001, 0b10_0001, "LAHF-SAHF and LZCNT");
     }
 
     #[test]
