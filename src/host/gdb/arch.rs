@@ -1074,7 +1074,7 @@ fn i386_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 #[cfg(feature = "cpu-x86")]
 pub static I386: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 8,
+    verified_version: 10,
     features: &[Feature::whole("org.gnu.gdb.i386.core")],
     architecture: None,
     regs: &I386_REGS,
@@ -1288,7 +1288,7 @@ fn amd64_write(chunk: &mut [u8], index: usize, data: &[u8]) -> Access {
 #[cfg(feature = "cpu-x86")]
 pub static AMD64: Arch = Arch {
     class: &crate::cpu::x86::CLASS,
-    verified_version: 8,
+    verified_version: 10,
     features: &[Feature::whole("org.gnu.gdb.i386.core")],
     architecture: Some("i386:x86-64"),
     regs: &AMD64_REGS,

@@ -6,6 +6,8 @@
 //! or arithmetic that can be checked by hand. The floating-point values are
 //! small integers and powers of two whose encodings can be read off.
 
+use alloc::string::ToString;
+
 use super::avx::*;
 use super::*;
 use crate::cpu::x86::fpu::mxcsr;
