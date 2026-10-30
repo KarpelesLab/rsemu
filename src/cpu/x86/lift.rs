@@ -4942,6 +4942,29 @@ mod tests {
     }
 
     #[test]
+    fn the_three_byte_maps_and_their_general_instructions_end_the_block() {
+        // inc eax ; <one of these> ; inc eax. Each is out of the subset — the
+        // SIMD ones and the two general-purpose ones alike — so the block
+        // ends at its address and the interpreter, which has the feature
+        // gates, executes it. Their lengths are `isa`'s tests.
+        for (bytes, name) in [
+            (&[0x66u8, 0x0f, 0x38, 0x00, 0xc1][..], "pshufb"),
+            (&[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x04], "palignr"),
+            (&[0xf2, 0x0f, 0x38, 0xf1, 0xc1], "crc32"),
+            (&[0xf3, 0x0f, 0xb8, 0xc1], "popcnt"),
+        ] {
+            let mut code = alloc::vec![0x40];
+            code.extend_from_slice(bytes);
+            code.push(0x40);
+            let l = plain(&code);
+            assert_eq!(l.insns, 1, "{name}");
+            assert_eq!(l.stop, Stop::Unsupported, "{name}");
+            let exit = l.block.marks().last().expect("a block has boundaries");
+            assert_eq!(exit.pc, AT + 1, "{name}: the interpreter takes over");
+        }
+    }
+
+    #[test]
     fn a_lock_prefix_and_a_repeat_prefix_are_both_refused() {
         // `lock inc [eax]` needs an atomic the IR cannot type at eight bits,
         // and `rep` is a loop.
