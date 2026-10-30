@@ -38,8 +38,8 @@
 //! | an x87 exception is pending | `#MF` | `#MF` |
 //!
 //! The feature is `Features::mmx` for the original set, `sse` as well for
-//! the integer instructions SSE added on `MM` registers, and `sse2` as well
-//! for SSE2's. The pending-exception check and the transition happen only
+//! the integer instructions SSE added on `MM` registers, `sse2` as well for
+//! SSE2's, and `ssse3` as well for the `MM` forms of Supplemental SSE3. The pending-exception check and the transition happen only
 //! when the instruction actually names an `MM` register: `CVTPI2PS xmm, m64`
 //! reads its doublewords from memory and leaves the x87 unit alone, which is
 //! the SDM's description of that form ("for operands of the form `xmm, m64`
@@ -71,8 +71,9 @@ use super::fpu::X87;
 
 use super::exec::{Ex, Exec, Fault, VEC_MF, VEC_NM, VEC_UD};
 use super::fpexec::{is_shift, packed, shift_lanes};
-use super::isa::{Arg, Fields, Insn, ModRm, Op, seg};
+use super::isa::{Arg, Extension, Fields, Insn, ModRm, Op, seg};
 use super::prot::{cr0, cr4};
+use super::simd::ssse3;
 
 /// Which extension an `MM`-register encoding arrived with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,8 @@ enum Level {
     /// SSE2's: three arithmetic instructions, the two cross-file moves and
     /// the double-precision conversions.
     Sse2,
+    /// Supplemental SSE3's, every one of which has an `MM` form.
+    Ssse3,
 }
 
 /// The extension an operation on `MM` registers needs.
@@ -115,6 +118,7 @@ const fn level(op: Op) -> Level {
         | Op::CVTPI2PD
         | Op::CVTPD2PI
         | Op::CVTTPD2PI => Level::Sse2,
+        _ if matches!(op.extension(), Some(Extension::Ssse3)) => Level::Ssse3,
         _ => Level::Mmx,
     }
 }
@@ -148,6 +152,7 @@ impl Exec<'_> {
                 Level::Mmx => true,
                 Level::Sse => features.sse,
                 Level::Sse2 => features.sse2,
+                Level::Ssse3 => features.ssse3,
             };
         if !present {
             return Err(Fault::bare(VEC_UD));
@@ -368,6 +373,11 @@ impl Exec<'_> {
                     // The count is the whole quadword: anything past the lane
                     // width clears the lane, or fills it with the sign.
                     shift_lanes(op, [dst, 0], src)[0]
+                } else if level(op) == Level::Ssse3 {
+                    // Eight bytes of operand, which `PSHUFB`, `PALIGNR` and
+                    // the horizontal forms see differently from the low half
+                    // of sixteen; see `simd::ssse3`.
+                    ssse3(op, [dst, 0], [src, 0], 8, f.imm as u8)[0]
                 } else {
                     lanes(op, dst, src)
                 };

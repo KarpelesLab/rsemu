@@ -849,6 +849,35 @@ mod tests {
     }
 
     #[test]
+    fn the_three_byte_maps_list_with_their_immediates() {
+        assert_eq!(text32(&[0x66, 0x0f, 0x38, 0x00, 0xc1]), "pshufb xmm0, xmm1");
+        // Without the `66` it is the `MM` form, which `REX` cannot widen.
+        assert_eq!(text32(&[0x0f, 0x38, 0x00, 0xc1]), "pshufb mm0, mm1");
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x38, 0x1d, 0x43, 0x10]),
+            "pabsw xmm0, xmmword [ds:ebx+0x10]"
+        );
+        assert_eq!(
+            text32(&[0x66, 0x0f, 0x3a, 0x0f, 0xca, 0x08]),
+            "palignr xmm1, xmm2, 0x8"
+        );
+        assert_eq!(
+            text32(&[0x0f, 0x3a, 0x0f, 0x03, 0x05]),
+            "palignr mm0, qword [ds:ebx], 0x5"
+        );
+        // The length counts the escape, the ModRM, the displacement and the
+        // immediate.
+        let d = disassemble_as(
+            Gen::I386,
+            Bits::B32,
+            0,
+            0x100,
+            &[0x66, 0x0f, 0x3a, 0x0f, 0x43, 0x10, 0x08, 0x90],
+        );
+        assert_eq!(d.fields.len, 7);
+    }
+
+    #[test]
     fn sse3_lists_without_a_repeat_prefix() {
         // The `F2`/`F3` are mandatory prefixes, part of the opcode.
         assert_eq!(text32(&[0xf2, 0x0f, 0x7c, 0xc1]), "haddps xmm0, xmm1");

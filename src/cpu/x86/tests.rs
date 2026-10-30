@@ -11041,3 +11041,176 @@ mod mmx {
         assert_eq!(pc.cpu.x87().tag, 0xffff, "paddb xmm made no transition");
     }
 }
+
+// ---------------------------------------------------------------------------
+// x86-64-v2: SSSE3, SSE4.1, SSE4.2, POPCNT
+// ---------------------------------------------------------------------------
+
+mod v2 {
+    use super::*;
+    use crate::cpu::x86::prot::cr4;
+
+    /// Scratch memory, sixteen-byte aligned.
+    const DATA: u64 = 0xb000;
+    /// Where a fault handler sits, and `RIP` once its `hlt` has retired.
+    const HANDLER: u64 = 0x3800;
+    const HANDLED: u64 = HANDLER + 1;
+
+    /// An x86-64 part with `features`, in 32-bit protected mode with
+    /// `CR4.OSFXSR` and `OSXMMEXCPT` set.
+    fn pc_with(features: Features) -> Pc {
+        let pc = Pc::with_features(Variant::X86_64, features);
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+        pc.cpu.set_sys(sys);
+        pc
+    }
+
+    /// Everything this module tests, switched on.
+    fn all() -> Features {
+        Features {
+            sse3: true,
+            ssse3: true,
+            ..Features::X86_64
+        }
+    }
+
+    fn v2pc() -> Pc {
+        pc_with(all())
+    }
+
+    /// `disp32` addressing for `reg`: `mod == 00`, `r/m == 101`.
+    fn disp32(reg: u8, addr: u64) -> Vec<u8> {
+        let mut out = alloc::vec![((reg & 7) << 3) | 0b101];
+        out.extend_from_slice(&(addr as u32).to_le_bytes());
+        out
+    }
+
+    /// `bytes` followed by a `disp32` ModRM naming `reg` and `addr`.
+    fn mem(bytes: &[u8], reg: u8, addr: u64) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        out.extend_from_slice(&disp32(reg, addr));
+        out
+    }
+
+    /// Run `code` followed by `hlt`, and require that the `hlt` is reached.
+    fn run(pc: &Pc, code: &[u8]) {
+        let mut all = code.to_vec();
+        all.push(0xf4);
+        pc.write(at::CODE0, &all);
+        assert!(pc.run(400) < 400, "the program reached its hlt");
+        assert_eq!(pc.regs().rip, at::CODE0 + all.len() as u64, "and no fault");
+    }
+
+    /// Run `code` and require that it raises `vector`, handled by a `hlt`.
+    fn faults(pc: &Pc, vector: u64, code: &[u8]) {
+        pc.idt(vector, gate(0x08, HANDLER as u32, sys_type::INT_GATE32, 0));
+        pc.write(HANDLER, &[0xf4]);
+        let mut all = code.to_vec();
+        all.push(0xf4);
+        pc.write(at::CODE0, &all);
+        assert!(pc.run(200) < 200);
+        assert_eq!(pc.regs().rip, HANDLED, "{code:02x?} raises vector {vector}");
+    }
+
+    fn write64(pc: &Pc, addr: u64, value: u64) {
+        for i in 0..8u64 {
+            pc.ram.write_u8(addr + i, (value >> (8 * i)) as u8).unwrap();
+        }
+    }
+
+    fn write128(pc: &Pc, addr: u64, v: [u64; 2]) {
+        write64(pc, addr, v[0]);
+        write64(pc, addr + 8, v[1]);
+    }
+
+    /// Load `XMM` registers directly.
+    fn set_xmm(pc: &Pc, values: &[(u8, [u64; 2])]) {
+        let mut sse = pc.cpu.sse();
+        for &(n, v) in values {
+            sse.set(n, v);
+        }
+        pc.cpu.set_sse(sse);
+    }
+
+    fn xmm(pc: &Pc, n: u8) -> [u64; 2] {
+        pc.cpu.sse().get(n)
+    }
+
+    /// `CPUID.01H:ECX` on a part with `features`.
+    fn leaf1_ecx(features: Features) -> u64 {
+        let pc = pc_with(features);
+        run(&pc, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0x0f, 0xa2]);
+        pc.regs().rcx & 0xffff_ffff
+    }
+
+    // -- SSSE3 -------------------------------------------------------------
+
+    #[test]
+    fn pshufb_reverses_a_register_from_memory() {
+        // pshufb xmm0, [DATA] with the control 15, 14, ..., 0.
+        let pc = v2pc();
+        set_xmm(&pc, &[(0, [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908])]);
+        write128(&pc, DATA, [0x0809_0a0b_0c0d_0e0f, 0x0001_0203_0405_0607]);
+        run(&pc, &mem(&[0x66, 0x0f, 0x38, 0x00], 0, DATA));
+        assert_eq!(xmm(&pc, 0), [0x0809_0a0b_0c0d_0e0f, 0x0001_0203_0405_0607]);
+    }
+
+    #[test]
+    fn palignr_takes_its_shift_from_the_immediate() {
+        // palignr xmm1, xmm2, 8: the source's high half, then the
+        // destination's low half.
+        let pc = v2pc();
+        set_xmm(&pc, &[(1, [0x1111, 0x2222]), (2, [0x3333, 0x4444])]);
+        run(&pc, &[0x66, 0x0f, 0x3a, 0x0f, 0xca, 0x08]);
+        assert_eq!(xmm(&pc, 1), [0x4444, 0x1111]);
+    }
+
+    #[test]
+    fn the_mm_forms_alias_the_x87_registers() {
+        // phaddw mm0, mm1 on an MM register: the MMX transition happens
+        // (TOP to 0, every tag valid) and the result's exponent field is all
+        // ones, exactly as for the original MMX set.
+        let pc = v2pc();
+        let mut x = pc.cpu.x87();
+        x.set_mm(0, 0x0004_0003_0002_0001);
+        x.set_mm(1, 0x0040_0030_0020_0010);
+        x.set_top(3);
+        pc.cpu.set_x87(x);
+        run(&pc, &[0x0f, 0x38, 0x01, 0xc1]);
+        let x = pc.cpu.x87();
+        assert_eq!(x.mm(0), 0x0070_0030_0007_0003);
+        assert_eq!(x.top(), 0);
+        assert_eq!(x.raw(0).sign_exp, 0xffff);
+        // palignr mm2, [DATA], 3.
+        let pc = v2pc();
+        let mut x = pc.cpu.x87();
+        x.set_mm(2, 0x1716_1514_1312_1110);
+        pc.cpu.set_x87(x);
+        write64(&pc, DATA, 0x0706_0504_0302_0100);
+        let mut code = mem(&[0x0f, 0x3a, 0x0f], 2, DATA);
+        code.push(3);
+        run(&pc, &code);
+        assert_eq!(pc.cpu.x87().mm(2), 0x1211_1007_0605_0403);
+    }
+
+    #[test]
+    fn ssse3_is_undefined_without_it_in_both_register_files() {
+        let without = Features {
+            sse3: true,
+            ..Features::X86_64
+        };
+        faults(&pc_with(without), 6, &[0x66, 0x0f, 0x38, 0x00, 0xc1]);
+        faults(&pc_with(without), 6, &[0x0f, 0x38, 0x00, 0xc1]);
+        faults(&pc_with(without), 6, &[0x0f, 0x3a, 0x0f, 0xc1, 0x01]);
+        assert_eq!(leaf1_ecx(without) & (1 << 9), 0);
+        assert_ne!(leaf1_ecx(all()) & (1 << 9), 0, "CPUID.01H:ECX.SSSE3");
+        // And it needs SSE3 under it.
+        let impossible = Features {
+            ssse3: true,
+            ..Features::X86_64
+        };
+        assert!(impossible.validate().is_err());
+    }
+}

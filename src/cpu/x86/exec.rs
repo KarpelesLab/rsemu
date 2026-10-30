@@ -4160,6 +4160,9 @@ impl<'a> Exec<'a> {
         if features.sse3 {
             ecx1 |= 1 << 0; // SSE3
         }
+        if features.ssse3 {
+            ecx1 |= 1 << 9; // SSSE3
+        }
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers
         }

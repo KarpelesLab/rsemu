@@ -1225,6 +1225,22 @@ const LOWERCASE: &[(&str, &str)] = &[
     ("MOVDDUP", "movddup"),
     ("MOVSHDUP", "movshdup"),
     ("MOVSLDUP", "movsldup"),
+    ("PABSB", "pabsb"),
+    ("PABSD", "pabsd"),
+    ("PABSW", "pabsw"),
+    ("PALIGNR", "palignr"),
+    ("PHADDD", "phaddd"),
+    ("PHADDSW", "phaddsw"),
+    ("PHADDW", "phaddw"),
+    ("PHSUBD", "phsubd"),
+    ("PHSUBSW", "phsubsw"),
+    ("PHSUBW", "phsubw"),
+    ("PMADDUBSW", "pmaddubsw"),
+    ("PMULHRSW", "pmulhrsw"),
+    ("PSHUFB", "pshufb"),
+    ("PSIGNB", "psignb"),
+    ("PSIGND", "psignd"),
+    ("PSIGNW", "psignw"),
 ];
 
 define_ops! {
@@ -1731,6 +1747,24 @@ define_ops! {
     MOVDDUP = "load one double into both halves",
     MOVSHDUP = "duplicate the odd singles into the even lanes below them",
     MOVSLDUP = "duplicate the even singles into the odd lanes above them",
+
+    // ---- SSSE3 -----------------------------------------------------------
+    PABSB = "the absolute values of packed signed bytes",
+    PABSD = "the absolute values of packed signed doublewords",
+    PABSW = "the absolute values of packed signed words",
+    PALIGNR = "concatenate destination and source, shift right by whole bytes, keep the low half",
+    PHADDD = "add adjacent pairs of doublewords within each operand",
+    PHADDSW = "add adjacent pairs of signed words within each operand, saturating",
+    PHADDW = "add adjacent pairs of words within each operand",
+    PHSUBD = "subtract each odd doubleword from the even one below it, within each operand",
+    PHSUBSW = "subtract adjacent signed words within each operand, saturating",
+    PHSUBW = "subtract each odd word from the even one below it, within each operand",
+    PMADDUBSW = "multiply unsigned by signed bytes and add adjacent products, saturating",
+    PMULHRSW = "the rounded, scaled high halves of signed word products",
+    PSHUFB = "permute bytes under the control of the source's bytes",
+    PSIGNB = "negate, zero or keep each byte by the sign of the source's",
+    PSIGND = "negate, zero or keep each doubleword by the sign of the source's",
+    PSIGNW = "negate, zero or keep each word by the sign of the source's",
 }
 
 impl Op {
@@ -2328,6 +2362,22 @@ impl Op {
             | Op::MOVDDUP
             | Op::MOVSHDUP
             | Op::MOVSLDUP => Extension::Sse3,
+            Op::PABSB
+            | Op::PABSD
+            | Op::PABSW
+            | Op::PALIGNR
+            | Op::PHADDD
+            | Op::PHADDSW
+            | Op::PHADDW
+            | Op::PHSUBD
+            | Op::PHSUBSW
+            | Op::PHSUBW
+            | Op::PMADDUBSW
+            | Op::PMULHRSW
+            | Op::PSHUFB
+            | Op::PSIGNB
+            | Op::PSIGND
+            | Op::PSIGNW => Extension::Ssse3,
             _ => return None,
         };
         Some(ext)
@@ -2488,6 +2538,9 @@ impl fmt::Display for Op {
 pub enum Extension {
     /// SSE3: `CPUID.01H:ECX[0]`.
     Sse3,
+    /// Supplemental SSE3: `CPUID.01H:ECX[9]`. Every instruction of it has an
+    /// `MM` form and an `XMM` form.
+    Ssse3,
 }
 
 /// One row of the instruction description: everything known about an encoding.
@@ -3726,21 +3779,82 @@ impl OpMap {
     }
 }
 
-/// The `0F 38` map with no mandatory prefix: SSSE3's instructions on `MM`
-/// registers.
-pub static TABLE_0F38: [Insn; 256] = [UNASSIGNED; 256];
+/// The `0F 38` map with no mandatory prefix: SSSE3 on `MM` registers.
+///
+/// Every SSSE3 instruction has two forms, the bare one on `MM` registers and
+/// the `66` one on `XMM` registers — the arrangement SSE2 made of MMX, kept
+/// for one more extension and then abandoned: nothing after SSSE3 has an
+/// `MM` form. *Intel SDM* volume 2 appendix A, table A-4.
+const THREE_38: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0x00 PSHUFB    Pq Qq None Documented;
+    0x01 PHADDW    Pq Qq None Documented;
+    0x02 PHADDD    Pq Qq None Documented;
+    0x03 PHADDSW   Pq Qq None Documented;
+    0x04 PMADDUBSW Pq Qq None Documented;
+    0x05 PHSUBW    Pq Qq None Documented;
+    0x06 PHSUBD    Pq Qq None Documented;
+    0x07 PHSUBSW   Pq Qq None Documented;
+    0x08 PSIGNB    Pq Qq None Documented;
+    0x09 PSIGNW    Pq Qq None Documented;
+    0x0a PSIGND    Pq Qq None Documented;
+    0x0b PMULHRSW  Pq Qq None Documented;
+    0x1c PABSB     Pq Qq None Documented;
+    0x1d PABSW     Pq Qq None Documented;
+    0x1e PABSD     Pq Qq None Documented;
+};
+
+/// The `0F 38` map with no mandatory prefix.
+pub static TABLE_0F38: [Insn; 256] = THREE_38.0;
+
+/// The `0F 38` map with a `66` prefix: SSSE3 on `XMM` registers, and SSE4.
+const THREE_38_66: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0x00 PSHUFB    Vx Wx None Documented;
+    0x01 PHADDW    Vx Wx None Documented;
+    0x02 PHADDD    Vx Wx None Documented;
+    0x03 PHADDSW   Vx Wx None Documented;
+    0x04 PMADDUBSW Vx Wx None Documented;
+    0x05 PHSUBW    Vx Wx None Documented;
+    0x06 PHSUBD    Vx Wx None Documented;
+    0x07 PHSUBSW   Vx Wx None Documented;
+    0x08 PSIGNB    Vx Wx None Documented;
+    0x09 PSIGNW    Vx Wx None Documented;
+    0x0a PSIGND    Vx Wx None Documented;
+    0x0b PMULHRSW  Vx Wx None Documented;
+    0x1c PABSB     Vx Wx None Documented;
+    0x1d PABSW     Vx Wx None Documented;
+    0x1e PABSD     Vx Wx None Documented;
+};
 
 /// The `0F 38` map with a `66` prefix.
-pub static TABLE_0F38_66: [Insn; 256] = [UNASSIGNED; 256];
+pub static TABLE_0F38_66: [Insn; 256] = THREE_38_66.0;
 
 /// The `0F 38` map with an `F2` prefix.
 pub static TABLE_0F38_F2: [Insn; 256] = [UNASSIGNED; 256];
 
+/// The `0F 3A` map with no mandatory prefix: `PALIGNR` on `MM` registers.
+/// *Intel SDM* volume 2 appendix A, table A-5.
+const THREE_3A: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0x0f PALIGNR   Pq Qq +Ib None Documented;
+};
+
 /// The `0F 3A` map with no mandatory prefix.
-pub static TABLE_0F3A: [Insn; 256] = [UNASSIGNED; 256];
+pub static TABLE_0F3A: [Insn; 256] = THREE_3A.0;
 
 /// The `0F 3A` map with a `66` prefix.
-pub static TABLE_0F3A_66: [Insn; 256] = [UNASSIGNED; 256];
+const THREE_3A_66: ([Insn; 256], [bool; 256]) = opmap! {
+    base [UNASSIGNED; 256];
+
+    0x0f PALIGNR   Vx Wx +Ib None Documented;
+};
+
+/// The `0F 3A` map with a `66` prefix.
+pub static TABLE_0F3A_66: [Insn; 256] = THREE_3A_66.0;
 
 /// Decode one opcode byte of an escape map under a mandatory prefix.
 ///
