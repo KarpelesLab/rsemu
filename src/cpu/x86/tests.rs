@@ -976,6 +976,68 @@ fn an_extension_named_in_a_machine_file_reaches_the_core() {
     assert!(!features.long, "nothing turned long mode on");
 }
 
+/// `level = "v2"` selects the x86-64-v2 preset from a machine file, and the
+/// per-extension overrides still apply on top of it.
+#[test]
+fn a_machine_file_selects_x86_64_v2_by_level() {
+    let (registry, mut options) = options_with_the_core();
+    let kept: Arc<crate::core::Captured<X86>> = Arc::new(crate::core::Captured::new());
+    let mine = Arc::clone(&kept);
+    options.bindings.replace("cpu.x86", move |props| {
+        let cpu = Arc::new(X86::from_props_defaulting(props, super::Variant::I80486)?);
+        mine.push(&cpu);
+        Ok(cpu)
+    });
+    let text = "machine \"m\" {\n  osc x = 1000000 Hz\n  space mem { width = 32 }\n  \
+                object dram \"ram\" { size = 4K }\n  \
+                object cpu \"cpu.x86\" { clock = x, space = mem, variant = \"x86-64\", \
+                level = \"v2\" }\n  \
+                map mem 0 size 4K = dram\n}\n";
+    crate::machine::build("t.machine", text, &registry, &options).expect("it builds");
+    let cpu = kept.take().expect("the constructor kept a handle");
+    assert_eq!(cpu.config().features, Features::X86_64_V2);
+}
+
+#[test]
+fn the_level_property_is_a_preset_the_overrides_refine() {
+    use crate::core::props::Props;
+    let level = |extra: &[(&str, bool)], level: &str, variant: &str| {
+        let mut props = Props::new().with("variant", variant).with("level", level);
+        for &(name, on) in extra {
+            props = props.with(name, on);
+        }
+        X86::from_props(&props).map(|cpu| cpu.config().features)
+    };
+    assert_eq!(level(&[], "v2", "x86-64").unwrap(), Features::X86_64_V2);
+    assert_eq!(level(&[], "v1", "x86-64").unwrap(), Features::X86_64);
+    // The variant alone is still the baseline: no existing machine changes.
+    assert_eq!(Variant::X86_64.features(), Features::X86_64);
+    // A leaf of the chain can go on its own...
+    let v = level(&[("sse42", false)], "v2", "x86-64").unwrap();
+    assert!(!v.sse42 && v.sse41);
+    // ...but not a link: SSE4.1 needs SSSE3.
+    assert!(level(&[("ssse3", false)], "v2", "x86-64").is_err());
+    // A level is an x86-64 level, and only those two exist here.
+    assert!(level(&[], "v2", "80486").is_err());
+    assert!(level(&[], "v3", "x86-64").is_err());
+    // And v1 plus the right overrides is v2.
+    let built = level(
+        &[
+            ("sse3", true),
+            ("ssse3", true),
+            ("sse41", true),
+            ("sse42", true),
+            ("popcnt", true),
+            ("cx16", true),
+            ("lahf_lm", true),
+        ],
+        "v1",
+        "x86-64",
+    )
+    .unwrap();
+    assert_eq!(built, Features::X86_64_V2);
+}
+
 /// An extension set no part could have is refused by the *core*, with the
 /// prerequisite named — not by the validator, which only knows types.
 #[test]
@@ -11767,6 +11829,82 @@ mod v2 {
         run(&pc, &[0x31, 0xc9, 0xf3, 0x0f, 0xb8, 0xc1]); // xor ecx, ecx ; popcnt
         assert_eq!(pc.regs().rax, 0);
         assert_eq!(pc.regs().eflags & 0x8d5, flags::ZF);
+    }
+
+    // -- The preset ----------------------------------------------------------
+
+    #[test]
+    fn the_v2_preset_reports_exactly_its_bits_and_the_baseline_none() {
+        // SSE3, SSSE3, CX16, SSE4.1, SSE4.2, POPCNT — and not MONITOR (3).
+        assert_eq!(
+            leaf1_ecx(Features::X86_64_V2),
+            1 | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23)
+        );
+        assert_eq!(leaf1_ecx(Features::X86_64), 0);
+        assert!(Features::X86_64_V2.validate().is_ok());
+    }
+
+    #[test]
+    fn each_v2_extension_is_undefined_on_a_part_without_it() {
+        // One representative instruction per bit, on the v2 part less that
+        // bit and everything built on it; the same bytes run on v2 itself.
+        let v2 = Features::X86_64_V2;
+        let cases: [(&str, Features, &[u8]); 6] = [
+            (
+                "sse3: haddps xmm0, xmm1",
+                Features {
+                    sse3: false,
+                    ssse3: false,
+                    sse41: false,
+                    sse42: false,
+                    ..v2
+                },
+                &[0xf2, 0x0f, 0x7c, 0xc1],
+            ),
+            (
+                "ssse3: pshufb xmm0, xmm1",
+                Features {
+                    ssse3: false,
+                    sse41: false,
+                    sse42: false,
+                    ..v2
+                },
+                &[0x66, 0x0f, 0x38, 0x00, 0xc1],
+            ),
+            (
+                "sse41: ptest xmm0, xmm1",
+                Features {
+                    sse41: false,
+                    sse42: false,
+                    ..v2
+                },
+                &[0x66, 0x0f, 0x38, 0x17, 0xc1],
+            ),
+            (
+                "sse42: pcmpgtq xmm0, xmm1",
+                Features { sse42: false, ..v2 },
+                &[0x66, 0x0f, 0x38, 0x37, 0xc1],
+            ),
+            (
+                "sse42: crc32 eax, ecx",
+                Features { sse42: false, ..v2 },
+                &[0xf2, 0x0f, 0x38, 0xf1, 0xc1],
+            ),
+            (
+                "popcnt: popcnt eax, ecx",
+                Features {
+                    popcnt: false,
+                    ..v2
+                },
+                &[0xf3, 0x0f, 0xb8, 0xc1],
+            ),
+        ];
+        for (name, without, code) in cases {
+            assert!(without.validate().is_ok(), "{name}: a real part");
+            let pc = pc_with(without);
+            faults(&pc, 6, code);
+            run(&pc_with(v2), code);
+        }
     }
 
     #[test]

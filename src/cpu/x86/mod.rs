@@ -163,8 +163,14 @@
 //! - **No `MONITOR`/`MWAIT`**: SSE3 is here otherwise ([`Features::sse3`]),
 //!   and those two raise `#UD` with their own `CPUID` bit clear. SSSE3,
 //!   SSE4.1 and SSE4.2 are here ([`Features::ssse3`], [`Features::sse41`],
-//!   [`Features::sse42`]), and so is `POPCNT` ([`Features::popcnt`]); no
-//!   AVX.
+//!   [`Features::sse42`]), and so is `POPCNT` ([`Features::popcnt`]) —
+//!   with `CMPXCHG16B` and 64-bit `LAHF`/`SAHF`, the whole x86-64-v2 level
+//!   ([`Features::X86_64_V2`]). No AVX.
+//! - **The legacy-SSE alignment rule is partial.** A 128-bit memory operand
+//!   must be sixteen-byte aligned; the instructions that exist to assert it
+//!   (`MOVAPS`, `MOVDQA`, the non-temporal moves, `MOVNTDQA`, `CMPXCHG16B`)
+//!   and a few conversions check, most of the arithmetic does not, and the
+//!   SSE3-through-SSE4.2 instructions follow the arithmetic.
 //! - **No `XSAVES`/`XRSTORS`**, and so no `IA32_XSS`: they exist for
 //!   supervisor state components, and there are none to save. `CPUID` leaf
 //!   `0Dh` says so.
@@ -385,7 +391,7 @@ use crate::core::device::{
 };
 use crate::core::error::{Error, Result};
 use crate::core::exec::{Exit, ExitMask, ExitReason, ExitingCore, Run};
-use crate::core::props::{Props, ValueKind};
+use crate::core::props::{Props, ValueKind, check_enum};
 use crate::core::registry::Registry;
 use crate::core::sched::{Budget, Consumed, TickCursor};
 use crate::core::space::{AddressSpace, MemAttrs, RequesterId};
@@ -535,7 +541,8 @@ pub enum Variant {
     /// another is a set of *independently selectable* extensions — [`Features`]
     /// — and a name here would imply a fixed bundle of them. This is the
     /// baseline: the architecture AMD introduced, with the pieces every part
-    /// implementing it has to have.
+    /// implementing it has to have. [`Features::X86_64_V2`] — the `level =
+    /// "v2"` property — is the same part with the next level's extensions.
     X86_64,
 }
 
@@ -768,6 +775,27 @@ impl Features {
         popcnt: false,
         cx16: false,
         lahf_lm: false,
+    };
+
+    /// The x86-64-v2 micro-architecture level: the baseline plus
+    /// `CMPXCHG16B`, `LAHF`/`SAHF` in 64-bit mode, `POPCNT`, SSE3, SSSE3,
+    /// SSE4.1 and SSE4.2.
+    ///
+    /// The level is the *System V AMD64 ABI*'s (§3.1.1, "Processor
+    /// Architecture", micro-architecture levels), which is the list
+    /// distributions build against — a `-march=x86-64-v2` binary assumes every
+    /// one of these and checks none of them. Not the [`Variant::X86_64`]
+    /// default, so a machine that names that part keeps the baseline; a
+    /// machine description selects this with `level = "v2"`.
+    pub const X86_64_V2: Features = Features {
+        sse3: true,
+        ssse3: true,
+        sse41: true,
+        sse42: true,
+        popcnt: true,
+        cx16: true,
+        lahf_lm: true,
+        ..Features::X86_64
     };
 
     /// Whether this combination describes a part that could exist.
@@ -2388,6 +2416,11 @@ impl Engine {
 /// by name rather than by "expected one of `interp`".
 const ENGINES: &[&str] = &["interp", "jit", "jit-host"];
 
+/// The values a machine file's `level` property takes: the x86-64
+/// micro-architecture levels this core implements. `v1` is the baseline,
+/// [`Features::X86_64`]; `v2` is [`Features::X86_64_V2`].
+const LEVELS: &[&str] = &["v1", "v2"];
+
 /// Everything the interpreter needs to mutate, behind one lock.
 #[derive(Debug)]
 struct Session {
@@ -2570,6 +2603,24 @@ impl X86 {
         // that the preset does not have is refused by `validate` where it
         // would make an impossible part.
         let mut features = variant.features();
+        // A micro-architecture level replaces the preset before the
+        // per-extension overrides apply, so `level = "v2", sse42 = false`
+        // means what it reads as. It names an x86-64 level and nothing else:
+        // on a 486 it would describe a part that never existed.
+        if let Some(level) = r.optional_str("level")? {
+            let level = check_enum("level", level, LEVELS)?;
+            if variant != Variant::X86_64 {
+                return Err(Error::Property(alloc::format!(
+                    "`level = \"{level}\"` names an x86-64 micro-architecture level, \
+                     and this part is `{}`",
+                    variant.name()
+                )));
+            }
+            features = match level {
+                "v2" => Features::X86_64_V2,
+                _ => Features::X86_64,
+            };
+        }
         for name in [
             "cpuid", "cr4", "msr", "mtrr", "pae", "long", "nx", "syscall", "cmov", "pse", "pge",
             "fpu", "cx8", "fxsr", "sse", "sse2", "mmx", "sse3", "ssse3", "sse41", "sse42",
@@ -3731,6 +3782,14 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "\"8086\", \"8088\", \"80386\", \"80486\" (the default) or \"x86-64\"",
         },
         PropertySpec {
+            name: "level",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "with variant \"x86-64\": the micro-architecture level, \"v1\" (the \
+                      baseline, the default) or \"v2\" (SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, \
+                      CMPXCHG16B and LAHF/SAHF in 64-bit mode); the overrides below apply on top",
+        },
+        PropertySpec {
             name: "cpuid",
             kind: ValueKind::Bool,
             required: false,
@@ -4565,6 +4624,7 @@ fn schema_for(name: &'static str) -> crate::machine::validate::ClassSchema {
         let prop = match spec.name {
             "variant" | "model" => prop.values(Variant::NAMES),
             "engine" => prop.values(ENGINES),
+            "level" => prop.values(LEVELS),
             _ => prop,
         };
         schema = schema.prop(prop);
