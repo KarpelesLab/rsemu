@@ -6970,6 +6970,36 @@ mod long_mode {
         }
 
         #[test]
+        fn in_64_bit_mode_vex_reaches_sixteen_ymm_registers() {
+            // `R̄`, `X̄`, `B̄` and `vvvv[3]` name registers 8-15, and
+            // `VZEROUPPER` clears all sixteen upper halves (*Intel SDM*
+            // volume 2 §2.3.5, `VZEROUPPER`).
+            let pc = xpc_with(avx_features());
+            let one = 0x3f80_0000_3f80_0000u64; // two singles of 1.0
+            let two = 0x4000_0000_4000_0000u64; // two singles of 2.0
+            let sum = 0x4040_0000_4040_0000u64; // two singles of 3.0
+            let mut sse = pc.cpu.sse();
+            sse.set_ymm(10, [[one; 2]; 2]);
+            sse.set_ymm(11, [[two; 2]; 2]);
+            sse.set_ymm(15, [[5, 6], [7, 8]]);
+            pc.cpu.set_sse(sse);
+            let mut code = xsetbv(7);
+            code.extend_from_slice(&[0xc4, 0x41, 0x2c, 0x58, 0xcb]); // vaddps ymm9, ymm10, ymm11
+            // vmovups [AREA], ymm9
+            code.extend_from_slice(&[0xc4, 0x61, 0x7c, 0x11, 0x0c, 0x25]);
+            code.extend_from_slice(&(AREA as u32).to_le_bytes());
+            code.extend_from_slice(&[0xc5, 0xf8, 0x77]); // vzeroupper
+            code.push(0xf4);
+            run64x(&pc, &code);
+            for i in 0..4 {
+                assert_eq!(read_u64(&pc, AREA + 8 * i), sum, "quadword {i}");
+            }
+            let sse = pc.cpu.sse();
+            assert_eq!(sse.ymm(9), [[sum; 2], [0; 2]]);
+            assert_eq!(sse.ymm(15), [[5, 6], [0; 2]], "all sixteen cleared");
+        }
+
+        #[test]
         fn the_ymm_upper_halves_survive_a_snapshot() {
             let pc = xpc_with(avx_features());
             distinctive_upper(&pc);
@@ -12313,3 +12343,6 @@ mod v2 {
         assert!(impossible.validate().is_err());
     }
 }
+
+/// AVX, in its own file: `tests/avx.rs`.
+mod avx;

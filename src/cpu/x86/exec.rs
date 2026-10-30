@@ -4202,6 +4202,9 @@ impl<'a> Exec<'a> {
         if features.movbe {
             ecx1 |= 1 << 22; // MOVBE
         }
+        if features.avx {
+            ecx1 |= 1 << 28; // AVX: the VEX encoding and the YMM registers
+        }
         if features.mtrr {
             edx1 |= 1 << 12; // MTRR: the memory-type range registers
         }

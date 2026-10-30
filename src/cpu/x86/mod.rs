@@ -93,8 +93,23 @@
 //! `0Dh`'s enumeration, and `XSAVE`, `XSAVEOPT`, `XSAVEC` and `XRSTOR` (both
 //! formats) over the x87 and SSE components, with the header rules and the
 //! init optimisation. `XGETBV` with `ECX = 1` reports an exact `XINUSE`.
-//! The components above the legacy region are one table, which is where AVX's
-//! `YMM` upper halves will go. See `xsave.rs`.
+//! The components above the legacy region are one table, whose one row is
+//! AVX's `YMM` upper halves. See `xsave.rs`.
+//!
+//! **AVX** (`avx`, off in every preset; needs `xsave` and `sse42`): the VEX
+//! prefix, decoded in `isa` where each legacy row says whether and how it is
+//! reached through one (*Intel SDM* volume 2 appendix A's `v`/`v1` marks,
+//! [`isa::Vex`]); the sixteen `YMM` registers, whose upper halves a legacy SSE
+//! write keeps and a `VEX.128` write zeroes; the gate (`#UD` without the
+//! feature, outside protected mode, without `CR4.OSXSAVE` or with `XCR0[2:1]`
+//! not `11b`, then `#NM` for `CR0.TS` — and `CR0.EM` ignored); every
+//! floating-point SSE–SSE4.1 instruction at 128 and 256 bits with a
+//! non-destructive third operand, all thirty-two `VCMP` predicates, every
+//! integer SSE2–SSE4.2 instruction at 128 bits, and AVX's own broadcasts,
+//! 128-bit inserts, extracts and permutes, in-lane permutes, masked moves
+//! (masked-off elements are never accessed), `VTESTPS`/`PD`, the is4 blends
+//! and `VZEROUPPER`/`VZEROALL`. The 256-bit lanes run the same kernels SSE
+//! does, once per 128-bit half. See `avx.rs`.
 //!
 //! **MMX** (`mmx`): the eight `MM` registers, which are the significands of
 //! the eight x87 registers rather than storage of their own, with the
@@ -167,7 +182,12 @@
 //!   with `CMPXCHG16B` and 64-bit `LAHF`/`SAHF`, the whole x86-64-v2 level
 //!   ([`Features::X86_64_V2`]). `LZCNT` is here too ([`Features::lzcnt`],
 //!   in no preset); without it `F3 0F BD` executes as `BSR`. So is
-//!   `MOVBE` ([`Features::movbe`], in no preset either). No AVX.
+//!   `MOVBE` ([`Features::movbe`], in no preset either).
+//!   AVX is here too ([`Features::avx`]: the VEX
+//!   encoding, the `YMM` registers, XSAVE component 2); **nothing after it
+//!   is** — AVX2, FMA, F16C and the VEX-encoded general-register
+//!   instructions (BMI1/BMI2) decode as `#UD`, and so do the 256-bit integer
+//!   forms AVX2 adds and the register forms of the broadcasts.
 //! - **The legacy-SSE alignment rule is partial.** A 128-bit memory operand
 //!   must be sixteen-byte aligned; the instructions that exist to assert it
 //!   (`MOVAPS`, `MOVDQA`, the non-temporal moves, `MOVNTDQA`, `CMPXCHG16B`)

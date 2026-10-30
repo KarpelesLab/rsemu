@@ -1511,6 +1511,13 @@ impl Exec<'_> {
             return Err(Fault::bare(VEC_UD));
         }
         self.sse_gate(op)?;
+        self.sse_dispatch(f)
+    }
+
+    /// Execute one SSE-family instruction whose gates have been passed —
+    /// the legacy encoding's, or for a VEX encoding `avx`'s.
+    pub(super) fn sse_dispatch(&mut self, f: &Fields) -> Ex<()> {
+        let op = f.insn.op;
         match op {
             // One host fence per guest barrier. `MFENCE` is the one that
             // matters on an x86-64 *host*: store-then-load is the single
@@ -1555,6 +1562,24 @@ impl Exec<'_> {
             _ if f.insn.extension().is_some() => self.simd_extension(f),
             _ => self.sse_data(f),
         }
+    }
+
+    /// The first source of a two-source SSE instruction: the destination's
+    /// own value in the legacy encoding, `VEX.vvvv` where a VEX form names
+    /// one ([`Fields::vvvv_is_source`]).
+    ///
+    /// Read wherever an instruction keeps part of its first operand — a
+    /// scalar conversion keeps the lanes above the one it writes, an insert
+    /// the lanes it does not replace — which is the whole of what the third
+    /// operand changes about those instructions (*Intel SDM* volume 2, the
+    /// `VEX.128` lines of each instruction's "Operation").
+    pub(super) fn xmm_src1(&self, f: &Fields) -> [u64; 2] {
+        let index = if f.vvvv_is_source() {
+            f.vvvv()
+        } else {
+            f.reg_num()
+        };
+        self.state.sse.get(index)
     }
 
     /// Read the r/m operand of an SSE instruction as a 128-bit pair.
@@ -1746,10 +1771,7 @@ impl Exec<'_> {
             }
 
             // -- Bitwise -------------------------------------------------
-            Op::ANDPS | Op::ANDPD | Op::PAND => self.sse_bitwise(f, |a, b| a & b),
-            Op::ANDNPS | Op::ANDNPD | Op::PANDN => self.sse_bitwise(f, |a, b| !a & b),
-            Op::ORPS | Op::ORPD | Op::POR => self.sse_bitwise(f, |a, b| a | b),
-            Op::XORPS | Op::XORPD | Op::PXOR => self.sse_bitwise(f, |a, b| a ^ b),
+            _ if is_bitwise(op) => self.sse_bitwise(f, op),
 
             // -- Shuffles ------------------------------------------------
             Op::UNPCKLPS | Op::UNPCKHPS | Op::UNPCKLPD | Op::UNPCKHPD | Op::SHUFPS | Op::SHUFPD => {
@@ -1773,12 +1795,15 @@ impl Exec<'_> {
                     binary::from_signed::<B64>(raw, bits, env)
                 };
                 self.sse_raise(fl)?;
+                // Everything above the converted lane comes from the first
+                // source: the destination itself, or `VEX.vvvv`.
+                let mut out = self.xmm_src1(f);
                 if op == Op::CVTSI2SS {
-                    let keep = self.state.sse.low(reg) & !0xffff_ffff;
-                    self.state.sse.set_low(reg, keep | value);
+                    out[0] = (out[0] & !0xffff_ffff) | value;
                 } else {
-                    self.state.sse.set_low(reg, value);
+                    out[0] = value;
                 }
+                self.state.sse.set(reg, out);
                 Ok(())
             }
             Op::CVTSS2SI | Op::CVTTSS2SI | Op::CVTSD2SI | Op::CVTTSD2SI => {
@@ -1804,31 +1829,34 @@ impl Exec<'_> {
                 let src = self.sse_read_rm(f, f.insn.src, false)?;
                 let (value, fl) = binary::convert::<B32, B64>(src[0] & 0xffff_ffff, env);
                 self.sse_raise(fl)?;
-                self.state.sse.set_low(reg, value);
+                let mut out = self.xmm_src1(f);
+                out[0] = value;
+                self.state.sse.set(reg, out);
                 Ok(())
             }
             Op::CVTSD2SS => {
                 let src = self.sse_read_rm(f, f.insn.src, false)?;
                 let (value, fl) = binary::convert::<B64, B32>(src[0], env);
                 self.sse_raise(fl)?;
-                let keep = self.state.sse.low(reg) & !0xffff_ffff;
-                self.state.sse.set_low(reg, keep | value);
+                let mut out = self.xmm_src1(f);
+                out[0] = (out[0] & !0xffff_ffff) | value;
+                self.state.sse.set(reg, out);
                 Ok(())
             }
-            Op::CVTPS2PD => {
+            Op::CVTPS2PD | Op::CVTDQ2PD => {
+                // Two lanes in, the low quadword's; a memory source is that
+                // quadword alone and so has no alignment requirement.
                 let src = self.sse_read_rm(f, f.insn.src, false)?;
-                let (lo, f0) = binary::convert::<B32, B64>(src[0] & 0xffff_ffff, env);
-                let (hi, f1) = binary::convert::<B32, B64>(src[0] >> 32, env);
-                self.sse_raise(f0 | f1)?;
-                self.state.sse.set(reg, [lo, hi]);
+                let (out, flags) = widen_to_doubles(op, src, 2, env);
+                self.sse_raise(flags)?;
+                self.state.sse.set(reg, [out[0], out[1]]);
                 Ok(())
             }
             Op::CVTPD2PS => {
                 let src = self.sse_read_rm(f, f.insn.src, false)?;
-                let (lo, f0) = binary::convert::<B64, B32>(src[0], env);
-                let (hi, f1) = binary::convert::<B64, B32>(src[1], env);
-                self.sse_raise(f0 | f1)?;
-                self.state.sse.set(reg, [lo | (hi << 32), 0]);
+                let (out, flags) = narrow_doubles(op, [src[0], src[1], 0, 0], 2, env);
+                self.sse_raise(flags)?;
+                self.state.sse.set(reg, out);
                 Ok(())
             }
 
@@ -1844,65 +1872,19 @@ impl Exec<'_> {
             // legacy-SSE packed operand must; `CVTDQ2PD` reads only 64 bits
             // and so has no alignment requirement (volume 2, each page's
             // exception table).
-            Op::CVTDQ2PS => {
+            Op::CVTDQ2PS | Op::CVTPS2DQ | Op::CVTTPS2DQ => {
                 let src = self.sse_read_rm(f, f.insn.src, true)?;
-                let mut flags = Flags::NONE;
-                let mut out = [0u32; 4];
-                for (i, o) in out.iter_mut().enumerate() {
-                    let lane = i64::from(dword_lane(src, i) as i32);
-                    let (v, fl) = binary::from_signed::<B32>(lane, 32, env);
-                    flags |= fl;
-                    *o = v as u32;
-                }
+                let (out, flags) = convert_dwords(op, src, env);
                 self.sse_raise(flags)?;
-                self.state.sse.set(reg, of_dwords(out));
-                Ok(())
-            }
-            Op::CVTPS2DQ | Op::CVTTPS2DQ => {
-                let src = self.sse_read_rm(f, f.insn.src, true)?;
-                let env = if op == Op::CVTTPS2DQ {
-                    env.round(Round::TowardZero)
-                } else {
-                    env
-                };
-                let mut flags = Flags::NONE;
-                let mut out = [0u32; 4];
-                for (i, o) in out.iter_mut().enumerate() {
-                    let lane = u64::from(dword_lane(src, i));
-                    let (v, fl) = binary::to_signed::<B32>(lane, 32, env);
-                    flags |= fl;
-                    *o = v as u32;
-                }
-                self.sse_raise(flags)?;
-                self.state.sse.set(reg, of_dwords(out));
+                self.state.sse.set(reg, out);
                 Ok(())
             }
             Op::CVTPD2DQ | Op::CVTTPD2DQ => {
                 let src = self.sse_read_rm(f, f.insn.src, true)?;
-                let env = if op == Op::CVTTPD2DQ {
-                    env.round(Round::TowardZero)
-                } else {
-                    env
-                };
-                let (lo, f0) = binary::to_signed::<B64>(src[0], 32, env);
-                let (hi, f1) = binary::to_signed::<B64>(src[1], 32, env);
-                self.sse_raise(f0 | f1)?;
                 // Two results, in the low quadword; the high one is zeroed.
-                self.state
-                    .sse
-                    .set(reg, of_dwords([lo as u32, hi as u32, 0, 0]));
-                Ok(())
-            }
-            Op::CVTDQ2PD => {
-                let src = self.sse_read_rm(f, f.insn.src, false)?;
-                // Every 32-bit integer is exact in binary64, so this cannot
-                // raise anything; the flags are passed on regardless rather
-                // than assumed away.
-                let lane = |i| i64::from(dword_lane(src, i) as i32);
-                let (lo, f0) = binary::from_signed::<B64>(lane(0), 32, env);
-                let (hi, f1) = binary::from_signed::<B64>(lane(1), 32, env);
-                self.sse_raise(f0 | f1)?;
-                self.state.sse.set(reg, [lo, hi]);
+                let (out, flags) = narrow_doubles(op, [src[0], src[1], 0, 0], 2, env);
+                self.sse_raise(flags)?;
+                self.state.sse.set(reg, out);
                 Ok(())
             }
 
@@ -1910,21 +1892,7 @@ impl Exec<'_> {
             Op::RCPPS | Op::RCPSS | Op::RSQRTPS | Op::RSQRTSS => {
                 let scalar = matches!(op, Op::RCPSS | Op::RSQRTSS);
                 let src = self.sse_read_rm(f, f.insn.src, !scalar)?;
-                let kernel = if matches!(op, Op::RCPPS | Op::RCPSS) {
-                    approx_reciprocal
-                } else {
-                    approx_reciprocal_sqrt
-                };
-                // The scalar forms replace the low lane and keep the other
-                // three, as every `SS` operation does.
-                let mut out = self.state.sse.get(reg);
-                for i in 0..if scalar { 1 } else { 4 } {
-                    let shift = 32 * (i % 2);
-                    let v = u64::from(kernel(dword_lane(src, i)));
-                    out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (v << shift);
-                }
-                // No `MXCSR` flag and no `#XM`: these raise no SIMD
-                // floating-point exception at all, a signalling NaN included.
+                let out = approximate(op, self.state.sse.get(reg), src);
                 self.state.sse.set(reg, out);
                 Ok(())
             }
@@ -2013,7 +1981,7 @@ impl Exec<'_> {
             // memory rather than an `XMM` operand.
             Op::PINSRW => {
                 let value = self.read_arg(f, Arg::Ew, 2)? as u16;
-                let mut out = self.state.sse.get(reg);
+                let mut out = self.xmm_src1(f);
                 let lane = (f.imm as usize) & 7;
                 let shift = 16 * (lane % 4);
                 out[lane / 4] =
@@ -2050,13 +2018,11 @@ impl Exec<'_> {
 
     /// The four bitwise operations, which are the same 128 bits whatever the
     /// lane width in the mnemonic says.
-    fn sse_bitwise(&mut self, f: &Fields, op: fn(u64, u64) -> u64) -> Ex<()> {
+    fn sse_bitwise(&mut self, f: &Fields, op: Op) -> Ex<()> {
         let reg = f.reg_num();
         let src = self.sse_read_rm(f, f.insn.src, false)?;
         let dst = self.state.sse.get(reg);
-        self.state
-            .sse
-            .set(reg, [op(dst[0], src[0]), op(dst[1], src[1])]);
+        self.state.sse.set(reg, bitwise(op, dst, src));
         Ok(())
     }
 
@@ -2065,27 +2031,7 @@ impl Exec<'_> {
         let reg = f.reg_num();
         let src = self.sse_read_rm(f, f.insn.src, false)?;
         let dst = self.state.sse.get(reg);
-        // The four singles of a register, low to high.
-        let s = |v: [u64; 2], i: u32| (v[(i / 2) as usize] >> (32 * (i % 2))) & 0xffff_ffff;
-        let imm = f.imm as u32;
-        let value = match op {
-            Op::UNPCKLPS => [s(dst, 0) | (s(src, 0) << 32), s(dst, 1) | (s(src, 1) << 32)],
-            Op::UNPCKHPS => [s(dst, 2) | (s(src, 2) << 32), s(dst, 3) | (s(src, 3) << 32)],
-            Op::UNPCKLPD => [dst[0], src[0]],
-            Op::UNPCKHPD => [dst[1], src[1]],
-            Op::SHUFPD => [
-                if imm & 1 == 0 { dst[0] } else { dst[1] },
-                if imm & 2 == 0 { src[0] } else { src[1] },
-            ],
-            // `SHUFPS`: the low two lanes come from the destination and the
-            // high two from the source, each selected by two bits of the
-            // immediate.
-            _ => [
-                s(dst, imm & 3) | (s(dst, (imm >> 2) & 3) << 32),
-                s(src, (imm >> 4) & 3) | (s(src, (imm >> 6) & 3) << 32),
-            ],
-        };
-        self.state.sse.set(reg, value);
+        self.state.sse.set(reg, shuffle(op, dst, src, f.imm as u8));
         Ok(())
     }
 
@@ -2103,9 +2049,9 @@ impl Exec<'_> {
             (dst[0], src[0])
         };
         let (order, fl) = if single {
-            Self::ordered_pair::<B32>(a, b, signalling, env)
+            ordered_pair::<B32>(a, b, signalling, env)
         } else {
-            Self::ordered_pair::<B64>(a, b, signalling, env)
+            ordered_pair::<B64>(a, b, signalling, env)
         };
         self.sse_raise(fl)?;
         match order {
@@ -2117,146 +2063,18 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// The comparison behind `COMISS`/`UCOMISS`, at one format.
-    /// Apply the environment's subnormal rule to a comparison operand.
-    ///
-    /// The arithmetic paths get this from `float`'s own decode, but a
-    /// comparison never reaches the kernel — `binary::compare` reads bit
-    /// patterns and takes no [`Env`] — so `#D` and `MXCSR.DAZ` have to be
-    /// applied here or they are silently missing. Both matter: the SDM lists
-    /// the denormal exception for every one of `COMISS`, `UCOMISS`, `CMPPS`
-    /// and their double-precision counterparts, and with `DAZ` set a
-    /// subnormal must compare **equal** to zero rather than merely close to
-    /// it.
-    fn compare_operand<F: crate::float::Format>(v: u64, env: Env) -> (u64, Flags) {
-        if !matches!(
-            binary::classify::<F>(v),
-            Category::PositiveSubnormal | Category::NegativeSubnormal
-        ) {
-            return (v, Flags::NONE);
-        }
-        let flags = if env.subnormal_inputs.reports() {
-            Flags::DENORMAL
-        } else {
-            Flags::NONE
-        };
-        if env.subnormal_inputs.flushes() {
-            // A zero of the same sign, which is all `DAZ` ever substitutes.
-            (v & F::SIGN, flags)
-        } else {
-            (v, flags)
-        }
-    }
-
-    fn ordered_pair<F: crate::float::Format>(
-        a: u64,
-        b: u64,
-        signalling: bool,
-        env: Env,
-    ) -> (Option<core::cmp::Ordering>, Flags) {
-        let (a, fa) = Self::compare_operand::<F>(a, env);
-        let (b, fb) = Self::compare_operand::<F>(b, env);
-        let kind = |v: u64| match binary::classify::<F>(v) {
-            Category::SignalingNan => Some(true),
-            Category::QuietNan => Some(false),
-            _ => None,
-        };
-        let (ka, kb) = (kind(a), kind(b));
-        let any = ka.is_some() || kb.is_some();
-        let snan = ka == Some(true) || kb == Some(true);
-        let mut flags = fa | fb;
-        if snan || (signalling && any) {
-            flags |= Flags::INVALID;
-        }
-        let order = if any {
-            None
-        } else {
-            binary::compare::<F>(a, b)
-        };
-        (order, flags)
-    }
-
     /// `CMPPS`/`CMPSS`/`CMPPD`/`CMPSD`: a lane-wise mask of all ones or all
-    /// zeros, under one of eight immediate predicates.
+    /// zeros, under one of eight immediate predicates — the legacy encoding
+    /// reads three bits of the immediate, where VEX reads five.
     fn sse_mask_compare(&mut self, f: &Fields, op: Op) -> Ex<()> {
-        let single = matches!(op, Op::CMPPS | Op::CMPSS);
-        let scalar = matches!(op, Op::CMPSS | Op::CMPSD);
-        let predicate = (f.imm as u8) & 7;
         let env = self.state.sse.env();
         let reg = f.reg_num();
         let src = self.sse_read_rm(f, f.insn.src, false)?;
         let dst = self.state.sse.get(reg);
-        let mut flags = Flags::NONE;
-        let mut out = dst;
-        if single {
-            let lanes = if scalar { 1 } else { 4 };
-            for i in 0..lanes {
-                let a = (dst[i / 2] >> (32 * (i % 2))) & 0xffff_ffff;
-                let b = (src[i / 2] >> (32 * (i % 2))) & 0xffff_ffff;
-                let (r, fl) = Self::predicate::<B32>(a, b, predicate, env);
-                flags |= fl;
-                let mask = if r { 0xffff_ffffu64 } else { 0 };
-                let shift = 32 * (i % 2);
-                out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (mask << shift);
-            }
-        } else {
-            let lanes = if scalar { 1 } else { 2 };
-            for i in 0..lanes {
-                let (r, fl) = Self::predicate::<B64>(dst[i], src[i], predicate, env);
-                flags |= fl;
-                out[i] = if r { u64::MAX } else { 0 };
-            }
-        }
+        let (out, flags) = compare(op, dst, src, (f.imm as u8) & 7, env);
         self.sse_raise(flags)?;
         self.state.sse.set(reg, out);
         Ok(())
-    }
-
-    /// One of the eight compare predicates (*Intel SDM* volume 2, `CMPPS`,
-    /// table 3-7).
-    ///
-    /// Predicates 0-2 and 4-6 are the *ordered* half in the sense that they
-    /// are false for an unordered pair — except that 4-6 are the negations of
-    /// 0-2 and are therefore true for it. Only 3 and 7 ask about ordering
-    /// directly. The signalling column matters too: `EQ`, `NEQ`, `ORD` and
-    /// `UNORD` are quiet and the other four signal on any NaN.
-    fn predicate<F: crate::float::Format>(a: u64, b: u64, which: u8, env: Env) -> (bool, Flags) {
-        let (a, fa) = Self::compare_operand::<F>(a, env);
-        let (b, fb) = Self::compare_operand::<F>(b, env);
-        let is_nan = |v: u64| {
-            matches!(
-                binary::classify::<F>(v),
-                Category::QuietNan | Category::SignalingNan
-            )
-        };
-        let snan = |v: u64| binary::classify::<F>(v) == Category::SignalingNan;
-        let unordered = is_nan(a) || is_nan(b);
-        let quiet = matches!(which, 0 | 3 | 4 | 7);
-        let mut flags = fa | fb;
-        if (quiet && (snan(a) || snan(b))) || (!quiet && unordered) {
-            flags |= Flags::INVALID;
-        }
-        let order = binary::compare::<F>(a, b);
-        let result = match which {
-            0 => order == Some(core::cmp::Ordering::Equal),
-            1 => order == Some(core::cmp::Ordering::Less),
-            2 => matches!(
-                order,
-                Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
-            ),
-            3 => unordered,
-            4 => unordered || order != Some(core::cmp::Ordering::Equal),
-            5 => unordered || order != Some(core::cmp::Ordering::Less),
-            6 => {
-                unordered
-                    || !matches!(
-                        order,
-                        Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
-                    )
-            }
-            _ => !unordered,
-        };
-        (result, flags)
     }
 
     /// The packed and scalar arithmetic: one kernel over four lane shapes.
@@ -2265,78 +2083,10 @@ impl Exec<'_> {
         let reg = f.reg_num();
         let src = self.sse_read_rm(f, f.insn.src, false)?;
         let dst = self.state.sse.get(reg);
-        let single = matches!(
-            op,
-            Op::ADDPS
-                | Op::ADDSS
-                | Op::SUBPS
-                | Op::SUBSS
-                | Op::MULPS
-                | Op::MULSS
-                | Op::DIVPS
-                | Op::DIVSS
-                | Op::MINPS
-                | Op::MINSS
-                | Op::MAXPS
-                | Op::MAXSS
-                | Op::SQRTPS
-                | Op::SQRTSS
-        );
-        let scalar = matches!(
-            op,
-            Op::ADDSS
-                | Op::ADDSD
-                | Op::SUBSS
-                | Op::SUBSD
-                | Op::MULSS
-                | Op::MULSD
-                | Op::DIVSS
-                | Op::DIVSD
-                | Op::MINSS
-                | Op::MINSD
-                | Op::MAXSS
-                | Op::MAXSD
-                | Op::SQRTSS
-                | Op::SQRTSD
-        );
-        let mut flags = Flags::NONE;
-        let mut out = dst;
-        if single {
-            let lanes = if scalar { 1 } else { 4 };
-            for i in 0..lanes {
-                let shift = 32 * (i % 2);
-                let a = (dst[i / 2] >> shift) & 0xffff_ffff;
-                let b = (src[i / 2] >> shift) & 0xffff_ffff;
-                let (v, fl) = Self::lane::<B32>(op, a, b, env);
-                flags |= fl;
-                out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (v << shift);
-            }
-        } else {
-            let lanes = if scalar { 1 } else { 2 };
-            for i in 0..lanes {
-                let (v, fl) = Self::lane::<B64>(op, dst[i], src[i], env);
-                flags |= fl;
-                out[i] = v;
-            }
-        }
+        let (out, flags) = arith(op, dst, src, env);
         self.sse_raise(flags)?;
         self.state.sse.set(reg, out);
         Ok(())
-    }
-
-    /// One lane of an SSE arithmetic operation.
-    fn lane<F: crate::float::Format>(op: Op, a: u64, b: u64, env: Env) -> (u64, Flags) {
-        match op {
-            Op::ADDPS | Op::ADDSS | Op::ADDPD | Op::ADDSD => binary::add::<F>(a, b, env),
-            Op::SUBPS | Op::SUBSS | Op::SUBPD | Op::SUBSD => binary::sub::<F>(a, b, env),
-            Op::MULPS | Op::MULSS | Op::MULPD | Op::MULSD => binary::mul::<F>(a, b, env),
-            Op::DIVPS | Op::DIVSS | Op::DIVPD | Op::DIVSD => binary::div::<F>(a, b, env),
-            Op::MINPS | Op::MINSS | Op::MINPD | Op::MINSD => binary::min::<F>(a, b, env),
-            Op::MAXPS | Op::MAXSS | Op::MAXPD | Op::MAXSD => binary::max::<F>(a, b, env),
-            // The square root is unary: the *source* is the operand and the
-            // destination lane is overwritten, which is why `a` goes unused.
-            _ => binary::sqrt::<F>(b, env),
-        }
     }
 
     // -----------------------------------------------------------------
@@ -2604,6 +2354,434 @@ impl Exec<'_> {
 // a 128-bit value in, a 128-bit value out, no memory, no flags and no
 // exception. That makes every one of them directly testable, which is what the
 // tests at the bottom of `super::tests` do.
+
+// ---------------------------------------------------------------------------
+// The floating-point lane kernels
+// ---------------------------------------------------------------------------
+//
+// Each takes the two 128-bit operands an instruction combines and returns the
+// 128-bit result with the exceptions it raised, touching nothing else — so the
+// legacy executor above calls each once and the VEX executor (`avx`) calls the
+// same one once per 128-bit lane, and the two encodings cannot disagree about
+// an answer. `dst` is the first source: the old destination for a legacy
+// encoding, `VEX.vvvv` for a VEX one, and in both cases what a scalar
+// operation keeps above the lane it replaces.
+
+/// The four bitwise operations, in any of their spellings.
+pub(super) fn bitwise(op: Op, a: [u64; 2], b: [u64; 2]) -> [u64; 2] {
+    let f = match op {
+        Op::ANDPS | Op::ANDPD | Op::PAND => |a: u64, b: u64| a & b,
+        Op::ANDNPS | Op::ANDNPD | Op::PANDN => |a: u64, b: u64| !a & b,
+        Op::ORPS | Op::ORPD | Op::POR => |a: u64, b: u64| a | b,
+        _ => |a: u64, b: u64| a ^ b,
+    };
+    [f(a[0], b[0]), f(a[1], b[1])]
+}
+
+/// Whether `op` is one of the bitwise operations [`bitwise`] answers.
+pub(super) const fn is_bitwise(op: Op) -> bool {
+    matches!(
+        op,
+        Op::ANDPS
+            | Op::ANDPD
+            | Op::PAND
+            | Op::ANDNPS
+            | Op::ANDNPD
+            | Op::PANDN
+            | Op::ORPS
+            | Op::ORPD
+            | Op::POR
+            | Op::XORPS
+            | Op::XORPD
+            | Op::PXOR
+    )
+}
+
+/// `UNPCK*` and `SHUFP*`, on one 128-bit lane.
+pub(super) fn shuffle(op: Op, dst: [u64; 2], src: [u64; 2], imm: u8) -> [u64; 2] {
+    // The four singles of a register, low to high.
+    let s = |v: [u64; 2], i: u32| (v[(i / 2) as usize] >> (32 * (i % 2))) & 0xffff_ffff;
+    let imm = u32::from(imm);
+    match op {
+        Op::UNPCKLPS => [s(dst, 0) | (s(src, 0) << 32), s(dst, 1) | (s(src, 1) << 32)],
+        Op::UNPCKHPS => [s(dst, 2) | (s(src, 2) << 32), s(dst, 3) | (s(src, 3) << 32)],
+        Op::UNPCKLPD => [dst[0], src[0]],
+        Op::UNPCKHPD => [dst[1], src[1]],
+        Op::SHUFPD => [
+            if imm & 1 == 0 { dst[0] } else { dst[1] },
+            if imm & 2 == 0 { src[0] } else { src[1] },
+        ],
+        // `SHUFPS`: the low two lanes come from the destination and the
+        // high two from the source, each selected by two bits of the
+        // immediate.
+        _ => [
+            s(dst, imm & 3) | (s(dst, (imm >> 2) & 3) << 32),
+            s(src, (imm >> 4) & 3) | (s(src, (imm >> 6) & 3) << 32),
+        ],
+    }
+}
+
+/// Apply the environment's subnormal rule to a comparison operand.
+///
+/// The arithmetic paths get this from `float`'s own decode, but a
+/// comparison never reaches the kernel — `binary::compare` reads bit
+/// patterns and takes no [`Env`] — so `#D` and `MXCSR.DAZ` have to be
+/// applied here or they are silently missing. Both matter: the SDM lists
+/// the denormal exception for every one of `COMISS`, `UCOMISS`, `CMPPS`
+/// and their double-precision counterparts, and with `DAZ` set a
+/// subnormal must compare **equal** to zero rather than merely close to
+/// it.
+fn compare_operand<F: crate::float::Format>(v: u64, env: Env) -> (u64, Flags) {
+    if !matches!(
+        binary::classify::<F>(v),
+        Category::PositiveSubnormal | Category::NegativeSubnormal
+    ) {
+        return (v, Flags::NONE);
+    }
+    let flags = if env.subnormal_inputs.reports() {
+        Flags::DENORMAL
+    } else {
+        Flags::NONE
+    };
+    if env.subnormal_inputs.flushes() {
+        // A zero of the same sign, which is all `DAZ` ever substitutes.
+        (v & F::SIGN, flags)
+    } else {
+        (v, flags)
+    }
+}
+
+/// The comparison behind `COMISS`/`UCOMISS`, at one format.
+fn ordered_pair<F: crate::float::Format>(
+    a: u64,
+    b: u64,
+    signalling: bool,
+    env: Env,
+) -> (Option<core::cmp::Ordering>, Flags) {
+    let (a, fa) = compare_operand::<F>(a, env);
+    let (b, fb) = compare_operand::<F>(b, env);
+    let kind = |v: u64| match binary::classify::<F>(v) {
+        Category::SignalingNan => Some(true),
+        Category::QuietNan => Some(false),
+        _ => None,
+    };
+    let (ka, kb) = (kind(a), kind(b));
+    let any = ka.is_some() || kb.is_some();
+    let snan = ka == Some(true) || kb == Some(true);
+    let mut flags = fa | fb;
+    if snan || (signalling && any) {
+        flags |= Flags::INVALID;
+    }
+    let order = if any {
+        None
+    } else {
+        binary::compare::<F>(a, b)
+    };
+    (order, flags)
+}
+
+/// One of the thirty-two compare predicates (*Intel SDM* volume 2, `CMPPD`,
+/// table 3-1). The legacy encodings reach the first eight.
+///
+/// Each is three things: a relation on an ordered pair, the answer for an
+/// unordered one, and whether a *quiet* NaN raises `#I` (a signalling NaN
+/// always does). Predicates 8-15 are the same relations as 0-7 with the
+/// unordered answer and the relation turned around — `EQ_UQ`, `NGE_US`,
+/// `NGT_US`, `FALSE_OQ`, `NEQ_OQ`, `GE_OS`, `GT_OS`, `TRUE_UQ` — and 16-31
+/// repeat 0-15 with the signalling column flipped. So one table of sixteen
+/// and one bit.
+pub(super) fn predicate<F: crate::float::Format>(
+    a: u64,
+    b: u64,
+    which: u8,
+    env: Env,
+) -> (bool, Flags) {
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    let (a, fa) = compare_operand::<F>(a, env);
+    let (b, fb) = compare_operand::<F>(b, env);
+    let is_nan = |v: u64| {
+        matches!(
+            binary::classify::<F>(v),
+            Category::QuietNan | Category::SignalingNan
+        )
+    };
+    let snan = |v: u64| binary::classify::<F>(v) == Category::SignalingNan;
+    let unordered = is_nan(a) || is_nan(b);
+    let order = binary::compare::<F>(a, b);
+    let (eq, lt, gt) = (
+        order == Some(Equal),
+        order == Some(Less),
+        order == Some(Greater),
+    );
+    // (the answer for an ordered pair, the answer for an unordered one,
+    //  whether a quiet NaN signals)
+    let (ordered, if_unordered, signals) = match which & 15 {
+        0 => (eq, false, false),        // EQ_OQ
+        1 => (lt, false, true),         // LT_OS
+        2 => (lt || eq, false, true),   // LE_OS
+        3 => (false, true, false),      // UNORD_Q
+        4 => (!eq, true, false),        // NEQ_UQ
+        5 => (!lt, true, true),         // NLT_US
+        6 => (!(lt || eq), true, true), // NLE_US
+        7 => (true, false, false),      // ORD_Q
+        8 => (eq, true, false),         // EQ_UQ
+        9 => (lt, true, true),          // NGE_US: not greater-or-equal
+        10 => (lt || eq, true, true),   // NGT_US: not greater
+        11 => (false, false, false),    // FALSE_OQ
+        12 => (!eq, false, false),      // NEQ_OQ
+        13 => (gt || eq, false, true),  // GE_OS
+        14 => (gt, false, true),        // GT_OS
+        _ => (true, true, false),       // TRUE_UQ
+    };
+    let signals = signals != (which & 16 != 0);
+    let mut flags = fa | fb;
+    if snan(a) || snan(b) || (signals && unordered) {
+        flags |= Flags::INVALID;
+    }
+    let result = if unordered { if_unordered } else { ordered };
+    (result, flags)
+}
+
+/// `CMPPS`/`CMPSS`/`CMPPD`/`CMPSD` on one 128-bit lane under predicate
+/// `which` (0-31).
+pub(super) fn compare(
+    op: Op,
+    dst: [u64; 2],
+    src: [u64; 2],
+    which: u8,
+    env: Env,
+) -> ([u64; 2], Flags) {
+    let single = matches!(op, Op::CMPPS | Op::CMPSS);
+    let scalar = matches!(op, Op::CMPSS | Op::CMPSD);
+    let mut flags = Flags::NONE;
+    let mut out = dst;
+    if single {
+        let lanes = if scalar { 1 } else { 4 };
+        for i in 0..lanes {
+            let shift = 32 * (i % 2);
+            let a = (dst[i / 2] >> shift) & 0xffff_ffff;
+            let b = (src[i / 2] >> shift) & 0xffff_ffff;
+            let (r, fl) = predicate::<B32>(a, b, which, env);
+            flags |= fl;
+            let mask = if r { 0xffff_ffffu64 } else { 0 };
+            out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (mask << shift);
+        }
+    } else {
+        let lanes = if scalar { 1 } else { 2 };
+        for i in 0..lanes {
+            let (r, fl) = predicate::<B64>(dst[i], src[i], which, env);
+            flags |= fl;
+            out[i] = if r { u64::MAX } else { 0 };
+        }
+    }
+    (out, flags)
+}
+
+/// Whether `op` is one of the arithmetic operations [`arith`] answers.
+pub(super) const fn is_arith(op: Op) -> bool {
+    matches!(
+        op,
+        Op::ADDPS
+            | Op::ADDSS
+            | Op::ADDPD
+            | Op::ADDSD
+            | Op::SUBPS
+            | Op::SUBSS
+            | Op::SUBPD
+            | Op::SUBSD
+            | Op::MULPS
+            | Op::MULSS
+            | Op::MULPD
+            | Op::MULSD
+            | Op::DIVPS
+            | Op::DIVSS
+            | Op::DIVPD
+            | Op::DIVSD
+            | Op::MINPS
+            | Op::MINSS
+            | Op::MINPD
+            | Op::MINSD
+            | Op::MAXPS
+            | Op::MAXSS
+            | Op::MAXPD
+            | Op::MAXSD
+            | Op::SQRTPS
+            | Op::SQRTSS
+            | Op::SQRTPD
+            | Op::SQRTSD
+    )
+}
+
+/// The packed and scalar arithmetic on one 128-bit lane: one kernel over
+/// four lane shapes. A scalar operation replaces the low element of `dst`
+/// and keeps the rest.
+pub(super) fn arith(op: Op, dst: [u64; 2], src: [u64; 2], env: Env) -> ([u64; 2], Flags) {
+    let single = matches!(
+        op,
+        Op::ADDPS
+            | Op::ADDSS
+            | Op::SUBPS
+            | Op::SUBSS
+            | Op::MULPS
+            | Op::MULSS
+            | Op::DIVPS
+            | Op::DIVSS
+            | Op::MINPS
+            | Op::MINSS
+            | Op::MAXPS
+            | Op::MAXSS
+            | Op::SQRTPS
+            | Op::SQRTSS
+    );
+    let scalar = matches!(
+        op,
+        Op::ADDSS
+            | Op::ADDSD
+            | Op::SUBSS
+            | Op::SUBSD
+            | Op::MULSS
+            | Op::MULSD
+            | Op::DIVSS
+            | Op::DIVSD
+            | Op::MINSS
+            | Op::MINSD
+            | Op::MAXSS
+            | Op::MAXSD
+            | Op::SQRTSS
+            | Op::SQRTSD
+    );
+    let mut flags = Flags::NONE;
+    let mut out = dst;
+    if single {
+        let lanes = if scalar { 1 } else { 4 };
+        for i in 0..lanes {
+            let shift = 32 * (i % 2);
+            let a = (dst[i / 2] >> shift) & 0xffff_ffff;
+            let b = (src[i / 2] >> shift) & 0xffff_ffff;
+            let (v, fl) = arith_lane::<B32>(op, a, b, env);
+            flags |= fl;
+            out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (v << shift);
+        }
+    } else {
+        let lanes = if scalar { 1 } else { 2 };
+        for i in 0..lanes {
+            let (v, fl) = arith_lane::<B64>(op, dst[i], src[i], env);
+            flags |= fl;
+            out[i] = v;
+        }
+    }
+    (out, flags)
+}
+
+/// One element of an SSE arithmetic operation.
+fn arith_lane<F: crate::float::Format>(op: Op, a: u64, b: u64, env: Env) -> (u64, Flags) {
+    match op {
+        Op::ADDPS | Op::ADDSS | Op::ADDPD | Op::ADDSD => binary::add::<F>(a, b, env),
+        Op::SUBPS | Op::SUBSS | Op::SUBPD | Op::SUBSD => binary::sub::<F>(a, b, env),
+        Op::MULPS | Op::MULSS | Op::MULPD | Op::MULSD => binary::mul::<F>(a, b, env),
+        Op::DIVPS | Op::DIVSS | Op::DIVPD | Op::DIVSD => binary::div::<F>(a, b, env),
+        Op::MINPS | Op::MINSS | Op::MINPD | Op::MINSD => binary::min::<F>(a, b, env),
+        Op::MAXPS | Op::MAXSS | Op::MAXPD | Op::MAXSD => binary::max::<F>(a, b, env),
+        // The square root is unary: the *source* is the operand and the
+        // destination lane is overwritten, which is why `a` goes unused.
+        _ => binary::sqrt::<F>(b, env),
+    }
+}
+
+/// `RCPPS`, `RCPSS`, `RSQRTPS` and `RSQRTSS` on one 128-bit lane.
+///
+/// The scalar forms replace the low lane and keep the other three, as
+/// every `SS` operation does. No `MXCSR` flag and no `#XM`: these raise no
+/// SIMD floating-point exception at all, a signalling NaN included.
+pub(super) fn approximate(op: Op, dst: [u64; 2], src: [u64; 2]) -> [u64; 2] {
+    let scalar = matches!(op, Op::RCPSS | Op::RSQRTSS);
+    let kernel = if matches!(op, Op::RCPPS | Op::RCPSS) {
+        approx_reciprocal
+    } else {
+        approx_reciprocal_sqrt
+    };
+    let mut out = dst;
+    for i in 0..if scalar { 1 } else { 4 } {
+        let shift = 32 * (i % 2);
+        let v = u64::from(kernel(dword_lane(src, i)));
+        out[i / 2] = (out[i / 2] & !(0xffff_ffffu64 << shift)) | (v << shift);
+    }
+    out
+}
+
+/// The same-width packed conversions between integer and floating-point
+/// lanes — `CVTDQ2PS`, `CVTPS2DQ` and `CVTTPS2DQ` — on one 128-bit lane.
+///
+/// Each lane is the scalar conversion, through the same `float` routine
+/// and the same environment, so `MXCSR.RC`, the truncating form, the
+/// integer indefinite `0x8000_0000` for a NaN or an out-of-range value, and
+/// the exception flags all come with it.
+pub(super) fn convert_dwords(op: Op, src: [u64; 2], env: Env) -> ([u64; 2], Flags) {
+    let mut flags = Flags::NONE;
+    let mut out = [0u32; 4];
+    let env = if op == Op::CVTTPS2DQ {
+        env.round(Round::TowardZero)
+    } else {
+        env
+    };
+    for (i, o) in out.iter_mut().enumerate() {
+        let (v, fl) = if op == Op::CVTDQ2PS {
+            let lane = i64::from(dword_lane(src, i) as i32);
+            binary::from_signed::<B32>(lane, 32, env)
+        } else {
+            let (v, fl) = binary::to_signed::<B32>(u64::from(dword_lane(src, i)), 32, env);
+            (v as u64, fl)
+        };
+        flags |= fl;
+        *o = v as u32;
+    }
+    (of_dwords(out), flags)
+}
+
+/// The widening conversions, `CVTPS2PD` and `CVTDQ2PD`: `n` singles or
+/// doublewords from the low end of `src`, as doubles. Two from a legacy or
+/// `VEX.128` encoding, four from a `VEX.256` one. Every 32-bit integer and
+/// every single is exact as a double, so only a NaN or a subnormal input
+/// raises anything.
+pub(super) fn widen_to_doubles(op: Op, src: [u64; 2], n: usize, env: Env) -> ([u64; 4], Flags) {
+    let mut out = [0u64; 4];
+    let mut flags = Flags::NONE;
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        let lane = dword_lane(src, i);
+        let (v, fl) = if op == Op::CVTDQ2PD {
+            binary::from_signed::<B64>(i64::from(lane as i32), 32, env)
+        } else {
+            binary::convert::<B32, B64>(u64::from(lane), env)
+        };
+        flags |= fl;
+        *o = v;
+    }
+    (out, flags)
+}
+
+/// The narrowing conversions, `CVTPD2PS`, `CVTPD2DQ` and `CVTTPD2DQ`: `n`
+/// doubles as singles or doublewords, packed into the low end of the result
+/// with the rest zero.
+pub(super) fn narrow_doubles(op: Op, src: [u64; 4], n: usize, env: Env) -> ([u64; 2], Flags) {
+    let env = if op == Op::CVTTPD2DQ {
+        env.round(Round::TowardZero)
+    } else {
+        env
+    };
+    let mut out = [0u32; 4];
+    let mut flags = Flags::NONE;
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        let (v, fl) = if op == Op::CVTPD2PS {
+            binary::convert::<B64, B32>(src[i], env)
+        } else {
+            let (v, fl) = binary::to_signed::<B64>(src[i], 32, env);
+            (v as u64, fl)
+        };
+        flags |= fl;
+        *o = v as u32;
+    }
+    (of_dwords(out), flags)
+}
 
 /// `RCPPS`/`RCPSS` on one single-precision lane.
 ///

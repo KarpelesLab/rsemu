@@ -43,8 +43,7 @@ impl Exec<'_> {
             Some(Extension::Popcnt) => features.popcnt,
             Some(Extension::Lzcnt) => features.lzcnt,
             Some(Extension::Movbe) => features.movbe,
-            // Not yet executed: every VEX encoding is `#UD` for now.
-            Some(Extension::Avx) => false,
+            Some(Extension::Avx) => features.avx,
         }
     }
 
@@ -148,21 +147,11 @@ impl Exec<'_> {
                 self.state.sse.set(reg, out);
                 Ok(())
             }
-            Op::MOVDDUP => {
+            Op::MOVDDUP | Op::MOVSLDUP | Op::MOVSHDUP => {
                 // A register source contributes its low double; a memory
-                // source is that double alone.
-                let src = self.sse_read_rm(f, Arg::Wq, false)?;
-                self.state.sse.set(reg, [src[0], src[0]]);
-                Ok(())
-            }
-            Op::MOVSLDUP | Op::MOVSHDUP => {
-                let src = self.sse_read_rm(f, Arg::Wx, false)?;
-                let odd = op == Op::MOVSHDUP;
-                let pick = |q: u64| {
-                    let lane = if odd { q >> 32 } else { q & 0xffff_ffff };
-                    lane | (lane << 32)
-                };
-                self.state.sse.set(reg, [pick(src[0]), pick(src[1])]);
+                // source of `MOVDDUP` is that double alone.
+                let src = self.sse_read_rm(f, f.insn.src, false)?;
+                self.state.sse.set(reg, duplicate(op, src));
                 Ok(())
             }
             Op::LDDQU => {
@@ -187,14 +176,7 @@ impl Exec<'_> {
             Op::PCMPGTQ => {
                 let src = self.sse_read_rm(f, Arg::Wx, false)?;
                 let dst = self.state.sse.get(reg);
-                let gt = |i: usize| {
-                    if (dst[i] as i64) > (src[i] as i64) {
-                        u64::MAX
-                    } else {
-                        0
-                    }
-                };
-                self.state.sse.set(reg, [gt(0), gt(1)]);
+                self.state.sse.set(reg, pcmpgtq(dst, src));
                 Ok(())
             }
             Op::PCMPESTRI | Op::PCMPESTRM | Op::PCMPISTRI | Op::PCMPISTRM => self.pcmpstr(f),
@@ -242,13 +224,13 @@ impl Exec<'_> {
             }
             Op::PINSRB => {
                 let value = self.read_narrow(f, 1)? as u8;
-                let mut v = bytes(self.state.sse.get(reg));
+                let mut v = bytes(self.xmm_src1(f));
                 v[usize::from(imm & 15)] = value;
                 self.state.sse.set(reg, of_bytes(v));
                 Ok(())
             }
             Op::PINSRD => {
-                let mut v = self.state.sse.get(reg);
+                let mut v = self.xmm_src1(f);
                 if f.rex_w() {
                     v[usize::from(imm & 1)] = self.read_arg(f, Arg::Ey, 8)?;
                 } else {
@@ -272,7 +254,7 @@ impl Exec<'_> {
                 } else {
                     src[0] as i32
                 };
-                let mut d = dwords(self.state.sse.get(reg));
+                let mut d = dwords(self.xmm_src1(f));
                 d[usize::from((imm >> 4) & 3)] = value;
                 for (i, lane) in d.iter_mut().enumerate() {
                     if imm & (1 << i) != 0 {
@@ -304,13 +286,7 @@ impl Exec<'_> {
             Op::PTEST => {
                 let src = self.sse_read_rm(f, Arg::Wx, false)?;
                 let dst = self.state.sse.get(reg);
-                let zf = (src[0] & dst[0]) | (src[1] & dst[1]) == 0;
-                let cf = (src[0] & !dst[0]) | (src[1] & !dst[1]) == 0;
-                self.set_flag(flags::ZF, zf);
-                self.set_flag(flags::CF, cf);
-                for bit in [flags::AF, flags::OF, flags::PF, flags::SF] {
-                    self.set_flag(bit, false);
-                }
+                self.set_test_flags(&dst, &src, u64::MAX);
                 Ok(())
             }
 
@@ -340,6 +316,26 @@ impl Exec<'_> {
                 self.state.sse.set(reg, sse41(op, dst, src, mask, imm));
                 Ok(())
             }
+        }
+    }
+
+    /// The flags `PTEST`, `VPTEST`, `VTESTPS` and `VTESTPD` set: `ZF` if
+    /// `src AND dst` is zero and `CF` if `src AND NOT dst` is, over every
+    /// quadword of the two operands, each first masked by `bits` — all of
+    /// them for `PTEST`, the sign bits of the lanes for `VTESTPS`/`PD`. The
+    /// other four arithmetic flags are cleared (*Intel SDM* volume 2,
+    /// `PTEST` and `VTESTPD/VTESTPS`).
+    pub(super) fn set_test_flags(&mut self, dst: &[u64], src: &[u64], bits: u64) {
+        let mut and = 0;
+        let mut andn = 0;
+        for (d, s) in dst.iter().zip(src) {
+            and |= d & s & bits;
+            andn |= !d & s & bits;
+        }
+        self.set_flag(flags::ZF, and == 0);
+        self.set_flag(flags::CF, andn == 0);
+        for bit in [flags::AF, flags::OF, flags::PF, flags::SF] {
+            self.set_flag(bit, false);
         }
     }
 
@@ -431,6 +427,34 @@ impl Exec<'_> {
         self.set_flag(flags::PF, false);
         Ok(())
     }
+}
+
+/// `MOVDDUP`, `MOVSLDUP` and `MOVSHDUP` on one 128-bit lane: the low
+/// double twice, or the even or the odd singles each twice.
+pub(super) fn duplicate(op: Op, src: [u64; 2]) -> [u64; 2] {
+    match op {
+        Op::MOVDDUP => [src[0], src[0]],
+        _ => {
+            let odd = op == Op::MOVSHDUP;
+            let pick = |q: u64| {
+                let lane = if odd { q >> 32 } else { q & 0xffff_ffff };
+                lane | (lane << 32)
+            };
+            [pick(src[0]), pick(src[1])]
+        }
+    }
+}
+
+/// `PCMPGTQ` on one 128-bit lane: signed quadwords, greater than.
+pub(super) fn pcmpgtq(dst: [u64; 2], src: [u64; 2]) -> [u64; 2] {
+    let gt = |i: usize| {
+        if (dst[i] as i64) > (src[i] as i64) {
+            u64::MAX
+        } else {
+            0
+        }
+    };
+    [gt(0), gt(1)]
 }
 
 /// The CRC-32C (Castagnoli) table, one entry per byte value, for the
