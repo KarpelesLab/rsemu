@@ -468,6 +468,7 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     #[test]
     fn crc32_is_zlibs() {

@@ -287,7 +287,7 @@ pub static ARM926: CatalogEntry = CatalogEntry {
 pub static ALPHARD_NAVI: CatalogEntry = CatalogEntry {
     name: "alphard-navi",
     summary: "Toyota Alphard nav computer: R-Car Gen1 Cortex-A9, U-Boot + Linux 2.6.35 from NOR",
-    media: &["flash"],
+    media: &["flash", "kwi"],
     source: include_str!("../../machines/alphard-navi.machine"),
 };
 
@@ -2581,6 +2581,11 @@ mod tests {
             // a proprietary NOR, which nothing in this tree may carry.
             #[cfg(feature = "machine-alphard-navi")]
             ("alphard-navi", "flash") => &[0xfe, 0xff, 0xff, 0xea],
+            // No KWI: the board boots its flash, which is the case the flash
+            // fixture above exercises. `navi::kwiboot`'s own tests build a
+            // synthetic KWI; a real one is a proprietary map-card file.
+            #[cfg(feature = "machine-alphard-navi")]
+            ("alphard-navi", "kwi") => &[],
             // The smallest thing `arm.loader`'s `format = "arm64"` accepts: a
             // 64-byte AArch64 `Image` header whose `code0` branches over it,
             // and `B .` on the far side. A bare `B .` would be *refused* here
