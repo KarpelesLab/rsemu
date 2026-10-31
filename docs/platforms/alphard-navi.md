@@ -29,6 +29,13 @@ The recovery root's `init` is Aisin's process manager `/vns/bin/pmng`, which
 starts `osloader`; osloader's job is to load the full system from the map SD
 card and warm-reboot into it, leaving a flag in on-chip SRAM at `0xfe794000`.
 
+The `osloader` → KWI → warm-boot path — the PWI config region, the KWI
+container format, the PCRD boot descriptor, and the exact DRAM staging — is
+reverse-engineered in detail in
+[alphard-navi-kwi-boot.md](alphard-navi-kwi-boot.md) and
+[alphard-navi-kwi-format.md](alphard-navi-kwi-format.md). It is model-generic,
+so the same loader boots any of the 11 head-unit models from its KWI.
+
 ## How the map was learnt
 
 Renesas's R-Car hardware manual is not public, and the Linux and U-Boot trees
@@ -237,7 +244,10 @@ monitor, 1 and 2 the CIS links to the base-board sub-CPUs, which raise GPIO
 
 ## What would move it further
 
-* Rendering: the HMI's OpenGL ES output, which needs the SGX to draw.
+* Rendering: the HMI's OpenGL ES output, which needs the SGX to draw. The GPU
+  (PowerVR SGX540, DDK 1.7), the PVR services command model, the OpenGL ES /
+  OpenVG userspace, and the DU display/compositing pipeline are documented in
+  [alphard-navi-gpu.md](alphard-navi-gpu.md).
 * The SCAC security chip (`sammc` polls its status and times out every few
   seconds).
 * The CIS peers on HSPI channels 1 and 2.
