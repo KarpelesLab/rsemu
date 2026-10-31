@@ -286,6 +286,9 @@ machine "alphard-navi" {
   # the flash's loader chain does, and maps a four-instruction stub over the
   # reset vector that enters the kernel as U-Boot would. Any model's KWI
   # boots. With the slot empty it does nothing and the flash boots as above.
+  # Given both, the KWI boots and the flash supplies only what the unit keeps
+  # in it -- its backup records and factory data (MAC, calibration) in the
+  # last bank, which no KWI carries; without them the system faults ~30 s in.
   object kwiboot "navi.kwiboot" { space = mem, image = "kwi", flash = "nor" }
 
   # -- placeholders: storage, not models (see the header) ---------------------

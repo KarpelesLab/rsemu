@@ -329,6 +329,15 @@ every key it has and a few more.
 
 * **The PCRD digest** at `0x11800a` — whether anything checks it, and what
   produces the 16-byte per-image half. Neither boot path in rsemu needs it.
-* **What else the product system reads from the NOR.** With `navi.kwiboot`
-  and no flash image the NOR reads as erased; anything in userland that reads
-  an MTD partition gets `0xff`.
+* **The unit's own data lives in the NOR, not in any KWI.** The last bank
+  (`0x700000`–`0x800000`, MTD `BANK4`) holds two mirrored sets of `BKD`
+  backup records, `FLS_1`/`FLS_2` markers, and a factory block at `0x7c0000`
+  (part number `8610058180`, a 2015 date, `13TMANJP-BD03`), with the WLAN MAC
+  at `0x7f4000`. The product system reads them through MTD. With
+  `navi.kwiboot` and no flash image the NOR reads erased: the MAC comes back
+  `ff ff ff ff ff ff`, the WLAN calibration check fails, an I2C bus-2
+  transfer times out and the kernel oopses in its error path about 30 s in.
+  Given the flash as well (`--media kwi=… --media flash=…`), the KWI-booted
+  system reads the unit's data and runs on with no oops — the loader is then
+  only taking the place of U-Boot and the recovery system. What a minimal
+  blank-unit `BANK4` would need to hold is still open.
