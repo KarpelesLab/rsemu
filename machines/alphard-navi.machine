@@ -1,6 +1,7 @@
 # alphard-navi - the Aisin navigation computer in a Toyota Alphard (GGH30).
 #
 #   rsemu run alphard-navi --media flash=S29JL064J.bin
+#   rsemu run alphard-navi --media kwi=LOADING.KWI      (no flash needed)
 #
 # The head unit (Toyota 86100-58182, Panasonic CQ-UT24J0AJ) carries an Aisin AW
 # computer board, 99370-00649, built around a Renesas R-Car Gen1 SoC (marked
@@ -278,6 +279,14 @@ machine "alphard-navi" {
 
   # The Display Unit: rcarfb drives plane 1 as 800x480 RGB565 from 0x9e000000.
   object du "rcar.du" { clock = dotclk, space = mem }
+
+  # The second way in: boot the product system straight from a map card's
+  # LOADING.KWI, with no flash image. Given `--media kwi=...`, this stages the
+  # KWI's kernel, root and USRCONF, leaves the shared area at 0x60000000 as
+  # the flash's loader chain does, and maps a four-instruction stub over the
+  # reset vector that enters the kernel as U-Boot would. Any model's KWI
+  # boots. With the slot empty it does nothing and the flash boots as above.
+  object kwiboot "navi.kwiboot" { space = mem, image = "kwi", flash = "nor" }
 
   # -- placeholders: storage, not models (see the header) ---------------------
   object extcs  "ram" { size = 4K }    # 0x18100000: a device on an LBSC chip select U-Boot probes

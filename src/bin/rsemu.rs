@@ -614,9 +614,13 @@ fn run(args: &[String]) -> ExitCode {
     // `scsi0` is an A4000T's SCSI cable at address 0, and the `hd0` argument
     // on a different port: no bytes is an address nobody answers at, which is
     // that machine with its SCSI drive taken out — it still has its IDE one.
+    // `flash` and `kwi` are alphard-navi's two ways in: its NOR dump, or a map
+    // card's LOADING.KWI booted directly. Either one alone is a working
+    // machine, so neither may be required — an empty `flash` is an erased
+    // chip, and an empty `kwi` leaves the board booting its flash.
     for slot in [
         "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "scsi0", "floppy", "floppy2",
-        "vgabios", "nvme0", "df0", "ext", "cd0", "cdrom",
+        "vgabios", "nvme0", "df0", "ext", "cd0", "cdrom", "flash", "kwi",
     ] {
         if !images.iter().any(|(bound, _)| bound == slot) {
             images.push((String::from(slot), Vec::new()));
