@@ -9,7 +9,7 @@ plus a machine description.
 | Motorola 68000 | see [`m68k.md`](m68k.md) — the 68000, 68010 and 68020 are implemented | Amiga, Atari ST, Genesis, early Macs |
 | MIPS | see [`mips.md`](mips.md) — the R3000A core is implemented | PlayStation, N64, routers |
 | PowerPC | *PowerPC Architecture Book* I–III; NXP hosts the classic PPC manuals | Mac, GameCube/Wii, embedded |
-| SuperH (SH-2/SH-4) | Renesas SH-2 and SH-4 hardware manuals | Saturn, Dreamcast |
+| SuperH (SH-2/SH-4) | Renesas SH-2 and SH-4 hardware manuals; the SH-4A core (`cpu-sh4a`) is implemented from the *SH-4A Software Manual* (REJ09B0003) | Saturn, Dreamcast, R-Car realtime cores |
 | 65816 | WDC W65C816S datasheet + *Programming the 65816* | SNES, Apple IIGS |
 | V850 | Renesas/NEC V850 architecture manuals | Automotive; see `../ghidra_v850` |
 | Z80 / 8080 | see [`z80-sm83.md`](z80-sm83.md) | |
