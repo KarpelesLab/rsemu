@@ -291,10 +291,16 @@ machine "alphard-navi" {
   # last bank, which no KWI carries; without them the system faults ~30 s in.
   object kwiboot "navi.kwiboot" { space = mem, image = "kwi", flash = "nor" }
 
+  # The mailbox between the Cortex-A9s and the SH-4A "realtime domain": two
+  # doorbells, EICR (0x30, SH -> ARM, GIC ID 85) and IICR (0x70, ARM -> SH).
+  # The kernel's iccom module releases the SH-4A and waits up to 6 s for
+  # EICR bit 2, "booted"; until an SH-4A runs, nothing rings it. The page's
+  # word 0x40 is the A9 secondary boot address, rst's.
+  object iccom "rcar.iccom" { }
+
   # -- placeholders: storage, not models (see the header) ---------------------
   object extcs  "ram" { size = 4K }    # 0x18100000: a device on an LBSC chip select U-Boot probes
   object extcs3 "ram" { size = 64K }   # 0x18300000: the device on chip select 3 the SD system maps (an external abort rebooted it)
-  object intc   "ram" { size = 4K }    # 0xfe700000: interrupt mask registers
   object intcs  "ram" { size = 8K }    # 0xfe780000: the interrupt controller's configuration
   object dbsc0  "ram" { size = 4K }    # 0xfe800000: DDR controller, channel 0
   object dbsc1  "ram" { size = 4K }    # 0xfec00000: DDR controller, channel 1
@@ -332,7 +338,7 @@ machine "alphard-navi" {
   map mem 0xf0000600 size 0x100  = mpcore.private
   map mem 0xf0001000 size 0x1000 = gic.dist
   map mem 0xf0100000 size 0x1000 = l2
-  map mem 0xfe700000 size 4K     = intc
+  map mem 0xfe700000 size 4K     = iccom
   map mem 0xfe700040 size 4      = rst.bar { priority = 1 }
   map mem 0xfe6cf000 size 4K     = rst
   map mem 0xfe780000 size 8K     = intcs
@@ -443,6 +449,7 @@ machine "alphard-navi" {
   wire scif3.tx-dreq -> hpbdmac.dreq6
   wire scif3.rx-dreq -> hpbdmac.dreq7
   wire sdhi3.dreq    -> hpbdmac.dreq39   # traced: ch39 serves SDHI3 both ways, reprogrammed per transfer
+  wire iccom.arm-irq -> gic.spi53    # ID 85: the SH-4A's doorbell
   wire hpbdmac.grp0  -> gic.spi110   # ID 142: channels 0-10
   wire hpbdmac.grp1  -> gic.spi111   # ID 143
   wire hpbdmac.grp2  -> gic.spi112   # ID 144

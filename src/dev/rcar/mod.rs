@@ -16,6 +16,7 @@
 //! | [`hpbdmac`] | `rcar.hpbdmac` | the HPB-DMAC: 44 request-paced peripheral DMA channels with double-buffered register sets |
 //! | [`sdhi`] | `rcar.sdhi` | the SD host interface: command engine, one-block buffer, DMA requests, driving a `sd.card` through a socket |
 //! | [`can`] | `rcar.can` | one CAN channel on a silent bus: the mode handshake, transmissions that complete |
+//! | [`iccom`] | `rcar.iccom` | the H1's ARM <-> SH-4A mailbox: two doorbells, each the other side's interrupt while non-zero |
 //! | [`iebus`] | `rcar.iebus` | the IEBus (AVC-LAN) controller on a silent bus: transmissions complete |
 //! | [`rst`] | `rcar.rst` | the H1's secondary-core reset control and boot address |
 //! | [`sysc`] | `rcar.sysc` | the SYSC power domains: switches that complete at once, with status and completion bits |
@@ -38,6 +39,7 @@ pub mod gpio;
 pub mod hpbdmac;
 pub mod hspi;
 pub mod i2c;
+pub mod iccom;
 pub mod iebus;
 pub mod rst;
 pub mod scif;
@@ -51,6 +53,7 @@ pub use gpio::Gpio;
 pub use hpbdmac::HpbDmac;
 pub use hspi::Hspi;
 pub use i2c::I2c;
+pub use iccom::Iccom;
 pub use iebus::IeBus;
 pub use rst::Rst;
 pub use scif::Scif;
@@ -68,6 +71,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     gpio::register(registry)?;
     hpbdmac::register(registry)?;
     hspi::register(registry)?;
+    iccom::register(registry)?;
     iebus::register(registry)?;
     i2c::register(registry)?;
     scif::register(registry)?;
@@ -88,6 +92,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     gpio::bind(bindings)?;
     hpbdmac::bind(bindings)?;
     hspi::bind(bindings)?;
+    iccom::bind(bindings)?;
     iebus::bind(bindings)?;
     i2c::bind(bindings)?;
     scif::bind(bindings)?;
@@ -106,6 +111,7 @@ pub fn schemas() -> Vec<ClassSchema> {
         gpio::schema(),
         hpbdmac::schema(),
         hspi::schema(),
+        iccom::schema(),
         iebus::schema(),
         i2c::schema(),
         scif::schema(),
