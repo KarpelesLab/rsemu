@@ -216,7 +216,7 @@ impl PdsBus for Bus<'_> {
                 }
             }
             DoutType::USSE => self.tasks.push(w0),
-            DoutType::TEXTURE => self.texture(w1, w2),
+            DoutType::TEXTURE => self.texture([w0, w1, w2, out.words[3]]),
             // Iterators: the coordinate comes from the rasteriser.
             _ => {}
         }
@@ -233,25 +233,37 @@ impl PdsBus for Bus<'_> {
 }
 
 impl Bus<'_> {
-    /// A texture fetch: `size` is `format[31:24] (width - 1)[23:12]
-    /// (height - 1)[11:0]`, `addr` the first texel; 32-bit texels, the row
-    /// stride the width \[G\].
-    fn texture(&mut self, size: u32, addr: u32) {
-        let (w, h) = (((size >> 12) & 0xfff) + 1, (size & 0xfff) + 1);
+    /// A texture fetch from the four-word descriptor (`T0..T3`, see
+    /// [`Texture::decode`]), at the pixel's interpolated coordinate, nearest
+    /// texel. A sampler word with any of `T0[25:21]` set returns four f16
+    /// lanes in `pa0..pa1`, which the UI's pixel shaders convert and blend
+    /// in f16; without (the transfer queue's), the raw texel in `pa0`,
+    /// which its copy shader moves straight out \[G\].
+    fn texture(&mut self, t: [u32; 4]) {
+        let tex = Texture::decode(t);
         let pick = |c: f32, n: u32| -> u32 {
             let v = c * n as f32;
             if v.is_nan() || v < 0.0 {
                 0
             } else {
-                (v as u32).min(n - 1)
+                (v as u32).min(n.max(1) - 1)
             }
         };
-        let (x, y) = (pick(self.tex_coord[0], w), pick(self.tex_coord[1], h));
-        let t = self
-            .gpu
-            .read(addr.wrapping_add(4 * (y * w + x)))
-            .unwrap_or(0);
-        let lane = |k: u32| f16_unorm(((t >> (8 * k)) & 0xff) as f32 / 255.0);
+        let (x, y) = (
+            pick(self.tex_coord[0], tex.width),
+            pick(self.tex_coord[1], tex.height),
+        );
+        let v = tex.surface.read(self.gpu, x, y);
+        if t[0] & 0x03e0_0000 == 0 {
+            self.primary[0] = v;
+            return;
+        }
+        let lanes: [u32; 4] = match tex.surface.bytes {
+            // [G] A one-channel texel feeds every lane.
+            1 => [v; 4],
+            _ => core::array::from_fn(|k| v >> (8 * k) & 0xff),
+        };
+        let lane = |k: usize| f16_unorm(lanes[k] as f32 / 255.0);
         self.primary[0] = lane(0) | lane(1) << 16;
         self.primary[1] = lane(2) | lane(3) << 16;
     }
@@ -440,10 +452,192 @@ enum Kind {
 /// The render target, from the pixel back end's `emit158`.
 #[derive(Clone, Copy, Debug)]
 struct Target {
+    surface: Surface,
+    /// The first pixel the render covers.
+    x0: u32,
+    /// The first pixel the render covers.
+    y0: u32,
+    /// One past the last.
+    x1: u32,
+    /// One past the last.
+    y1: u32,
+}
+
+impl Target {
+    /// The pixel back end's words, `emit158 #0, r0, r2, r4` \[strong\]:
+    ///
+    /// * `r0`: the format in `[31:28]` (8: 8 bits a pixel; 0: 32; 3–6: 16
+    ///   \[G\]) and the layout in `[27:26]` (0 strided, 1 tiled, 2
+    ///   twiddled);
+    /// * `r1`: the address (`[1:0]` a rotation, not modelled);
+    /// * `r2[13:0] + 1`: half the stride, in pixels;
+    /// * `r4`: the first pixel, `x[11:0] y[23:12]`, and for a twiddled
+    ///   surface `log2(w/16)[27:24] log2(h/16)[31:28]`;
+    /// * `r5`: the last pixel, inclusive, the same way.
+    fn from_pbe([[r0, r1], [r2, _], [r4, r5]]: [[u32; 2]; 3]) -> Target {
+        let format = r0 >> 28;
+        Target {
+            surface: Surface {
+                addr: r1 & !3,
+                layout: match r0 >> 26 & 3 {
+                    1 => Layout::Tiled,
+                    2 => Layout::Twiddled,
+                    _ => Layout::Strided,
+                },
+                bytes: format_bytes(format == 8, (3..=6).contains(&format)),
+                stride: ((r2 & 0x3fff) + 1) * 2,
+                log2: ((r4 >> 24 & 0xf) + 4, (r4 >> 28 & 0xf) + 4),
+            },
+            x0: r4 & 0xfff,
+            y0: r4 >> 12 & 0xfff,
+            x1: (r5 & 0xfff) + 1,
+            y1: (r5 >> 12 & 0xfff) + 1,
+        }
+    }
+}
+
+/// How a surface's pixels are laid out in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// Rows of `stride` pixels.
+    Strided,
+    /// 32 × 32 tiles, row after row of them, `stride` pixels a row of
+    /// tiles; within a tile, rows of 32 \[G\].
+    Tiled,
+    /// Morton order: x and y bits interleaved, y the lower, over the
+    /// smaller dimension, the larger's remaining bits above \[G\].
+    Twiddled,
+}
+
+/// A surface in GPU memory: where pixel `(x, y)` is.
+#[derive(Clone, Copy, Debug)]
+struct Surface {
     addr: u32,
+    layout: Layout,
+    /// Bytes a pixel: 1, 2 or 4.
+    bytes: u32,
+    /// Pixels a row (strided and tiled).
     stride: u32,
+    /// log2 of the width and height (twiddled).
+    log2: (u32, u32),
+}
+
+impl Surface {
+    fn offset(&self, x: u32, y: u32) -> u32 {
+        let index = match self.layout {
+            Layout::Strided => y.wrapping_mul(self.stride).wrapping_add(x),
+            Layout::Tiled => {
+                let per_row = self.stride.div_ceil(32);
+                ((y / 32) * per_row + x / 32) * 1024 + (y % 32) * 32 + x % 32
+            }
+            Layout::Twiddled => twiddle(x, y, self.log2),
+        };
+        self.addr.wrapping_add(index.wrapping_mul(self.bytes))
+    }
+
+    fn read(&self, gpu: &dyn GpuMemory, x: u32, y: u32) -> u32 {
+        let at = self.offset(x, y);
+        let word = gpu.read(at & !3).unwrap_or(0);
+        match self.bytes {
+            1 => word >> (8 * (at & 3)) & 0xff,
+            2 => word >> (8 * (at & 2)) & 0xffff,
+            _ => word,
+        }
+    }
+
+    fn write(&self, gpu: &dyn GpuMemory, x: u32, y: u32, v: u32) {
+        let at = self.offset(x, y);
+        if self.bytes == 4 {
+            gpu.write(at, v);
+            return;
+        }
+        let (shift, mask) = match self.bytes {
+            1 => (8 * (at & 3), 0xff),
+            _ => (8 * (at & 2), 0xffff),
+        };
+        let word = gpu.read(at & !3).unwrap_or(0);
+        gpu.write(at & !3, word & !(mask << shift) | (v & mask) << shift);
+    }
+}
+
+/// The Morton index of `(x, y)` in a `2^lw × 2^lh` surface \[G\].
+fn twiddle(x: u32, y: u32, (lw, lh): (u32, u32)) -> u32 {
+    let m = lw.min(lh);
+    let mut index = 0;
+    for k in 0..m {
+        index |= (y >> k & 1) << (2 * k) | (x >> k & 1) << (2 * k + 1);
+    }
+    let rest = if lw > lh { x >> m } else { y >> m };
+    index | rest << (2 * m)
+}
+
+/// Bytes a pixel for a format field \[G beyond 8 and 32 bits\].
+fn format_bytes(eight: bool, sixteen: bool) -> u32 {
+    if eight {
+        1
+    } else if sixteen {
+        2
+    } else {
+        4
+    }
+}
+
+/// A texture, from its four descriptor words:
+///
+/// * `T1[31:30]` the layout — 0 twiddled with `log2(w)` in `[19:16]` and
+///   `log2(h)` in `[3:0]`; otherwise `(w − 1)[23:12]` and `(h − 1)[11:0]`,
+///   and 1 strided at the width \[G\], 2 tiled (rows of tiles the width
+///   rounded up to 32), 3 strided at `T0`'s stride;
+/// * `T1[28:24]` the format: 0 is 8 bits a texel, `0x0c` 32, `0x02..0x05`
+///   16 \[G\];
+/// * `T2` the address; `T3` format bits not modelled;
+/// * `T0` the sampler and, for layout 3, the stride: `v = bytes/4 − 1`,
+///   `v[2:0]` in `[11:9]`, `v[12:3]` in `[26:17]`, `v[14:13]` in `[2:1]`.
+///
+/// \[strong\]: the transfer queue's writer in `libsrv_um`, checked against
+/// strides of 356, 2048 and 4096 bytes and every texture the UI samples.
+#[derive(Clone, Copy, Debug)]
+struct Texture {
+    surface: Surface,
     width: u32,
     height: u32,
+}
+
+impl Texture {
+    fn decode([t0, t1, t2, _]: [u32; 4]) -> Texture {
+        let format = t1 >> 24 & 0x1f;
+        let bytes = format_bytes(format == 0, (2..=5).contains(&format));
+        let layout = t1 >> 30;
+        let (width, height, log2) = if layout == 0 {
+            let (lw, lh) = (t1 >> 16 & 0xf, t1 & 0xf);
+            (1 << lw, 1 << lh, (lw, lh))
+        } else {
+            ((t1 >> 12 & 0xfff) + 1, (t1 & 0xfff) + 1, (0, 0))
+        };
+        let stride = match layout {
+            3 => {
+                let v = (t0 >> 9 & 7) | (t0 >> 17 & 0x3ff) << 3 | (t0 >> 1 & 3) << 13;
+                (v + 1) * 4 / bytes
+            }
+            2 => width.next_multiple_of(32),
+            _ => width,
+        };
+        Texture {
+            surface: Surface {
+                addr: t2 & !3,
+                layout: match layout {
+                    0 => Layout::Twiddled,
+                    2 => Layout::Tiled,
+                    _ => Layout::Strided,
+                },
+                bytes,
+                stride,
+                log2,
+            },
+            width,
+            height,
+        }
+    }
 }
 
 /// Draws the TA command at `cmd` (a kernel virtual address readable through
@@ -466,6 +660,113 @@ pub fn render_ta_traced(
 ) -> (Option<Summary>, Vec<String>) {
     let (s, t) = render(gpu, cmd, code_bases, Some(Vec::new()));
     (s, t.unwrap_or_default())
+}
+
+/// Performs the transfer (blit) command at `cmd`: a render with no tile
+/// accelerator, whose one rectangle samples the source and whose pixel back
+/// end writes the destination \[strong\]:
+///
+/// * `+0x00[24:0] << 4`, plus `+0x18 & 0xfff0_0000`, is a short ISP stream:
+///   the per-draw PDS program, a control word, the per-pixel PDS program
+///   (its texture DOUT is the source), then for each source the `(u, v)` of
+///   three vertices, `2·sources, 0`, and three vertices `x << 16 | y`, z —
+///   `(c + 1024) << 4` fixed point, or `(c + 2048) << 3` when `+0x3c` is
+///   set — in the order `(x0, y0) (x1, y0) (x0, y1)`;
+/// * `+0x24`/`+0x28` the pixel-event program and its rows, whose end-of-tile
+///   branch emits the destination as for a TA render.
+///
+/// Read off `libsrv_um`'s transfer-queue writer and the commands in a
+/// snapshot. Each destination pixel inside the rectangle runs the per-pixel
+/// program with `(u, v)` interpolated linearly and `o0` the destination's
+/// current value.
+pub fn render_transfer(gpu: &dyn GpuMemory, cmd: u32, code_bases: [u32; 16]) -> Option<Summary> {
+    let mut r = Renderer {
+        gpu,
+        code_bases,
+        secondary: Box::new([0; usse::BANK_SIZE]),
+        summary: Summary::default(),
+        trace: None,
+    };
+    r.transfer(cmd)
+}
+
+impl Renderer<'_> {
+    fn transfer(&mut self, cmd: u32) -> Option<Summary> {
+        let g = self.gpu;
+        let word = |o: u32| g.read(cmd.wrapping_add(o));
+        let isp = (word(0x18)? & 0xfff0_0000).wrapping_add((word(0)? & 0x01ff_ffff) << 4);
+        let fine = word(0x3c)? != 0;
+        let ran = self.run(word(0x24)?, word(0x28)?, [0; 3], Kind::Event, &mut [0; 4]);
+        let target = Target::from_pbe(
+            ran.emits
+                .iter()
+                .find(|(e, _)| e.form == FORM_PBE)?
+                .0
+                .sources,
+        );
+        let s = |i: u32| g.read(isp.wrapping_add(4 * i)).unwrap_or(0);
+        let f = |i: u32| f32::from_bits(s(i));
+        let (secondary, primary) = (s(0), s(2));
+        // The count follows the coordinates; a source's own (0, 0) would also
+        // read as "no sources", so the largest consistent count wins.
+        let sources = (0..=3)
+            .rev()
+            .find(|&n| s(3 + 6 * n) == 2 * n && s(4 + 6 * n) == 0)?;
+        let v = 3 + 6 * sources + 2;
+        let at = |c: u32| {
+            if fine {
+                c as f32 / 8.0 - 2048.0
+            } else {
+                c as f32 / 16.0 - 1024.0
+            }
+        };
+        let (x0, y0) = (at(s(v) >> 16), at(s(v) & 0xffff));
+        let (x1, y1) = (at(s(v + 2) >> 16), at(s(v + 4) & 0xffff));
+        let (u0, v0, u1, v1) = (f(3), f(4), f(5), f(8));
+        self.run(
+            pds_address(secondary),
+            secondary >> 27,
+            [0; 3],
+            Kind::State,
+            &mut [0; 4],
+        );
+        let clamp = |c: f32, lo: u32, hi: u32| -> u32 {
+            if c.is_nan() || c < lo as f32 {
+                lo
+            } else {
+                (c as u32).clamp(lo, hi)
+            }
+        };
+        let (px0, px1) = (
+            clamp(x0, target.x0, target.x1),
+            clamp(x1, target.x0, target.x1),
+        );
+        let (py0, py1) = (
+            clamp(y0, target.y0, target.y1),
+            clamp(y1, target.y0, target.y1),
+        );
+        if (px1 - px0) as usize * (py1 - py0) as usize > MAX_PIXELS {
+            return None;
+        }
+        let surface = target.surface;
+        let (pds, rows) = (pds_address(primary), primary >> 27);
+        for y in py0..py1 {
+            let ty = (y as f32 + 0.5 - y0) / (y1 - y0);
+            for x in px0..px1 {
+                let tx = (x as f32 + 0.5 - x0) / (x1 - x0);
+                let mut o = [surface.read(g, x, y), 0, 0, 0];
+                let (u, v) = (u0 + (u1 - u0) * tx, v0 + (v1 - v0) * ty);
+                self.run(pds, rows, [0; 3], Kind::Pixel(u, v), &mut o);
+                surface.write(g, x, y, o[0]);
+                self.summary.pixels += 1;
+            }
+        }
+        self.summary.target = surface.addr;
+        self.summary.width = px1 - px0;
+        self.summary.height = py1 - py0;
+        self.summary.draws = 1;
+        Some(self.summary)
+    }
 }
 
 fn render(
@@ -492,21 +793,26 @@ impl Renderer<'_> {
         let regs = gpu.read(cmd + CMD_REGS)?;
         let stream = gpu.read(cmd + CMD_STREAM)?;
         let target = r.target(regs)?;
-        r.summary.target = target.addr;
-        r.summary.width = target.width;
-        r.summary.height = target.height;
-        let (w, h) = (target.width as usize, target.height as usize);
+        r.summary.target = target.surface.addr;
+        r.summary.width = target.x1;
+        r.summary.height = target.y1;
+        // The tile buffer spans the target from its origin, so a pixel's
+        // index is its position.
+        let (w, h) = (target.x1 as usize, target.y1 as usize);
         if w * h > MAX_PIXELS {
             return None;
         }
-        let pixel = |x: usize, y: usize| target.addr + y as u32 * target.stride + 4 * x as u32;
+        let surface = target.surface;
         let mut tile: Vec<u32> = vec![0; w * h];
         for (i, t) in tile.iter_mut().enumerate() {
-            *t = gpu.read(pixel(i % w, i / w)).unwrap_or(0);
+            *t = surface.read(gpu, (i % w) as u32, (i / w) as u32);
         }
         r.walk(stream, &mut tile, w, h);
         for (i, t) in tile.iter().enumerate() {
-            gpu.write(pixel(i % w, i / w), *t);
+            let (x, y) = ((i % w) as u32, (i / w) as u32);
+            if x >= target.x0 && y >= target.y0 {
+                surface.write(gpu, x, y, *t);
+            }
         }
         Some(r.summary)
     }
@@ -519,13 +825,7 @@ impl Renderer<'_> {
         let rows = self.gpu.read(regs + REGS_EVENT_ROWS)?;
         let ran = self.run(at, rows, [0; 3], Kind::Event, &mut [0; 4]);
         let (e, _) = ran.emits.iter().find(|(e, _)| e.form == FORM_PBE)?;
-        let [[_format, addr], [stride, _], [_, bounds]] = e.sources;
-        Some(Target {
-            addr,
-            stride: (stride + 1) * 8,
-            width: (bounds & 0xfff) + 1,
-            height: (bounds >> 12 & 0xfff) + 1,
-        })
+        Some(Target::from_pbe(e.sources))
     }
 
     /// Walks the control stream at `at`, drawing into `tile`.
@@ -626,7 +926,7 @@ impl Renderer<'_> {
         } else {
             verts.as_chunks::<3>().0.to_vec()
         };
-        let (ppds, prows) = (pds_address(state), (state >> 28) + 1);
+        let (ppds, prows) = (pds_address(state), state >> 27);
         self.note(|| {
             format!(
                 "draw type {} n {count} vpds {vpds:08x} ppds {ppds:08x}/{prows} verts {:?}",
@@ -746,6 +1046,61 @@ mod tests {
         // The control words the same helpers emit are not state blocks.
         assert_eq!(StateBlock::parse(&block(&[0x800])), None);
         assert_eq!(StateBlock::parse(&block(&[0x2000, 0x0018_000e])), None);
+    }
+
+    #[test]
+    fn texture_words_give_layout_size_and_stride() {
+        // A strided 8-bit staging source: v = 88 is a 356-byte row.
+        let t = Texture::decode([0x0016_0000, 0xc016_0020, 0x0010_2de4, 0]);
+        assert_eq!(t.surface.layout, Layout::Strided);
+        assert_eq!((t.surface.bytes, t.surface.stride), (1, 356));
+        assert_eq!((t.width, t.height), (0x161, 0x21));
+        // 4096 bytes, the high stride bits.
+        assert_eq!(
+            Texture::decode([0x00fe_0e00, 0xc0ff_f006, 0, 0])
+                .surface
+                .stride,
+            4096
+        );
+        // A tiled 32-bit texture: rows of tiles the width rounded up to 32.
+        let t = Texture::decode([0x03fe_0090, 0x8c01_f011, 0x1191_a000, 0]);
+        assert_eq!((t.surface.layout, t.surface.bytes), (Layout::Tiled, 4));
+        assert_eq!((t.width, t.height, t.surface.stride), (32, 18, 32));
+        // A twiddled 8-bit atlas, log2 sizes.
+        let t = Texture::decode([0x03fe_0090, 0x0008_0006, 0x1191_6000, 0xe000_0000]);
+        assert_eq!(
+            (t.surface.layout, t.width, t.height, t.surface.bytes),
+            (Layout::Twiddled, 256, 64, 1)
+        );
+    }
+
+    #[test]
+    fn pixel_back_end_words_give_the_destination() {
+        // The UI's display buffer: 32 bits, strided, 800 pixels a row.
+        let t = Target::from_pbe([[0x0011_0000, 0x1079_7800], [0x18f, 0], [0, 0x001d_f31f]]);
+        assert_eq!(
+            (t.surface.bytes, t.surface.stride, t.surface.layout),
+            (4, 800, Layout::Strided)
+        );
+        assert_eq!((t.x0, t.y0, t.x1, t.y1), (0, 0, 800, 480));
+        assert_eq!(t.surface.offset(1, 1), 0x1079_7800 + 3200 + 4);
+        // A tiled 8-bit texture upload, 480-pixel rows of tiles.
+        let t = Target::from_pbe([[0x8401_0000, 0x11a4_0000], [0xef, 0], [0, 0x0002_0160]]);
+        assert_eq!(
+            (t.surface.bytes, t.surface.stride, t.surface.layout),
+            (1, 480, Layout::Tiled)
+        );
+        assert_eq!(t.surface.offset(33, 1), 0x11a4_0000 + 1024 + 32 + 1);
+    }
+
+    #[test]
+    fn twiddling_interleaves_the_smaller_dimension() {
+        assert_eq!(twiddle(0, 1, (2, 2)), 1);
+        assert_eq!(twiddle(1, 0, (2, 2)), 2);
+        assert_eq!(twiddle(3, 3, (2, 2)), 15);
+        // 8 x 2: one interleaved bit pair, then x's remaining bits.
+        assert_eq!(twiddle(2, 0, (3, 1)), 4);
+        assert_eq!(twiddle(7, 1, (3, 1)), 15);
     }
 
     #[test]

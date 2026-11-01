@@ -4,8 +4,9 @@
 //! and complete its kernel commands. A TA kick is drawn before it is
 //! completed ([`render`]; `render = "on"`, the default): its control stream,
 //! vertex and pixel programs run on the [`usse`] and [`pds`] interpreters and
-//! the result lands in the render target. Transfer and 2D kicks are
-//! completed without drawing.
+//! the result lands in the render target. A transfer kick is drawn the same
+//! way (a blit is a render with no tile accelerator); 2D kicks are completed
+//! without drawing.
 //!
 //! # What the host driver expects
 //!
@@ -509,7 +510,11 @@ impl Shared {
                             return;
                         };
                         let app = Gpu { directory, ..*gpu };
-                        let done = render::render_ta(&app, cmd, code_bases);
+                        let done = if word(0) == CMD_KICK_TRANSFER {
+                            render::render_transfer(&app, cmd, code_bases)
+                        } else {
+                            render::render_ta(&app, cmd, code_bases)
+                        };
                         if self.log.is_some() {
                             self.note(&alloc::format!("sgx:   render {done:x?}\n"));
                         }
@@ -565,6 +570,7 @@ fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32, draw: &mut dyn FnMut(u3
                 complete_ta(gpu, cmd)
             }
             CMD_KICK_TRANSFER => {
+                draw(cmd);
                 complete_transfer(gpu, cmd);
                 read = write;
                 break;
