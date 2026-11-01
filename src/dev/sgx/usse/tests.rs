@@ -1152,3 +1152,115 @@ mod firmware {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The UI shader corpus's control forms (§9, §10)
+
+/// `setbase dst, src0, src1, src2`: four 12-bit fields, b47:36 down to b11:0.
+fn setbase(d: u64, s0: u64, s1: u64, s2: u64) -> u64 {
+    class(1) | 3 << 56 | d << 36 | s0 << 24 | s1 << 12 | s2
+}
+
+#[test]
+fn class1_forms_decode() {
+    assert_eq!(
+        dis(setbase(0xbd, 0, 0xbd, 0)),
+        "setbase #0xbd, #0, #0xbd, #0"
+    );
+    assert_eq!(
+        dis(class(1) | 1 << 56 | 1 << 36 | 2 << 24 | 3 << 12 | 4),
+        "op189 #1, #2, #3, #4"
+    );
+    assert_eq!(
+        dis(class(1) | 4 << 56 | 0xfff << 36),
+        "op192 #-1, #0, #0, #0"
+    );
+    assert_eq!(dis(class(1) | 5 << 56 | 1 | 1 << 8), "op193 #1, #1");
+    // §9: flags1.3, END elsewhere, is b50 here.
+    assert!(decode(setbase(0, 0, 0, 0) | b(50)).unwrap().is_end());
+}
+
+#[test]
+fn setbase_moves_every_register_in_its_slot() {
+    // The corpus's swap through r7: `setbase #0x6f, #0, #7, #0` then
+    // `mov o78, r0` writes o189 from r7 — temporaries move too.
+    let mov = |d: u64, s1: u64| alu(10, true, d, s1, 0) | b(48) | 2 << 28;
+    let words = [
+        setbase(0x6f, 0, 7, 0),
+        mov(b(32) | d_r(78), s1_r(0)),
+        setbase(0, 0, 0, 0),
+        mov(d_r(1), s1_r(0)) | END,
+    ];
+    let (u, _, stop) = run(&words, |u| {
+        u.temp[0] = 0x11;
+        u.temp[7] = 0x77;
+    });
+    assert_eq!(stop, Stop::End { pc: 4 });
+    assert_eq!(u.output[189], 0x77);
+    assert_eq!(u.temp[1], 0x11, "offsets reset to zero");
+    assert_eq!(u.base, [0; 4]);
+}
+
+/// An EMIT of sub-form `sub` (b47:44) from `src0` = o0 with immediate
+/// `src1`/`src2`, as the shaders' state bursts are.
+fn emit_burst(sub: u64) -> u64 {
+    class(2) | 3 << 56 | sub << 44 | b(51) | s1_imm(0) | s2_imm(0)
+}
+
+#[test]
+fn emit_forms_decode() {
+    assert_eq!(
+        dis(emit_burst(4) | b(50) | b(21)),
+        "emit159.syncs?.f3.20 #0, o0, #0, #0, #0"
+    );
+    assert_eq!(dis(emit_burst(5)), "emit160 #0, o0, #0, #0, #0");
+    assert_eq!(dis(emit_burst(6)), "emit161 #0, o0, #0, #0, #0");
+    // useasm 158: the end-of-tile program's `emit #0, r0, r2, r4, #4`.
+    let w = class(2) | 3 << 56 | 1 << 7 | 2 | 4 << 22;
+    assert_eq!(dis(w), "emit158 #0, r0, r2, r4, #4");
+}
+
+#[derive(Default)]
+struct BurstBus {
+    inner: MockBus,
+    seen: Vec<(Emit, [u32; 4])>,
+}
+
+impl UsseBus for BurstBus {
+    fn load(&mut self, addr: u32, size: Size) -> MemResult<u32> {
+        self.inner.load(addr, size)
+    }
+    fn store(&mut self, addr: u32, size: Size, value: u32) -> MemResult {
+        self.inner.store(addr, size, value)
+    }
+    fn reg_read(&mut self, index: u32) -> u32 {
+        self.inner.reg_read(index)
+    }
+    fn reg_write(&mut self, index: u32, value: u32) {
+        self.inner.reg_write(index, value)
+    }
+    fn emit_from(&mut self, emit: &Emit, usse: &Usse) -> MemResult {
+        let mut regs = [0; 4];
+        regs.copy_from_slice(&usse.output[..4]);
+        self.seen.push((*emit, regs));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_burst_emit_hands_the_bus_its_registers() {
+    let mut bus = BurstBus {
+        inner: MockBus::program(BASE, &[emit_burst(4) | b(43)]),
+        ..BurstBus::default()
+    };
+    let mut usse = Usse::new(BASE, 0);
+    usse.output[..4].copy_from_slice(&[5, 6, 7, 8]);
+    assert_eq!(usse.run(&mut bus, 10), Stop::End { pc: 1 });
+    let (e, regs) = bus.seen[0];
+    assert_eq!(e.form, EMIT_159);
+    assert_eq!(e.src0_reg, Some((Bank::Output, 0)));
+    assert_eq!(regs, [5, 6, 7, 8]);
+    // A bus that only knows `emit` still gets it through the default.
+    let (_, mock, _) = run(&[emit_burst(5) | b(43)], |_| {});
+    assert_eq!(mock.emits[0].form, EMIT_160);
+}

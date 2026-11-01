@@ -205,7 +205,22 @@ pub struct Arg {
     pub inv: bool,
     /// The high 16 bits rather than the low (`IMAE`'s `b56`, §2.3).
     pub hi: bool,
+    /// Which operand slot the field is — [`SLOT_DST`], [`SLOT_SRC0`],
+    /// [`SLOT_SRC1`], [`SLOT_SRC2`], or [`SLOT_NONE`] — and so which of the
+    /// `SETBASE` offsets applies to it (§9).
+    pub slot: u8,
 }
+
+/// The destination slot (`b27:21`).
+pub const SLOT_DST: u8 = 0;
+/// The `src0` slot (`b20:14`).
+pub const SLOT_SRC0: u8 = 1;
+/// The `src1` slot (`b13:7`).
+pub const SLOT_SRC1: u8 = 2;
+/// The `src2` slot (`b6:0`).
+pub const SLOT_SRC2: u8 = 3;
+/// Not a register slot.
+pub const SLOT_NONE: u8 = 4;
 
 impl Arg {
     const NONE: Arg = Arg::of(Operand::None);
@@ -216,6 +231,7 @@ impl Arg {
             neg: false,
             inv: false,
             hi: false,
+            slot: SLOT_NONE,
         }
     }
 }
@@ -358,6 +374,8 @@ pub enum Op {
     Emit,
     /// Set the repeat increments \[G\].
     Smlsi,
+    /// Set the four register-number base offsets (§9) \[strong\].
+    SetBase,
     /// A vector floating-point instruction (not interpreted yet).
     Vector,
     /// Decoded, but with no known semantics.
@@ -455,6 +473,8 @@ enum Opd {
     Drc,
     /// An immediate bit field.
     Field(u32, u32),
+    /// A two's-complement immediate bit field.
+    SField(u32, u32),
     /// `LIMM`'s 32-bit immediate (§5.1).
     LimmImm,
     /// `BA`'s target, `b19:0`.
@@ -611,6 +631,13 @@ const F_EMIT: &[Flag] = &[
     Flag("f2.5", b(44)),
     Flag("f3.20", b(21)),
 ];
+/// The EMIT forms other than 162: the encoder flips only END (b43),
+/// flags1.17 (b50) and flags3.20 (b21) (§10).
+const F_EMIT_B: &[Flag] = &[
+    Flag("syncs?", b(50)),
+    Flag("end", b(43)),
+    Flag("f3.20", b(21)),
+];
 const F_SYNCS51: &[Flag] = &[Flag("syncs?", b(51))];
 const F_SMLSI: &[Flag] = &[Flag("end", b(50))];
 const F_VEC: &[Flag] = &[
@@ -756,6 +783,21 @@ const O_PHAS: &[Opd] = &[
     Opd::PhasSel(2),
 ];
 const O_OP205: &[Opd] = &[Opd::Field(4, 3)];
+/// §9: useasm arguments 0–3 land in b47:36, b35:24, b23:12, b11:0.
+const O_FOUR12: &[Opd] = &[
+    Opd::Field(36, 12),
+    Opd::Field(24, 12),
+    Opd::Field(12, 12),
+    Opd::Field(0, 12),
+];
+const O_SETBASE: &[Opd] = O_FOUR12;
+const O_FOUR12S: &[Opd] = &[
+    Opd::SField(36, 12),
+    Opd::SField(24, 12),
+    Opd::SField(12, 12),
+    Opd::SField(0, 12),
+];
+const O_OP193: &[Opd] = &[Opd::Field(0, 1), Opd::Field(8, 1)];
 const O_VMAD: &[Opd] = &[
     Opd::VecReg(22),
     Opd::VecReg(12),
@@ -863,6 +905,12 @@ static FORMS: &[Form] = &[
         ops: O_SMLSI,
         exec: Op::Smlsi,
     },
+    // §9: the rest of class 1. Sub-ops 1, 3 and 4 take four 12-bit fields,
+    // sub-op 5 two single bits; only sub-op 3 has known semantics.
+    class1(1, "op189", O_FOUR12, Op::Opaque),
+    class1(3, "setbase", O_SETBASE, Op::SetBase),
+    class1(4, "op192", O_FOUR12S, Op::Opaque),
+    class1(5, "op193", O_OP193, Op::Opaque),
     // -- op 31, class 2 (b53), sub-op b58:56 (§6.3, §6.4, §7).
     Form {
         mask: OPCODE | CLASS | SUB,
@@ -888,7 +936,10 @@ static FORMS: &[Form] = &[
         ops: O_WDF,
         exec: Op::Wdf,
     },
-    // EMIT family: the form the microkernel uses has b47 set, b46 clear.
+    // EMIT family (§10): b47:46 pick the form. The microkernel's has b47
+    // set, b46 clear (useasm 162); useasm 158 clears both; 159–161 set b46
+    // and pick a sub-form with b45:44. Every form carries the same operand
+    // fields — the encoder merely leaves some at fixed values (`#0`).
     Form {
         mask: OPCODE | CLASS | SUB | b(47) | b(46),
         value: class(2) | 3 << 56 | b(47),
@@ -901,6 +952,10 @@ static FORMS: &[Form] = &[
         ops: O_EMIT,
         exec: Op::Emit,
     },
+    emit(0, "emit158"),
+    emit(b(46), "emit159"),
+    emit(b(46) | b(44), "emit160"),
+    emit(b(46) | b(45), "emit161"),
     Form {
         mask: OPCODE | CLASS | SUB,
         value: class(2) | 4 << 56,
@@ -1090,6 +1145,38 @@ static FORMS: &[Form] = &[
     vector(6, 0, 0, "vcplx", &[]),
     vector(8, 0, 0, "pck", &[]),
 ];
+
+/// An EMIT form other than 162 (§10): `sub` is its b47:44.
+const fn emit(sub: u64, name: &'static str) -> Form {
+    Form {
+        mask: OPCODE | CLASS | SUB | 0xf << 44,
+        value: class(2) | 3 << 56 | sub,
+        name: Name::Fixed(name),
+        inverted: 0,
+        pred: PredEnc::None,
+        rpt: RptEnc::None,
+        end: Some(43),
+        flags: F_EMIT_B,
+        ops: O_EMIT,
+        exec: Op::Emit,
+    }
+}
+
+/// A class-1 control form (§9): `sub` is b58:56.
+const fn class1(sub: u64, name: &'static str, ops: &'static [Opd], exec: Op) -> Form {
+    Form {
+        mask: OPCODE | CLASS | SUB,
+        value: class(1) | sub << 56,
+        name: Name::Fixed(name),
+        inverted: 0,
+        pred: PredEnc::None,
+        rpt: RptEnc::None,
+        end: Some(50),
+        flags: F_SMLSI,
+        ops,
+        exec,
+    }
+}
 
 const fn bitwise(hw: u64, second: bool, name: &'static str, bop: BitOp) -> Form {
     Form {
@@ -1285,7 +1372,10 @@ pub fn decode(word: u64) -> Option<Insn> {
     let mut nargs = 0;
     for opd in form.ops {
         if let Some(arg) = decode_opd(*opd, word) {
-            args[nargs] = arg;
+            args[nargs] = Arg {
+                slot: opd_slot(*opd),
+                ..arg
+            };
             nargs += 1;
         }
     }
@@ -1297,6 +1387,20 @@ pub fn decode(word: u64) -> Option<Insn> {
         args,
         nargs: nargs as u8,
     })
+}
+
+/// Which register slot an operand encoding occupies (§9).
+fn opd_slot(opd: Opd) -> u8 {
+    match opd {
+        Opd::Dst | Opd::DstTest | Opd::DstMem => SLOT_DST,
+        Opd::Src0Mad { .. } | Opd::Src0Mad26 | Opd::Src0Mem(_) | Opd::EmitSrc(None) => SLOT_SRC0,
+        Opd::Src { slot: Slot::S1, .. }
+        | Opd::TestS1
+        | Opd::TestDup
+        | Opd::EmitSrc(Some(Slot::S1)) => SLOT_SRC1,
+        Opd::Src { slot: Slot::S2, .. } | Opd::TestS2 | Opd::EmitSrc(Some(Slot::S2)) => SLOT_SRC2,
+        _ => SLOT_NONE,
+    }
 }
 
 /// The standard destination (§2.3, "Destination").
@@ -1495,6 +1599,14 @@ fn decode_opd(opd: Opd, w: u64) -> Option<Arg> {
         Opd::PredDst => Arg::of(Operand::Pred(field(w, 34, 2) as u8)),
         Opd::Drc => Arg::of(Operand::Drc(field(w, 32, 1) as u8)),
         Opd::Field(lo, width) => Arg::of(hex(field(w, lo, width))),
+        Opd::SField(lo, width) => {
+            let v = field(w, lo, width) as i64;
+            let sign = 1i64 << (width - 1);
+            Arg::of(Operand::Imm {
+                value: (v ^ sign) - sign,
+                style: ImmStyle::Hex,
+            })
+        }
         // §5.1: imm[20:0] → b20:0, imm[25:21] → b40:36, imm[31:26] → b49:44.
         Opd::LimmImm => Arg::of(hex(field(w, 0, 21)
             | field(w, 36, 5) << 21
@@ -1735,7 +1847,7 @@ impl Size {
 }
 
 /// What an `EMIT` sends: a target unit, three source values and an
-/// immediate, with the raw word for whatever is not decoded yet.
+/// immediate, with the raw word for whatever is not decoded yet (§10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Emit {
     /// The target, `b33:32`.
@@ -1747,7 +1859,27 @@ pub struct Emit {
     pub imm: u32,
     /// The instruction word.
     pub word: u64,
+    /// The form, `b47:44`: [`EMIT_158`], [`EMIT_159`], [`EMIT_160`],
+    /// [`EMIT_161`], or `8`–`11` for the microkernel's useasm 162 (whose
+    /// `b45`/`b44` are flags).
+    pub form: u8,
+    /// Where `src0` resolves to — bank and register number, after `SETBASE`
+    /// and index registers — when it names a register. The bursts the
+    /// shaders end with (`emit159`/`emit160` from `o0` after filling
+    /// `o0..oN`) send the registers from here on \[G\]; how many is not in
+    /// the instruction, so the bus is handed the whole engine through
+    /// [`UsseBus::emit_from`].
+    pub src0_reg: Option<(Bank, u32)>,
 }
+
+/// `Emit::form` of useasm 158: four operands and an immediate.
+pub const EMIT_158: u8 = 0;
+/// `Emit::form` of useasm 159: `b46`.
+pub const EMIT_159: u8 = 4;
+/// `Emit::form` of useasm 160: `b46 | b44`.
+pub const EMIT_160: u8 = 5;
+/// `Emit::form` of useasm 161: `b46 | b45`.
+pub const EMIT_161: u8 = 6;
 
 /// Everything outside the engine: GPU memory and the SGX register file.
 ///
@@ -1779,6 +1911,14 @@ pub trait UsseBus {
     fn emit(&mut self, emit: &Emit) -> MemResult {
         let _ = emit;
         Err(BusError::Unassigned)
+    }
+
+    /// Takes an `EMIT` with the issuing engine's registers in view, for the
+    /// forms that send a run of registers rather than their three operands
+    /// (§10). The default forwards to [`UsseBus::emit`].
+    fn emit_from(&mut self, emit: &Emit, usse: &Usse) -> MemResult {
+        let _ = usse;
+        self.emit(emit)
     }
 }
 
@@ -1883,6 +2023,9 @@ pub struct Usse {
     pub link: u32,
     /// The last `SMLSI`'s fields, kept but not yet applied \[G\].
     pub smlsi: [i32; 11],
+    /// The register-number offsets `SETBASE` sets, by slot: destination,
+    /// `src0`, `src1`, `src2` (§9).
+    pub base: [u32; 4],
     /// The entry the program declared for its next phase.
     pub next_phase: Option<u32>,
     /// Instructions retired.
@@ -1897,6 +2040,7 @@ impl fmt::Debug for Usse {
             .field("preds", &self.preds)
             .field("link", &self.link)
             .field("index", &self.index)
+            .field("base", &self.base)
             .field("next_phase", &self.next_phase)
             .field("retired", &self.retired)
             .finish_non_exhaustive()
@@ -1920,6 +2064,7 @@ impl Usse {
             preds: [false; 4],
             link: 0,
             smlsi: [0; 11],
+            base: [0; 4],
             next_phase: None,
             retired: 0,
         }
@@ -1986,11 +2131,23 @@ impl Usse {
         Ok(())
     }
 
-    fn loc(&self, op: Operand, rep: u8, pc: u32, word: u64) -> Result<Loc, Stop> {
+    fn loc(&self, op: Operand, slot: u8, rep: u8, pc: u32, word: u64) -> Result<Loc, Stop> {
         let bad = Stop::BadRegister { pc, word };
         let rep = usize::from(rep);
         let (bank, n) = match op {
-            Operand::Reg { bank, num } => (bank, usize::from(num) + rep),
+            // §9 [strong]: a SETBASE offset moves every directly-numbered
+            // register in its slot, temporaries as much as outputs. [G] It
+            // leaves the special bank, the index registers and the indexed
+            // forms alone.
+            Operand::Reg { bank, num } => {
+                let base = match bank {
+                    Bank::Temp | Bank::Output | Bank::Primary | Bank::Secondary => {
+                        self.base.get(usize::from(slot)).copied().unwrap_or(0) as usize
+                    }
+                    Bank::Special | Bank::Index => 0,
+                };
+                (bank, usize::from(num) + base + rep)
+            }
             // [G] An index register holds a register number.
             Operand::Indexed {
                 bank,
@@ -2047,7 +2204,7 @@ impl Usse {
     fn read(&self, arg: &Arg, rep: u8, pc: u32, word: u64) -> Result<u32, Stop> {
         let v = match arg.op {
             Operand::Imm { value, .. } => value as u32,
-            op => self.get(self.loc(op, rep, pc, word)?),
+            op => self.get(self.loc(op, arg.slot, rep, pc, word)?),
         };
         let v = if arg.hi { v >> 16 } else { v };
         let v = if arg.inv { !v } else { v };
@@ -2058,7 +2215,7 @@ impl Usse {
         match arg.op {
             Operand::Discard => Ok(()),
             op => {
-                let loc = self.loc(op, rep, pc, word)?;
+                let loc = self.loc(op, arg.slot, rep, pc, word)?;
                 self.set(loc, v, pc, word)
             }
         }
@@ -2149,14 +2306,30 @@ impl Usse {
                         _ => [self.read(arg, 0, pc, w)?, self.read(arg, 1, pc, w)?],
                     };
                 }
+                let src0_reg = match a[1].op {
+                    Operand::Imm { .. } => None,
+                    op => {
+                        let Loc(bank, n) = self.loc(op, a[1].slot, 0, pc, w)?;
+                        Some((bank, n as u32))
+                    }
+                };
                 let emit = Emit {
                     target: field(w, 32, 2) as u8,
                     sources,
                     imm: self.read(&a[4], 0, pc, w)?,
                     word: w,
+                    form: field(w, 44, 4) as u8,
+                    src0_reg,
                 };
-                bus.emit(&emit)
+                bus.emit_from(&emit, self)
                     .map_err(|error| Stop::Fault { pc, addr: 0, error })?;
+            }
+            Op::SetBase => {
+                for (b, arg) in self.base.iter_mut().zip(a) {
+                    if let Operand::Imm { value, .. } = arg.op {
+                        *b = value as u32;
+                    }
+                }
             }
             Op::Smlsi => {
                 for (s, arg) in self.smlsi.iter_mut().zip(a) {

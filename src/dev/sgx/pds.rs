@@ -268,7 +268,15 @@ pub enum Cond {
     Always,
     /// 0: when P0 is set \[strong\].
     P0,
-    /// Anything else: a hardware flag whose meaning is not known.
+    /// Anything else: a hardware flag whose meaning is not known; the
+    /// interpreter asks [`PdsBus::condition`]. Where they are seen in the
+    /// navi's programs: `3` on the `DOUTU` that ends every vertex PDS
+    /// program, which the driver's generator ORs in unconditionally
+    /// (`0x0300_0005 | ...`), so it is presumably true whenever a vertex
+    /// task should run \[G\]; `3` and `4` on the two branches of the
+    /// event-dispatch programs in the pixel PDS heap, which pick one of
+    /// three `DOUTU`s \[G: hardware event flags\]; `1` and `2` only in words
+    /// that are data, not code.
     Other(u8),
 }
 
@@ -288,12 +296,19 @@ impl Cond {
 pub struct DoutType(pub u8);
 
 impl DoutType {
-    /// Iterator set-up \[G\]; not executed.
+    /// Iterator set-up \[G\]: two window words, both from the data
+    /// segment. Every pixel PDS program in the navi's UI issues one, after
+    /// its `DOUTU` and before its [`DoutType::TEXTURE`]. Passed to the bus
+    /// unchanged when it [accepts](PdsBus::accepts_dout) the type.
     pub const ITER: DoutType = DoutType(2);
     /// DMA from memory into attribute registers: `W0` address, `W1`
     /// control `(dwords - 1) | first_register << 8`.
     pub const DMA: DoutType = DoutType(3);
-    /// Texture fetch \[G\]; not executed.
+    /// Texture fetch \[G\]: one window word from the data segment, the
+    /// last DOUT of every pixel PDS program in the navi's UI — the
+    /// non-dependent texture reads that land in the pixel task's primary
+    /// attributes before it starts. Passed to the bus unchanged when it
+    /// [accepts](PdsBus::accepts_dout) the type.
     pub const TEXTURE: DoutType = DoutType(4);
     /// Start a USSE task: `W0..W2` (§6).
     pub const USSE: DoutType = DoutType(5);
@@ -588,8 +603,27 @@ pub trait PdsBus {
     /// Reads the word at GPU virtual address `addr`.
     fn load(&mut self, addr: u32) -> MemResult<u32>;
 
-    /// Takes a DMA, attribute or USSE DOUT.
+    /// Takes a DOUT of a type [`PdsBus::accepts_dout`] accepts.
     fn dout(&mut self, out: &Dout) -> MemResult;
+
+    /// Whether [`PdsBus::dout`] takes DOUTs of type `kind`. A DOUT of a type
+    /// it does not take stops the PDS with [`Stop::Unimplemented`] instead.
+    /// The default is the three types this module knows the meaning of:
+    /// DMA, attribute and USSE. A bus that models the iterators and the
+    /// texture unit adds [`DoutType::ITER`] and [`DoutType::TEXTURE`]: their
+    /// window words reach it unchanged (§4.2).
+    fn accepts_dout(&self, kind: DoutType) -> bool {
+        matches!(kind, DoutType::DMA | DoutType::ATTR | DoutType::USSE)
+    }
+
+    /// Evaluates condition code `cc` (`[26:24]` of the word: neither 7,
+    /// always, nor 0, `P0`) for the instruction at `pc` (§3.1). Their
+    /// meanings are not known; `None`, the default, stops the PDS with
+    /// [`Stop::Unimplemented`]. See [`Cond::Other`] for where each is seen.
+    fn condition(&mut self, cc: u8, pc: u32) -> Option<bool> {
+        let _ = (cc, pc);
+        None
+    }
 }
 
 /// Why the PDS stopped. `pc` counts code words from the first.
@@ -760,13 +794,16 @@ impl Pds {
         let enabled = match insn.cond {
             Cond::Always => true,
             Cond::P0 => self.p0,
-            Cond::Other(_) => {
-                return Err(Stop::Unimplemented {
-                    pc,
-                    word,
-                    why: "condition",
-                });
-            }
+            Cond::Other(cc) => match bus.condition(cc, pc) {
+                Some(taken) => taken,
+                None => {
+                    return Err(Stop::Unimplemented {
+                        pc,
+                        word,
+                        why: "condition",
+                    });
+                }
+            },
         };
         self.pc = pc.wrapping_add(1);
         self.retired = self.retired.wrapping_add(1);
@@ -794,7 +831,7 @@ impl Pds {
                 if add {
                     words[0] = words[0].wrapping_add(words[3]);
                 }
-                if !matches!(win.kind, DoutType::DMA | DoutType::ATTR | DoutType::USSE) {
+                if !bus.accepts_dout(win.kind) {
                     self.pc = pc;
                     return Err(Stop::Unimplemented {
                         pc,
@@ -890,6 +927,10 @@ mod tests {
     struct Bus {
         mem: BTreeMap<u32, u32>,
         outs: Vec<Dout>,
+        /// Condition codes this bus answers, and whether it takes every
+        /// DOUT type.
+        conds: BTreeMap<u8, bool>,
+        all_types: bool,
     }
 
     impl Bus {
@@ -913,6 +954,14 @@ mod tests {
         fn dout(&mut self, out: &Dout) -> MemResult {
             self.outs.push(*out);
             Ok(())
+        }
+
+        fn accepts_dout(&self, kind: DoutType) -> bool {
+            self.all_types || matches!(kind, DoutType::DMA | DoutType::ATTR | DoutType::USSE)
+        }
+
+        fn condition(&mut self, cc: u8, _pc: u32) -> Option<bool> {
+            self.conds.get(&cc).copied()
         }
     }
 
@@ -1062,6 +1111,35 @@ mod tests {
         pds.launch(&mut bus, 0x1000, 1, [0; 3]).unwrap();
         assert_eq!(pds.ds[0][PERSISTENT], 0x77);
         assert_eq!(pds.ds[1][TEMPS], 0);
+    }
+
+    #[test]
+    fn the_bus_answers_conditions_and_takes_iterator_and_texture_douts() {
+        // `(cc3) bra 2; halt; (cc4) dout2 d0, d1; dout4 d2; halt`.
+        let code = [
+            bra(3, 2),
+            HALT,
+            dout(false, 4, 0, false, 0, [0, 1, 0, 0], 2),
+            dout(false, 7, 1, false, 0, [0, 0, 0, 0], 4),
+            HALT,
+        ];
+        let data = [[10, 11, 0, 0], [12, 13, 0, 0]];
+        let mut bus = Bus::program(&data, &code);
+        bus.conds.insert(3, true);
+        bus.conds.insert(4, false);
+        bus.all_types = true;
+        let mut pds = Pds::default();
+        pds.launch(&mut bus, 0x1000, 2, [0; 3]).unwrap();
+        assert_eq!(pds.run(&mut bus, 100), Stop::Halt { pc: 4 });
+        assert_eq!(bus.outs.len(), 1, "cc4 false skips the dout2");
+        assert_eq!(bus.outs[0].kind, DoutType::TEXTURE);
+        assert_eq!(bus.outs[0].words[0], 12);
+        bus.conds.insert(4, true);
+        bus.outs.clear();
+        pds.launch(&mut bus, 0x1000, 2, [0; 3]).unwrap();
+        pds.run(&mut bus, 100);
+        assert_eq!(bus.outs[0].kind, DoutType::ITER);
+        assert_eq!(bus.outs[0].words[..2], [10, 11]);
     }
 
     #[test]
