@@ -185,6 +185,8 @@ struct Bus<'a> {
     tasks: Vec<u32>,
     emits: Vec<(Emit, [u32; 32])>,
     tex_coord: [f32; 2],
+    /// The pixel's interpolated varyings (vertex outputs `o4` on).
+    varyings: [f32; 8],
 }
 
 impl PdsBus for Bus<'_> {
@@ -217,7 +219,18 @@ impl PdsBus for Bus<'_> {
             }
             DoutType::USSE => self.tasks.push(w0),
             DoutType::TEXTURE => self.texture([w0, w1, w2, out.words[3]]),
-            // Iterators: the coordinate comes from the rasteriser.
+            // [G] The iterators load the varyings as F16 lanes: the first
+            // (o4..o7) into pa0..pa1, the second (o8..o11) into pa2..pa3. A
+            // texture DOUT after them replaces pa0..pa1 with the texel. The
+            // UI's untextured shader packs pa0 as its colour; the textured
+            // one scales the texel's alpha by pa2's.
+            DoutType::ITER => {
+                let h = |k: usize| f16_unorm(self.varyings[k]);
+                self.primary[0] = h(0) | h(1) << 16;
+                self.primary[1] = h(2) | h(3) << 16;
+                self.primary[2] = h(4) | h(5) << 16;
+                self.primary[3] = h(6) | h(7) << 16;
+            }
             _ => {}
         }
         Ok(())
@@ -345,9 +358,11 @@ impl Renderer<'_> {
             tasks: Vec::new(),
             emits: Vec::new(),
             tex_coord: [0.0; 2],
+            varyings: [0.0; 8],
         };
-        if let Kind::Pixel(s, t) = kind {
-            bus.tex_coord = [s, t];
+        if let Kind::Pixel(v) = kind {
+            bus.tex_coord = [v[0], v[1]];
+            bus.varyings = v;
         }
         let mut pds = Pds::default();
         let stop = match pds.launch(&mut bus, at, rows, ir) {
@@ -446,7 +461,7 @@ enum Kind {
     /// The pixel event program.
     Event,
     /// A pixel's program, with its texture coordinate.
-    Pixel(f32, f32),
+    Pixel([f32; 8]),
 }
 
 /// The render target, from the pixel back end's `emit158`.
@@ -756,7 +771,13 @@ impl Renderer<'_> {
                 let tx = (x as f32 + 0.5 - x0) / (x1 - x0);
                 let mut o = [surface.read(g, x, y), 0, 0, 0];
                 let (u, v) = (u0 + (u1 - u0) * tx, v0 + (v1 - v0) * ty);
-                self.run(pds, rows, [0; 3], Kind::Pixel(u, v), &mut o);
+                self.run(
+                    pds,
+                    rows,
+                    [0; 3],
+                    Kind::Pixel([u, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                    &mut o,
+                );
                 surface.write(g, x, y, o[0]);
                 self.summary.pixels += 1;
             }
@@ -959,7 +980,7 @@ impl Renderer<'_> {
                     ppds,
                     prows,
                     [0; 3],
-                    Kind::Pixel(fr.attrs[0], fr.attrs[1]),
+                    Kind::Pixel(core::array::from_fn(|k| fr.attrs[k])),
                     &mut o,
                 );
                 if first {
