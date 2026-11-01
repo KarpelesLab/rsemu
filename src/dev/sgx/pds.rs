@@ -332,7 +332,7 @@ impl DoutType {
         match self {
             DoutType::USSE => 3,
             DoutType::DMA | DoutType::ATTR | DoutType::ITER => 2,
-            DoutType::TEXTURE => 1,
+            DoutType::TEXTURE => 4,
             _ => 4,
         }
     }
@@ -460,14 +460,19 @@ fn decode_window(w: u32) -> Window {
             }
         }
     };
+    let kind = DoutType((w & 0xf) as u8);
+    // A texture DOUT sends four words: rowA's pair from DS0 and rowB's
+    // from DS1, whatever the selectors hold \[strong\]. Every textured UI
+    // program keeps a four-word texture descriptor in exactly those words
+    // (address third) and leaves the selectors at 0.
+    let sel = if kind == DoutType::TEXTURE {
+        [0, 1, 2, 3]
+    } else {
+        [w >> 10 & 3, w >> 8 & 3, w >> 6 & 3, w >> 4 & 3]
+    };
     Window {
-        kind: DoutType((w & 0xf) as u8),
-        words: [
-            pick(w >> 10 & 3),
-            pick(w >> 8 & 3),
-            pick(w >> 6 & 3),
-            pick(w >> 4 & 3),
-        ],
+        kind,
+        words: sel.map(pick),
         ir_source,
     }
 }

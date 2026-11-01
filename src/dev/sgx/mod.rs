@@ -1,8 +1,11 @@
 //! A PowerVR SGX stand-in: the register block, and the part of the GPU's
 //! own firmware — its "microkernel" — that the host driver talks to through
 //! shared memory. Enough for the driver to start the core, check its build
-//! and complete its kernel commands. **No rendering**: a kick that would draw
-//! is acknowledged and nothing is drawn.
+//! and complete its kernel commands. A TA kick is drawn before it is
+//! completed (the `render` module; `render = "on"`, the default): its control stream,
+//! vertex and pixel programs run on the [`usse`] and [`pds`] interpreters and
+//! the result lands in the render target. Transfer and 2D kicks are
+//! completed without drawing.
 //!
 //! # What the host driver expects
 //!
@@ -98,6 +101,7 @@
 mod hw;
 pub mod pds;
 pub mod raster;
+mod render;
 pub mod usse;
 
 use alloc::boxed::Box;
@@ -172,6 +176,9 @@ const CMD_KICK_TRANSFER: u32 = 0x157;
 const CMD_KICK_2D: u32 = 0x132;
 
 /// A hardware context: its command ring's base and control pair.
+/// A context's page directory, physical \[strong\]: the TA command and all it
+/// names translate through it.
+const CTX_DIRECTORY: u32 = 0x08;
 const CTX_CCB_BASE: u32 = 0x0c;
 const CTX_CCB_CTL: u32 = 0x10;
 /// A context's command ring (a command never wraps: the ring has an
@@ -289,12 +296,20 @@ struct Shared {
     log: Option<Arc<dyn crate::host::chardev::CharDevice>>,
     /// The hardware mode's knobs; `None` in the stand-in mode.
     hw: Option<hw::Tuning>,
+    /// The stand-in draws each TA command before completing it (`render`).
+    render: bool,
     /// The hardware mode's engine. Taken out for the length of a slice, so
     /// that no lock is held while the firmware reaches memory.
     engine: Mutex<Option<Box<hw::Engine>>>,
 }
 
 impl Shared {
+    /// The sixteen USE code bases, as GPU addresses (`(reg & 0x3ff_ffff) << 6`).
+    fn code_bases(&self) -> [u32; 16] {
+        let s = self.state.lock();
+        core::array::from_fn(|i| (s.reg(0xa0c + 4 * i as u64) & 0x03ff_ffff) << 6)
+    }
+
     fn note(&self, text: &str) {
         if let Some(log) = &self.log {
             log.write(text.as_bytes());
@@ -483,7 +498,23 @@ impl Shared {
                 },
                 CMD_CLEANUP => gpu.update(host + 8, |v| v | 1),
                 CMD_KICK_TA | CMD_KICK_TRANSFER | CMD_KICK_2D => {
-                    let (from, to) = complete_kick(gpu, word(0), word(3));
+                    let code_bases = self.code_bases();
+                    let mut draw = |cmd: u32| {
+                        if !self.render {
+                            return;
+                        }
+                        // The command and what it points at are in the
+                        // issuing context's address space.
+                        let Some(directory) = gpu.read(word(3) + CTX_DIRECTORY) else {
+                            return;
+                        };
+                        let app = Gpu { directory, ..*gpu };
+                        let done = render::render_ta(&app, cmd, code_bases);
+                        if self.log.is_some() {
+                            self.note(&alloc::format!("sgx:   render {done:x?}\n"));
+                        }
+                    };
+                    let (from, to) = complete_kick(gpu, word(0), word(3), &mut draw);
                     if self.log.is_some() {
                         self.note(&alloc::format!(
                             "sgx:   context {:#x} ring {from:#x} -> {to:#x}\n",
@@ -510,7 +541,7 @@ impl Shared {
 /// snapshotted, plus one — never "Complete = Pending" wholesale, because the
 /// host's waits are exact matches and CPU-side operations move the counters
 /// too.
-fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32) -> (u32, u32) {
+fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32, draw: &mut dyn FnMut(u32)) -> (u32, u32) {
     let (Some(base), Some(ctl)) = (
         gpu.read(context + CTX_CCB_BASE),
         gpu.read(context + CTX_CCB_CTL),
@@ -529,7 +560,10 @@ fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32) -> (u32, u32) {
         }
         let cmd = base.wrapping_add(read);
         let size = match kind {
-            CMD_KICK_TA => complete_ta(gpu, cmd),
+            CMD_KICK_TA => {
+                draw(cmd);
+                complete_ta(gpu, cmd)
+            }
             CMD_KICK_TRANSFER => {
                 complete_transfer(gpu, cmd);
                 read = write;
@@ -670,6 +704,7 @@ fn find_ta3d(gpu: &Gpu<'_>, kicker: u32) -> Option<u32> {
 }
 
 /// GPU-virtual memory, through the kernel's directory.
+#[derive(Clone, Copy)]
 struct Gpu<'a> {
     space: &'a AddressSpace,
     directory: u32,
@@ -758,6 +793,7 @@ impl Sgx {
         let mode = r.or_str("mode", "standin")?.to_string();
         let ipt = r.or_range("ipt", 256u64, 1..=1 << 20)?;
         let timer_ticks = r.or_range("timer-ticks", 59u64, 0..=1 << 32)?;
+        let render = r.or_enum("render", "on", &["on", "off"])? == "on";
         r.finish()?;
         let hw = match mode.as_str() {
             "standin" => None,
@@ -773,23 +809,25 @@ impl Sgx {
                 as Arc<dyn crate::host::chardev::CharDevice>),
             None => None,
         };
-        Ok(Sgx::build(revision, log, hw))
+        Ok(Sgx::build(revision, log, hw, render))
     }
 
     /// Build one reporting `revision` (major.minor.maintenance in bits
     /// 23:16, 15:8, 7:0).
     #[must_use]
     pub fn with_revision(revision: u32) -> Sgx {
-        Sgx::build(revision, None, None)
+        Sgx::build(revision, None, None, false)
     }
 
     fn build(
         revision: u32,
         log: Option<Arc<dyn crate::host::chardev::CharDevice>>,
         hw: Option<hw::Tuning>,
+        render: bool,
     ) -> Sgx {
         let shared = Arc::new(Shared {
             log,
+            render,
             revision,
             hw,
             engine: Mutex::with_rank(
@@ -819,7 +857,7 @@ impl Sgx {
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "a PowerVR SGX stand-in: registers and the firmware's command handshake, no rendering",
+    summary: "a PowerVR SGX stand-in: registers, the firmware's command handshake, and TA commands drawn",
     properties: &[
         PropertySpec {
             name: "revision",
@@ -850,6 +888,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "hw mode: device ticks between firmware timer events, 0 for none (default 59)",
+        },
+        PropertySpec {
+            name: "render",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "stand-in: `on` (default) draws each TA command before completing it, `off` only completes it",
         },
     ],
     construct: |props| Ok(Box::new(Sgx::new(props)?)),
@@ -1365,6 +1409,7 @@ mod tests {
                     ipt: 64,
                     timer_ticks: 0,
                 }),
+                false,
             );
             sgx.attach_space(&space);
             reg_w(&sgx, KERNEL_DIRECTORY, 0x1000);

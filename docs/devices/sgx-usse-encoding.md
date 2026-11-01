@@ -485,7 +485,10 @@ they appear:
 **DOUT types.**
 
 - Type 2 (iterators): two window words.
-- Type 4 (texture): one window word.
+- Type 4 (texture): four words, rowA's DS0 pair then rowB's DS1 pair,
+  whatever the selectors say [strong: every textured UI program keeps a
+  four-word descriptor there — e.g. `03fe0090 6c31f1df 111bf800 10000000`,
+  the third word the texture's address — with the selectors at 0].
 
 Every UI pixel PDS program is `doutu; dout2; dout4; halt`. A bus that
 declares these types through `PdsBus::accepts_dout` receives the window
