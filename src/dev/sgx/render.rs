@@ -187,6 +187,8 @@ struct Bus<'a> {
     tex_coord: [f32; 2],
     /// The pixel's interpolated varyings (vertex outputs `o4` on).
     varyings: [f32; 8],
+    /// The next primary attribute an iterator or texture fetch fills.
+    next_attr: usize,
 }
 
 impl PdsBus for Bus<'_> {
@@ -224,13 +226,7 @@ impl PdsBus for Bus<'_> {
             // texture DOUT after them replaces pa0..pa1 with the texel. The
             // UI's untextured shader packs pa0 as its colour; the textured
             // one scales the texel's alpha by pa2's.
-            DoutType::ITER => {
-                let h = |k: usize| f16_unorm(self.varyings[k]);
-                self.primary[0] = h(0) | h(1) << 16;
-                self.primary[1] = h(2) | h(3) << 16;
-                self.primary[2] = h(4) | h(5) << 16;
-                self.primary[3] = h(6) | h(7) << 16;
-            }
+            DoutType::ITER => self.iterate(w0),
             _ => {}
         }
         Ok(())
@@ -246,12 +242,62 @@ impl PdsBus for Bus<'_> {
 }
 
 impl Bus<'_> {
+    /// The primary attributes iterators and texture fetches fill are
+    /// allocated in issue order from `pa0` \[G\], which every pixel program
+    /// in the UI agrees with:
+    ///
+    /// * an iterator whose word has a non-zero top byte (`0x2fc0000f`,
+    ///   `0x2fc01900`, `0x1fc01900`) writes a varying as four F16 lanes, two
+    ///   registers: the first varying (`o4..o7`) when the word iterates
+    ///   nothing else (`[11:8]` clear), else the second (`o8..o11`) — the
+    ///   first being the texture coordinate. The transfer queue's
+    ///   `0x0000f800` only feeds the coordinate and writes nothing;
+    /// * a texture fetch writes after it.
+    ///
+    /// So the untextured shader packs its colour from `pa0`, the glyph and
+    /// icon shaders take the vertex colour from `pa0` and the mask's alpha
+    /// from `pa2.w`, the compositor blends the layer it samples from `pa2`,
+    /// and the transfer queue's copy moves the texel from `pa0`.
+    fn iterate(&mut self, word: u32) {
+        if word >> 24 == 0 {
+            return;
+        }
+        let from = if word & 0xf00 == 0 { 0 } else { 4 };
+        let v = self.varyings;
+        let h = |k: usize| f16_unorm(v[from + k]);
+        self.attr(h(0) | h(1) << 16);
+        self.attr(h(2) | h(3) << 16);
+        // [G] The same varying, as four unorm8 bytes, at pa64: the UI's
+        // texturing shaders modulate the texel by it with the byte-wise
+        // blend (`blend o0, pa2, pa64, src2-colour, zero`), the vertex colour
+        // of GL's MODULATE; the compositor's is white, a plain copy.
+        let byte = |k: usize| {
+            let c = v[from + k];
+            if c.is_nan() || c <= 0.0 {
+                0
+            } else if c >= 1.0 {
+                255
+            } else {
+                (c * 255.0 + 0.5) as u32
+            }
+        };
+        self.primary[64] = byte(0) | byte(1) << 8 | byte(2) << 16 | byte(3) << 24;
+    }
+
+    fn attr(&mut self, v: u32) {
+        if let Some(p) = self.primary.get_mut(self.next_attr) {
+            *p = v;
+        }
+        self.next_attr += 1;
+    }
+
     /// A texture fetch from the four-word descriptor (`T0..T3`, see
     /// [`Texture::decode`]), at the pixel's interpolated coordinate, nearest
-    /// texel. A sampler word with any of `T0[25:21]` set returns four f16
-    /// lanes in `pa0..pa1`, which the UI's pixel shaders convert and blend
-    /// in f16; without (the transfer queue's), the raw texel in `pa0`,
-    /// which its copy shader moves straight out \[G\].
+    /// texel. With `T3[31:28]` = `0xe` (the 8-bit masks the UI's glyphs and
+    /// icons use) it returns four F16 lanes, two registers, which those
+    /// shaders scale in F16; otherwise the raw texel, one register, which
+    /// the compositor's byte-wise `blend` and the transfer queue's copy use
+    /// as it is \[G\].
     fn texture(&mut self, t: [u32; 4]) {
         let tex = Texture::decode(t);
         let pick = |c: f32, n: u32| -> u32 {
@@ -267,8 +313,8 @@ impl Bus<'_> {
             pick(self.tex_coord[1], tex.height),
         );
         let v = tex.surface.read(self.gpu, x, y);
-        if t[0] & 0x03e0_0000 == 0 {
-            self.primary[0] = v;
+        if t[3] >> 28 != 0xe {
+            self.attr(v);
             return;
         }
         let lanes: [u32; 4] = match tex.surface.bytes {
@@ -277,8 +323,8 @@ impl Bus<'_> {
             _ => core::array::from_fn(|k| v >> (8 * k) & 0xff),
         };
         let lane = |k: usize| f16_unorm(lanes[k] as f32 / 255.0);
-        self.primary[0] = lane(0) | lane(1) << 16;
-        self.primary[1] = lane(2) | lane(3) << 16;
+        self.attr(lane(0) | lane(1) << 16);
+        self.attr(lane(2) | lane(3) << 16);
     }
 }
 
@@ -359,6 +405,7 @@ impl Renderer<'_> {
             emits: Vec::new(),
             tex_coord: [0.0; 2],
             varyings: [0.0; 8],
+            next_attr: 0,
         };
         if let Kind::Pixel(v) = kind {
             bus.tex_coord = [v[0], v[1]];
