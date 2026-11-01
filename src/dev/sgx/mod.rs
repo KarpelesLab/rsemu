@@ -2,7 +2,7 @@
 //! own firmware — its "microkernel" — that the host driver talks to through
 //! shared memory. Enough for the driver to start the core, check its build
 //! and complete its kernel commands. A TA kick is drawn before it is
-//! completed (the `render` module; `render = "on"`, the default): its control stream,
+//! completed ([`render`]; `render = "on"`, the default): its control stream,
 //! vertex and pixel programs run on the [`usse`] and [`pds`] interpreters and
 //! the result lands in the render target. Transfer and 2D kicks are
 //! completed without drawing.
@@ -101,7 +101,7 @@
 mod hw;
 pub mod pds;
 pub mod raster;
-mod render;
+pub mod render;
 pub mod usse;
 
 use alloc::boxed::Box;
@@ -701,6 +701,16 @@ fn find_ta3d(gpu: &Gpu<'_>, kicker: u32) -> Option<u32> {
     (0..TA3D_SCAN / CCB_SLOT)
         .map(|i| start.wrapping_add(i * CCB_SLOT))
         .find(|&a| gpu.read(a) == Some(a))
+}
+
+impl render::GpuMemory for Gpu<'_> {
+    fn read(&self, va: u32) -> Option<u32> {
+        Gpu::read(self, va)
+    }
+
+    fn write(&self, va: u32, value: u32) {
+        Gpu::write(self, va, value);
+    }
 }
 
 /// GPU-virtual memory, through the kernel's directory.

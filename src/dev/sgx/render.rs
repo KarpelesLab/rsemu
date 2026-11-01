@@ -72,7 +72,6 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::Gpu;
 use super::pds::{Dout, DoutType, Pds, PdsBus};
 use super::raster::{self, Rect, Vertex};
 use super::usse::{self, Emit, Size, Usse, UsseBus};
@@ -98,7 +97,7 @@ const MAX_PIXELS: usize = 2048 * 2048;
 
 /// What drawing a command did, for the log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Summary {
+pub struct Summary {
     /// The render target's address.
     pub target: u32,
     /// Its size.
@@ -111,6 +110,35 @@ pub(super) struct Summary {
     pub pixels: u64,
     /// Programs that stopped on something other than their end.
     pub faults: u32,
+    /// The first of them: the program's address and why it stopped.
+    pub first_fault: Option<Fault>,
+}
+
+/// Why a program stopped early.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// The PDS program at `at` stopped.
+    Pds {
+        /// The program.
+        at: u32,
+        /// Why.
+        stop: super::pds::Stop,
+    },
+    /// The USSE program started at `at` stopped.
+    Usse {
+        /// The program's first instruction.
+        at: u32,
+        /// Why.
+        stop: usse::Stop,
+    },
+}
+
+/// GPU-virtual memory as one context sees it, through its MMU.
+pub trait GpuMemory {
+    /// The word at `va`, if it is mapped.
+    fn read(&self, va: u32) -> Option<u32>;
+    /// Writes the word at `va`, if it is mapped.
+    fn write(&self, va: u32, value: u32);
 }
 
 /// The PDS address a stream or state word names.
@@ -143,7 +171,7 @@ fn f16_unorm(v: f32) -> u32 {
 /// The engine-facing side of a program run: memory through the context's
 /// MMU, and whatever the programs send out.
 struct Bus<'a> {
-    gpu: &'a Gpu<'a>,
+    gpu: &'a dyn GpuMemory,
     primary: [u32; usse::BANK_SIZE],
     secondary: &'a mut [u32; usse::BANK_SIZE],
     /// DMAs fill the secondary attributes too (state programs).
@@ -268,7 +296,7 @@ impl UsseBus for Bus<'_> {
 
 /// One drawing session: a command's memory view and running state.
 struct Renderer<'a> {
-    gpu: &'a Gpu<'a>,
+    gpu: &'a dyn GpuMemory,
     code_bases: [u32; 16],
     secondary: Box<[u32; usse::BANK_SIZE]>,
     summary: Summary,
@@ -298,8 +326,14 @@ impl Renderer<'_> {
             bus.tex_coord = [s, t];
         }
         let mut pds = Pds::default();
-        let mut ok = pds.launch(&mut bus, at, rows, ir).is_ok()
-            && matches!(pds.run(&mut bus, PDS_BUDGET), super::pds::Stop::Halt { .. });
+        let stop = match pds.launch(&mut bus, at, rows, ir) {
+            Ok(()) => pds.run(&mut bus, PDS_BUDGET),
+            Err(stop) => stop,
+        };
+        let mut fault = match stop {
+            super::pds::Stop::Halt { .. } => None,
+            stop => Some(Fault::Pds { at, stop }),
+        };
         for w0 in core::mem::take(&mut bus.tasks) {
             let base = self.code_bases[(w0 & 0xf) as usize];
             let mut u = Box::new(Usse::new(base, w0 >> 4 & 0xf_ffff));
@@ -307,26 +341,30 @@ impl Renderer<'_> {
             u.secondary = *bus.secondary;
             u.output[..4].copy_from_slice(o);
             let mut budget = USSE_BUDGET;
-            let done = loop {
+            let start = u.address_of(u.pc);
+            loop {
                 let before = u.retired;
                 let stop = u.run(&mut bus, budget);
                 budget = budget.saturating_sub(u.retired - before);
                 match stop {
                     usse::Stop::Phase { next: Some(n), .. } if n != 0 && budget > 0 => u.pc = n,
                     usse::Stop::Phase { next: None, .. } if budget > 0 => {}
-                    usse::Stop::Phase { .. } | usse::Stop::End { .. } => break true,
-                    _ => break false,
+                    usse::Stop::Phase { .. } | usse::Stop::End { .. } => break,
+                    stop => {
+                        fault = fault.or(Some(Fault::Usse { at: start, stop }));
+                        break;
+                    }
                 }
-            };
-            ok &= done;
+            }
             o.copy_from_slice(&u.output[..4]);
         }
-        if !ok {
+        if fault.is_some() {
             self.summary.faults += 1;
+            self.summary.first_fault = self.summary.first_fault.or(fault);
         }
         Ran {
             emits: bus.emits,
-            ok,
+            ok: fault.is_none(),
         }
     }
 }
@@ -357,7 +395,10 @@ struct Target {
 /// `gpu`, the issuing context's MMU), with the USE code bases the host
 /// programmed. Returns what it did, or `None` if the command did not
 /// describe a render this model understands.
-pub(super) fn render_ta(gpu: &Gpu<'_>, cmd: u32, code_bases: [u32; 16]) -> Option<Summary> {
+///
+/// Public so that a command can be replayed against a snapshot's memory,
+/// outside a running machine.
+pub fn render_ta(gpu: &dyn GpuMemory, cmd: u32, code_bases: [u32; 16]) -> Option<Summary> {
     let mut r = Renderer {
         gpu,
         code_bases,
