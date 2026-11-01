@@ -114,6 +114,9 @@ pub enum Bank {
     Special,
     /// The index registers, `i`.
     Index,
+    /// The vector forms' four 128-bit internal registers, `v0`–`v3` (§8),
+    /// numbered here by 32-bit component: `v<k>` is number `4k`.
+    Internal,
 }
 
 impl Bank {
@@ -128,6 +131,7 @@ impl Bank {
             Bank::Secondary => "sa",
             Bank::Special => "g",
             Bank::Index => "i",
+            Bank::Internal => "v",
         }
     }
 }
@@ -205,6 +209,8 @@ pub enum Operand {
     /// A blend operation (§11): the encoder's `18` add, `19` subtract, `22`
     /// and `23` (min and max \[G\]).
     BlendOp(u8),
+    /// A named field value (a `pck` format, §8.6).
+    Text(&'static str),
 }
 
 /// An operand with its modifiers.
@@ -222,6 +228,13 @@ pub struct Arg {
     /// [`SLOT_SRC1`], [`SLOT_SRC2`], or [`SLOT_NONE`] — and so which of the
     /// `SETBASE` offsets applies to it (§9).
     pub slot: u8,
+    /// A vector source's swizzle: per result component, the source
+    /// component (`0`–`3`), or `4`/`5` for the constants 0.0/1.0 \[G\] (§8).
+    pub swz: Option<[u8; 4]>,
+    /// A vector source's absolute-value modifier (§8).
+    pub abs: bool,
+    /// A vector destination's write mask, bit `k` for component `k` (§8).
+    pub mask: Option<u8>,
 }
 
 /// The destination slot (`b27:21`).
@@ -245,6 +258,9 @@ impl Arg {
             inv: false,
             hi: false,
             slot: SLOT_NONE,
+            swz: None,
+            abs: false,
+            mask: None,
         }
     }
 }
@@ -260,6 +276,9 @@ pub enum Pred {
     IfNot(u8),
     /// The per-instance predicate.
     PerInstance,
+    /// A predicate code the encoder produces but whose meaning is not
+    /// known (the vector forms' `6`, §8).
+    Unknown(u8),
 }
 
 impl Pred {
@@ -285,7 +304,20 @@ impl Pred {
         }
     }
 
-    /// The vector forms' two bits (§8, `OPTABLE`): `0 none, 1 p0, 2 !p0,
+    /// The three-bit field of vector ops 1–3 and 6–8 (§8): `0 none, 1 p0,
+    /// 2 p1, 3 p2, 4 !p0, 5 !p1, 6 ?, 7 pN`.
+    fn vector3(v: u64) -> Pred {
+        match v {
+            0 => Pred::Always,
+            1..=3 => Pred::If(v as u8 - 1),
+            4 => Pred::IfNot(0),
+            5 => Pred::IfNot(1),
+            6 => Pred::Unknown(6),
+            _ => Pred::PerInstance,
+        }
+    }
+
+    /// `vmad`'s two bits (§8, `OPTABLE`): `0 none, 1 p0, 2 !p0,
     /// 3 pN`.
     fn vector(v: u64) -> Pred {
         match v {
@@ -304,6 +336,7 @@ impl fmt::Display for Pred {
             Pred::If(n) => write!(f, "p{n}"),
             Pred::IfNot(n) => write!(f, "!p{n}"),
             Pred::PerInstance => f.write_str("pN"),
+            Pred::Unknown(v) => write!(f, "?{v}"),
         }
     }
 }
@@ -354,6 +387,22 @@ pub enum BlendForm {
     Masked,
 }
 
+/// Which vector form (§8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecOp {
+    /// Op 0, `src0 · src1 + src2` on four F32 components.
+    Mad,
+    /// Op 1: an F32 two-source operation, sub-op `b14:12`.
+    Op1,
+    /// Op 3: an operation on a general source and two internal registers,
+    /// sub-op `b53:52` (or `b54:52`).
+    Op3,
+    /// Op 7: a vector move, variant `b47:46`.
+    Op7,
+    /// Op 8: a lane format conversion.
+    Pck,
+}
+
 /// What an instruction does — the interpreter's dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -401,6 +450,8 @@ pub enum Op {
     SetBase,
     /// A per-byte blend (ops 16 and 18, §11).
     Blend(BlendForm),
+    /// A vector floating-point instruction this interpreter executes (§8).
+    Vec(VecOp),
     /// A vector floating-point instruction (not interpreted yet).
     Vector,
     /// Decoded, but with no known semantics.
@@ -417,6 +468,8 @@ enum PredEnc {
     Long(u32),
     Short(u32),
     Vector(u32),
+    /// Three bits, vector ops 1–3 and 6–8.
+    Vector3(u32),
 }
 
 /// How the repeat count is encoded: `count - 1` in `width` bits at `lo`.
@@ -514,8 +567,6 @@ enum Opd {
     SmlsiField(u32),
     /// `PHAS`'s selectors (§7).
     PhasSel(u8),
-    /// The vector forms' 6-bit register fields (§8; not decoded further).
-    VecReg(u32),
     /// A blend factor: complement bit, code field (low bit, width) and the
     /// code-to-selector table (§11).
     Factor(u32, u32, u32, &'static [u8]),
@@ -524,6 +575,53 @@ enum Opd {
     BlendOp(u32),
     /// Opcode 17's 1-bit operation: 18 or 19 (§11).
     BlendOp1(u32),
+    /// A vector destination (§8): a 6-bit field at `lo` counting 64-bit
+    /// registers (`60`–`63` in the temporaries are `v0`–`v3`), the standard
+    /// bank bits, and a write mask at `mask`.
+    VDst { lo: u32, mask: u32 },
+    /// A vector source: a 6-bit field at `lo` with the bank bits of `bank`,
+    /// its swizzle, and the negate and absolute-value bits.
+    VSrc {
+        lo: u32,
+        bank: VBank,
+        swz: Swz,
+        neg: Option<u32>,
+        abs: Option<u32>,
+    },
+    /// An op-3 internal-register source: a 2-bit field and its swizzle.
+    VInt {
+        lo: u32,
+        swz: Swz,
+        neg: Option<u32>,
+        abs: Option<u32>,
+    },
+    /// The `pck` destination: the standard destination and a lane mask at
+    /// `b37:34`.
+    PckDst,
+    /// The `pck` source: `src1` with its four per-lane selects.
+    PckSrc,
+    /// A `pck` format field.
+    PckFmt(u32),
+}
+
+/// Which bank bits a vector source uses (§8).
+#[derive(Clone, Copy, Debug)]
+enum VBank {
+    /// `b34`: primary attribute, else temporary.
+    Src0,
+    /// `b31:30` with the extension bit `b49`.
+    S1,
+    /// `b29:28` with the extension bit `b48`.
+    S2,
+}
+
+/// How a vector source's swizzle is encoded (§8).
+#[derive(Clone, Copy, Debug)]
+enum Swz {
+    /// An index — its bits listed low first — into a table.
+    Table(&'static [u32], &'static [[u8; 4]]),
+    /// `vop` `src1`: a 3-bit code per component.
+    Comp12,
 }
 
 /// A flag the disassembler prints when its bits differ from the encoder's
@@ -539,6 +637,8 @@ enum Name {
     Mem(&'static str),
     /// The test form: the sub-op's name + `.test`.
     Test,
+    /// Computed from the word.
+    Dyn(fn(u64) -> &'static str),
 }
 
 /// One instruction form.
@@ -702,10 +802,32 @@ const F_OP23: &[Flag] = &[
     Flag("b54", b(54)),
 ];
 const F_SMLSI: &[Flag] = &[Flag("end", b(50))];
+/// The vector forms (§8). The encoder puts its END flag at b43, but the
+/// vertex shaders set b43 on nearly every vector instruction with live code
+/// after it, so it is printed as `b43` and does not end the program \[G\].
 const F_VEC: &[Flag] = &[
     Flag("skipinv", b(55)),
     Flag("nosched", b(52)),
-    Flag("end", b(43)),
+    Flag("b43", b(43)),
+];
+/// Op 3: b52 is part of its sub-op.
+const F_VOP3: &[Flag] = &[Flag("skipinv", b(55)), Flag("b43", b(43))];
+const F_VMAD: &[Flag] = &[
+    Flag("skipinv", b(55)),
+    Flag("nosched", b(52)),
+    Flag("b43", b(43)),
+    Flag("f16?", b(58)),
+];
+/// `pck`: b54 (the encoder's END) is set mid-program too; b18 \[G: the
+/// normalising scale\], b53/b48/b50 are seen in the corpus only.
+const F_PCK: &[Flag] = &[
+    Flag("skipinv", b(55)),
+    Flag("nosched", b(52)),
+    Flag("b54", b(54)),
+    Flag("norm", b(18)),
+    Flag("b53", b(53)),
+    Flag("b50", b(50)),
+    Flag("b48", b(48)),
 ];
 
 // Operand lists.
@@ -910,11 +1032,95 @@ const O_FOUR12S: &[Opd] = &[
 ];
 const O_OP193: &[Opd] = &[Opd::Field(0, 1), Opd::Field(8, 1)];
 const O_VMAD: &[Opd] = &[
-    Opd::VecReg(22),
-    Opd::VecReg(12),
-    Opd::VecReg(6),
-    Opd::VecReg(0),
+    Opd::VDst { lo: 22, mask: 39 },
+    Opd::VSrc {
+        lo: 12,
+        bank: VBank::Src0,
+        swz: Swz::Table(&[18, 19, 53], &vector::SW_MAD0),
+        neg: Some(37),
+        abs: Some(50),
+    },
+    Opd::VSrc {
+        lo: 6,
+        bank: VBank::S1,
+        swz: Swz::Table(&[20, 21, 44], &vector::SW_MAD1),
+        neg: None,
+        abs: Some(38),
+    },
+    Opd::VSrc {
+        lo: 0,
+        bank: VBank::S2,
+        swz: Swz::Table(&[45, 46, 47], &vector::SW_MAD2),
+        neg: Some(35),
+        abs: Some(36),
+    },
 ];
+const O_VOP: &[Opd] = &[
+    Opd::VDst { lo: 22, mask: 39 },
+    Opd::VSrc {
+        lo: 6,
+        bank: VBank::S1,
+        swz: Swz::Comp12,
+        neg: Some(37),
+        abs: Some(38),
+    },
+    Opd::VSrc {
+        lo: 0,
+        bank: VBank::S2,
+        swz: Swz::Table(&[44, 45, 46, 47], &vector::SW16),
+        neg: None,
+        abs: Some(36),
+    },
+];
+const O_VOP3: &[Opd] = &[
+    Opd::VDst { lo: 22, mask: 39 },
+    Opd::VSrc {
+        lo: 0,
+        bank: VBank::S1,
+        swz: Swz::Table(&[6, 7, 8, 9, 10], &vector::SW32),
+        neg: Some(38),
+        abs: Some(37),
+    },
+    Opd::VInt {
+        lo: 28,
+        swz: Swz::Table(&[18, 19, 20, 21, 34], &vector::SW32),
+        neg: None,
+        abs: Some(46),
+    },
+    Opd::VInt {
+        lo: 12,
+        swz: Swz::Table(&[14, 15, 16, 17, 54], &vector::SW32),
+        neg: Some(36),
+        abs: Some(35),
+    },
+    Opd::Field(47, 2),
+];
+const O_VOP7: &[Opd] = &[
+    Opd::VDst { lo: 18, mask: 24 },
+    Opd::VSrc {
+        lo: 12,
+        bank: VBank::Src0,
+        swz: Swz::Table(&[], &[vector::XYZW]),
+        neg: None,
+        abs: None,
+    },
+    Opd::VSrc {
+        lo: 6,
+        bank: VBank::S1,
+        swz: Swz::Table(&[35, 36, 37, 38], &vector::SW16),
+        neg: None,
+        abs: None,
+    },
+    Opd::VSrc {
+        lo: 0,
+        bank: VBank::S2,
+        swz: Swz::Table(&[], &[vector::XYZW]),
+        neg: None,
+        abs: None,
+    },
+    Opd::Field(40, 2),
+];
+const O_PCK: &[Opd] = &[Opd::PckFmt(41), Opd::PckFmt(38), Opd::PckDst, Opd::PckSrc];
 
 /// Fields used in match masks.
 const CLASS: u64 = 7 << 52; // op 31: b54:52 (§7)
@@ -1275,13 +1481,87 @@ static FORMS: &[Form] = &[
     sop(24, "op24", F_SOP, RptEnc::Field(44, 3), O_DST2, Op::Opaque),
     sop(25, "op25", F_SOP, RptEnc::Field(44, 3), O_SRC3, Op::Opaque),
     // -- vector floating point (§8): decoded to a name only.
-    vector(0, b(58), 0, "vmad", O_VMAD),
-    vector(0, b(58), b(58), "vmad.b58", O_VMAD),
-    vector(1, 0, 0, "vop1", &[]),
-    vector(2, 0, 0, "vop2", &[]),
-    vector(6, 0, 0, "vcplx", &[]),
-    vector(8, 0, 0, "pck", &[]),
+    Form {
+        flags: F_VMAD,
+        exec: Op::Vec(VecOp::Mad),
+        ..vector(0, 0, 0, "vmad", O_VMAD)
+    },
+    Form {
+        name: Name::Dyn(vop1_name),
+        pred: PredEnc::Vector3(56),
+        exec: Op::Vec(VecOp::Op1),
+        ..vector(1, 0, 0, "", O_VOP)
+    },
+    Form {
+        name: Name::Dyn(vop2_name),
+        pred: PredEnc::Vector3(56),
+        ..vector(2, 0, 0, "", O_VOP)
+    },
+    Form {
+        name: Name::Dyn(vop3_name),
+        pred: PredEnc::Vector3(56),
+        flags: F_VOP3,
+        exec: Op::Vec(VecOp::Op3),
+        ..vector(3, 0, 0, "", O_VOP3)
+    },
+    Form {
+        pred: PredEnc::Vector3(56),
+        ..vector(6, 0, 0, "vcplx", &[])
+    },
+    Form {
+        name: Name::Dyn(vop7_name),
+        pred: PredEnc::Vector3(56),
+        rpt: RptEnc::Field(44, 2),
+        exec: Op::Vec(VecOp::Op7),
+        ..vector(7, 0, 0, "", O_VOP7)
+    },
+    Form {
+        pred: PredEnc::Vector3(56),
+        flags: F_PCK,
+        exec: Op::Vec(VecOp::Pck),
+        ..vector(8, 0, 0, "pck", O_PCK)
+    },
 ];
+
+/// Op 1's sub-ops, `b14:12` (§8.4): 0 multiply \[strong\], 1 add \[G\],
+/// the rest unknown.
+fn vop1_name(w: u64) -> &'static str {
+    [
+        "vmul", "vadd", "vop1.2", "vop1.3", "vop1.4", "vop1.5", "vop1.6", "vop1.7",
+    ][field(w, 12, 3) as usize]
+}
+
+/// Op 2: op 1's sub-ops on F16 \[strong: it takes a four-component mask on
+/// a 64-bit register\].
+fn vop2_name(w: u64) -> &'static str {
+    [
+        "vmul16", "vadd16", "vop2.2", "vop2.3", "vop2.4", "vop2.5", "vop2.6", "vop2.7",
+    ][field(w, 12, 3) as usize]
+}
+
+/// Op 3's sub-op (§8.3): `b53:52` when it is 2 or 3 (b54 then belongs to
+/// a swizzle), else `b54:52`. 3 is the multiply-add \[strong\].
+fn vop3_sub(w: u64) -> u64 {
+    match field(w, 52, 2) {
+        s @ (2 | 3) => s,
+        _ => field(w, 52, 3),
+    }
+}
+
+fn vop3_name(w: u64) -> &'static str {
+    match vop3_sub(w) {
+        3 => "vmad3",
+        2 => "vop3.2",
+        4 => "vop3.4",
+        5 => "vop3.5",
+        _ => "vop3.?",
+    }
+}
+
+/// Op 7's variant, `b47:46` (§8.5): 0 a move \[strong\].
+fn vop7_name(w: u64) -> &'static str {
+    ["vmov", "vop7.1", "vop7.2", "vop7.3"][field(w, 46, 2) as usize]
+}
 
 /// A blend-family form (§11): the shared header — short predicate b58:57,
 /// END b54 — and the given repeat field.
@@ -1407,7 +1687,7 @@ const fn vector(
         inverted: 0,
         pred: PredEnc::Vector(56),
         rpt: RptEnc::None,
-        end: Some(43),
+        end: None,
         flags: F_VEC,
         ops,
         exec: Op::Vector,
@@ -1524,6 +1804,7 @@ pub fn decode(word: u64) -> Option<Insn> {
         PredEnc::Long(lo) => Pred::long(field(word, lo, 3)),
         PredEnc::Short(lo) => Pred::short(field(word, lo, 2)),
         PredEnc::Vector(lo) => Pred::vector(field(word, lo, 2)),
+        PredEnc::Vector3(lo) => Pred::vector3(field(word, lo, 3)),
     };
     let repeat = match form.rpt {
         RptEnc::None => 1,
@@ -1548,6 +1829,77 @@ pub fn decode(word: u64) -> Option<Insn> {
         args,
         nargs: nargs as u8,
     })
+}
+
+/// `pck`'s 7-bit fields reach `v0`–`v3` as `r124`–`r127`, as the
+/// encoder numbers them (§8.6).
+fn internal_alias(op: Operand) -> Operand {
+    match op {
+        Operand::Reg {
+            bank: Bank::Temp,
+            num: n @ 124..=127,
+        } => reg(Bank::Internal, 4 * u64::from(n - 124)),
+        op => op,
+    }
+}
+
+/// A vector 6-bit register field as a destination (§8): 64-bit registers,
+/// the temporaries' `60`–`63` being `v0`–`v3`.
+fn vreg_dst(w: u64, f: u64) -> Operand {
+    match dst_std(w) {
+        Operand::Reg {
+            bank: Bank::Temp, ..
+        } if f >= 60 => reg(Bank::Internal, 4 * (f - 60)),
+        Operand::Reg {
+            bank: bank @ (Bank::Temp | Bank::Output | Bank::Primary | Bank::Secondary),
+            ..
+        } => reg(bank, 2 * f),
+        Operand::Reg { bank, .. } => reg(bank, f),
+        Operand::Indexed { bank, index, .. } => Operand::Indexed {
+            bank,
+            index,
+            offset: f as u8,
+        },
+        op => op,
+    }
+}
+
+/// A vector 6-bit register field as a source (§8).
+fn vreg_src(w: u64, f: u64, bank: VBank) -> Operand {
+    let (bank, ext) = match bank {
+        VBank::Src0 => (if bit(w, 34) { 2 } else { 0 }, false),
+        VBank::S1 => (field(w, 30, 2), bit(w, 49)),
+        VBank::S2 => (field(w, 28, 2), bit(w, 48)),
+    };
+    match (ext, bank) {
+        (false, 0) if f >= 60 => reg(Bank::Internal, 4 * (f - 60)),
+        (false, b) => reg(Bank::INDEXABLE[b as usize], 2 * f),
+        (true, 1) => reg(Bank::Special, f),
+        (true, 2) => hex(f),
+        // [G] Not seen from the encoder.
+        (true, b) => indexed(if b == 0 { 1 } else { 2 }, f as u8),
+    }
+}
+
+/// Decodes a swizzle field.
+fn swizzle(w: u64, swz: Swz) -> [u8; 4] {
+    match swz {
+        Swz::Table(bits, table) => {
+            let i = bits
+                .iter()
+                .enumerate()
+                .fold(0usize, |i, (k, &b)| i | usize::from(bit(w, b)) << k);
+            table[i % table.len()]
+        }
+        Swz::Comp12 => {
+            const COMP: [[u32; 3]; 4] = [[15, 16, 17], [18, 19, 20], [21, 34, 35], [50, 53, 54]];
+            COMP.map(|bits| {
+                bits.iter()
+                    .enumerate()
+                    .fold(0u8, |c, (k, &b)| c | u8::from(bit(w, b)) << k)
+            })
+        }
+    }
 }
 
 /// Which register slot an operand encoding occupies (§9).
@@ -1791,7 +2143,6 @@ fn decode_opd(opd: Opd, w: u64) -> Option<Arg> {
         }),
         Opd::SmlsiField(lo) => Arg::of(hex(field(w, lo, 4) << 1)),
         Opd::PhasSel(n) => Arg::of(phas_selector(w, n)),
-        Opd::VecReg(lo) => Arg::of(reg(Bank::Temp, field(w, lo, 6))),
         Opd::Factor(comp, lo, width, table) => Arg::of(Operand::Factor {
             value: table
                 .get(field(w, lo, width) as usize)
@@ -1801,6 +2152,42 @@ fn decode_opd(opd: Opd, w: u64) -> Option<Arg> {
         }),
         Opd::BlendOp(lo) => Arg::of(Operand::BlendOp([18, 19, 22, 23][field(w, lo, 2) as usize])),
         Opd::BlendOp1(n) => Arg::of(Operand::BlendOp(18 + field(w, n, 1) as u8)),
+        Opd::VDst { lo, mask } => Arg {
+            mask: Some(field(w, mask, 4) as u8),
+            ..Arg::of(vreg_dst(w, field(w, lo, 6)))
+        },
+        Opd::VSrc {
+            lo,
+            bank,
+            swz,
+            neg,
+            abs,
+        } => Arg {
+            swz: Some(swizzle(w, swz)),
+            neg: neg.is_some_and(|n| bit(w, n)),
+            abs: abs.is_some_and(|n| bit(w, n)),
+            ..Arg::of(vreg_src(w, field(w, lo, 6), bank))
+        },
+        Opd::VInt { lo, swz, neg, abs } => Arg {
+            swz: Some(swizzle(w, swz)),
+            neg: neg.is_some_and(|n| bit(w, n)),
+            abs: abs.is_some_and(|n| bit(w, n)),
+            ..Arg::of(reg(Bank::Internal, 4 * field(w, lo, 2)))
+        },
+        Opd::PckDst => Arg {
+            mask: Some(field(w, 34, 4) as u8),
+            ..Arg::of(internal_alias(dst_std(w)))
+        },
+        Opd::PckSrc => Arg {
+            swz: Some([
+                field(w, 0, 2) as u8,
+                field(w, 16, 2) as u8,
+                field(w, 14, 2) as u8,
+                field(w, 19, 2) as u8,
+            ]),
+            ..Arg::of(internal_alias(src_slot(w, Slot::S1, Imm::U7)))
+        },
+        Opd::PckFmt(lo) => Arg::of(Operand::Text(vector::Fmt::of(field(w, lo, 3)).name())),
     })
 }
 
@@ -1902,7 +2289,12 @@ impl Disasm<'_> {
                 bank: Bank::Special,
                 num,
             } if num < 64 => write!(f, "c{num}"),
+            Operand::Reg {
+                bank: Bank::Internal,
+                num,
+            } => write!(f, "v{}", num / 4),
             Operand::Reg { bank, num } => write!(f, "{}{num}", bank.prefix()),
+            Operand::Text(t) => f.write_str(t),
             Operand::Indexed {
                 bank,
                 index,
@@ -1963,6 +2355,7 @@ impl fmt::Display for Disasm<'_> {
         }
         match form.name {
             Name::Fixed(name) => f.write_str(name)?,
+            Name::Dyn(name) => f.write_str(name(w))?,
             Name::Mem(stem) => {
                 let space = if bit(w, 43) {
                     "t"
@@ -2003,7 +2396,27 @@ impl fmt::Display for Disasm<'_> {
             if arg.neg {
                 f.write_str("-")?;
             }
+            if arg.abs {
+                f.write_str("|")?;
+            }
             self.write_operand(f, arg.op)?;
+            if arg.abs {
+                f.write_str("|")?;
+            }
+            if let Some(m) = arg.mask {
+                f.write_str(if m == 0 { "._" } else { "." })?;
+                for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
+                    if m >> k & 1 != 0 {
+                        f.write_str(c)?;
+                    }
+                }
+            }
+            if let Some(sw) = arg.swz {
+                f.write_str(".")?;
+                for c in sw {
+                    f.write_str(["x", "y", "z", "w", "0", "1", "?", "?"][usize::from(c & 7)])?;
+                }
+            }
             if arg.inv {
                 f.write_str(".inv")?;
             }
@@ -2211,6 +2624,9 @@ pub struct Usse {
     pub constants: [u32; 64],
     /// The index registers.
     pub index: [u32; 4],
+    /// The vector internal registers `v0`–`v3`, four 32-bit components
+    /// each (§8).
+    pub internal: [u32; 16],
     /// The predicates `p0`–`p3`.
     pub preds: [bool; 4],
     /// The link register, an instruction index.
@@ -2255,6 +2671,7 @@ impl Usse {
             special: [0; 64],
             constants: [0; 64],
             index: [0; 4],
+            internal: [0; 16],
             preds: [false; 4],
             link: 0,
             smlsi: [0; 11],
@@ -2294,6 +2711,7 @@ impl Usse {
             Pred::PerInstance => {
                 return Err(unimpl(pc, word, "per-instance predicate"));
             }
+            Pred::Unknown(_) => return Err(unimpl(pc, word, "predicate code")),
         };
         self.pc = pc.wrapping_add(1);
         if enabled {
@@ -2338,7 +2756,7 @@ impl Usse {
                     Bank::Temp | Bank::Output | Bank::Primary | Bank::Secondary => {
                         self.base.get(usize::from(slot)).copied().unwrap_or(0) as usize
                     }
-                    Bank::Special | Bank::Index => 0,
+                    Bank::Special | Bank::Index | Bank::Internal => 0,
                 };
                 (bank, usize::from(num) + base + rep)
             }
@@ -2359,6 +2777,7 @@ impl Usse {
             Bank::Temp => 128,
             Bank::Special => 128,
             Bank::Index => self.index.len(),
+            Bank::Internal => self.internal.len(),
             _ => BANK_SIZE,
         };
         if n < limit {
@@ -2377,6 +2796,7 @@ impl Usse {
             Bank::Special if n < 64 => self.constants[n],
             Bank::Special => self.special[n - 64],
             Bank::Index => self.index[n],
+            Bank::Internal => self.internal[n],
         }
     }
 
@@ -2389,6 +2809,7 @@ impl Usse {
             Bank::Special if n < 64 => return Err(Stop::BadRegister { pc, word }),
             Bank::Special => self.special[n - 64] = v,
             Bank::Index => self.index[n] = v,
+            Bank::Internal => self.internal[n] = v,
         }
         Ok(())
     }
@@ -2544,6 +2965,7 @@ impl Usse {
                     self.write(&a[0], rep, r, pc, w)?;
                 }
             }
+            Op::Vec(v) => self.vector(insn, v, pc)?,
             Op::Vector => return Err(unimpl(pc, w, "vector floating point")),
             Op::Opaque => return Err(unimpl(pc, w, "unknown semantics")),
         }
@@ -2598,6 +3020,146 @@ impl Usse {
         self.write(&a[0], 0, r, pc, w)?;
         if let Operand::Pred(n) = a[1].op {
             self.preds[usize::from(n)] = p;
+        }
+        Ok(())
+    }
+
+    /// Component `c` of a vector source, after its swizzle and modifiers
+    /// (§8), as F32 bits.
+    fn vsrc(&self, arg: &Arg, c: usize, step: u8, pc: u32, w: u64) -> Result<u32, Stop> {
+        let sw = arg.swz.unwrap_or(vector::XYZW)[c];
+        let v = match (sw, arg.op) {
+            // [G] The encoder's two extra codes as the constants 0 and 1.
+            (4, _) => 0,
+            (5, _) => 1.0f32.to_bits(),
+            (6.., _) => return Err(unimpl(pc, w, "swizzle code")),
+            (_, Operand::Imm { .. }) => return Err(unimpl(pc, w, "vector immediate")),
+            (sw, op) => self.get(self.loc(op, arg.slot, sw + step, pc, w)?),
+        };
+        let v = if arg.abs { v & 0x7fff_ffff } else { v };
+        Ok(if arg.neg { v ^ 0x8000_0000 } else { v })
+    }
+
+    /// Writes component `c` of a vector destination.
+    fn vdst(&mut self, arg: &Arg, c: usize, step: u8, v: u32, pc: u32, w: u64) -> Result<(), Stop> {
+        let loc = self.loc(arg.op, arg.slot, c as u8 + step, pc, w)?;
+        self.set(loc, v, pc, w)
+    }
+
+    /// The vector forms (§8). A 64-bit register operand reads its four
+    /// components from four consecutive 32-bit registers, and a destination
+    /// writes component `k` to the `k`-th; `v0`–`v3` hold four each.
+    /// Arithmetic is IEEE single precision, a multiply-add rounding twice
+    /// \[G\].
+    fn vector(&mut self, insn: &Insn, v: VecOp, pc: u32) -> Result<(), Stop> {
+        let w = insn.word;
+        let a = insn.args();
+        let f = f32::from_bits;
+        let mask = a[0].mask.unwrap_or(0xf);
+        if v == VecOp::Pck {
+            return self.pck(insn, pc);
+        }
+        let steps = match v {
+            VecOp::Op7 => insn.repeat,
+            _ => 1,
+        };
+        for rep in 0..steps {
+            // [G] Each repeat moves the registers on by one 64-bit register.
+            let step = 2 * rep;
+            let mut out = [None; 4];
+            for (c, o) in out.iter_mut().enumerate() {
+                if mask >> c & 1 == 0 {
+                    continue;
+                }
+                let r = match v {
+                    VecOp::Mad if bit(w, 58) => return Err(unimpl(pc, w, "vmad variant b58")),
+                    VecOp::Mad => {
+                        // b37 negates the product: it is decoded onto src0.
+                        let x = f(self.vsrc(&a[1], c, 0, pc, w)?);
+                        let y = f(self.vsrc(&a[2], c, 0, pc, w)?);
+                        let z = f(self.vsrc(&a[3], c, 0, pc, w)?);
+                        x * y + z
+                    }
+                    VecOp::Op1 => {
+                        let x = f(self.vsrc(&a[1], c, 0, pc, w)?);
+                        let y = f(self.vsrc(&a[2], c, 0, pc, w)?);
+                        match field(w, 12, 3) {
+                            0 => x * y,
+                            1 => x + y,
+                            _ => return Err(unimpl(pc, w, "vector sub-op")),
+                        }
+                    }
+                    VecOp::Op3 => {
+                        if vop3_sub(w) != 3 {
+                            return Err(unimpl(pc, w, "vector sub-op"));
+                        }
+                        let x = f(self.vsrc(&a[1], c, 0, pc, w)?);
+                        let y = f(self.vsrc(&a[2], c, 0, pc, w)?);
+                        let z = f(self.vsrc(&a[3], c, 0, pc, w)?);
+                        x * y + z
+                    }
+                    VecOp::Op7 => {
+                        if field(w, 46, 2) != 0 {
+                            return Err(unimpl(pc, w, "vector move variant"));
+                        }
+                        f(self.vsrc(&a[2], c, step, pc, w)?)
+                    }
+                    VecOp::Pck => unreachable!("handled above"),
+                };
+                *o = Some(r.to_bits());
+            }
+            // All sources are read before any component is written.
+            for (c, o) in out.iter().enumerate() {
+                if let Some(r) = *o {
+                    self.vdst(&a[0], c, step, r, pc, w)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `pck` (§8.6): each destination lane the mask enables takes the source
+    /// lane its select names, converted between the two formats.
+    fn pck(&mut self, insn: &Insn, pc: u32) -> Result<(), Stop> {
+        use vector::Fmt;
+        let w = insn.word;
+        let a = insn.args();
+        let (dfmt, sfmt) = (Fmt::of(field(w, 41, 3)), Fmt::of(field(w, 38, 3)));
+        let norm = bit(w, 18);
+        let sel = a[3].swz.unwrap_or(vector::XYZW);
+        let mask = a[2].mask.unwrap_or(0);
+        let mut vals = [0u32; 4];
+        for k in 0..4 {
+            if mask >> k & 1 == 0 {
+                continue;
+            }
+            let (word, shift, width) =
+                sfmt.lane(u32::from(sel[k]))
+                    .ok_or(unimpl(pc, w, "pck format"))?;
+            let src = match a[3].op {
+                Operand::Imm { value, .. } => value as u32,
+                op => self.get(self.loc(op, a[3].slot, word as u8, pc, w)?),
+            };
+            let lane = if width == 32 {
+                src
+            } else {
+                src >> shift & ((1 << width) - 1)
+            };
+            vals[k] = dfmt.encode(sfmt.decode(lane, norm), norm);
+        }
+        for (k, v) in vals.iter().enumerate() {
+            if mask >> k & 1 == 0 {
+                continue;
+            }
+            let (word, shift, width) = dfmt.lane(k as u32).ok_or(unimpl(pc, w, "pck format"))?;
+            let loc = self.loc(a[2].op, a[2].slot, word as u8, pc, w)?;
+            let new = if width == 32 {
+                *v
+            } else {
+                let m = ((1u32 << width) - 1) << shift;
+                self.get(loc) & !m | v << shift & m
+            };
+            self.set(loc, new, pc, w)?;
         }
         Ok(())
     }
@@ -2757,6 +3319,8 @@ fn bitwise_op(op: BitOp, x: u32, y: u32) -> Option<u32> {
         BitOp::Rlp => return None,
     })
 }
+
+mod vector;
 
 #[cfg(test)]
 mod tests;

@@ -453,7 +453,7 @@ fn op31_odd_forms_decode() {
         | (imm & 0x3f) << 22
         | (imm >> 6 & 0x3f) << 35;
     assert_eq!(dis(emit), "emit162.f2.4.f2.5 #0, r0, r2, r4, #0x843");
-    assert_eq!(dis(0), "vmad r0, r0, r0, r0");
+    assert_eq!(dis(0), "vmad r0._, r0.xxxx, r0.xxxx, r0.xxxx");
     assert_eq!(dis(class(0) | 7 << 38), ".word");
 }
 
@@ -804,9 +804,10 @@ fn stops_are_reported() {
         }
     );
     assert_eq!(u.pc, 2);
-    // Vector, RLP and unknown words.
-    let (u, _, stop) = run(&[0], |_| {});
-    assert!(matches!(stop, Stop::Unimplemented { pc: 0, word: 0, .. }));
+    // An unknown vector sub-op, RLP and unknown words.
+    let vop = op(1) | 5 << 12 | b(39);
+    let (u, _, stop) = run(&[vop], |_| {});
+    assert!(matches!(stop, Stop::Unimplemented { pc: 0, word, .. } if word == vop));
     assert_eq!(u.pc, 0);
     let (_, _, stop) = run(&[op(14) | d_r(1)], |_| {});
     assert!(matches!(stop, Stop::Unimplemented { why: "RLP", .. }));
@@ -1312,4 +1313,82 @@ fn blend_executes_per_byte() {
         u.output[0] = 0xaaaa_aaaa;
     });
     assert_eq!(u.output[0], 0x44aa_aa11);
+}
+
+// ---------------------------------------------------------------------------
+// The vector forms (§8)
+
+/// `vmul v1.xyzw, sa26.xyzw, v0.xxxx`: the first step of the UI vertex
+/// shader's matrix transform.
+fn vmul_v1() -> u64 {
+    op(1)
+        | 60 << 22 // dst field 60: v1 is 61, v0 is 60
+        | 1 << 22
+        | 0xf << 39
+        | 3 << 30
+        | 13 << 6 // src1 sa26 (64-bit field 13)
+        | b(18) | b(34) | b(50) | b(53) // src1 swizzle x, y, z, w
+        | 60 // src2 v0, swizzle index 0 = xxxx
+}
+
+/// `vmad3 v0.xyzw, sa22.xyzw, v0.yyyy, v1.xyzw`.
+fn vmad3_v0() -> u64 {
+    op(3) | 3 << 52 | 60 << 22 | 0xf << 39 | 3 << 30 | 11 | 4 << 6 | 1 << 18 | 1 << 12 | 4 << 14
+}
+
+#[test]
+fn vector_forms_decode() {
+    assert_eq!(dis(vmul_v1()), "vmul v1.xyzw, sa26.xyzw, v0.xxxx");
+    assert_eq!(
+        dis(vmad3_v0()),
+        "vmad3 v0.xyzw, sa22.xyzw, v0.yyyy, v1.xyzw, #0"
+    );
+    // b43 is not END on the vector forms.
+    assert!(!decode(vmul_v1() | b(43)).unwrap().is_end());
+    // Op 7 variant 0, the move: dst b23:18, mask b27:24, src1 swizzle b38:35.
+    let vmov = op(7) | 2 << 18 | 1 << 24 | b(32) | b(49) | 1 << 30 | 3 << 6;
+    assert_eq!(dis(vmov), "vmov o4.x, r0.xyzw, c3.xxxx, r0.xyzw, #0");
+}
+
+#[test]
+fn the_matrix_chain_executes() {
+    let f = |x: f32| x.to_bits();
+    let (u, _, stop) = run(&[vmul_v1(), vmad3_v0(), nop() | b(43)], |u| {
+        u.internal[..4].copy_from_slice(&[f(2.0), f(3.0), 0, 0]);
+        for (i, v) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
+            u.secondary[26 + i] = f(*v);
+            u.secondary[22 + i] = f(*v * 10.0);
+        }
+    });
+    assert_eq!(stop, Stop::End { pc: 3 });
+    let v1: Vec<f32> = u.internal[4..8]
+        .iter()
+        .map(|b| f32::from_bits(*b))
+        .collect();
+    assert_eq!(v1, [2.0, 4.0, 6.0, 8.0]);
+    let v0: Vec<f32> = u.internal[..4].iter().map(|b| f32::from_bits(*b)).collect();
+    assert_eq!(v0, [32.0, 64.0, 96.0, 128.0]);
+}
+
+#[test]
+fn pck_converts_lanes() {
+    // pck.norm u8 <- f32: o4 bytes from pa3..pa6.
+    let w = op(8)
+        | 6 << 38
+        | b(18)
+        | 0xf << 34
+        | b(32)
+        | 4 << 21
+        | 2 << 30
+        | 3 << 7
+        | 1 << 16
+        | 2 << 14
+        | 3 << 19;
+    assert_eq!(dis(w), "pck.norm u8, f32, o4.xyzw, pa3.xyzw");
+    let (u, _, _) = run(&[w, nop() | b(43)], |u| {
+        for (i, v) in [1.0f32, 0.5, 0.0, 2.0].iter().enumerate() {
+            u.primary[3 + i] = v.to_bits();
+        }
+    });
+    assert_eq!(u.output[4], 0xff00_80ff);
 }
