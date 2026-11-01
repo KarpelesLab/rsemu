@@ -1243,6 +1243,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::m68k::register(&mut reg)?;
     #[cfg(feature = "cpu-mips")]
     crate::cpu::mips::register(&mut reg)?;
+    #[cfg(feature = "cpu-sh4a")]
+    crate::cpu::sh4a::register(&mut reg)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::register(&mut reg)?;
     #[cfg(feature = "dev-riscv")]
@@ -1412,6 +1414,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::m68k::bind(&mut b)?;
     #[cfg(feature = "cpu-mips")]
     crate::cpu::mips::bind(&mut b)?;
+    #[cfg(feature = "cpu-sh4a")]
+    crate::cpu::sh4a::bind(&mut b)?;
     #[cfg(feature = "cpu-riscv")]
     crate::cpu::riscv::bind(&mut b)?;
     #[cfg(feature = "dev-riscv")]
@@ -1588,6 +1592,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::m68k::schema());
     #[cfg(feature = "cpu-mips")]
     table.insert(crate::cpu::mips::schema());
+    #[cfg(feature = "cpu-sh4a")]
+    table.insert(crate::cpu::sh4a::schema());
     #[cfg(feature = "cpu-riscv")]
     table.insert(crate::cpu::riscv::schema());
     #[cfg(feature = "dev-riscv")]

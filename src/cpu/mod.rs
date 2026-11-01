@@ -17,6 +17,7 @@
 
 //! | `m68k` | `cpu-m68k` | MC68000 interpreter with a modelled prefetch queue, exceptions, disassembler; 68010, 68020 and 68EC020 as models of it |
 //! | `mips` | `cpu-mips` | MIPS I / R3000A interpreter: branch and load delay slots, CP0, the 64-entry TLB, disassembler |
+//! | `sh4a` | `cpu-sh4a` | Renesas SH-4A interpreter: banked registers, delay slots, exceptions and interrupts, software-IEEE FPU, UTLB/ITLB/PMB MMU, disassembler |
 
 //! | `arm::a64` | `cpu-arm-a64` | AArch64 A64 interpreter: EL0/EL1, the VBAR_EL1 vector table, the VMSAv8-64 MMU, scalar floating point in software IEEE-754, `FEAT_LSE`/`FEAT_CRC32`/`FEAT_FP` as instance properties |
 
@@ -35,6 +36,10 @@ pub mod mips;
 #[cfg(feature = "cpu-mos6502")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-mos6502")))]
 pub mod mos6502;
+
+#[cfg(feature = "cpu-sh4a")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-sh4a")))]
+pub mod sh4a;
 
 // The family module always compiles and links nothing; the cores underneath
 // it are individually gated.
