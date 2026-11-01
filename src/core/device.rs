@@ -310,6 +310,15 @@ impl ExportId {
     /// [`Export::Opaque`].
     pub const EXCLUSIVE_MONITOR: ExportId = ExportId(14);
 
+    /// A processor's prioritised interrupt-request input, for an
+    /// architecture whose interrupt controller hands the core a *level and a
+    /// vector code* rather than one line per source — the SuperH's
+    /// `IMASK`/`INTEVT` boundary. Published by the core, stored into by the
+    /// controller whenever its highest pending request changes. Transported
+    /// as [`Export::Cell`]; the packing is the core's (for the SH-4A,
+    /// `cpu::sh4a::pack_request`), and zero means nothing is pending.
+    pub const INTERRUPT_REQUEST: ExportId = ExportId(15);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -331,6 +340,7 @@ impl ExportId {
             ExportId::REMOVABLE_MEDIA => Some("removable media"),
             ExportId::RESET_ADDRESS => Some("reset address"),
             ExportId::EXCLUSIVE_MONITOR => Some("global exclusive monitor"),
+            ExportId::INTERRUPT_REQUEST => Some("interrupt request"),
             _ => None,
         }
     }
