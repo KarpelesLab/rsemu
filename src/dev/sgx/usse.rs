@@ -15,8 +15,10 @@
 //! was **measured from the guest's own `useasm` encoder, run as a black box**:
 //! the encoder entry in the navi's `libGLES_CM.so` was executed in a small ARM
 //! interpreter, every input field of every opcode was flipped, and the change
-//! in the 64-bit output recorded. Our notes on that measurement (`ENCODING.md`,
-//! cited below by section, `§n`) grade every claim:
+//! in the 64-bit output recorded. Our notes on that measurement
+//! (`docs/devices/sgx-usse-encoding.md`, cited below by section, `§n`; it
+//! replaces the lost `ENCODING.md` and records the method well enough to
+//! repeat it) grade every claim:
 //!
 //! * **exact** — a field position or encoding read off the encoder;
 //! * **strong** — consistent across encoder, firmware and the shader

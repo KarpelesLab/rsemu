@@ -17,8 +17,9 @@
 //! time; the 48 prebuilt programs in the user-space libraries; and the
 //! firmware programs `libsrv_init.so` installs, checked against the
 //! microkernel entries they must reach. Our notes on that study
-//! (`PDS_ENCODING.md`) grade each claim exact / strong / guess; the guesses
-//! are marked `[G]` below.
+//! (`PDS_ENCODING.md`, since lost; the later additions are in
+//! `docs/devices/sgx-usse-encoding.md` §13) grade each claim exact / strong
+//! / guess; the guesses are marked `[G]` below.
 //!
 //! # Programs
 //!
