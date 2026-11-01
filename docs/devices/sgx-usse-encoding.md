@@ -289,6 +289,10 @@ and 353–355 for format 7.
   - b18 is flags2 bit 8, executed as the normalising scale [G];
   - b47:44 is a thermometer of the repeat count;
   - b53, b48 and b50 appear only in the corpus, with no known meaning.
+- **c10 [G]:** four unsigned 10-bit lanes over a register pair, three in
+  the first word from the bottom and the fourth at the bottom of the second,
+  1023 being 1.0. The UI's constant-setup programs (`fe008310`, `fe008480`)
+  are the only users: one converts an immediate, the other reads lane 3.
 - **Lane layout used in execution [G]:** 8-bit lanes are the bytes of one
   word; 16-bit lanes are packed two to a word; f32 lanes are one word each.
   c10 and o8 are not executed.

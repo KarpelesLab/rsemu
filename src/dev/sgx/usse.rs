@@ -3303,17 +3303,21 @@ impl Usse {
             if mask >> k & 1 == 0 {
                 continue;
             }
-            let (word, shift, width) =
-                sfmt.lane(u32::from(sel[k]))
-                    .ok_or(unimpl(pc, w, "pck format"))?;
-            let src = match a[3].op {
+            // An immediate is the lane's value whatever the source format's
+            // layout; a register needs the layout to find the lane.
+            let lane = match a[3].op {
                 Operand::Imm { value, .. } => value as u32,
-                op => self.get(self.loc(op, a[3].slot, word as u8, pc, w)?),
-            };
-            let lane = if width == 32 {
-                src
-            } else {
-                src >> shift & ((1 << width) - 1)
+                op => {
+                    let (word, shift, width) =
+                        sfmt.lane(u32::from(sel[k]))
+                            .ok_or(unimpl(pc, w, "pck format"))?;
+                    let src = self.get(self.loc(op, a[3].slot, word as u8, pc, w)?);
+                    if width == 32 {
+                        src
+                    } else {
+                        src >> shift & ((1 << width) - 1)
+                    }
+                }
             };
             vals[k] = dfmt.encode(sfmt.decode(lane, norm), norm);
         }

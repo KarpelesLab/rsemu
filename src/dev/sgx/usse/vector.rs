@@ -151,6 +151,10 @@ impl Fmt {
             Fmt::U8 | Fmt::S8 => (0, 8 * lane, 8),
             Fmt::U16 | Fmt::S16 | Fmt::F16 => (lane / 2, 16 * (lane % 2), 16),
             Fmt::F32 => (lane, 0, 32),
+            // [G] Four 10-bit lanes over a register pair: three in the
+            // first word from the bottom, the fourth at the second's.
+            Fmt::C10 if lane < 3 => (0, 10 * lane, 10),
+            Fmt::C10 if lane == 3 => (1, 0, 10),
             Fmt::O8 | Fmt::C10 => return None,
         })
     }
@@ -173,7 +177,9 @@ impl Fmt {
             }
             Fmt::F16 => f16_to_f32(v as u16),
             Fmt::F32 => f32::from_bits(v),
-            Fmt::O8 | Fmt::C10 => 0.0,
+            // [G] Unsigned, 1023 being 1.0.
+            Fmt::C10 => (v & 0x3ff) as f32 / 1023.0,
+            Fmt::O8 => 0.0,
         }
     }
 
@@ -195,7 +201,8 @@ impl Fmt {
             Fmt::S16 => int(x, -32768.0, 32767.0) & 0xffff,
             Fmt::F16 => u32::from(f32_to_f16(x)),
             Fmt::F32 => x.to_bits(),
-            Fmt::O8 | Fmt::C10 => 0,
+            Fmt::C10 => int(x * 1023.0, 0.0, 1023.0),
+            Fmt::O8 => 0,
         }
     }
 }
