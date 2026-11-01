@@ -1264,3 +1264,52 @@ fn a_burst_emit_hands_the_bus_its_registers() {
     let (_, mock, _) = run(&[emit_burst(5) | b(43)], |_| {});
     assert_eq!(mock.emits[0].form, EMIT_160);
 }
+
+// ---------------------------------------------------------------------------
+// The blend family (§11)
+
+/// Opcode 16, `o0 = pa0 · pa0.a + pa1 · (1 - pa0.a)` on all four bytes —
+/// GL's SRC_ALPHA / ONE_MINUS_SRC_ALPHA — assembled field by field.
+fn blend_over() -> u64 {
+    op(16)
+        | b(55)
+        | b(32)
+        | 2 << 30
+        | 2 << 28
+        | 1 // src1 pa0, src2 pa1
+        | 3 << 38 // rgb f1: code 3 = s1.a
+        | b(47) | 3 << 35 // rgb f2: 1 - s1.a
+        | b(43) // alpha f1: 1 - zero
+        | b(34) | 1 << 41 // alpha f2: 1 - s1.a
+}
+
+#[test]
+fn blend_forms_decode() {
+    assert_eq!(
+        dis(blend_over()),
+        "blend2.skipinv o0, pa0, pa1, s1.a, 1-s1.a, add, one, 1-s1.a, add"
+    );
+    // Opcode 18: shared factors, ops at b53:52 / b42:41, mask b46:43.
+    let w = op(18) | b(32) | s1_r(1) | 2 | 2 << 38 | 0xf << 43 | 1 << 52;
+    assert_eq!(dis(w), "blend o0, r1, r2, s1, zero, sub, add, #0xf");
+}
+
+#[test]
+fn blend_executes_per_byte() {
+    // src 50% alpha red over opaque blue.
+    let (u, _, stop) = run(&[blend_over() | END], |u| {
+        u.primary[0] = 0x80ff_0000;
+        u.primary[1] = 0xff00_00ff;
+    });
+    assert_eq!(stop, Stop::End { pc: 1 });
+    // rgb: ff·0x80/255 = 0x80, 0xff·0x7f/255 = 0x7f; alpha: 0x80 + 0xff·0x7f/255.
+    assert_eq!(u.output[0], 0xff80_007f);
+    // Opcode 18 with a mask writes only the enabled bytes: s1·1 + s2·0.
+    let w = op(18) | b(32) | s1_r(1) | 2 | b(56) | 1 << 43 | b(46);
+    let (u, _, _) = run(&[w | END], |u| {
+        u.temp[1] = 0x4433_2211;
+        u.temp[2] = 0x5555_5555;
+        u.output[0] = 0xaaaa_aaaa;
+    });
+    assert_eq!(u.output[0], 0x44aa_aa11);
+}

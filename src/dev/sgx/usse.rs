@@ -192,6 +192,19 @@ pub enum Operand {
         /// The selector value.
         value: u8,
     },
+    /// A blend factor (§11): the encoder's selector value — `0` zero, `2`
+    /// saturate, `4`/`5`/`6` the colour of `src0`/`src1`/`src2`, `7`/`8`/`9`
+    /// their alpha, `24`/`25` unknown — and whether it is complemented
+    /// (`1 - f`).
+    Factor {
+        /// The selector value.
+        value: u8,
+        /// `1 - f`.
+        comp: bool,
+    },
+    /// A blend operation (§11): the encoder's `18` add, `19` subtract, `22`
+    /// and `23` (min and max \[G\]).
+    BlendOp(u8),
 }
 
 /// An operand with its modifiers.
@@ -331,6 +344,16 @@ pub enum MadUnit {
     Hw26,
 }
 
+/// Which blend unit form (§11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendForm {
+    /// Opcode 16: separate colour and alpha factors and operations.
+    Split,
+    /// Opcode 18: one factor pair, a colour and an alpha operation, and a
+    /// byte write mask.
+    Masked,
+}
+
 /// What an instruction does — the interpreter's dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -376,6 +399,8 @@ pub enum Op {
     Smlsi,
     /// Set the four register-number base offsets (§9) \[strong\].
     SetBase,
+    /// A per-byte blend (ops 16 and 18, §11).
+    Blend(BlendForm),
     /// A vector floating-point instruction (not interpreted yet).
     Vector,
     /// Decoded, but with no known semantics.
@@ -491,6 +516,14 @@ enum Opd {
     PhasSel(u8),
     /// The vector forms' 6-bit register fields (§8; not decoded further).
     VecReg(u32),
+    /// A blend factor: complement bit, code field (low bit, width) and the
+    /// code-to-selector table (§11).
+    Factor(u32, u32, u32, &'static [u8]),
+    /// A blend operation: a 2-bit field of codes 0–3 meaning selectors 18,
+    /// 19, 22, 23 (§11).
+    BlendOp(u32),
+    /// Opcode 17's 1-bit operation: 18 or 19 (§11).
+    BlendOp1(u32),
 }
 
 /// A flag the disassembler prints when its bits differ from the encoder's
@@ -639,6 +672,35 @@ const F_EMIT_B: &[Flag] = &[
     Flag("f3.20", b(21)),
 ];
 const F_SYNCS51: &[Flag] = &[Flag("syncs?", b(51))];
+/// The blend family's header (§11).
+const F_SOP: &[Flag] = &[
+    Flag("skipinv", b(55)),
+    Flag("syncs?", b(50)),
+    Flag("end", b(54)),
+];
+const F_BLEND2: &[Flag] = &[
+    Flag("skipinv", b(55)),
+    Flag("syncs?", b(50)),
+    Flag("end", b(54)),
+    Flag("m26", b(20)),
+    Flag("am26", b(15)),
+    Flag("arev", b(14)),
+];
+const F_BLEND3: &[Flag] = &[
+    Flag("skipinv", b(55)),
+    Flag("syncs?", b(50)),
+    Flag("end", b(54)),
+    Flag("b45", b(45)),
+    Flag("b44", b(44)),
+    Flag("b46", b(46)),
+    Flag("b43", b(43)),
+];
+/// Op 23: b54 is set mid-program in the corpus, so not END there \[G\].
+const F_OP23: &[Flag] = &[
+    Flag("skipinv", b(55)),
+    Flag("syncs?", b(50)),
+    Flag("b54", b(54)),
+];
 const F_SMLSI: &[Flag] = &[Flag("end", b(50))];
 const F_VEC: &[Flag] = &[
     Flag("skipinv", b(55)),
@@ -783,6 +845,55 @@ const O_PHAS: &[Opd] = &[
     Opd::PhasSel(2),
 ];
 const O_OP205: &[Opd] = &[Opd::Field(4, 3)];
+// §11: the factor code tables, code -> encoder selector value.
+const FT_SPLIT_RGB1: &[u8] = &[0, 5, 6, 8, 9, 2, 24];
+const FT_SPLIT_RGB2: &[u8] = &[0, 5, 6, 8, 9, 2, 25];
+const FT_SPLIT_A1: &[u8] = &[0, 8, 9, 24];
+const FT_SPLIT_A2: &[u8] = &[0, 8, 9, 25];
+const FT_SHARED: &[u8] = &[0, 2, 5, 8, 4, 7, 6, 9];
+const O_BLEND2: &[Opd] = &[
+    Opd::Dst,
+    S1,
+    S2,
+    Opd::Factor(56, 38, 3, FT_SPLIT_RGB1),
+    Opd::Factor(47, 35, 3, FT_SPLIT_RGB2),
+    Opd::BlendOp(18),
+    Opd::Factor(43, 52, 2, FT_SPLIT_A1),
+    Opd::Factor(34, 41, 2, FT_SPLIT_A2),
+    Opd::BlendOp(16),
+];
+const O_BLENDM: &[Opd] = &[
+    Opd::Dst,
+    S1,
+    S2,
+    Opd::Factor(56, 38, 3, FT_SHARED),
+    Opd::Factor(47, 35, 3, FT_SHARED),
+    Opd::BlendOp(52),
+    Opd::BlendOp(41),
+    Opd::Field(43, 4),
+];
+const O_BLEND3: &[Opd] = &[
+    Opd::Dst,
+    Opd::Src0Mad { hi: false },
+    S1,
+    S2,
+    Opd::Factor(56, 38, 3, FT_SHARED),
+    Opd::Factor(47, 35, 3, FT_SHARED),
+    Opd::BlendOp1(41),
+    Opd::Field(52, 2),
+];
+const O_OP23: &[Opd] = &[
+    Opd::Dst,
+    Opd::Src0Mad { hi: false },
+    S1,
+    S2,
+    Opd::Field(40, 2),
+    Opd::Field(38, 2),
+    Opd::Field(35, 3),
+    Opd::Field(52, 2),
+];
+const O_SRC3: &[Opd] = &[Opd::Dst, Opd::Src0Mad { hi: false }, S1, S2];
+const O_DST2: &[Opd] = &[Opd::Dst, S1, S2];
 /// §9: useasm arguments 0–3 land in b47:36, b35:24, b23:12, b11:0.
 const O_FOUR12: &[Opd] = &[
     Opd::Field(36, 12),
@@ -1137,6 +1248,32 @@ static FORMS: &[Form] = &[
         ops: O_ST,
         exec: Op::Store,
     },
+    // -- ops 16–25: the per-byte blend family (§11).
+    sop(
+        16,
+        "blend2",
+        F_BLEND2,
+        RptEnc::Field(44, 3),
+        O_BLEND2,
+        Op::Blend(BlendForm::Split),
+    ),
+    sop(17, "blend3", F_BLEND3, RptEnc::None, O_BLEND3, Op::Opaque),
+    sop(
+        18,
+        "blend",
+        F_SOP,
+        RptEnc::None,
+        O_BLENDM,
+        Op::Blend(BlendForm::Masked),
+    ),
+    sop(19, "op19", F_SOP, RptEnc::Field(44, 3), O_SRC3, Op::Opaque),
+    sop(22, "op22", F_SOP, RptEnc::Field(44, 3), O_DST2, Op::Opaque),
+    Form {
+        end: None,
+        ..sop(23, "op23", F_OP23, RptEnc::Field(44, 2), O_OP23, Op::Opaque)
+    },
+    sop(24, "op24", F_SOP, RptEnc::Field(44, 3), O_DST2, Op::Opaque),
+    sop(25, "op25", F_SOP, RptEnc::Field(44, 3), O_SRC3, Op::Opaque),
     // -- vector floating point (§8): decoded to a name only.
     vector(0, b(58), 0, "vmad", O_VMAD),
     vector(0, b(58), b(58), "vmad.b58", O_VMAD),
@@ -1145,6 +1282,30 @@ static FORMS: &[Form] = &[
     vector(6, 0, 0, "vcplx", &[]),
     vector(8, 0, 0, "pck", &[]),
 ];
+
+/// A blend-family form (§11): the shared header — short predicate b58:57,
+/// END b54 — and the given repeat field.
+const fn sop(
+    hw: u64,
+    name: &'static str,
+    flags: &'static [Flag],
+    rpt: RptEnc,
+    ops: &'static [Opd],
+    exec: Op,
+) -> Form {
+    Form {
+        mask: OPCODE,
+        value: op(hw),
+        name: Name::Fixed(name),
+        inverted: 0,
+        pred: PredEnc::Short(57),
+        rpt,
+        end: Some(54),
+        flags,
+        ops,
+        exec,
+    }
+}
 
 /// An EMIT form other than 162 (§10): `sub` is its b47:44.
 const fn emit(sub: u64, name: &'static str) -> Form {
@@ -1631,6 +1792,15 @@ fn decode_opd(opd: Opd, w: u64) -> Option<Arg> {
         Opd::SmlsiField(lo) => Arg::of(hex(field(w, lo, 4) << 1)),
         Opd::PhasSel(n) => Arg::of(phas_selector(w, n)),
         Opd::VecReg(lo) => Arg::of(reg(Bank::Temp, field(w, lo, 6))),
+        Opd::Factor(comp, lo, width, table) => Arg::of(Operand::Factor {
+            value: table
+                .get(field(w, lo, width) as usize)
+                .copied()
+                .unwrap_or(0xff),
+            comp: bit(w, comp),
+        }),
+        Opd::BlendOp(lo) => Arg::of(Operand::BlendOp([18, 19, 22, 23][field(w, lo, 2) as usize])),
+        Opd::BlendOp1(n) => Arg::of(Operand::BlendOp(18 + field(w, n, 1) as u8)),
     })
 }
 
@@ -1755,6 +1925,30 @@ impl Disasm<'_> {
                 self.pc.wrapping_add((n as u32).wrapping_mul(8))
             ),
             Operand::Selector { kind, value } => write!(f, "t{kind}:{value}"),
+            Operand::Factor { value, comp } => {
+                let name = match value {
+                    0 if comp => return f.write_str("one"),
+                    0 => "zero",
+                    2 => "sat",
+                    4 => "s0",
+                    5 => "s1",
+                    6 => "s2",
+                    7 => "s0.a",
+                    8 => "s1.a",
+                    9 => "s2.a",
+                    24 => "f24",
+                    25 => "f25",
+                    _ => "f?",
+                };
+                write!(f, "{}{name}", if comp { "1-" } else { "" })
+            }
+            Operand::BlendOp(v) => f.write_str(match v {
+                18 => "add",
+                19 => "sub",
+                22 => "min?",
+                23 => "max?",
+                _ => "op?",
+            }),
         }
     }
 }
@@ -2338,6 +2532,18 @@ impl Usse {
                     }
                 }
             }
+            Op::Blend(form) => {
+                for rep in 0..insn.repeat {
+                    let x = self.read(&a[1], rep, pc, w)?;
+                    let y = self.read(&a[2], rep, pc, w)?;
+                    let old = match form {
+                        BlendForm::Masked => self.read(&a[0], rep, pc, w).unwrap_or(0),
+                        BlendForm::Split => 0,
+                    };
+                    let r = blend(insn, form, x, y, old).ok_or(unimpl(pc, w, "blend selector"))?;
+                    self.write(&a[0], rep, r, pc, w)?;
+                }
+            }
             Op::Vector => return Err(unimpl(pc, w, "vector floating point")),
             Op::Opaque => return Err(unimpl(pc, w, "unknown semantics")),
         }
@@ -2452,6 +2658,83 @@ impl Usse {
         }
         Ok(())
     }
+}
+
+/// One blend factor for byte `k` of `x` (`src1`) against `y` (`src2`), as a
+/// 0–255 weight (§11). `None` for the selectors with no known meaning, or
+/// that name `src0`, which these forms do not have. \[G\] Byte 3 is alpha.
+fn blend_factor(sel: Operand, k: usize, x: [u8; 4], y: [u8; 4]) -> Option<u32> {
+    let Operand::Factor { value, comp } = sel else {
+        return None;
+    };
+    let f = match value {
+        0 => 0,
+        // GL's SRC_ALPHA_SATURATE: min(As, 1 - Ad) on colour, one on alpha.
+        2 if k == 3 => 255,
+        2 => x[3].min(255 - y[3]),
+        5 => x[k],
+        6 => y[k],
+        8 => x[3],
+        9 => y[3],
+        _ => return None,
+    };
+    Some(u32::from(if comp { 255 - f } else { f }))
+}
+
+/// A unorm8 product, rounded to nearest \[G\].
+fn mul8(a: u8, f: u32) -> u32 {
+    (u32::from(a) * f + 127) / 255
+}
+
+/// Combines byte `k` (§11): `x·f1 OP y·f2`, saturated to 0–255. \[G\] 22 and
+/// 23 are taken as GL's MIN and MAX, which ignore the factors; `rev` swaps
+/// the subtraction (opcode 16's `b14`).
+fn blend_byte(op: Operand, rev: bool, x: u8, fx: u32, y: u8, fy: u32) -> Option<u8> {
+    let (p, q) = (mul8(x, fx), mul8(y, fy));
+    let (p, q) = if rev { (q, p) } else { (p, q) };
+    Some(match op {
+        Operand::BlendOp(18) => (p + q).min(255) as u8,
+        Operand::BlendOp(19) => p.saturating_sub(q) as u8,
+        Operand::BlendOp(22) => x.min(y),
+        Operand::BlendOp(23) => x.max(y),
+        _ => return None,
+    })
+}
+
+/// Opcodes 16 and 18 (§11): per byte, `src1·f1 OP src2·f2`. Opcode 16 has
+/// separate alpha factors and operation; opcode 18 shares its factors,
+/// applies its alpha operation to byte 3 and writes only the bytes its
+/// mask (`b46:43`, `b43 + k` for byte `k` \[G\]) enables, `old` keeping the
+/// rest.
+fn blend(insn: &Insn, form: BlendForm, x: u32, y: u32, old: u32) -> Option<u32> {
+    let a = insn.args();
+    let w = insn.word;
+    let (xb, yb, ob) = (x.to_le_bytes(), y.to_le_bytes(), old.to_le_bytes());
+    let mut out = [0u8; 4];
+    for k in 0..4 {
+        let alpha = k == 3;
+        let (f1, f2, op, rev) = match form {
+            BlendForm::Split if alpha => (a[6].op, a[7].op, a[8].op, bit(w, 14)),
+            BlendForm::Split => (a[3].op, a[4].op, a[5].op, false),
+            BlendForm::Masked => (
+                a[3].op,
+                a[4].op,
+                if alpha { a[6].op } else { a[5].op },
+                false,
+            ),
+        };
+        if form == BlendForm::Split && (bit(w, 20) || bit(w, 15)) {
+            return None;
+        }
+        if form == BlendForm::Masked && !bit(w, 43 + k as u32) {
+            out[k] = ob[k];
+            continue;
+        }
+        let fx = blend_factor(f1, k, xb, yb)?;
+        let fy = blend_factor(f2, k, xb, yb)?;
+        out[k] = blend_byte(op, rev, xb[k], fx, yb[k], fy)?;
+    }
+    Some(u32::from_le_bytes(out))
 }
 
 fn unimpl(pc: u32, word: u64, why: &'static str) -> Stop {
