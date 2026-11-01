@@ -396,6 +396,8 @@ pub enum VecOp {
     Mad,
     /// Op 1: an F32 two-source operation, sub-op `b14:12`.
     Op1,
+    /// Op 2: op 1's sub-ops on four F16 lanes, two to a 32-bit register.
+    Op2,
     /// Op 3: an operation on a general source and two internal registers,
     /// sub-op `b53:52` (or `b54:52`).
     Op3,
@@ -1533,6 +1535,7 @@ static FORMS: &[Form] = &[
     Form {
         name: Name::Dyn(vop2_name),
         pred: PredEnc::Vector3(56),
+        exec: Op::Vec(VecOp::Op2),
         ..vector(2, 0, 0, "", O_VOP)
     },
     Form {
@@ -3155,6 +3158,56 @@ impl Usse {
         self.set(loc, v, pc, w)
     }
 
+    /// Op 2 (§8.4): op 1's multiply and add on F16 lanes. Lane `k` of a
+    /// 64-bit register operand is the `k % 2` half (low first) of its
+    /// `k / 2`-th 32-bit register; swizzle codes 4 and 5 are 0 and 1 as for
+    /// F32 \[G\]. Each result is rounded to F16. The UI's textured pixel
+    /// shader scales a texel's alpha by the vertex colour's with it
+    /// (`vmul16 pa2.x, pa0.w000, pa2.wwww`).
+    fn vector16(&mut self, insn: &Insn, pc: u32) -> Result<(), Stop> {
+        use vector::{f16_to_f32, f32_to_f16};
+        let w = insn.word;
+        let a = insn.args();
+        let mask = a[0].mask.unwrap_or(0xf);
+        let lane = |u: &Self, arg: &Arg, c: usize| -> Result<f32, Stop> {
+            let sw = arg.swz.unwrap_or(vector::XYZW)[c];
+            let h = match (sw, arg.op) {
+                (4, _) => 0,
+                (5, _) => 0x3c00,
+                (6.., _) => return Err(unimpl(pc, w, "swizzle code")),
+                (_, Operand::Imm { .. }) => return Err(unimpl(pc, w, "vector immediate")),
+                (sw, op) => {
+                    let r = u.get(u.loc(op, arg.slot, sw / 2, pc, w)?);
+                    (r >> (16 * u32::from(sw % 2))) as u16
+                }
+            };
+            let h = if arg.abs { h & 0x7fff } else { h };
+            Ok(f16_to_f32(if arg.neg { h ^ 0x8000 } else { h }))
+        };
+        let mut out = [None; 4];
+        for (c, o) in out.iter_mut().enumerate() {
+            if mask >> c & 1 == 0 {
+                continue;
+            }
+            let (x, y) = (lane(self, &a[1], c)?, lane(self, &a[2], c)?);
+            *o = Some(match field(w, 12, 3) {
+                0 => x * y,
+                1 => x + y,
+                _ => return Err(unimpl(pc, w, "vector sub-op")),
+            });
+        }
+        for (c, o) in out.iter().enumerate() {
+            if let Some(r) = *o {
+                let loc = self.loc(a[0].op, a[0].slot, (c / 2) as u8, pc, w)?;
+                let shift = 16 * (c % 2) as u32;
+                let old = self.get(loc);
+                let new = old & !(0xffff << shift) | u32::from(f32_to_f16(r)) << shift;
+                self.set(loc, new, pc, w)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The vector forms (§8). A 64-bit register operand reads its four
     /// components from four consecutive 32-bit registers, and a destination
     /// writes component `k` to the `k`-th; `v0`–`v3` hold four each.
@@ -3167,6 +3220,9 @@ impl Usse {
         let mask = a[0].mask.unwrap_or(0xf);
         if v == VecOp::Pck {
             return self.pck(insn, pc);
+        }
+        if v == VecOp::Op2 {
+            return self.vector16(insn, pc);
         }
         let steps = match v {
             VecOp::Op7 => insn.repeat,
@@ -3218,7 +3274,7 @@ impl Usse {
                         }
                         f(self.vsrc(&a[2], c, step, pc, w)?)
                     }
-                    VecOp::Pck => unreachable!("handled above"),
+                    VecOp::Pck | VecOp::Op2 => unreachable!("handled above"),
                 };
                 *o = Some(r.to_bits());
             }

@@ -1455,3 +1455,19 @@ fn a_sample_goes_to_the_bus() {
         }
     ));
 }
+
+#[test]
+fn vmul16_scales_one_f16_lane_by_another() {
+    use super::vector::{f16_to_f32, f32_to_f16};
+    // The UI's textured pixel shader: `vmul16 pa2.x, pa0.w000, pa2.wwww` —
+    // the texel's alpha (pa1's high half) times the colour's (pa3's).
+    let w = 0x10c0_308a_a051_8001;
+    assert_eq!(dis(w), "vmul16.skipinv pa2.x, pa0.w000, pa2.wwww");
+    let (u, _, _) = run(&[w, nop() | b(43)], |u| {
+        u.primary[1] = u32::from(f32_to_f16(0.5)) << 16 | 0x1234;
+        u.primary[2] = 0xabcd_0000;
+        u.primary[3] = u32::from(f32_to_f16(0.75)) << 16;
+    });
+    assert_eq!(f16_to_f32(u.primary[2] as u16), 0.375);
+    assert_eq!(u.primary[2] >> 16, 0xabcd, "the other lane is kept");
+}
