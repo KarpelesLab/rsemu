@@ -110,8 +110,8 @@ machine "alphard-navi" {
   # -- SoC peripherals ---------------------------------------------------------
 
   # TMU0: channel 0 is the kernel's 1 ms tick (GIC ID 64), channel 1 its free-
-  # running clocksource. TMU1 channel 0 is a 20 ms timer on ID 68. TMU2 is
-  # mapped because the kernel's static I/O table maps it.
+  # running clocksource. TMU1 channel 0 is a 20 ms timer on ID 68. TMU2 is the
+  # SH-4A's: its firmware's OS tick (see the realtime domain below).
   object tmu0 "rcar.tmu" { clock = pclk }
   object tmu1 "rcar.tmu" { clock = pclk }
   object tmu2 "rcar.tmu" { clock = pclk }
@@ -298,6 +298,26 @@ machine "alphard-navi" {
   # word 0x40 is the A9 secondary boot address, rst's.
   object iccom "rcar.iccom" { }
 
+  # -- the realtime domain ---------------------------------------------------
+  #
+  # The H1's SH-4A. The SD system's shldr copies RTFM_SH4A_RCH100.bin to
+  # 0x96e00000; the iccom module writes its SH physical address, 0x16e00000,
+  # to rtctl and releases the core, which starts in P2 at 0xb6e00000 and
+  # rings iccom's EICR with "booted". The SH's 29-bit physical space is the
+  # ARM's DRAM from 0x80000000, and its P4 area is the same SoC registers:
+  # the mailbox, its interrupt controller (over the HPB-DMAC's status page,
+  # which keeps its own words) and TMU2, its tick. The 0xfd0x/0xfffe1 blocks
+  # its start-up writes are storage.
+  space shmem { width = 32, unassigned = unassigned }
+  object sh "cpu.sh4a" { clock = cpuclk, space = shmem, held = true }
+  object rtctl  "rcar.rtctl"  { processor = sh }
+  object shintc "rcar.shintc" { processor = sh }
+  object shfd05 "ram" { size = 64K }
+  object shfd0d "ram" { size = 4K }
+  object shfd10 "ram" { size = 4K }
+  object shfd20 "ram" { size = 4K }
+  object shfffe "ram" { size = 4K }
+
   # -- placeholders: storage, not models (see the header) ---------------------
   object extcs  "ram" { size = 4K }    # 0x18100000: a device on an LBSC chip select U-Boot probes
   object extcs3 "ram" { size = 64K }   # 0x18300000: the device on chip select 3 the SD system maps (an external abort rebooted it)
@@ -308,7 +328,6 @@ machine "alphard-navi" {
   object misc0  "ram" { size = 32K }   # 0xffc00000: 0xffc00300/400 (DMA request routing, among others)
   object vin    "ram" { size = 16K }   # 0xffc50000: video capture; the SD kernel's vc_* driver (an external abort reset it)
   object darc   "ram" { size = 4K }    # 0xffc55000: the kernel's UIO_DARC block
-  object pcu    "ram" { size = 4K }    # 0xfe400000: audio routing, dumped by route_pcu_regdmp once ACC is on
   object audio2 "ram" { size = 4K }    # 0xffda2000: audio routing, the same dump
   object hscifx "ram" { size = 4K }    # 0xffe48000: touched by hscif_phc_Exit
   object usbh2  "ram" { size = 4K }    # 0xfff70000: touched by rcar_usbh_init
@@ -359,7 +378,23 @@ machine "alphard-navi" {
   map mem 0xffc46000 size 0x100  = gpio6
   map mem 0xffc50000 size 16K    = vin
   map mem 0xffc55000 size 4K     = darc
-  map mem 0xfe400000 size 4K     = pcu
+  map mem 0xfe400000 size 4K     = rtctl
+  map mem 0xfe782000 size 0x48   = shintc.masks { priority = 1 }
+  map mem 0xfe782290 size 0x30   = shintc.enables { priority = 1 }
+
+  map shmem 0x00000000 size 512M = alias(dram, 0x20000000)
+  map shmem 0x80000000 size 512M = alias(dram, 0x20000000)
+  map shmem 0xfd050000 size 64K  = shfd05
+  map shmem 0xfd0d0000 size 4K   = shfd0d
+  map shmem 0xfd100000 size 4K   = shfd10
+  map shmem 0xfd200000 size 4K   = shfd20
+  map shmem 0xfe700000 size 4K   = iccom
+  map shmem 0xfe780000 size 8K   = intcs
+  map shmem 0xfe782000 size 0x48 = shintc.masks
+  map shmem 0xfe782290 size 0x30 = shintc.enables
+  map shmem 0xffd82000 size 0x30 = tmu2
+  map shmem 0xffd82030 size 0xfd0 = tmu2x
+  map shmem 0xfffe1000 size 4K   = shfffe
   map mem 0xffda2000 size 4K     = audio2
   map mem 0xffe48000 size 4K     = hscifx
   map mem 0xfff70000 size 4K     = usbh2
@@ -450,6 +485,11 @@ machine "alphard-navi" {
   wire scif3.rx-dreq -> hpbdmac.dreq7
   wire sdhi3.dreq    -> hpbdmac.dreq39   # traced: ch39 serves SDHI3 both ways, reprogrammed per transfer
   wire iccom.arm-irq -> gic.spi53    # ID 85: the SH-4A's doorbell
+  wire iccom.sh-irq  -> shintc.iccom # INTEVT 0x6c0: the ARM's doorbell
+  wire rtctl.hold    -> sh.hold
+  wire tmu2.irq0     -> shintc.tmu0
+  wire tmu2.irq1     -> shintc.tmu1
+  wire tmu2.irq2     -> shintc.tmu2
   wire hpbdmac.grp0  -> gic.spi110   # ID 142: channels 0-10
   wire hpbdmac.grp1  -> gic.spi111   # ID 143
   wire hpbdmac.grp2  -> gic.spi112   # ID 144

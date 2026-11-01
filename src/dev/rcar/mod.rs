@@ -19,6 +19,8 @@
 //! | [`iccom`] | `rcar.iccom` | the H1's ARM <-> SH-4A mailbox: two doorbells, each the other side's interrupt while non-zero |
 //! | [`iebus`] | `rcar.iebus` | the IEBus (AVC-LAN) controller on a silent bus: transmissions complete |
 //! | [`rst`] | `rcar.rst` | the H1's secondary-core reset control and boot address |
+//! | [`rtctl`] | `rcar.rtctl` | the H1's SH-4A reset hold and boot address |
+//! | [`shintc`] | `rcar.shintc` | the H1 SH-4A's interrupt controller: mask, per-source enables, level and INTEVT to the core |
 //! | [`sysc`] | `rcar.sysc` | the SYSC power domains: switches that complete at once, with status and completion bits |
 //! | [`du`] | `rcar.du` | the R-Car Display Unit: timing registers, up to eight planes composed from guest memory, a frame counter on the dot clock |
 //!
@@ -42,8 +44,10 @@ pub mod i2c;
 pub mod iccom;
 pub mod iebus;
 pub mod rst;
+pub mod rtctl;
 pub mod scif;
 pub mod sdhi;
+pub mod shintc;
 pub mod sysc;
 pub mod tmu;
 
@@ -56,8 +60,10 @@ pub use i2c::I2c;
 pub use iccom::Iccom;
 pub use iebus::IeBus;
 pub use rst::Rst;
+pub use rtctl::RtCtl;
 pub use scif::Scif;
 pub use sdhi::Sdhi;
+pub use shintc::ShIntc;
 pub use sysc::Sysc;
 pub use tmu::Tmu;
 
@@ -76,6 +82,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     i2c::register(registry)?;
     scif::register(registry)?;
     rst::register(registry)?;
+    rtctl::register(registry)?;
+    shintc::register(registry)?;
     sdhi::register(registry)?;
     sysc::register(registry)?;
     tmu::register(registry)?;
@@ -97,6 +105,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     i2c::bind(bindings)?;
     scif::bind(bindings)?;
     rst::bind(bindings)?;
+    rtctl::bind(bindings)?;
+    shintc::bind(bindings)?;
     sdhi::bind(bindings)?;
     sysc::bind(bindings)?;
     tmu::bind(bindings)?;
@@ -116,6 +126,8 @@ pub fn schemas() -> Vec<ClassSchema> {
         i2c::schema(),
         scif::schema(),
         rst::schema(),
+        rtctl::schema(),
+        shintc::schema(),
         sdhi::schema(),
         sysc::schema(),
         tmu::schema(),
