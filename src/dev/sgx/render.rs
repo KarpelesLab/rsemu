@@ -69,6 +69,8 @@
 //! a pixel \[G\].
 
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -300,6 +302,16 @@ struct Renderer<'a> {
     code_bases: [u32; 16],
     secondary: Box<[u32; usse::BANK_SIZE]>,
     summary: Summary,
+    /// Lines describing the work, when the caller asked for them.
+    trace: Option<Vec<String>>,
+}
+
+impl Renderer<'_> {
+    fn note(&mut self, f: impl FnOnce() -> String) {
+        if let Some(t) = &mut self.trace {
+            t.push(f());
+        }
+    }
 }
 
 /// What a program run left behind.
@@ -358,14 +370,57 @@ impl Renderer<'_> {
             }
             o.copy_from_slice(&u.output[..4]);
         }
-        if fault.is_some() {
+        let emits = bus.emits;
+        if let Some(f) = fault {
+            self.note(|| format!("  fault {f:x?}"));
             self.summary.faults += 1;
             self.summary.first_fault = self.summary.first_fault.or(fault);
         }
         Ran {
-            emits: bus.emits,
+            emits,
             ok: fault.is_none(),
         }
+    }
+}
+
+/// A state block as the tile accelerator receives it \[G\]: word 0 a
+/// header whose bits say which words follow —
+///
+/// * bit 0, bit 1: one word each (`0x01d00200`, `0x0000f000` in the UI);
+/// * always: the per-draw PDS program, a word of its size, and the
+///   per-pixel PDS program (`(w >> 28) + 1` data rows);
+/// * bit 7: two more words;
+/// * bit 9: six viewport floats: x scale, x offset, y offset, y scale, z
+///   scale, z offset.
+///
+/// Read off the four header forms the UI sends (`0xdfc3`, `0xd4c3`,
+/// `0xc440`, `0x0040`), whose per-pixel program and viewport only land on
+/// sensible values this way. Bit 6 is set in every state block and in none
+/// of the other words the state helpers emit (`0x800`, `0x2000`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StateBlock {
+    pixel_pds: u32,
+    viewport: Option<[f32; 6]>,
+}
+
+impl StateBlock {
+    fn parse(w: &[u32; 32]) -> Option<StateBlock> {
+        let hdr = w[0];
+        if hdr & 0x40 == 0 || hdr >> 16 != 0 {
+            return None;
+        }
+        let mut k = 1 + (hdr & 1) as usize + (hdr >> 1 & 1) as usize;
+        let pixel_pds = w[k + 2];
+        k += 3;
+        if hdr & 0x80 != 0 {
+            k += 2;
+        }
+        let viewport =
+            (hdr & 0x200 != 0).then(|| core::array::from_fn(|j| f32::from_bits(w[k + j])));
+        Some(StateBlock {
+            pixel_pds,
+            viewport,
+        })
     }
 }
 
@@ -399,32 +454,62 @@ struct Target {
 /// Public so that a command can be replayed against a snapshot's memory,
 /// outside a running machine.
 pub fn render_ta(gpu: &dyn GpuMemory, cmd: u32, code_bases: [u32; 16]) -> Option<Summary> {
+    render(gpu, cmd, code_bases, None).0
+}
+
+/// [`render_ta`], also describing the work line by line: each state block,
+/// each draw's vertices and pixel program, and the first pixel's outcome.
+pub fn render_ta_traced(
+    gpu: &dyn GpuMemory,
+    cmd: u32,
+    code_bases: [u32; 16],
+) -> (Option<Summary>, Vec<String>) {
+    let (s, t) = render(gpu, cmd, code_bases, Some(Vec::new()));
+    (s, t.unwrap_or_default())
+}
+
+fn render(
+    gpu: &dyn GpuMemory,
+    cmd: u32,
+    code_bases: [u32; 16],
+    trace: Option<Vec<String>>,
+) -> (Option<Summary>, Option<Vec<String>>) {
     let mut r = Renderer {
         gpu,
         code_bases,
         secondary: Box::new([0; usse::BANK_SIZE]),
         summary: Summary::default(),
+        trace,
     };
-    let regs = gpu.read(cmd + CMD_REGS)?;
-    let stream = gpu.read(cmd + CMD_STREAM)?;
-    let target = r.target(regs)?;
-    r.summary.target = target.addr;
-    r.summary.width = target.width;
-    r.summary.height = target.height;
-    let (w, h) = (target.width as usize, target.height as usize);
-    if w * h > MAX_PIXELS {
-        return None;
+    let s = r.command(cmd);
+    (s, r.trace)
+}
+
+impl Renderer<'_> {
+    fn command(&mut self, cmd: u32) -> Option<Summary> {
+        let gpu = self.gpu;
+        let r = self;
+        let regs = gpu.read(cmd + CMD_REGS)?;
+        let stream = gpu.read(cmd + CMD_STREAM)?;
+        let target = r.target(regs)?;
+        r.summary.target = target.addr;
+        r.summary.width = target.width;
+        r.summary.height = target.height;
+        let (w, h) = (target.width as usize, target.height as usize);
+        if w * h > MAX_PIXELS {
+            return None;
+        }
+        let pixel = |x: usize, y: usize| target.addr + y as u32 * target.stride + 4 * x as u32;
+        let mut tile: Vec<u32> = vec![0; w * h];
+        for (i, t) in tile.iter_mut().enumerate() {
+            *t = gpu.read(pixel(i % w, i / w)).unwrap_or(0);
+        }
+        r.walk(stream, &mut tile, w, h);
+        for (i, t) in tile.iter().enumerate() {
+            gpu.write(pixel(i % w, i / w), *t);
+        }
+        Some(r.summary)
     }
-    let pixel = |x: usize, y: usize| target.addr + y as u32 * target.stride + 4 * x as u32;
-    let mut tile: Vec<u32> = vec![0; w * h];
-    for (i, t) in tile.iter_mut().enumerate() {
-        *t = gpu.read(pixel(i % w, i / w)).unwrap_or(0);
-    }
-    r.walk(stream, &mut tile, w, h);
-    for (i, t) in tile.iter().enumerate() {
-        gpu.write(pixel(i % w, i / w), *t);
-    }
-    Some(r.summary)
 }
 
 impl Renderer<'_> {
@@ -445,7 +530,7 @@ impl Renderer<'_> {
 
     /// Walks the control stream at `at`, drawing into `tile`.
     fn walk(&mut self, mut at: u32, tile: &mut [u32], w: usize, h: usize) {
-        let mut state = [0u32; 32];
+        let mut state = 0u32;
         // [G] Until a state block sets one: the full target.
         let mut viewport = [
             w as f32 / 2.0,
@@ -463,16 +548,13 @@ impl Renderer<'_> {
                     let w1 = self.gpu.read(at + 4).unwrap_or(0);
                     let ran = self.run(pds_address(w0), w1 >> 27, [0; 3], Kind::State, &mut [0; 4]);
                     for (e, regs) in &ran.emits {
-                        if e.form != FORM_PBE && regs[3] != 0 {
-                            state = *regs;
-                            let mut k = 6;
-                            if state[0] & 0x80 != 0 {
-                                k += 2;
-                            }
-                            if state[0] & 0x200 != 0 {
-                                for (j, v) in viewport.iter_mut().enumerate() {
-                                    *v = f32::from_bits(state[k + j]);
-                                }
+                        if e.form != FORM_PBE
+                            && let Some(block) = StateBlock::parse(regs)
+                        {
+                            self.note(|| format!("state {:08x?} -> {block:x?}", &regs[..12]));
+                            state = block.pixel_pds;
+                            if let Some(vp) = block.viewport {
+                                viewport = vp;
                             }
                         }
                     }
@@ -483,7 +565,7 @@ impl Renderer<'_> {
                     for (i, v) in d.iter_mut().enumerate() {
                         *v = self.gpu.read(at + 4 * i as u32).unwrap_or(0);
                     }
-                    self.draw(&d, &state, &viewport, tile, w, h);
+                    self.draw(&d, state, &viewport, tile, w, h);
                     at = at.wrapping_add(24);
                 }
                 0xc => return,
@@ -496,7 +578,7 @@ impl Renderer<'_> {
     fn draw(
         &mut self,
         d: &[u32; 6],
-        state: &[u32; 32],
+        state: u32,
         vp: &[f32; 6],
         tile: &mut [u32],
         w: usize,
@@ -544,10 +626,22 @@ impl Renderer<'_> {
         } else {
             verts.as_chunks::<3>().0.to_vec()
         };
-        let (ppds, prows) = (pds_address(state[5]), (state[5] >> 28) + 1);
-        if state[3] == 0 {
+        let (ppds, prows) = (pds_address(state), (state >> 28) + 1);
+        self.note(|| {
+            format!(
+                "draw type {} n {count} vpds {vpds:08x} ppds {ppds:08x}/{prows} verts {:?}",
+                d[0] >> 28,
+                verts
+                    .iter()
+                    .take(4)
+                    .map(|v| v.map(|v| (v.x, v.y, v.attrs[..8].to_vec())))
+                    .collect::<Vec<_>>()
+            )
+        });
+        if state == 0 {
             return;
         }
+        let mut first = true;
         let clip = Rect {
             x0: 0,
             y0: 0,
@@ -568,6 +662,17 @@ impl Renderer<'_> {
                     Kind::Pixel(fr.attrs[0], fr.attrs[1]),
                     &mut o,
                 );
+                if first {
+                    first = false;
+                    let before = tile[i];
+                    let f = self.summary.first_fault;
+                    self.note(|| {
+                        format!(
+                            "  pixel ({}, {}) {before:08x} -> {:08x} (faults so far {f:x?})",
+                            fr.x, fr.y, o[0]
+                        )
+                    });
+                }
                 tile[i] = o[0];
                 self.summary.pixels += 1;
             });
@@ -586,6 +691,61 @@ mod tests {
         assert_eq!(pds_address(0x4f24_0e00), 0xf240_e000);
         assert_eq!(pds_address(0x1703_c80c), 0xf03c_80c0);
         assert_eq!(pds_address(0x0f01_c618), 0xf01c_6180);
+    }
+
+    fn block(words: &[u32]) -> [u32; 32] {
+        let mut w = [0; 32];
+        w[..words.len()].copy_from_slice(words);
+        w
+    }
+
+    #[test]
+    fn state_blocks_place_the_pixel_program_by_their_header() {
+        // The four header forms the UI sends, as captured.
+        let full = block(&[
+            0xdfc3,
+            0x01d0_0200,
+            0xf000,
+            0x0f03_c800,
+            0x0801_e000,
+            0x1703_c802,
+            0x8000_0018,
+            0xe,
+            0x43c8_0000,
+            0x43c8_0000,
+            0x4370_0000,
+            0xc370_0000,
+            0x3f00_0000,
+            0x3f00_0000,
+        ]);
+        let b = StateBlock::parse(&full).expect("a state block");
+        assert_eq!(b.pixel_pds, 0x1703_c802);
+        assert_eq!(b.viewport, Some([400.0, 400.0, 240.0, -240.0, 0.5, 0.5]));
+        let no_vp = block(&[
+            0xd4c3,
+            0x01d0_0200,
+            0xf000,
+            0x0f03_c800,
+            0x0801_e000,
+            0x0f01_c618,
+        ]);
+        assert_eq!(
+            StateBlock::parse(&no_vp).map(|b| (b.pixel_pds, b.viewport)),
+            Some((0x0f01_c618, None))
+        );
+        let short = block(&[0xc440, 0x0f03_c800, 0x0801_e000, 0x1703_c81e, 0x0c00_1000]);
+        assert_eq!(
+            StateBlock::parse(&short).map(|b| b.pixel_pds),
+            Some(0x1703_c81e)
+        );
+        let shortest = block(&[0x40, 0x0f03_c800, 0x0801_e000, 0x1703_c82a]);
+        assert_eq!(
+            StateBlock::parse(&shortest).map(|b| b.pixel_pds),
+            Some(0x1703_c82a)
+        );
+        // The control words the same helpers emit are not state blocks.
+        assert_eq!(StateBlock::parse(&block(&[0x800])), None);
+        assert_eq!(StateBlock::parse(&block(&[0x2000, 0x0018_000e])), None);
     }
 
     #[test]
