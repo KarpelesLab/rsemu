@@ -102,6 +102,11 @@
 //! would make the emulated machine faster than any real one and lose output
 //! under load.
 //!
+//! `TEND` is the one exception to "immediately": it sets one run slice after
+//! the FIFO empties, not on the write that emptied it. A driver that clears
+//! `TEND` right after filling `SCFTDR` and then waits on `TEIE` would
+//! otherwise erase the only end it was ever going to see.
+//!
 //! **Why not a baud-timed transmitter**: the two UARTs already in the tree do
 //! not time characters from their divisors, and for the same reason — the
 //! character rate is this device's **clock domain**, which the machine file
@@ -164,7 +169,7 @@ use crate::machine::realize::Instance;
 pub const CLASS_NAME: &str = "rcar.scif";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// How much address space the register block answers.
 ///
@@ -380,6 +385,9 @@ struct State {
     rx_armed: bool,
     /// A byte arrived since the last run slice.
     rx_fresh: bool,
+    /// The last byte left the FIFO during this run slice: `TEND` sets at
+    /// the next one (see `finish_transmit`).
+    tx_draining: bool,
     dl: u16,
     cks: u16,
     hssrr: u16,
@@ -404,6 +412,7 @@ impl State {
             lsr_seen: 0,
             rx_armed: false,
             rx_fresh: false,
+            tx_draining: false,
             dl: 0,
             cks: 0,
             hssrr: 0,
@@ -571,6 +580,7 @@ impl Scif {
     /// This is what [`Device::run`] does; a test that is not running a
     /// scheduler calls it directly.
     pub fn pump(&self) {
+        self.regs.finish_transmit();
         self.regs.pump();
     }
 
@@ -692,6 +702,24 @@ impl Registers {
         self.refresh();
     }
 
+    /// One run slice has passed since the FIFO emptied: the last stop bit
+    /// has gone with nothing behind it, and `TEND` sets.
+    ///
+    /// Not at the moment `SCFTDR` is written. A driver fills the FIFO, then
+    /// reads `SCFSR` and writes it back with `TEND` and `TDFE` cleared,
+    /// then enables `TEIE` and waits: on the part `TEND` still reads 0 at
+    /// that read, because the bytes take character times to leave. Setting
+    /// it at once let that write-back clear the only `TEND` the transfer
+    /// would ever raise, and the driver waited forever with `TDFE` holding
+    /// the line up — the navi's SCIF1 did exactly that.
+    fn finish_transmit(&self) {
+        let mut state = self.state.lock();
+        if state.tx_draining && state.tx.is_empty() {
+            state.fsr |= FSR_TEND;
+        }
+        state.tx_draining = false;
+    }
+
     /// Whether the receiver takes bytes: enabled, and not held in reset.
     fn receiving(state: &State) -> bool {
         state.scr & SCR_RE != 0 && state.fcr & FCR_RFRST == 0
@@ -723,8 +751,8 @@ impl Registers {
                 }
             }
             if moved && state.tx.is_empty() {
-                // The last stop bit has gone with nothing behind it.
-                state.fsr |= FSR_TEND;
+                // The last byte is on the wire; its stop bit has not gone yet.
+                state.tx_draining = true;
             }
             if state.fcr & FCR_LOOP == 0 && Self::receiving(&state) {
                 // Only as many as fit: bytes the host is still holding are not
@@ -948,6 +976,26 @@ impl MemOps for Registers {
     }
 }
 
+/// Snapshot upgrades for `rcar.scif`, which `crate::machine::default_migrations`
+/// calls so a save state from an older build still loads.
+///
+/// # v2 -> v3: the transmitter's last character
+///
+/// v3 appends `tx_draining`, the flag that holds `TEND` back for one run
+/// slice after the FIFO empties. A v2 build set `TEND` at once, so it never
+/// had a byte in flight: the step copies v2 verbatim and appends `false`.
+///
+/// # Errors
+///
+/// [`Error::State`] if a step is already registered for this class.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS_NAME, 2, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_bool(false)
+    })
+}
+
 /// The `rcar.scif` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
@@ -1049,6 +1097,7 @@ impl Device for Scif {
     }
 
     fn run(&self, budget: Budget) -> Consumed {
+        self.regs.finish_transmit();
         self.regs.pump();
         self.regs.tick();
         Consumed::new(budget.ticks)
@@ -1081,7 +1130,8 @@ impl Device for Scif {
             w.write_u16(half)?;
         }
         w.write_bool(state.rx_armed)?;
-        w.write_bool(state.rx_fresh)
+        w.write_bool(state.rx_fresh)?;
+        w.write_bool(state.tx_draining)
         // The port's queues are the host's state, not the machine's, and are
         // deliberately absent (`ROADMAP.md` §4.5). The variant is a
         // construction property and is the machine file's to restate.
@@ -1123,6 +1173,7 @@ impl Device for Scif {
         state.hsttrgr = r.read_u16()?;
         state.rx_armed = r.read_bool()?;
         state.rx_fresh = r.read_bool()?;
+        state.tx_draining = r.read_bool()?;
         *self.regs.state.lock() = state;
         self.regs.refresh();
         Ok(())
@@ -1260,6 +1311,8 @@ mod tests {
             write(&s, SCFTDR, 1, u32::from(b));
         }
         assert_eq!(port.drain(), b"hello".to_vec());
+        assert_eq!(fsr(&s) & FSR_TEND, 0, "the last stop bit is still going");
+        s.pump();
         assert_ne!(fsr(&s) & FSR_TEND, 0, "and the transmitter is idle again");
         assert_eq!(read(&s, SCFDR, 2) >> 8, 0);
     }
@@ -1281,7 +1334,27 @@ mod tests {
         let _ = port.drain();
         s.pump();
         assert_eq!(port.drain(), b"xy".to_vec(), "and nothing was lost");
+        s.pump();
         assert_ne!(fsr(&s) & FSR_TEND, 0);
+    }
+
+    #[test]
+    fn a_driver_that_acks_tend_after_filling_still_gets_the_end_interrupt() {
+        // The navi kernel's sequence: fill SCFTDR, read SCFSR and write it
+        // back with TEND and TDFE cleared, enable TEIE, wait for TEND.
+        let (s, port, probe) = with_irq(Variant::Scif);
+        write(&s, SCSCR, 2, u32::from(SCR_TE));
+        for &b in b"0123456789" {
+            write(&s, SCFTDR, 1, u32::from(b));
+        }
+        let seen = read(&s, SCFSR, 2);
+        assert_eq!(seen & u32::from(FSR_TEND), 0, "nothing has finished yet");
+        write(&s, SCFSR, 2, seen & !u32::from(FSR_TEND | FSR_TDFE));
+        write(&s, SCSCR, 2, u32::from(SCR_TE | SCR_TEIE));
+        assert_eq!(level(&probe), 0, "no end yet");
+        s.pump();
+        assert_eq!(port.drain(), b"0123456789".to_vec());
+        assert_eq!(level(&probe), 1, "the transmit-end interrupt arrives");
     }
 
     #[test]
@@ -1492,6 +1565,46 @@ mod tests {
             s.save(&mut chunk).unwrap();
         }
         w.to_vec().unwrap()
+    }
+
+    #[test]
+    fn a_v2_chunk_loads_into_this_build_and_the_port_runs_on() {
+        let (saved, port) = wired(Variant::Scif);
+        write(&saved, SCSCR, 2, u32::from(SCR_TE | SCR_RE));
+        port.feed(b"in");
+        saved.pump();
+        let v3 = snapshot(&saved);
+        // v2 is v3 without the trailing `tx_draining` byte.
+        let reader = StateReader::new(&v3).unwrap();
+        let (class, version, data) = reader.load_raw("scif").unwrap();
+        assert_eq!(
+            version, 3,
+            "this test knows how to undo v3 and nothing else"
+        );
+        let mut w = StateWriter::new(reader.shape().clone());
+        w.raw_chunk("scif", class, 2, &data[..data.len() - 1])
+            .unwrap();
+        let v2 = w.to_vec().unwrap();
+
+        let (restored, other) = wired(Variant::Scif);
+        let reader = StateReader::new(&v2).unwrap();
+        let chunk = reader
+            .load(
+                "scif",
+                CLASS.name,
+                CLASS.version,
+                &crate::machine::default_migrations().unwrap(),
+            )
+            .unwrap();
+        assert!(chunk.migrated(), "the chain ran");
+        restored.load(&mut chunk.reader()).unwrap();
+        let want = saved.regs.state.lock().clone();
+        assert_eq!(*restored.regs.state.lock(), want);
+        assert_eq!(read(&restored, SCFRDR, 1), u32::from(b'i'));
+        write(&restored, SCFTDR, 1, u32::from(b'o'));
+        restored.pump();
+        assert_eq!(other.drain(), b"o".to_vec(), "and it transmits");
+        assert_ne!(fsr(&restored) & FSR_TEND, 0);
     }
 
     #[test]

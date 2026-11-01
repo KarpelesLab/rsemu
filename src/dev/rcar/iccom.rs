@@ -357,7 +357,8 @@ mod tests {
             .load("iccom", CLASS.name, CLASS.version, &Migrations::new())
             .unwrap();
         back.load(&mut chunk.reader()).unwrap();
-        assert_eq!(*back.shared.state.lock(), *m.shared.state.lock());
+        let restored = back.shared.state.lock().clone();
+        assert_eq!(restored, *m.shared.state.lock());
         assert_eq!(save(&back), bytes);
     }
 }
