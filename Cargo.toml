@@ -196,6 +196,7 @@ full = [
     "dev-rcar",
     "dev-watchdog-pin",
     "dev-i2c-regfile",
+    "dev-ak77xx",
     "dev-linux-printk",
     "dev-sgx",
     "dev-navi",
@@ -1458,6 +1459,7 @@ machine-arm926 = ["cpu-arm-aprofile"]
 machine-alphard-navi = [
     "cpu-arm-aprofile-vfp",
     "cpu-sh4a",
+    "dev-ak77xx",
     "dev-navi",
     "dev-i2c-regfile",
     "dev-linux-printk",
@@ -1523,6 +1525,12 @@ dev-watchdog-pin = []
 # read back instead of timing their drivers out. A placeholder by name.
 # `no_std + alloc`, no dependencies beyond the I2C bus.
 dev-i2c-regfile = ["bus-i2c"]
+
+# An AKM AK77xx-family audio DSP's I2C command set (src/dev/ak77xx.rs,
+# `akm.ak77xx`): control registers, coefficient and program RAM downloads and
+# the CRC the host checks them with. The navi's echo canceller. No signal
+# processing. `no_std + alloc`, no dependencies beyond the I2C bus.
+dev-ak77xx = ["bus-i2c"]
 
 # A debugging tap (src/dev/linux_printk.rs, `linux.printk`): gives a Linux
 # kernel whose printk was compiled to a stub its log back, by patching the stub
