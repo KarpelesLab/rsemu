@@ -97,6 +97,7 @@
 
 mod hw;
 pub mod pds;
+pub mod raster;
 pub mod usse;
 
 use alloc::boxed::Box;
