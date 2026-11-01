@@ -448,6 +448,8 @@ pub enum Op {
     Smlsi,
     /// Set the four register-number base offsets (§9) \[strong\].
     SetBase,
+    /// A texture sample (op 28, §12): handed to [`UsseBus::sample`].
+    Sample,
     /// A per-byte blend (ops 16 and 18, §11).
     Blend(BlendForm),
     /// A vector floating-point instruction this interpreter executes (§8).
@@ -772,6 +774,16 @@ const F_EMIT_B: &[Flag] = &[
     Flag("f3.20", b(21)),
 ];
 const F_SYNCS51: &[Flag] = &[Flag("syncs?", b(51))];
+/// Op 28 (§12): the encoder's flags1.0/.2/.3/.4 and flags3.16/.2/.3.
+const F_SMP: &[Flag] = &[
+    Flag("skipinv", b(55)),
+    Flag("nosched", b(52)),
+    Flag("end", b(54)),
+    Flag("f1.4", b(53)),
+    Flag("f3.16", b(51)),
+    Flag("f3.2", b(37)),
+    Flag("f3.3", b(38)),
+];
 /// The blend family's header (§11).
 const F_SOP: &[Flag] = &[
     Flag("skipinv", b(55)),
@@ -1015,6 +1027,14 @@ const O_OP23: &[Opd] = &[
     Opd::Field(52, 2),
 ];
 const O_SRC3: &[Opd] = &[Opd::Dst, Opd::Src0Mad { hi: false }, S1, S2];
+/// §12: destination (b39 primary attribute), coordinates at `src0` and
+/// sampler state at `src1` — both register pairs, as EMIT's — and a DRC.
+const O_SMP: &[Opd] = &[
+    Opd::DstMem,
+    Opd::EmitSrc(None),
+    Opd::EmitSrc(Some(Slot::S1)),
+    Opd::Drc,
+];
 const O_DST2: &[Opd] = &[Opd::Dst, S1, S2];
 /// §9: useasm arguments 0–3 land in b47:36, b35:24, b23:12, b11:0.
 const O_FOUR12: &[Opd] = &[
@@ -1454,6 +1474,19 @@ static FORMS: &[Form] = &[
         ops: O_ST,
         exec: Op::Store,
     },
+    // -- op 28: texture sampling (§12); b43:42 is useasm 111/112/113.
+    Form {
+        mask: OPCODE,
+        value: op(28),
+        name: Name::Dyn(smp_name),
+        inverted: 0,
+        pred: PredEnc::Long(56),
+        rpt: RptEnc::Field(44, 2),
+        end: Some(54),
+        flags: F_SMP,
+        ops: O_SMP,
+        exec: Op::Sample,
+    },
     // -- ops 16–25: the per-byte blend family (§11).
     sop(
         16,
@@ -1522,6 +1555,12 @@ static FORMS: &[Form] = &[
         ..vector(8, 0, 0, "pck", O_PCK)
     },
 ];
+
+/// Op 28's variant, `b43:42` (§12): useasm 111, 112, 113 \[G: the
+/// dimensionality\].
+fn smp_name(w: u64) -> &'static str {
+    ["smp1", "smp2", "smp3", "smp.3"][field(w, 42, 2) as usize]
+}
 
 /// Op 1's sub-ops, `b14:12` (§8.4): 0 multiply \[strong\], 1 add \[G\],
 /// the rest unknown.
@@ -2488,6 +2527,33 @@ pub const EMIT_160: u8 = 5;
 /// `Emit::form` of useasm 161: `b46 | b45`.
 pub const EMIT_161: u8 = 6;
 
+/// A texture sample request (op 28, §12). The coordinates and the sampler
+/// state are what the instruction's `src0` and `src1` name — four
+/// registers from each, since how many the unit reads is not known; the
+/// bus decodes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// `b43:42`: the useasm variant (111 + n).
+    pub variant: u8,
+    /// Four registers from `src0`.
+    pub coords: [u32; 4],
+    /// Four registers from `src1`.
+    pub state: [u32; 4],
+    /// The repeat count.
+    pub repeat: u8,
+    /// The instruction word.
+    pub word: u64,
+}
+
+/// What a sample returns: up to four words for the destination registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Texel {
+    /// The words, from the destination register on.
+    pub words: [u32; 4],
+    /// How many of them to write.
+    pub count: u8,
+}
+
 /// Everything outside the engine: GPU memory and the SGX register file.
 ///
 /// Addresses are GPU virtual; translating them through the SGX MMU is the
@@ -2518,6 +2584,13 @@ pub trait UsseBus {
     fn emit(&mut self, emit: &Emit) -> MemResult {
         let _ = emit;
         Err(BusError::Unassigned)
+    }
+
+    /// Samples a texture for op 28 (§12). `None`, the default, stops the
+    /// engine with [`Stop::Unimplemented`]: texture fetch is the caller's.
+    fn sample(&mut self, req: &Sample) -> Option<MemResult<Texel>> {
+        let _ = req;
+        None
     }
 
     /// Takes an `EMIT` with the issuing engine's registers in view, for the
@@ -2966,6 +3039,33 @@ impl Usse {
                 }
             }
             Op::Vec(v) => self.vector(insn, v, pc)?,
+            Op::Sample => {
+                let four = |arg: &Arg| -> Result<[u32; 4], Stop> {
+                    let mut r = [0; 4];
+                    for (i, v) in r.iter_mut().enumerate() {
+                        *v = match arg.op {
+                            Operand::Imm { value, .. } if i == 0 => value as u32,
+                            Operand::Imm { .. } => 0,
+                            _ => self.read(arg, i as u8, pc, w)?,
+                        };
+                    }
+                    Ok(r)
+                };
+                let req = Sample {
+                    variant: field(w, 42, 2) as u8,
+                    coords: four(&a[1])?,
+                    state: four(&a[2])?,
+                    repeat: insn.repeat,
+                    word: w,
+                };
+                let texel = bus
+                    .sample(&req)
+                    .ok_or(unimpl(pc, w, "texture sample"))?
+                    .map_err(|error| Stop::Fault { pc, addr: 0, error })?;
+                for i in 0..texel.count.min(4) {
+                    self.write(&a[0], i, texel.words[usize::from(i)], pc, w)?;
+                }
+            }
             Op::Vector => return Err(unimpl(pc, w, "vector floating point")),
             Op::Opaque => return Err(unimpl(pc, w, "unknown semantics")),
         }

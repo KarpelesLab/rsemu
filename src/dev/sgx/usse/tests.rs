@@ -1392,3 +1392,65 @@ fn pck_converts_lanes() {
     });
     assert_eq!(u.output[4], 0xff00_80ff);
 }
+
+// ---------------------------------------------------------------------------
+// Texture sampling (§12)
+
+#[derive(Default)]
+struct SampleBus {
+    inner: MockBus,
+    reqs: Vec<Sample>,
+}
+
+impl UsseBus for SampleBus {
+    fn load(&mut self, addr: u32, size: Size) -> MemResult<u32> {
+        self.inner.load(addr, size)
+    }
+    fn store(&mut self, addr: u32, size: Size, value: u32) -> MemResult {
+        self.inner.store(addr, size, value)
+    }
+    fn reg_read(&mut self, index: u32) -> u32 {
+        self.inner.reg_read(index)
+    }
+    fn reg_write(&mut self, index: u32, value: u32) {
+        self.inner.reg_write(index, value)
+    }
+    fn sample(&mut self, req: &Sample) -> Option<MemResult<Texel>> {
+        self.reqs.push(*req);
+        Some(Ok(Texel {
+            words: [0xaa, 0xbb, 0, 0],
+            count: 2,
+        }))
+    }
+}
+
+/// `smp2 r1, r2, r4, drc0`: dst b27:21, coordinates src0 (pair field
+/// b20:14), state src1 (pair field b13:7), variant b43:42.
+fn smp2() -> u64 {
+    op(28) | 1 << 42 | d_r(1) | 1 << 14 | 2 << 7
+}
+
+#[test]
+fn a_sample_goes_to_the_bus() {
+    assert_eq!(dis(smp2()), "smp2 r1, r2, r4, drc0");
+    let mut bus = SampleBus {
+        inner: MockBus::program(BASE, &[smp2() | END]),
+        ..SampleBus::default()
+    };
+    let mut usse = Usse::new(BASE, 0);
+    usse.temp[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+    assert_eq!(usse.run(&mut bus, 10), Stop::End { pc: 1 });
+    assert_eq!(bus.reqs[0].variant, 1);
+    assert_eq!(bus.reqs[0].coords, [1, 2, 3, 4]);
+    assert_eq!(bus.reqs[0].state, [3, 4, 5, 6]);
+    assert_eq!(usse.temp[1..4], [0xaa, 0xbb, 2], "count limits the writes");
+    // A bus without texture support stops the engine.
+    let (_, _, stop) = run(&[smp2()], |_| {});
+    assert!(matches!(
+        stop,
+        Stop::Unimplemented {
+            why: "texture sample",
+            ..
+        }
+    ));
+}
