@@ -924,16 +924,29 @@ impl Renderer<'_> {
             };
             let f = |k: usize| f32::from_bits(o[k]);
             let cw = f(3);
-            if !ran.ok || cw == 0.0 || cw.is_nan() {
+            if !ran.ok || cw.is_nan() {
                 verts.push(None);
                 continue;
             }
-            let mut v = Vertex {
-                x: f(0) / cw * vp[0] + vp[1],
-                y: f(1) / cw * vp[3] + vp[2],
-                z: f(2) / cw * vp[4] + vp[5],
-                inv_w: 1.0 / cw,
-                ..Vertex::default()
+            // [G] A w of 0 is a vertex already in window coordinates: each
+            // UI scene opens with one triangle at (0, 0), (1600, 0),
+            // (0, 960), z 1, w 0, under a state block without a viewport,
+            // that clears the 800 x 480 target.
+            let mut v = if cw == 0.0 {
+                Vertex {
+                    x: f(0),
+                    y: f(1),
+                    z: f(2),
+                    ..Vertex::default()
+                }
+            } else {
+                Vertex {
+                    x: f(0) / cw * vp[0] + vp[1],
+                    y: f(1) / cw * vp[3] + vp[2],
+                    z: f(2) / cw * vp[4] + vp[5],
+                    inv_w: 1.0 / cw,
+                    ..Vertex::default()
+                }
             };
             for (k, a) in v.attrs.iter_mut().enumerate().take(8) {
                 *a = f(4 + k);
