@@ -1142,7 +1142,10 @@ const O_VOP7: &[Opd] = &[
     },
     Opd::Field(40, 2),
 ];
-const O_PCK: &[Opd] = &[Opd::PckFmt(41), Opd::PckFmt(38), Opd::PckDst, Opd::PckSrc];
+// The destination's format at b40:38, the source's at b43:41 \[strong\]:
+// the UI's vertex shader unpacks s16 screen positions into f32 with
+// b43:41 = 4 and b40:38 = 6, and the matrix after it needs the floats.
+const O_PCK: &[Opd] = &[Opd::PckFmt(38), Opd::PckFmt(41), Opd::PckDst, Opd::PckSrc];
 
 /// Fields used in match masks.
 const CLASS: u64 = 7 << 52; // op 31: b54:52 (§7)
@@ -2221,7 +2224,11 @@ fn decode_opd(opd: Opd, w: u64) -> Option<Arg> {
         },
         Opd::PckSrc => Arg {
             swz: Some([
-                field(w, 0, 2) as u8,
+                // [G] With b54 set, b1:0 is not lane 0's select and lane 0
+                // reads x. Both corpus uses are `f32 <- f32` copies of a
+                // vertex position into `v0` whose b1:0 is 2; only an `xyzw`
+                // copy feeds the matrix that follows a position.
+                if bit(w, 54) { 0 } else { field(w, 0, 2) as u8 },
                 field(w, 16, 2) as u8,
                 field(w, 14, 2) as u8,
                 field(w, 19, 2) as u8,
@@ -3192,7 +3199,12 @@ impl Usse {
                         }
                     }
                     VecOp::Op3 => {
-                        if vop3_sub(w) != 3 {
+                        // [G] Sub-op 2 is taken as a multiply-add too. Its
+                        // one corpus use (the UI compositor's vertex shader)
+                        // forms the texture coordinate from a constant
+                        // (0, 0, 0, 1), `v0.zzww` and `v0`: only `a·b + c`
+                        // passes the transformed coordinate through.
+                        if !matches!(vop3_sub(w), 2 | 3) {
                             return Err(unimpl(pc, w, "vector sub-op"));
                         }
                         let x = f(self.vsrc(&a[1], c, 0, pc, w)?);
@@ -3226,7 +3238,7 @@ impl Usse {
         use vector::Fmt;
         let w = insn.word;
         let a = insn.args();
-        let (dfmt, sfmt) = (Fmt::of(field(w, 41, 3)), Fmt::of(field(w, 38, 3)));
+        let (dfmt, sfmt) = (Fmt::of(field(w, 38, 3)), Fmt::of(field(w, 41, 3)));
         let norm = bit(w, 18);
         let sel = a[3].swz.unwrap_or(vector::XYZW);
         let mask = a[2].mask.unwrap_or(0);

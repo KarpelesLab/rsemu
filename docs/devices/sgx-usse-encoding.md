@@ -272,14 +272,19 @@ is F16: it takes a four-bit mask on the same register (strong).
 The encoder opcode is `302 + 7·src + dst` for formats 0–6, plus 344, 352
 and 353–355 for format 7.
 
-- **Formats:** dst at b43:41, src at b40:38. The structure is exact; the
-  names are a guess: 0 u8, 1 s8, 2 o8, 3 u16, 4 s16, 5 f16, 6 f32, 7 c10.
+- **Formats:** src at b43:41, dst at b40:38 [strong: first written the
+  other way round; the UI vertex shader's `s16` → `f32` position unpack at
+  `fe008368` only works this way]. The structure is exact; the names are a
+  guess: 0 u8, 1 s8, 2 o8, 3 u16, 4 s16, 5 f16, 6 f32, 7 c10.
 - **Lane mask:** b37:34.
 - **dst:** b27:21, the 7-bit standard destination. `r124`–`r127` are
   `v0`–`v3`.
 - **src:** the 7-bit `src1` slot.
 - **Per-lane source select:** lane 0 at b1:0, lane 1 at b17:16, lane 2 at
   b15:14, lane 3 at b20:19.
+  With b54 set, lane 0 reads x whatever b1:0 holds [G: the two corpus
+  uses, `f32 <- f32` position copies at `fe0083c8` and its twin, have
+  b1:0 = 2 and must copy `xyzw`].
 - **Other bits:**
   - b18 is flags2 bit 8, executed as the normalising scale [G];
   - b47:44 is a thermometer of the repeat count;

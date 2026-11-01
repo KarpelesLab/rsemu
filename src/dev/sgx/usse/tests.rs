@@ -1372,9 +1372,10 @@ fn the_matrix_chain_executes() {
 
 #[test]
 fn pck_converts_lanes() {
-    // pck.norm u8 <- f32: o4 bytes from pa3..pa6.
+    // pck.norm u8 <- f32: o4 bytes from pa3..pa6. The source format is at
+    // b43:41, the destination's at b40:38.
     let w = op(8)
-        | 6 << 38
+        | 6 << 41
         | b(18)
         | 0xf << 34
         | b(32)
