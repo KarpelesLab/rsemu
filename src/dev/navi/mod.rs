@@ -7,6 +7,7 @@
 //! | [`psc`] | `navi.psc` | the base board MCU's power-supply-control protocol peer |
 //! | [`dcdcad`] | `navi.dcdcad` | the DC-DC/ADC monitor on HSPI channel 0 |
 //! | [`kwiboot`] | `navi.kwiboot` | boots the product system from a `LOADING.KWI`, no flash needed |
+//! | [`scac`] | `navi.scac` | the SCAC security coprocessor, present and holding no keys |
 //!
 //! [`kwi`] reads the KWI container `kwiboot` boots from.
 
@@ -19,10 +20,12 @@ pub mod dcdcad;
 pub mod kwi;
 pub mod kwiboot;
 pub mod psc;
+pub mod scac;
 
 pub use dcdcad::Dcdcad;
 pub use kwiboot::KwiBoot;
 pub use psc::Psc;
+pub use scac::Scac;
 
 /// Add every class here to a registry.
 ///
@@ -32,6 +35,7 @@ pub use psc::Psc;
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     psc::register(registry)?;
     kwiboot::register(registry)?;
+    scac::register(registry)?;
     dcdcad::register(registry)
 }
 
@@ -43,11 +47,17 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     psc::bind(bindings)?;
     kwiboot::bind(bindings)?;
+    scac::bind(bindings)?;
     dcdcad::bind(bindings)
 }
 
 /// Every class's validator schema.
 #[must_use]
 pub fn schemas() -> Vec<ClassSchema> {
-    alloc::vec![psc::schema(), dcdcad::schema(), kwiboot::schema()]
+    alloc::vec![
+        psc::schema(),
+        dcdcad::schema(),
+        kwiboot::schema(),
+        scac::schema()
+    ]
 }
