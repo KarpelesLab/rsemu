@@ -180,8 +180,9 @@ machine "alphard-navi" {
   object rtc     "epson.rx8581" { clock = rtcxtal, bus = "i2c2", time = rtc-time }
   # The touch panel: a resistive controller whose INT is GPIO 147 (bank 4
   # pin 19), falling edge. Driven by the host pointer; the left button is the
-  # finger. Clocked only to pace its samples behind the driver.
-  object tpnl    "rohm.bu21023" { clock = wdclk, bus = "i2c2", address = 0x5c }
+  # finger. Clocked only to pace its samples behind the driver. The panel's
+  # Y runs bottom to top: a tap on a menu's lower row opened the one above.
+  object tpnl    "rohm.bu21023" { clock = wdclk, bus = "i2c2", address = 0x5c, flip-y = true }
   object e2prom  "i2c.regfile" { bus = "i2c2", addresses = "0x54, 0x55, 0x56, 0x57" }
 
   # -- kernel logs (a debugging aid, not part of the board) ------------------
@@ -221,11 +222,7 @@ machine "alphard-navi" {
   # `ans` (GPIO 115) strobes after every byte; `req` (GPIO 92) says a frame
   # waits. The host's F1-F8 and Page Up/Down press them (host::input::navi).
   object scif5 "rcar.scif" { clock = pclk / 1024, link = "tab", side = "a" }
-  # Whether the key manager counts a bitmap's bytes from its opcode (0) or
-  # from the byte before (1) is not settled yet; `-p tab-key-offset=1` tries
-  # the other.
-  param tab-key-offset = 0
-  object tab "navi.tab" { clock = wdclk, link = "tab", key-offset = tab-key-offset }
+  object tab "navi.tab" { clock = wdclk, link = "tab" }
 
   # The PowerVR SGX: a stand-in for its firmware's handshake with the host
   # driver -- start, build check, kernel commands -- and no rendering.

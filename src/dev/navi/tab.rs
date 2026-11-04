@@ -33,9 +33,10 @@
 //!
 //! A press or release queues the whole bitmap of its opcode: `0x1A` for the
 //! panel keys, `0x1D` for SEEK and the steering switches. Each key is a bit
-//! of one byte; the byte numbers count from the opcode as byte 0, moved by
-//! the `key-offset` property while that base is unconfirmed. Holding and
-//! repeating are the SoC's business.
+//! of one byte. The key manager numbers those bytes from the one before the
+//! opcode, so its byte `n` is payload byte `n - 1` (`key-offset = 1`, the
+//! default): in a live run, counting from the opcode opened nothing and this
+//! opened the screens. Holding and repeating are the SoC's business.
 //!
 //! # Sources
 //!
@@ -109,69 +110,22 @@ pub struct Key {
     bit: u8,
 }
 
-/// The controls this model knows, in the key manager's own order for the
-/// panel. The names follow the owner's manual and are not all confirmed.
+/// The controls this model knows: the ten panel keys of the key manager's
+/// own list. `info`, `audio` and `open` are confirmed by the screen each one
+/// opened. The others did nothing visible from the map-error screen they
+/// were tried on, and carry the owner's manual's remaining names, unconfirmed.
+#[rustfmt::skip]
 pub const KEYS: &[Key] = &[
-    Key {
-        name: "setup",
-        opcode: OP_PANEL,
-        byte: 9,
-        bit: 4,
-    },
-    Key {
-        name: "info",
-        opcode: OP_PANEL,
-        byte: 9,
-        bit: 6,
-    },
-    Key {
-        name: "destination",
-        opcode: OP_PANEL,
-        byte: 6,
-        bit: 4,
-    },
-    Key {
-        name: "position",
-        opcode: OP_PANEL,
-        byte: 6,
-        bit: 5,
-    },
-    Key {
-        name: "tv",
-        opcode: OP_PANEL,
-        byte: 10,
-        bit: 1,
-    },
-    Key {
-        name: "audio",
-        opcode: OP_PANEL,
-        byte: 6,
-        bit: 6,
-    },
-    Key {
-        name: "traffic",
-        opcode: OP_PANEL,
-        byte: 9,
-        bit: 5,
-    },
-    Key {
-        name: "open",
-        opcode: OP_PANEL,
-        byte: 7,
-        bit: 5,
-    },
-    Key {
-        name: "seek-down",
-        opcode: OP_STEER,
-        byte: 2,
-        bit: 2,
-    },
-    Key {
-        name: "seek-up",
-        opcode: OP_STEER,
-        byte: 2,
-        bit: 3,
-    },
+    Key { name: "setup", opcode: OP_PANEL, byte: 9, bit: 5 },
+    Key { name: "info", opcode: OP_PANEL, byte: 9, bit: 4 },
+    Key { name: "destination", opcode: OP_PANEL, byte: 6, bit: 4 },
+    Key { name: "position", opcode: OP_PANEL, byte: 6, bit: 5 },
+    Key { name: "tv", opcode: OP_PANEL, byte: 10, bit: 1 },
+    Key { name: "audio", opcode: OP_PANEL, byte: 9, bit: 6 },
+    Key { name: "traffic", opcode: OP_PANEL, byte: 6, bit: 6 },
+    Key { name: "open", opcode: OP_PANEL, byte: 7, bit: 5 },
+    Key { name: "seek-down", opcode: OP_STEER, byte: 2, bit: 2 },
+    Key { name: "seek-up", opcode: OP_STEER, byte: 2, bit: 3 },
 ];
 
 /// The key named `name`.
@@ -294,7 +248,7 @@ impl Tab {
     pub fn new(props: &Props) -> Result<Tab> {
         let mut r = props.reader();
         let link = r.require_str("link")?.to_string();
-        let offset = r.or_range("key-offset", 0u64, 0..=1)? as usize;
+        let offset = r.or_range("key-offset", 1u64, 0..=1)? as usize;
         r.finish()?;
         let link = links::attach(props, &link)?;
         Ok(Tab::on(link, offset))
@@ -388,7 +342,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "key-offset",
             kind: ValueKind::Uint,
             required: false,
-            summary: "0 if key byte numbers count from the opcode, 1 if from the byte before it",
+            summary: "1 (default) if key byte numbers count from the byte before the opcode, 0 if from it",
         },
     ],
     construct: |props| Ok(Box::new(Tab::new(props)?)),
@@ -537,7 +491,7 @@ mod tests {
 
     fn tab() -> (Tab, Arc<crate::bus::uart::LinkEnd>) {
         let link = Arc::new(UartLink::new());
-        let t = Tab::on(Arc::clone(&link), 0);
+        let t = Tab::on(Arc::clone(&link), 1);
         link.respond_on_b(Arc::clone(&t.shared) as Arc<dyn Responder>);
         (t, link.end(Side::A))
     }
@@ -576,7 +530,11 @@ mod tests {
         let mut frame = alloc::vec![FRAME, (PANEL_LEN + 3) as u8];
         frame.extend_from_slice(&rest);
         assert_eq!(frame[2], OP_PANEL);
-        assert_eq!(frame[2 + 6], 1 << 6, "AUDIO: byte 6 bit 6, from the opcode");
+        assert_eq!(
+            frame[2 + 8],
+            1 << 6,
+            "AUDIO: the key manager's byte 9, bit 6"
+        );
         assert_eq!(
             frame.iter().fold(0u8, |a, b| a.wrapping_add(*b)),
             0,
@@ -596,7 +554,11 @@ mod tests {
         let again = clock(&soc, &[READ, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
         assert_eq!(first, again);
         assert_eq!(first[3], OP_STEER);
-        assert_eq!(first[5], 1 << 3, "SEEK up: byte 2 bit 3 of 0x1D");
+        assert_eq!(
+            first[4],
+            1 << 3,
+            "SEEK up: the key manager's byte 2, bit 3, of 0x1D"
+        );
     }
 
     #[test]

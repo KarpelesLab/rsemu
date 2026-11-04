@@ -13,7 +13,8 @@
 //! | Page Up / Page Down | SEEK up / down |
 //!
 //! They reach the unit as its audio microcontroller sends them, over TAB-II
-//! (`navi.tab`).
+//! (`navi.tab`). Info, AUDIO and Open are confirmed by the screens they
+//! open; `navi.tab`'s key table says which of the rest are guesses.
 
 use alloc::sync::Arc;
 
