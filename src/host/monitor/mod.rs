@@ -142,6 +142,13 @@ pub struct Env<'a> {
     /// `cont` runs to here; without one it runs until the session is
     /// interrupted.
     pub deadline: Option<GlobalTime>,
+    /// Where `pointer` posts: the machine's recorder and the input channel
+    /// this session registered on it, so a scripted touch is recorded and
+    /// replayed like a VNC client's.
+    pub input: Option<(
+        alloc::sync::Arc<crate::core::record::Recorder>,
+        crate::core::record::Channel,
+    )>,
 }
 
 /// The console's own state: which processor commands act on, and whether the
@@ -274,6 +281,7 @@ impl Monitor {
             "write" => Response::stay(self.write(target, &args, false)),
             "writep" => Response::stay(self.write(target, &args, true)),
 
+            "pointer" => Response::stay(pointer(env, &args)),
             "save" => Response::stay(save(target.machine(), args.first().copied())),
             "load" => Response::stay(load(target.machine_mut(), args.first().copied())),
             "timeline" => Response::stay(timeline(env)),
@@ -897,6 +905,43 @@ fn wires(machine: &Machine) -> String {
     out
 }
 
+/// `pointer <x> <y> [buttons]` — post a pointer event, as a VNC client would.
+///
+/// It is delivered at the next round boundary of the following `run`, through
+/// the session's recorded input channel: a touch screen sees bit 0 of
+/// `buttons` as the finger.
+fn pointer(env: &Env<'_>, args: &[&str]) -> String {
+    let Some((recorder, channel)) = &env.input else {
+        return String::from(
+            "this session has no input channel (it needs deterministic threading)\n",
+        );
+    };
+    let parse = |i: usize, default: Option<u32>| -> core::result::Result<u32, String> {
+        match args.get(i) {
+            Some(w) => parse_number(w).map_err(|_| format!("`{w}` is not a number\n")),
+            None => default.ok_or_else(|| String::from("usage: pointer <x> <y> [buttons]\n")),
+        }
+    };
+    let (x, y, buttons) = match (parse(0, None), parse(1, None), parse(2, Some(0))) {
+        (Ok(x), Ok(y), Ok(b)) if b <= 0xff => (x, y, b as u8),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        _ => return String::from("buttons is a byte\n"),
+    };
+    let event = crate::host::input::InputEvent::Pointer { x, y, buttons };
+    match recorder.post(channel, &event.encode()) {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
+/// Decimal, or hex with `0x`.
+fn parse_number(w: &str) -> core::result::Result<u32, core::num::ParseIntError> {
+    match w.strip_prefix("0x") {
+        Some(h) => u32::from_str_radix(h, 16),
+        None => w.parse(),
+    }
+}
+
 /// `save <file>` — a machine snapshot on the host's disk.
 fn save(machine: &Machine, path: Option<&str>) -> String {
     let Some(path) = path else {
@@ -1150,6 +1195,7 @@ memory
 state
   time                  the current virtual instant
   hash                  the machine state hash (ROADMAP.md \u{a7}0)
+  pointer <x> <y> [btn] post a pointer event (bit 0 of btn: left / finger)
   save <file>           write a snapshot
   load <file>           restore one
   timeline              the rewind history: cadence, keyframes, bytes held

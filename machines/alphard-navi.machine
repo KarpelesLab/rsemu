@@ -171,7 +171,10 @@ machine "alphard-navi" {
   object rcam    "i2c.regfile" { bus = "i2c1", addresses = "0x20" }   # ADV7180 rear camera decoder
   object usbhub  "i2c.regfile" { bus = "i2c1", addresses = "0x2c" }
   object rtc     "i2c.regfile" { bus = "i2c2", addresses = "0x51" }   # RA-8581SA
-  object tpnl    "i2c.regfile" { bus = "i2c2", addresses = "0x5c" }   # touch panel
+  # The touch panel: a resistive controller whose INT is GPIO 147 (bank 4
+  # pin 19), falling edge. Driven by the host pointer; the left button is the
+  # finger. Clocked only to pace its samples behind the driver.
+  object tpnl    "rohm.bu21023" { clock = wdclk, bus = "i2c2", address = 0x5c }
   object e2prom  "i2c.regfile" { bus = "i2c2", addresses = "0x54, 0x55, 0x56, 0x57" }
 
   # -- kernel logs (a debugging aid, not part of the board) ------------------
@@ -472,6 +475,7 @@ machine "alphard-navi" {
   wire gpio6.irq   -> gic.spi147      # ID 179
   wire mapcard.cd  -> gpio2.in26      # GPIO 90: SDHI3's card-detect switch, low when a card is in
   wire mapcard.cd  -> gpio2.in28      # GPIO 92: the same switch as userspace watches it (falling edge)
+  wire tpnl.int    -> gpio4.in19      # GPIO 147: the touch panel, active low
   wire gpio4.out28 -> subwdt.kick     # GPIO 4.28: the watchdog kick
   wire i2c0.irq    -> gic.spi79       # ID 111
   wire i2c1.irq    -> gic.spi82       # ID 114

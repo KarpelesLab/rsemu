@@ -241,6 +241,10 @@ pub mod i2c_regfile;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-ak77xx")))]
 pub mod ak77xx;
 
+#[cfg(feature = "dev-bu21023")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-bu21023")))]
+pub mod bu21023;
+
 #[cfg(feature = "dev-linux-printk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-linux-printk")))]
 pub mod linux_printk;

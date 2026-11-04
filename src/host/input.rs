@@ -1209,6 +1209,10 @@ pub mod amiga;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-mac")))]
 pub mod mac;
 
+#[cfg(feature = "dev-bu21023")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-bu21023")))]
+pub mod touch;
+
 #[cfg(test)]
 mod tests {
     use super::*;

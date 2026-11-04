@@ -1354,6 +1354,8 @@ fn install_capture(
     // built.
     #[cfg(feature = "dev-usb-hid")]
     rsemu::host::input::mouse::capture::install(options)?;
+    #[cfg(feature = "dev-bu21023")]
+    rsemu::host::input::touch::capture::install(options)?;
     #[cfg(feature = "dev-nes-apu")]
     rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
     // The other three sound chips, and unlike the NES's these are installed
@@ -1819,10 +1821,26 @@ fn monitor_session(
     let deadline = args
         .span_given
         .then(|| target.machine().now().saturating_add(args.span));
+    // The pointer, for scripted input: the board's sinks behind a feed on a
+    // channel of this session's own, registered on the recorder before the
+    // first run so `pointer` is recorded like a VNC client's events.
+    let input = timeline.as_ref().and_then(|t| {
+        let recorder = Arc::clone(t.recorder());
+        let feed = Arc::new(rsemu::host::input::Feed::new());
+        for sink in input_sinks(hosts) {
+            feed.attach(sink);
+        }
+        let channel = rsemu::host::input::channel("mon");
+        recorder
+            .register(channel.clone(), rsemu::host::input::sink(&feed))
+            .ok()
+            .map(|()| (recorder, channel))
+    });
     let mut env = Env {
         hosts: Some(hosts),
         timeline: timeline.as_mut(),
         deadline,
+        input,
     };
 
     if !args.quiet {
@@ -2643,7 +2661,7 @@ fn interact(
 /// get scan codes typed into it, because a serial console is not a keyboard.
 /// The input sinks a live frontend feeds: whichever of a keyboard, pads and
 /// pointers this board opened. Shared by `--vnc` and `--window`.
-#[cfg(any(feature = "vnc", feature = "window"))]
+#[cfg(any(feature = "vnc", feature = "window", feature = "monitor"))]
 fn input_sinks(hosts: &HostObjects) -> Vec<Arc<dyn rsemu::host::input::InputSink>> {
     let mut sinks: Vec<Arc<dyn rsemu::host::input::InputSink>> = Vec::new();
 
@@ -2687,6 +2705,11 @@ fn input_sinks(hosts: &HostObjects) -> Vec<Arc<dyn rsemu::host::input::InputSink
     #[cfg(feature = "dev-mac")]
     if let Some(mouse) = rsemu::host::input::mac::MacMouseSink::open(hosts) {
         sinks.push(Arc::new(mouse));
+    }
+    // A touch screen: the pointer's left button is the finger.
+    #[cfg(feature = "dev-bu21023")]
+    if let Some(touch) = rsemu::host::input::touch::TouchSink::open(hosts) {
+        sinks.push(Arc::new(touch));
     }
     sinks
 }

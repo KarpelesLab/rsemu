@@ -197,6 +197,7 @@ full = [
     "dev-watchdog-pin",
     "dev-i2c-regfile",
     "dev-ak77xx",
+    "dev-bu21023",
     "dev-linux-printk",
     "dev-sgx",
     "dev-navi",
@@ -1460,6 +1461,7 @@ machine-alphard-navi = [
     "cpu-arm-aprofile-vfp",
     "cpu-sh4a",
     "dev-ak77xx",
+    "dev-bu21023",
     "dev-navi",
     "dev-i2c-regfile",
     "dev-linux-printk",
@@ -1531,6 +1533,12 @@ dev-i2c-regfile = ["bus-i2c"]
 # the CRC the host checks them with. The navi's echo canceller. No signal
 # processing. `no_std + alloc`, no dependencies beyond the I2C bus.
 dev-ak77xx = ["bus-i2c"]
+
+# A ROHM BU21023-class resistive touch controller on I2C (src/dev/bu21023.rs,
+# `rohm.bu21023`): the register file, the firmware download and start-up
+# handshake, and one active-low interrupt per sample, fed by the host pointer.
+# The navi's touch panel. `no_std + alloc`, no dependencies beyond the I2C bus.
+dev-bu21023 = ["bus-i2c"]
 
 # A debugging tap (src/dev/linux_printk.rs, `linux.printk`): gives a Linux
 # kernel whose printk was compiled to a stub its log back, by patching the stub

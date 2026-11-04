@@ -76,6 +76,7 @@ fn script(machine: &mut Machine, hosts: &HostObjects, lines: &[&str]) -> String 
         // and never come back.
         deadline: Some(GlobalTime::from_nanos(1_000_000)),
         timeline: None,
+        input: None,
     };
     let mut out = String::new();
     for line in lines {
@@ -302,6 +303,7 @@ fn quit_and_its_spellings_end_the_session() {
         hosts: Some(&hosts),
         timeline: None,
         deadline: None,
+        input: None,
     };
     for spelling in ["quit", "q", "exit"] {
         let response = monitor.execute(&mut target, &mut env, spelling);
@@ -504,6 +506,7 @@ fn step_moves_the_program_counter_and_status_admits_it() {
         hosts: Some(&hosts),
         timeline: None,
         deadline: None,
+        input: None,
     };
     let quiet = monitor.execute(&mut target, &mut env, "status");
     assert!(
@@ -665,6 +668,7 @@ fn rewind_puts_the_machine_back_where_it_was() {
         hosts: Some(&hosts),
         timeline: Some(&mut timeline),
         deadline: None,
+        input: None,
     };
 
     // Two virtual seconds, so the default one-second cadence has taken
@@ -718,6 +722,7 @@ fn a_deadline_bounds_a_cont_that_named_no_span() {
         hosts: Some(&hosts),
         timeline: None,
         deadline: Some(GlobalTime::from_nanos(120_000_000)),
+        input: None,
     };
     let response = monitor.execute(&mut target, &mut env, "cont");
     assert_eq!(response.flow, Flow::Advance(None));
@@ -741,6 +746,7 @@ fn an_advance_stops_when_the_session_says_to() {
         hosts: Some(&hosts),
         timeline: None,
         deadline: None,
+        input: None,
     };
     let mut slices = 0;
     monitor.advance(

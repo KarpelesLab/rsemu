@@ -1261,6 +1261,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::i2c_regfile::register(&mut reg)?;
     #[cfg(feature = "dev-ak77xx")]
     crate::dev::ak77xx::register(&mut reg)?;
+    #[cfg(feature = "dev-bu21023")]
+    crate::dev::bu21023::register(&mut reg)?;
     #[cfg(feature = "dev-linux-printk")]
     crate::dev::linux_printk::register(&mut reg)?;
     #[cfg(feature = "dev-sgx")]
@@ -1434,6 +1436,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::i2c_regfile::bind(&mut b)?;
     #[cfg(feature = "dev-ak77xx")]
     crate::dev::ak77xx::bind(&mut b)?;
+    #[cfg(feature = "dev-bu21023")]
+    crate::dev::bu21023::bind(&mut b)?;
     #[cfg(feature = "dev-linux-printk")]
     crate::dev::linux_printk::bind(&mut b)?;
     #[cfg(feature = "dev-sgx")]
@@ -1620,6 +1624,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::i2c_regfile::schema());
     #[cfg(feature = "dev-ak77xx")]
     table.insert(crate::dev::ak77xx::schema());
+    #[cfg(feature = "dev-bu21023")]
+    table.insert(crate::dev::bu21023::schema());
     #[cfg(feature = "dev-linux-printk")]
     table.insert(crate::dev::linux_printk::schema());
     #[cfg(feature = "dev-sgx")]
