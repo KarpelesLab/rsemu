@@ -20,6 +20,16 @@
 //! Each direction holds [`LINK_CAPACITY`] bytes and then refuses, so a
 //! transmitter whose peer is not reading sees its FIFO stay full, as a UART
 //! with flow control does. No framing, no baud rate: bytes.
+//!
+//! # Clocked-synchronous peers
+//!
+//! On a synchronous serial line the master's clock moves a byte each way at
+//! once: every byte end `a` sends clocks one back. A peer that works that way
+//! installs a [`Responder`] on end `b`, and a write on end `a` then calls it
+//! byte by byte and queues each reply for end `a` to read **before the write
+//! returns**. Polling from its own run slice instead would put the reply a
+//! scheduler round or two behind the byte, which is later than a master that
+//! times its slave's answer will wait for.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -52,10 +62,21 @@ impl Side {
     }
 }
 
+/// A clocked-synchronous peer on end `b`: answers each byte end `a` sends.
+pub trait Responder: Send + Sync + fmt::Debug {
+    /// End `a` clocked out `byte`; return the byte clocked back.
+    ///
+    /// Called from inside end `a`'s write, so with the transmitting device's
+    /// own lock held: take only a [`LockRank::LEAF`] lock here, and make no
+    /// outward call (drive a wire from the device's own run slice instead).
+    fn clock(&self, byte: u8) -> u8;
+}
+
 /// Two queues: what end `a` has sent and `b` has not read, and the reverse.
 pub struct UartLink {
     a_to_b: Mutex<VecDeque<u8>>,
     b_to_a: Mutex<VecDeque<u8>>,
+    responder: Mutex<Option<Arc<dyn Responder>>>,
 }
 
 impl fmt::Debug for UartLink {
@@ -80,7 +101,15 @@ impl UartLink {
         UartLink {
             a_to_b: Mutex::with_rank(LockRank::LEAF, VecDeque::new()),
             b_to_a: Mutex::with_rank(LockRank::LEAF, VecDeque::new()),
+            responder: Mutex::with_rank(LockRank::LEAF, None),
         }
+    }
+
+    /// Make end `b` a clocked-synchronous peer: from now on each byte end `a`
+    /// writes is handed to `responder` at once, and its answer is what end
+    /// `a` reads. Nothing end `a` writes reaches end `b`'s queue any more.
+    pub fn respond_on_b(&self, responder: Arc<dyn Responder>) {
+        *self.responder.lock() = Some(responder);
     }
 
     /// One end, as a character device.
@@ -125,6 +154,21 @@ impl CharDevice for LinkEnd {
     }
 
     fn write(&self, src: &[u8]) -> usize {
+        if self.side == Side::A {
+            let responder = self.link.responder.lock().clone();
+            if let Some(responder) = responder {
+                let mut sent = 0;
+                for &byte in src {
+                    if self.link.b_to_a.lock().len() >= LINK_CAPACITY {
+                        break;
+                    }
+                    let reply = responder.clock(byte);
+                    self.link.b_to_a.lock().push_back(reply);
+                    sent += 1;
+                }
+                return sent;
+            }
+        }
         let (_, outbound) = self.link.queues(self.side);
         let mut q = outbound.lock();
         let n = src.len().min(LINK_CAPACITY - q.len());
@@ -172,6 +216,26 @@ pub mod links {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct Echo;
+    impl Responder for Echo {
+        fn clock(&self, byte: u8) -> u8 {
+            !byte
+        }
+    }
+
+    #[test]
+    fn a_synchronous_peer_answers_inside_the_write() {
+        let link = Arc::new(UartLink::new());
+        let (a, b) = (link.end(Side::A), link.end(Side::B));
+        link.respond_on_b(Arc::new(Echo));
+        assert_eq!(a.write(&[0x0f, 0x55]), 2);
+        let mut got = [0u8; 4];
+        assert_eq!(a.read(&mut got), 2, "already there");
+        assert_eq!(&got[..2], [0xf0, 0xaa]);
+        assert_eq!(b.read(&mut got), 0, "nothing queued for end b");
+    }
 
     #[test]
     fn what_one_end_writes_the_other_reads() {
