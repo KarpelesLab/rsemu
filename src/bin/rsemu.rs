@@ -1356,6 +1356,8 @@ fn install_capture(
     rsemu::host::input::mouse::capture::install(options)?;
     #[cfg(feature = "dev-bu21023")]
     rsemu::host::input::touch::capture::install(options)?;
+    #[cfg(feature = "dev-navi")]
+    rsemu::host::input::navi::capture::install(options)?;
     #[cfg(feature = "dev-nes-apu")]
     rsemu::host::audio::nes::capture::install(options, ring_for(args))?;
     // The other three sound chips, and unlike the NES's these are installed
@@ -2710,6 +2712,11 @@ fn input_sinks(hosts: &HostObjects) -> Vec<Arc<dyn rsemu::host::input::InputSink
     #[cfg(feature = "dev-bu21023")]
     if let Some(touch) = rsemu::host::input::touch::TouchSink::open(hosts) {
         sinks.push(Arc::new(touch));
+    }
+    // The navi's buttons, on function keys.
+    #[cfg(feature = "dev-navi")]
+    if let Some(keys) = rsemu::host::input::navi::NaviKeySink::open(hosts) {
+        sinks.push(Arc::new(keys));
     }
     sinks
 }

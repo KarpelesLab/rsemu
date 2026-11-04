@@ -8,6 +8,7 @@
 //! | [`dcdcad`] | `navi.dcdcad` | the DC-DC/ADC monitor on HSPI channel 0 |
 //! | [`kwiboot`] | `navi.kwiboot` | boots the product system from a `LOADING.KWI`, no flash needed |
 //! | [`scac`] | `navi.scac` | the SCAC security coprocessor, present and holding no keys |
+//! | [`tab`] | `navi.tab` | the audio microcontroller on TAB-II: panel keys and steering switches |
 //!
 //! [`kwi`] reads the KWI container `kwiboot` boots from.
 
@@ -21,11 +22,13 @@ pub mod kwi;
 pub mod kwiboot;
 pub mod psc;
 pub mod scac;
+pub mod tab;
 
 pub use dcdcad::Dcdcad;
 pub use kwiboot::KwiBoot;
 pub use psc::Psc;
 pub use scac::Scac;
+pub use tab::Tab;
 
 /// Add every class here to a registry.
 ///
@@ -36,6 +39,7 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     psc::register(registry)?;
     kwiboot::register(registry)?;
     scac::register(registry)?;
+    tab::register(registry)?;
     dcdcad::register(registry)
 }
 
@@ -48,6 +52,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     psc::bind(bindings)?;
     kwiboot::bind(bindings)?;
     scac::bind(bindings)?;
+    tab::bind(bindings)?;
     dcdcad::bind(bindings)
 }
 

@@ -1213,6 +1213,10 @@ pub mod mac;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-bu21023")))]
 pub mod touch;
 
+#[cfg(feature = "dev-navi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-navi")))]
+pub mod navi;
+
 #[cfg(test)]
 mod tests {
     use super::*;

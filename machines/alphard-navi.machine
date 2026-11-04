@@ -216,7 +216,16 @@ machine "alphard-navi" {
 
   object psc "navi.psc" { clock = wdclk, link = "psc", side = "b", log = "psc" }
   object scif4 "rcar.scif" { clock = pclk / 1024, port = "scif4" }
-  object scif5 "rcar.scif" { clock = pclk / 1024, port = "scif5" }
+  # SCIF5 is TAB-II, clocked-synchronous, to the audio microcontroller: the
+  # panel keys and the steering switches arrive on it as switch bitmaps.
+  # `ans` (GPIO 115) strobes after every byte; `req` (GPIO 92) says a frame
+  # waits. The host's F1-F8 and Page Up/Down press them (host::input::navi).
+  object scif5 "rcar.scif" { clock = pclk / 1024, link = "tab", side = "a" }
+  # Whether the key manager counts a bitmap's bytes from its opcode (0) or
+  # from the byte before (1) is not settled yet; `-p tab-key-offset=1` tries
+  # the other.
+  param tab-key-offset = 0
+  object tab "navi.tab" { clock = wdclk, link = "tab", key-offset = tab-key-offset }
 
   # The PowerVR SGX: a stand-in for its firmware's handshake with the host
   # driver -- start, build check, kernel commands -- and no rendering.
@@ -481,7 +490,8 @@ machine "alphard-navi" {
   wire gpio5.irq   -> gic.spi146      # ID 178
   wire gpio6.irq   -> gic.spi147      # ID 179
   wire mapcard.cd  -> gpio2.in26      # GPIO 90: SDHI3's card-detect switch, low when a card is in
-  wire mapcard.cd  -> gpio2.in28      # GPIO 92: the same switch as userspace watches it (falling edge)
+  wire tab.req     -> gpio2.in28      # GPIO 92: TAB-II data ready
+  wire tab.ans     -> gpio3.in19      # GPIO 115: TAB-II answer strobe, rising edge
   wire tpnl.int    -> gpio4.in19      # GPIO 147: the touch panel, active low
   wire gpio4.out28 -> subwdt.kick     # GPIO 4.28: the watchdog kick
   wire i2c0.irq    -> gic.spi79       # ID 111

@@ -282,6 +282,7 @@ impl Monitor {
             "writep" => Response::stay(self.write(target, &args, true)),
 
             "pointer" => Response::stay(pointer(env, &args)),
+            "key" => Response::stay(key(env, &args)),
             "save" => Response::stay(save(target.machine(), args.first().copied())),
             "load" => Response::stay(load(target.machine_mut(), args.first().copied())),
             "timeline" => Response::stay(timeline(env)),
@@ -934,6 +935,37 @@ fn pointer(env: &Env<'_>, args: &[&str]) -> String {
     }
 }
 
+/// `key <keysym> <down|up>` — post a key event, as a VNC client would.
+///
+/// The keysym is an X11 keysym number (`0xffc3` is F6), delivered like
+/// `pointer`'s events.
+fn key(env: &Env<'_>, args: &[&str]) -> String {
+    let Some((recorder, channel)) = &env.input else {
+        return String::from(
+            "this session has no input channel (it needs deterministic threading)\n",
+        );
+    };
+    let (Some(sym), Some(dir)) = (args.first(), args.get(1)) else {
+        return String::from("usage: key <keysym> <down|up>\n");
+    };
+    let Ok(sym) = parse_number(sym) else {
+        return format!("`{sym}` is not a keysym number\n");
+    };
+    let down = match *dir {
+        "down" => true,
+        "up" => false,
+        _ => return String::from("usage: key <keysym> <down|up>\n"),
+    };
+    let event = crate::host::input::InputEvent::Key {
+        keysym: crate::host::input::Keysym(sym),
+        down,
+    };
+    match recorder.post(channel, &event.encode()) {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
 /// Decimal, or hex with `0x`.
 fn parse_number(w: &str) -> core::result::Result<u32, core::num::ParseIntError> {
     match w.strip_prefix("0x") {
@@ -1196,6 +1228,7 @@ state
   time                  the current virtual instant
   hash                  the machine state hash (ROADMAP.md \u{a7}0)
   pointer <x> <y> [btn] post a pointer event (bit 0 of btn: left / finger)
+  key <keysym> <down|up> post a key event (an X11 keysym, e.g. 0xffc3 for F6)
   save <file>           write a snapshot
   load <file>           restore one
   timeline              the rewind history: cadence, keyframes, bytes held
