@@ -1263,6 +1263,8 @@ pub fn registry() -> Result<Registry> {
     crate::dev::ak77xx::register(&mut reg)?;
     #[cfg(feature = "dev-bu21023")]
     crate::dev::bu21023::register(&mut reg)?;
+    #[cfg(feature = "dev-rx8581")]
+    crate::dev::rx8581::register(&mut reg)?;
     #[cfg(feature = "dev-linux-printk")]
     crate::dev::linux_printk::register(&mut reg)?;
     #[cfg(feature = "dev-sgx")]
@@ -1438,6 +1440,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::dev::ak77xx::bind(&mut b)?;
     #[cfg(feature = "dev-bu21023")]
     crate::dev::bu21023::bind(&mut b)?;
+    #[cfg(feature = "dev-rx8581")]
+    crate::dev::rx8581::bind(&mut b)?;
     #[cfg(feature = "dev-linux-printk")]
     crate::dev::linux_printk::bind(&mut b)?;
     #[cfg(feature = "dev-sgx")]
@@ -1626,6 +1630,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::dev::ak77xx::schema());
     #[cfg(feature = "dev-bu21023")]
     table.insert(crate::dev::bu21023::schema());
+    #[cfg(feature = "dev-rx8581")]
+    table.insert(crate::dev::rx8581::schema());
     #[cfg(feature = "dev-linux-printk")]
     table.insert(crate::dev::linux_printk::schema());
     #[cfg(feature = "dev-sgx")]

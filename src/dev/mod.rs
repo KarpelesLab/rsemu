@@ -245,6 +245,10 @@ pub mod ak77xx;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-bu21023")))]
 pub mod bu21023;
 
+#[cfg(feature = "dev-rx8581")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-rx8581")))]
+pub mod rx8581;
+
 #[cfg(feature = "dev-linux-printk")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-linux-printk")))]
 pub mod linux_printk;

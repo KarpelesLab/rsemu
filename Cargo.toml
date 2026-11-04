@@ -198,6 +198,7 @@ full = [
     "dev-i2c-regfile",
     "dev-ak77xx",
     "dev-bu21023",
+    "dev-rx8581",
     "dev-linux-printk",
     "dev-sgx",
     "dev-navi",
@@ -1462,6 +1463,7 @@ machine-alphard-navi = [
     "cpu-sh4a",
     "dev-ak77xx",
     "dev-bu21023",
+    "dev-rx8581",
     "dev-navi",
     "dev-i2c-regfile",
     "dev-linux-printk",
@@ -1539,6 +1541,12 @@ dev-ak77xx = ["bus-i2c"]
 # handshake, and one active-low interrupt per sample, fed by the host pointer.
 # The navi's touch panel. `no_std + alloc`, no dependencies beyond the I2C bus.
 dev-bu21023 = ["bus-i2c"]
+
+# An Epson RX-8581 real-time clock on I2C (src/dev/rx8581.rs, `epson.rx8581`):
+# the BCD calendar counting on its own 32.768 kHz crystal from a `time`
+# property, flags and the STOP bit; alarm and timer are storage. The navi's
+# RTC. `no_std + alloc`, no dependencies beyond the I2C bus.
+dev-rx8581 = ["bus-i2c"]
 
 # A debugging tap (src/dev/linux_printk.rs, `linux.printk`): gives a Linux
 # kernel whose printk was compiled to a stub its log back, by patching the stub

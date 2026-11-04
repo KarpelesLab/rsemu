@@ -170,7 +170,14 @@ machine "alphard-navi" {
   object gvif    "i2c.regfile" { bus = "i2c1", addresses = "0x27" }   # CXD4905 GVIF
   object rcam    "i2c.regfile" { bus = "i2c1", addresses = "0x20" }   # ADV7180 rear camera decoder
   object usbhub  "i2c.regfile" { bus = "i2c1", addresses = "0x2c" }
-  object rtc     "i2c.regfile" { bus = "i2c2", addresses = "0x51" }   # RA-8581SA
+  # The RTC (RA-8581SA, an Epson RX-8581) on its own crystal. Nothing in the
+  # kernel reads it; the GPS library does, for the date. It starts from
+  # `rtc-time`, so a run is reproducible: pass
+  # `-p rtc-time=$(date +%Y-%m-%dT%H:%M:%S)` for today. Empty powers it up as
+  # a dead backup battery would, with its "time not valid" flag set.
+  param rtc-time = "2026-01-01T00:00:00"
+  osc rtcxtal = 32768 Hz
+  object rtc     "epson.rx8581" { clock = rtcxtal, bus = "i2c2", time = rtc-time }
   # The touch panel: a resistive controller whose INT is GPIO 147 (bank 4
   # pin 19), falling edge. Driven by the host pointer; the left button is the
   # finger. Clocked only to pace its samples behind the driver.
