@@ -1151,8 +1151,13 @@ impl<'a> Exec<'a> {
         };
 
         let privileged = self.state.privileged();
+        // The stacked xPSR keeps ITSTATE (the ICI/IT bits): an interrupt
+        // taken inside an IT block must resume it with the remaining slots
+        // still conditional (DDI 0403 B1.5.6, B1.5.8 — exception return
+        // restores EPSR.IT from the frame). Only the exception number is
+        // replaced, and bit 9 records the alignment padding.
         let xpsr_stacked =
-            (self.state.xpsr & !(xpsr::EXCEPTION | 0x0600_fc00)) | if aligned { 1 << 9 } else { 0 };
+            (self.state.xpsr & !(xpsr::EXCEPTION | (1 << 9))) | if aligned { 1 << 9 } else { 0 };
         let frame = [
             self.state.r[0],
             self.state.r[1],

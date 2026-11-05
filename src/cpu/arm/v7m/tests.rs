@@ -906,6 +906,53 @@ fn a_higher_priority_interrupt_preempts_a_lower_one() {
     assert!(h.cpu.with_sys(|s| s.is_active(Exception::IRQ0)));
 }
 
+/// `MOVS r0,#0; CMP r0,#1; ITT EQ; MOV r1,#1; MOV r2,#2; B .` with IRQ0
+/// (a `BX lr` handler) pended after `skip` instructions: the block's
+/// condition fails, so neither slot may run, interrupt or not.
+fn it_block_survives_an_interrupt(cfg: Config, skip: usize) -> Harness {
+    let h = Harness::new(cfg, &[0x2000, 0x2801, 0xbf04, 0x2101, 0x2202, 0xe7fe]);
+    h.set_word(16 * 4, 0x301);
+    h.set_word(0x300, 0x4770); // `BX lr`
+    h.cpu.with_sys(|s| s.set_enable(Exception::IRQ0, true));
+    for _ in 0..skip {
+        h.cpu.step();
+    }
+    h.cpu.pend_irq(0);
+    h.cpu.step(); // exception entry
+    assert_eq!(h.cpu.current_exception(), Exception::IRQ0);
+    h.cpu.step(); // `BX lr`: exception return
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    for _ in skip..5 {
+        h.cpu.step();
+    }
+    h
+}
+
+#[test]
+fn an_interrupt_inside_an_it_block_resumes_it_still_conditional() {
+    // Before the first slot, and between the two: ITSTATE goes out in the
+    // stacked xPSR and comes back on return. Dropping it ran both moves
+    // unconditionally, which broke newlib's word-at-a-time `strlen` on
+    // STM32 firmware whenever a UART interrupt landed in it.
+    for skip in [3, 4] {
+        let h = it_block_survives_an_interrupt(Config::CORTEX_M4, skip);
+        assert_eq!(h.cpu.reg(1), 0, "first slot ran after an interrupt at {skip}");
+        assert_eq!(h.cpu.reg(2), 0, "second slot ran after an interrupt at {skip}");
+        assert_eq!(h.cpu.pc(), ENTRY + 10, "parked on the `B .`");
+    }
+}
+
+#[cfg(feature = "cpu-arm-v8m")]
+#[test]
+fn an_interrupt_inside_an_it_block_resumes_it_still_conditional_on_a_cortex_m33() {
+    for skip in [3, 4] {
+        let h = it_block_survives_an_interrupt(Config::CORTEX_M33F, skip);
+        assert_eq!(h.cpu.reg(1), 0, "first slot ran after an interrupt at {skip}");
+        assert_eq!(h.cpu.reg(2), 0, "second slot ran after an interrupt at {skip}");
+        assert_eq!(h.cpu.pc(), ENTRY + 10, "parked on the `B .`");
+    }
+}
+
 #[test]
 fn an_equal_priority_interrupt_waits_for_the_handler_to_finish() {
     let h = Harness::m4(&[0xbf00]);
