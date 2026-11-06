@@ -185,6 +185,11 @@ const CTX_CCB_CTL: u32 = 0x10;
 /// A context's command ring (a command never wraps: the ring has an
 /// overflow area past its end).
 const CONTEXT_CCB_SIZE: u32 = 0x1_0000;
+/// A transfer command's size on its context ring. Unlike TA and 2D commands
+/// it does not lead with its size (the same value sits at `+0xa0`); every
+/// single-command transfer kick in a navi trace advanced the read offset by
+/// exactly this \[strong\].
+const TRANSFER_CMD_SIZE: u32 = 0x1c0;
 /// TA command flag: the TA/3D dependency sync is the command's own.
 const TA_DEPENDENCY: u32 = 1 << 9;
 
@@ -557,8 +562,13 @@ fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32, draw: &mut dyn FnMut(u3
         return (u32::MAX, u32::MAX);
     };
     let from = read;
-    // One command per kick for a transfer; the others walk by size. The
-    // bound is a guard against a corrupt size, not a limit a guest meets.
+    // Every command between the offsets, in order. Each kick names one
+    // command, but the host can queue several before the device sees the
+    // first kick; the later kicks then find the ring already drained (a
+    // navi trace: 144 transfer kicks, 144 commands, 14 kicks empty after
+    // batches of up to four). Taking only the first dropped the rest --
+    // texture uploads, so whole buttons and icons went missing. The bound
+    // is a guard against a corrupt size, not a limit a guest meets.
     for _ in 0..256 {
         if read == write {
             break;
@@ -572,12 +582,14 @@ fn complete_kick(gpu: &Gpu<'_>, kind: u32, context: u32, draw: &mut dyn FnMut(u3
             CMD_KICK_TRANSFER => {
                 draw(cmd);
                 complete_transfer(gpu, cmd);
-                read = write;
-                break;
+                TRANSFER_CMD_SIZE
             }
             _ => complete_2d(gpu, cmd),
         };
-        if size == 0 {
+        // A size that would step past the write offset is not a command
+        // boundary: stop at the host's offset rather than walk garbage.
+        let left = write.wrapping_sub(read) & (CONTEXT_CCB_SIZE - 1);
+        if size == 0 || size > left {
             read = write;
             break;
         }
@@ -1247,6 +1259,28 @@ mod tests {
         assert_eq!(m(&space, 0xe204), 12);
         assert_eq!(m(&space, 0xe300), 2, "the fence the client waits on");
         assert_eq!(m(&space, 0xc104), 0x200);
+    }
+
+    #[test]
+    fn transfers_queued_before_their_kicks_are_all_completed() {
+        // The host queued two uploads before the device saw either kick.
+        // Both fences move, in order, and the second kick finds the ring
+        // already drained.
+        let (sgx, space) = started();
+        for (i, fence) in [(0, 0xe300), (1, 0xe304)] {
+            let s = 0x2_0000 + i * TRANSFER_CMD_SIZE + 0xa8;
+            mw(&space, s + 0xb8, 1);
+            mw(&space, s + 0xbc, fence);
+            mw(&space, s + 0xc0, 5 + i);
+        }
+        let ctx = context(&space, 2 * TRANSFER_CMD_SIZE);
+        submit(&space, &[CMD_KICK_TRANSFER, 0, 0, ctx]);
+        submit(&space, &[CMD_KICK_TRANSFER, 0, 0, ctx]);
+        reg_w(&sgx, COMMAND_KICK, 1);
+        sgx.shared.run();
+        assert_eq!(m(&space, 0xe300), 5, "the first upload's fence");
+        assert_eq!(m(&space, 0xe304), 6, "the second, no longer skipped");
+        assert_eq!(m(&space, 0xc104), 2 * TRANSFER_CMD_SIZE);
     }
 
     #[test]
