@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/rsemu/compare/v0.0.8...v0.0.9) - 2026-11-06
+
+### Fixed
+
+- *(dev-sgx)* complete every transfer queued on the ring, not just the first
+
 ## [0.0.8](https://github.com/KarpelesLab/rsemu/compare/v0.0.7...v0.0.8) - 2026-11-06
 
 ### Added
