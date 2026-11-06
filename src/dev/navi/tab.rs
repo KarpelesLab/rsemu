@@ -294,7 +294,9 @@ impl Tab {
     }
 
     fn line(slot: &Mutex<Option<WireSource>>, high: bool) {
-        if let Some(out) = slot.lock().clone() {
+        // Bind first: the guard must be gone before the wire reaches its sink.
+        let out = slot.lock().clone();
+        if let Some(out) = out {
             out.set(Level::from_bool(high));
         }
     }

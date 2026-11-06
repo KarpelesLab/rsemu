@@ -936,8 +936,16 @@ fn an_interrupt_inside_an_it_block_resumes_it_still_conditional() {
     // STM32 firmware whenever a UART interrupt landed in it.
     for skip in [3, 4] {
         let h = it_block_survives_an_interrupt(Config::CORTEX_M4, skip);
-        assert_eq!(h.cpu.reg(1), 0, "first slot ran after an interrupt at {skip}");
-        assert_eq!(h.cpu.reg(2), 0, "second slot ran after an interrupt at {skip}");
+        assert_eq!(
+            h.cpu.reg(1),
+            0,
+            "first slot ran after an interrupt at {skip}"
+        );
+        assert_eq!(
+            h.cpu.reg(2),
+            0,
+            "second slot ran after an interrupt at {skip}"
+        );
         assert_eq!(h.cpu.pc(), ENTRY + 10, "parked on the `B .`");
     }
 }
@@ -947,8 +955,16 @@ fn an_interrupt_inside_an_it_block_resumes_it_still_conditional() {
 fn an_interrupt_inside_an_it_block_resumes_it_still_conditional_on_a_cortex_m33() {
     for skip in [3, 4] {
         let h = it_block_survives_an_interrupt(Config::CORTEX_M33F, skip);
-        assert_eq!(h.cpu.reg(1), 0, "first slot ran after an interrupt at {skip}");
-        assert_eq!(h.cpu.reg(2), 0, "second slot ran after an interrupt at {skip}");
+        assert_eq!(
+            h.cpu.reg(1),
+            0,
+            "first slot ran after an interrupt at {skip}"
+        );
+        assert_eq!(
+            h.cpu.reg(2),
+            0,
+            "second slot ran after an interrupt at {skip}"
+        );
         assert_eq!(h.cpu.pc(), ENTRY + 10, "parked on the `B .`");
     }
 }

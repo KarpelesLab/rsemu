@@ -214,6 +214,7 @@ pub fn disassemble_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     fn d(w: u16) -> String {
         format_word(w, 0x8c00_1000, Mode::default())

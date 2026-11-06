@@ -485,7 +485,8 @@ mod tests {
             .load("dsp", CLASS.name, CLASS.version, &Migrations::new())
             .unwrap();
         back.load(&mut chunk.reader()).unwrap();
-        assert_eq!(*back.target.state.lock(), *dev.target.state.lock());
+        let theirs = dev.target.state.lock().clone();
+        assert_eq!(*back.target.state.lock(), theirs);
         assert_eq!(save(&back), bytes);
     }
 }

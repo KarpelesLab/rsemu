@@ -219,7 +219,9 @@ impl Target {
     /// Put `int` where the state says. Never called with the state lock held.
     fn drive(&self) {
         let low = self.state.lock().asserted;
-        if let Some(out) = self.int.lock().clone() {
+        // Bind first: the guard must be gone before the wire reaches its sink.
+        let out = self.int.lock().clone();
+        if let Some(out) = out {
             out.set(Level::from_bool(!low));
         }
     }

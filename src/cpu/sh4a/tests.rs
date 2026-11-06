@@ -7,6 +7,7 @@
 //! section is named.
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::core::device::{Device, Export, ExportId};
