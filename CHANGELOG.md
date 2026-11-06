@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/rsemu/compare/v0.0.7...v0.0.8) - 2026-11-06
+
+### Added
+
+- *(dev-navi)* the panel keys over TAB-II, from the host keyboard
+- *(bus-uart)* clocked-synchronous peers that answer inside the write
+- *(dev)* an Epson RX-8581 real-time clock for the navi
+- *(dev)* the navi's touch panel, a ROHM BU21023-class controller
+- *(dev-navi)* the SCAC security coprocessor, present and holding no keys
+- *(dev)* the AKM AK77xx DSP's I2C command set, the navi's echo canceller
+- *(machine)* give the navi its SH-4A realtime domain
+- *(cpu-sh4a)* Renesas SH-4A interpreter
+- *(device)* an interrupt-request export for level-and-vector controllers
+- *(dev-rcar)* the H1's ARM <-> SH-4A mailbox (ICCOM)
+- *(dev-sgx)* pck converts c10 lanes, and an immediate source needs no lane layout
+- *(dev-sgx)* iterators hand the pixel shader its varyings
+- *(dev-sgx)* execute the F16 vector multiply and add
+- *(dev-sgx)* perform transfer-queue blits, and address surfaces by layout
+- *(dev-sgx)* say why a drawn program stopped, and draw through a memory trait
+- *(dev-sgx)* draw TA commands — control stream, vertex and pixel programs, render target
+- *(dev-sgx)* decode USSE op 28 and hand texture samples to the bus
+- *(dev-sgx)* decode every USSE vector form in the UI corpus and execute the F32 ones
+- *(dev-sgx)* decode the USSE blend family and execute its two-factor forms
+- *(dev-sgx)* USSE setbase and the EMIT forms the UI shaders end with, PDS conditions and DOUT types through the bus
+- *(dev-sgx)* triangle coverage, interpolation, blending and pixel formats
+- *(machine)* boot the navi's product system from a LOADING.KWI, no flash
+- *(cpu-x86)* the x86-64-v3 preset, selected by level = "v3"
+- *(cpu-x86)* [**breaking**] AVX2, FMA and F16C
+- *(cpu-x86)* [**breaking**] BMI1 and BMI2, the VEX-encoded general-register instructions
+- *(cpu-x86)* execute AVX — the VEX.128 and VEX.256 instruction set
+- *(cpu-x86)* [**breaking**] the YMM upper halves, as XSAVE state component 2
+- *(cpu-x86)* [**breaking**] decode the VEX prefix
+- *(cpu-x86)* MOVBE, memory forms only
+- *(cpu-x86)* LZCNT, and BSR where the part has none
+- *(cpu-x86)* CPUID leaf 7 sub-leaf 0, assembled from the features
+- *(cpu-x86)* the x86-64-v2 preset, selected by level = "v2"
+- *(cpu-x86)* gate CMPXCHG16B and 64-bit LAHF/SAHF on their CPUID bits
+- *(cpu-x86)* POPCNT, with its own CPUID bit
+- *(cpu-x86)* SSE4.2 — the string compares, PCMPGTQ and CRC32
+- *(cpu-x86)* SSE4.1
+- *(cpu-x86)* SSSE3, in both its MMX and XMM forms
+- *(cpu-x86)* SSE3, and CPUID now reports it
+- *(cpu-x86)* [**breaking**] decode the 0F 38 and 0F 3A three-byte opcode maps
+- *(cpu-x86)* [**breaking**] the XSAVE feature set — XCR0, XGETBV/XSETBV, XSAVE, XSAVEOPT, XSAVEC and XRSTOR
+- *(cpu-x86)* correctly rounded x87 transcendentals, FBLD/FBSTP and FISTTP
+- *(cpu-x86)* [**breaking**] make the x86 Config and Features non_exhaustive
+- *(cpu-x86)* [**breaking**] MMX, with its registers aliased onto the x87 unit
+- *(cpu-x86)* ExitingCore exits and host-armed execution breakpoints
+
+### Fixed
+
+- *(dev)* release the wire slot before driving it, and mend the red CI
+- *(cpu-arm)* keep ITSTATE in the stacked xPSR so an interrupted IT block resumes conditional
+- *(dev-navi)* confirm the key byte base, correct the key names, flip touch Y
+- *(dev-scif)* raise TEND one run slice after the FIFO drains, not on the write
+- *(dev-sgx)* iterated varyings and texels fill attributes in issue order
+- *(dev-sgx)* draw window-space vertices, so each UI scene's clear happens
+- *(dev-sgx)* a state block's header says where its pixel program is
+- *(dev-sgx)* pck's formats run source b43:41 to destination b40:38
+- *(machine)* give the catalog navi its `kwi` slot, and build kwi's tests without std
+- *(cpu-x86)* migrate v8 and v9 processor chunks to v10
+- *(cpu-x86)* re-verify the gdb register maps at state version 10, and build the AVX2 tests without std
+- *(cpu-x86)* keep MASKMOVDQU's summary out of rustdoc's link syntax
+- *(cpu-x86)* restart a faulting REP string op with its completed iterations
+- *(cpu-x86)* the thirteen SSE/SSE2 encodings CPUID claimed and the decoder lacked
+
+### Other
+
+- note the SH-4A core in the CPU source table
+- *(dev-sgx)* record how the USSE/PDS encodings were measured, and what
+- *(machine)* the navi keeps its own data in NOR bank 4, which no KWI has
+- *(machine)* the navi's KWI container, its boot chain and its GPU
+- *(cpu-x86)* say in avx.rs what AVX2, FMA and F16C added to it
+- *(cpu-x86)* record AVX2, FMA and F16C, and the choices they made
+- *(float)* the fused multiply-add in binary32 and under MXCSR's modes
+- *(cpu-x86)* record BMI1 and BMI2 and take them off the #UD list
+- *(cpu-x86)* record AVX, the VEX decoding choice and what is still #UD
+- *(cpu-x86)* the lifter hands every v2 instruction to the interpreter
+
 ## [0.0.7](https://github.com/KarpelesLab/rsemu/compare/v0.0.6...v0.0.7) - 2026-10-29
 
 ### Added

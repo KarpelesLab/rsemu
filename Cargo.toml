@@ -1,6 +1,6 @@
 [package]
 name          = "rsemu"
-version       = "0.0.7"
+version       = "0.0.8"
 edition       = "2024"
 # Edition 2024 stabilised in 1.85; 1.91 is the floor we hold to. The project is
 # stable-only (ROADMAP.md §0) — the sole nightly is one CI job for threaded
