@@ -5,6 +5,15 @@
 //! command. Before it does, [`render_ta`] performs the work the command
 //! describes, so the pixels are in memory when the host is told they are.
 //!
+//! As on the hardware, that work is in two halves. Every command runs the
+//! vertex stage and bins its triangles into the target's [`Scenes`] entry;
+//! only the command that ends the scene renders it, shading every binned
+//! pixel in submission order. A command the host sent mid-scene (its
+//! control stream full, or a texture it must replace still in use) has its
+//! textures sampled at that render, after the uploads queued behind it --
+//! the keypad's labels go to fresh memory after the partial command that
+//! draws them, so shading them early read memory not yet written.
+//!
 //! # Sources
 //!
 //! As for the rest of this device: the navi's own binaries and memory, never
@@ -33,7 +42,13 @@
 //! |---|---|---|
 //! | 4, 6 | 2 | a state PDS program: address `PDS(w0)`, data rows `w1 >> 27` |
 //! | 8, 9 | 6 | a draw: `w0[15:0]` indices, `w1` the u16 index list, `w4`/`w5` the vertex PDS program and its rows (`w5[3:0]`) |
+//! | 0 | 2 | a link: the stream goes on at `w0[27:0] << 2`; `w1` is `0x003fffff` \[G] |
 //! | `c` | 1 | end of this command's stream |
+//!
+//! The host writes the stream into a circular buffer and links from its end
+//! back to its start: a navi keypad command ran to `0x1115aeb8`, linked with
+//! `0x04455800` to `0x11156000`, and the next command's stream began at
+//! `0x1115674c`, just past the wrapped part. Words after a link are stale.
 //!
 //! `PDS(w)` is `0xf000_0000 | (w & 0xff_ffff) << 4` \[strong\]: every PDS
 //! pointer seen, vertex- and pixel-side, resolves that way. A 4-index draw of
@@ -69,6 +84,7 @@
 //! a pixel \[G\].
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -77,8 +93,10 @@ use alloc::vec::Vec;
 use super::pds::{Dout, DoutType, Pds, PdsBus};
 use super::raster::{self, Rect, Vertex};
 use super::usse::{self, Emit, Size, Usse, UsseBus};
+use crate::core::Result;
 use crate::core::error::BusError;
 use crate::core::space::MemResult;
+use crate::core::state::{Sink, Source};
 
 /// TA command fields.
 const CMD_REGS: u32 = 0x38;
@@ -116,6 +134,158 @@ pub struct Summary {
     pub first_fault: Option<Fault>,
 }
 
+/// The vertex attributes a binned triangle keeps: as many as the pixel stage
+/// interpolates.
+const BINNED_ATTRS: usize = 8;
+/// A scene that outgrows this many triangles is dropped rather than kept
+/// growing: a host that never ends a scene must not exhaust the emulator.
+const MAX_BINNED: usize = 1 << 16;
+
+/// A triangle the vertex stage binned, waiting for its scene's render.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Prim {
+    tri: [Vertex; 3],
+    /// The state word naming the per-pixel PDS program and its rows.
+    pixel: u32,
+    /// The secondary attributes in force, an index into [`Scene::banks`].
+    bank: u32,
+}
+
+/// One render target's scene so far: what a parameter buffer holds on the
+/// hardware.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Scene {
+    prims: Vec<Prim>,
+    /// Each distinct secondary bank a state program left, in order.
+    banks: Vec<[u32; usse::BANK_SIZE]>,
+}
+
+/// The scenes TA commands have binned and not yet rendered, by render
+/// target address.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Scenes(BTreeMap<u32, Scene>);
+
+impl Scenes {
+    /// Whether no scene is in progress.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Encodes every scene in progress.
+    ///
+    /// # Errors
+    ///
+    /// If the sink fails.
+    pub fn save<S: Sink + ?Sized>(&self, w: &mut S) -> Result<()> {
+        w.write_seq_len(self.0.len() as u64)?;
+        for (&target, scene) in &self.0 {
+            w.write_u32(target)?;
+            w.write_seq_len(scene.banks.len() as u64)?;
+            for bank in &scene.banks {
+                for &v in bank.iter() {
+                    w.write_u32(v)?;
+                }
+            }
+            w.write_seq_len(scene.prims.len() as u64)?;
+            for p in &scene.prims {
+                w.write_u32(p.pixel)?;
+                w.write_u32(p.bank)?;
+                for v in &p.tri {
+                    for f in [v.x, v.y, v.z, v.inv_w] {
+                        w.write_u32(f.to_bits())?;
+                    }
+                    for a in &v.attrs[..BINNED_ATTRS] {
+                        w.write_u32(a.to_bits())?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes what [`Scenes::save`] wrote.
+    ///
+    /// # Errors
+    ///
+    /// If the source is short or a triangle names a bank that is not there.
+    pub fn load<'a, S: Source<'a> + ?Sized>(r: &mut S) -> Result<Scenes> {
+        let mut out = BTreeMap::new();
+        // The smallest encodings: a scene with nothing in it, a bank, a
+        // triangle.
+        for _ in 0..r.read_seq_len(4 + 8 + 8)? {
+            let target = r.read_u32()?;
+            let mut scene = Scene::default();
+            for _ in 0..r.read_seq_len(4 * usse::BANK_SIZE as u64)? {
+                let mut bank = [0u32; usse::BANK_SIZE];
+                for v in bank.iter_mut() {
+                    *v = r.read_u32()?;
+                }
+                scene.banks.push(bank);
+            }
+            for _ in 0..r.read_seq_len(8 + 3 * 4 * (4 + BINNED_ATTRS as u64))? {
+                let pixel = r.read_u32()?;
+                let bank = r.read_u32()?;
+                if bank as usize >= scene.banks.len() {
+                    return Err(crate::core::Error::State(format!(
+                        "sgx scene: triangle names bank {bank} of {}",
+                        scene.banks.len()
+                    )));
+                }
+                let mut tri = [Vertex::default(); 3];
+                for v in &mut tri {
+                    let mut f = || r.read_u32().map(f32::from_bits);
+                    v.x = f()?;
+                    v.y = f()?;
+                    v.z = f()?;
+                    v.inv_w = f()?;
+                    for a in &mut v.attrs[..BINNED_ATTRS] {
+                        *a = f()?;
+                    }
+                }
+                scene.prims.push(Prim { tri, pixel, bank });
+            }
+            out.insert(target, scene);
+        }
+        Ok(Scenes(out))
+    }
+}
+
+#[cfg(test)]
+impl Scenes {
+    /// A scene in progress on the target at `0x1000`: two banks, a
+    /// triangle under each.
+    pub(super) fn sample() -> Scenes {
+        let v = |x: f32, y: f32| {
+            let mut v = Vertex {
+                x,
+                y,
+                z: 0.5,
+                inv_w: 0.25,
+                ..Vertex::default()
+            };
+            v.attrs[..BINNED_ATTRS].copy_from_slice(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+            v
+        };
+        let mut banks = alloc::vec![[0u32; usse::BANK_SIZE]; 2];
+        banks[1][7] = 0x1191_a000;
+        let tri = [v(1.0, 2.0), v(30.0, 2.0), v(1.0, 40.0)];
+        let prims = alloc::vec![
+            Prim {
+                tri,
+                pixel: 0x1703_c80c,
+                bank: 0
+            },
+            Prim {
+                tri,
+                pixel: 0x0f01_c618,
+                bank: 1
+            },
+        ];
+        Scenes(BTreeMap::from([(0x1000, Scene { prims, banks })]))
+    }
+}
+
 /// Why a program stopped early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
@@ -141,6 +311,11 @@ pub trait GpuMemory {
     fn read(&self, va: u32) -> Option<u32>;
     /// Writes the word at `va`, if it is mapped.
     fn write(&self, va: u32, value: u32);
+}
+
+/// Where a control-stream link word goes on (see the module table).
+fn stream_link(w: u32) -> u32 {
+    (w & 0x0fff_ffff) << 2
 }
 
 /// The PDS address a stream or state word names.
@@ -375,6 +550,10 @@ struct Renderer<'a> {
     summary: Summary,
     /// Lines describing the work, when the caller asked for them.
     trace: Option<Vec<String>>,
+    /// The scene this command adds to.
+    scene: Scene,
+    /// A state program ran since the bank was last binned.
+    bank_dirty: bool,
 }
 
 impl Renderer<'_> {
@@ -709,8 +888,18 @@ impl Texture {
 ///
 /// Public so that a command can be replayed against a snapshot's memory,
 /// outside a running machine.
-pub fn render_ta(gpu: &dyn GpuMemory, cmd: u32, code_bases: [u32; 16]) -> Option<Summary> {
-    render(gpu, cmd, code_bases, None).0
+///
+/// `end` says the command ends its scene (the command flag the caller
+/// reads): its triangles join the target's binned ones in `scenes` and the
+/// whole scene is shaded into the target. Otherwise they are only binned.
+pub fn render_ta(
+    gpu: &dyn GpuMemory,
+    cmd: u32,
+    code_bases: [u32; 16],
+    scenes: &mut Scenes,
+    end: bool,
+) -> Option<Summary> {
+    render(gpu, cmd, code_bases, scenes, end, None).0
 }
 
 /// [`render_ta`], also describing the work line by line: each state block,
@@ -719,8 +908,10 @@ pub fn render_ta_traced(
     gpu: &dyn GpuMemory,
     cmd: u32,
     code_bases: [u32; 16],
+    scenes: &mut Scenes,
+    end: bool,
 ) -> (Option<Summary>, Vec<String>) {
-    let (s, t) = render(gpu, cmd, code_bases, Some(Vec::new()));
+    let (s, t) = render(gpu, cmd, code_bases, scenes, end, Some(Vec::new()));
     (s, t.unwrap_or_default())
 }
 
@@ -748,6 +939,8 @@ pub fn render_transfer(gpu: &dyn GpuMemory, cmd: u32, code_bases: [u32; 16]) -> 
         secondary: Box::new([0; usse::BANK_SIZE]),
         summary: Summary::default(),
         trace: None,
+        scene: Scene::default(),
+        bank_dirty: true,
     };
     r.transfer(cmd)
 }
@@ -841,6 +1034,8 @@ fn render(
     gpu: &dyn GpuMemory,
     cmd: u32,
     code_bases: [u32; 16],
+    scenes: &mut Scenes,
+    end: bool,
     trace: Option<Vec<String>>,
 ) -> (Option<Summary>, Option<Vec<String>>) {
     let mut r = Renderer {
@@ -849,13 +1044,15 @@ fn render(
         secondary: Box::new([0; usse::BANK_SIZE]),
         summary: Summary::default(),
         trace,
+        scene: Scene::default(),
+        bank_dirty: true,
     };
-    let s = r.command(cmd);
+    let s = r.command(cmd, scenes, end);
     (s, r.trace)
 }
 
 impl Renderer<'_> {
-    fn command(&mut self, cmd: u32) -> Option<Summary> {
+    fn command(&mut self, cmd: u32, scenes: &mut Scenes, end: bool) -> Option<Summary> {
         let gpu = self.gpu;
         let r = self;
         let regs = gpu.read(cmd + CMD_REGS)?;
@@ -870,12 +1067,22 @@ impl Renderer<'_> {
         if w * h > MAX_PIXELS {
             return None;
         }
+        let key = target.surface.addr;
+        r.scene = scenes.0.remove(&key).unwrap_or_default();
+        r.walk(stream, w, h);
+        if !end {
+            let scene = core::mem::take(&mut r.scene);
+            if scene.prims.len() <= MAX_BINNED {
+                scenes.0.insert(key, scene);
+            }
+            return Some(r.summary);
+        }
         let surface = target.surface;
         let mut tile: Vec<u32> = vec![0; w * h];
         for (i, t) in tile.iter_mut().enumerate() {
             *t = surface.read(gpu, (i % w) as u32, (i / w) as u32);
         }
-        r.walk(stream, &mut tile, w, h);
+        r.shade(&mut tile, w, h);
         for (i, t) in tile.iter().enumerate() {
             let (x, y) = ((i % w) as u32, (i / w) as u32);
             if x >= target.x0 && y >= target.y0 {
@@ -897,7 +1104,7 @@ impl Renderer<'_> {
     }
 
     /// Walks the control stream at `at`, drawing into `tile`.
-    fn walk(&mut self, mut at: u32, tile: &mut [u32], w: usize, h: usize) {
+    fn walk(&mut self, mut at: u32, w: usize, h: usize) {
         let mut state = 0u32;
         // [G] Until a state block sets one: the full target.
         let mut viewport = [
@@ -908,13 +1115,15 @@ impl Renderer<'_> {
             0.5,
             0.5,
         ];
-        let end = at.wrapping_add(4 * STREAM_WORDS);
-        while at != end {
+        // A budget of words, not an end address: a link moves the walk.
+        for _ in 0..STREAM_WORDS {
             let Some(w0) = self.gpu.read(at) else { return };
             match w0 >> 28 {
+                0 if w0 != 0 => at = stream_link(w0),
                 4 | 6 => {
                     let w1 = self.gpu.read(at + 4).unwrap_or(0);
                     let ran = self.run(pds_address(w0), w1 >> 27, [0; 3], Kind::State, &mut [0; 4]);
+                    self.bank_dirty = true;
                     for (e, regs) in &ran.emits {
                         if e.form != FORM_PBE
                             && let Some(block) = StateBlock::parse(regs)
@@ -933,7 +1142,7 @@ impl Renderer<'_> {
                     for (i, v) in d.iter_mut().enumerate() {
                         *v = self.gpu.read(at + 4 * i as u32).unwrap_or(0);
                     }
-                    self.draw(&d, state, &viewport, tile, w, h);
+                    self.draw(&d, state, &viewport);
                     at = at.wrapping_add(24);
                 }
                 0xc => return,
@@ -942,16 +1151,8 @@ impl Renderer<'_> {
         }
     }
 
-    /// One draw.
-    fn draw(
-        &mut self,
-        d: &[u32; 6],
-        state: u32,
-        vp: &[f32; 6],
-        tile: &mut [u32],
-        w: usize,
-        h: usize,
-    ) {
+    /// One draw's vertex stage: its triangles join the scene.
+    fn draw(&mut self, d: &[u32; 6], state: u32, vp: &[f32; 6]) {
         self.summary.draws += 1;
         let count = (d[0] & 0xffff).min(4096);
         let (vpds, vrows) = (pds_address(d[4]), d[5] & 0xf);
@@ -1022,18 +1223,43 @@ impl Renderer<'_> {
         if state == 0 {
             return;
         }
-        let mut first = true;
+        for t in tris {
+            let [Some(a), Some(b), Some(c)] = t else {
+                continue;
+            };
+            if self.bank_dirty || self.scene.banks.is_empty() {
+                self.scene.banks.push(*self.secondary);
+                self.bank_dirty = false;
+            }
+            let bank = (self.scene.banks.len() - 1) as u32;
+            self.scene.prims.push(Prim {
+                tri: [a, b, c],
+                pixel: state,
+                bank,
+            });
+        }
+    }
+
+    /// The 3D render: every binned triangle, in submission order, shaded
+    /// into `tile` with the secondary attributes it was binned under.
+    fn shade(&mut self, tile: &mut [u32], w: usize, h: usize) {
+        let scene = core::mem::take(&mut self.scene);
         let clip = Rect {
             x0: 0,
             y0: 0,
             x1: w as i32,
             y1: h as i32,
         };
-        for t in tris {
-            let [Some(a), Some(b), Some(c)] = t else {
-                continue;
-            };
-            raster::triangle(&[a, b, c], 8, clip, |fr| {
+        let mut loaded = None;
+        for p in &scene.prims {
+            if loaded != Some(p.bank) {
+                self.secondary
+                    .copy_from_slice(&scene.banks[p.bank as usize][..]);
+                loaded = Some(p.bank);
+            }
+            let (ppds, prows) = (pds_address(p.pixel), p.pixel >> 27);
+            let mut first = true;
+            raster::triangle(&p.tri, BINNED_ATTRS, clip, |fr| {
                 let i = fr.y as usize * w + fr.x as usize;
                 let mut o = [tile[i], 0, 0, 0];
                 self.run(
@@ -1064,6 +1290,31 @@ impl Renderer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binned_scenes_round_trip() {
+        let scenes = Scenes::sample();
+        let mut bytes = Vec::new();
+        scenes.save(&mut bytes).unwrap();
+        let mut r = crate::core::state::ChunkReader::new(&bytes);
+        assert_eq!(Scenes::load(&mut r).unwrap(), scenes);
+        r.end().unwrap();
+    }
+
+    #[test]
+    fn a_triangle_naming_a_missing_bank_is_refused() {
+        let mut scenes = Scenes::sample();
+        scenes.0.get_mut(&0x1000).unwrap().banks.pop();
+        let mut bytes = Vec::new();
+        scenes.save(&mut bytes).unwrap();
+        let mut r = crate::core::state::ChunkReader::new(&bytes);
+        assert!(Scenes::load(&mut r).is_err());
+    }
+
+    #[test]
+    fn a_stream_link_wraps_to_the_buffer_start() {
+        assert_eq!(stream_link(0x0445_5800), 0x1115_6000);
+    }
 
     #[test]
     fn pds_pointers_resolve_into_the_pds_heap() {

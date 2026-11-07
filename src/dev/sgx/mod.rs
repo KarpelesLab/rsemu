@@ -126,7 +126,7 @@ use crate::machine::realize::{BindCtx, Instance};
 pub const CLASS_NAME: &str = "pvr.sgx";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// How much address space the register block answers.
 pub const REGISTER_WINDOW_LEN: u64 = 0x1_0000;
@@ -192,6 +192,10 @@ const CONTEXT_CCB_SIZE: u32 = 0x1_0000;
 const TRANSFER_CMD_SIZE: u32 = 0x1c0;
 /// TA command flag: the TA/3D dependency sync is the command's own.
 const TA_DEPENDENCY: u32 = 1 << 9;
+/// TA command flag: the command closes its scene, so the 3D render follows
+/// it. A command without it (flags 0 in every navi trace: the control stream
+/// filled mid-scene) is a partial TA, and the scene is not rendered yet.
+const TA_SCENE_END: u32 = 1 << 10;
 
 /// The misc-info answer: offset, value. Word 4 and word 6 (the core
 /// revision, hardware and software) are added from the `revision` prop.
@@ -304,6 +308,10 @@ struct Shared {
     hw: Option<hw::Tuning>,
     /// The stand-in draws each TA command before completing it (`render`).
     render: bool,
+    /// The scenes partial TA commands binned, until the command that ends
+    /// each is drawn. Taken out while a command draws, so that no lock is
+    /// held while it reaches memory.
+    scenes: Mutex<render::Scenes>,
     /// The hardware mode's engine. Taken out for the length of a slice, so
     /// that no lock is held while the firmware reaches memory.
     engine: Mutex<Option<Box<hw::Engine>>>,
@@ -518,7 +526,11 @@ impl Shared {
                         let done = if word(0) == CMD_KICK_TRANSFER {
                             render::render_transfer(&app, cmd, code_bases)
                         } else {
-                            render::render_ta(&app, cmd, code_bases)
+                            let end = gpu.read(cmd + 0x1c).unwrap_or(0) & TA_SCENE_END != 0;
+                            let mut scenes = core::mem::take(&mut *self.scenes.lock());
+                            let done = render::render_ta(&app, cmd, code_bases, &mut scenes, end);
+                            *self.scenes.lock() = scenes;
+                            done
                         };
                         if self.log.is_some() {
                             self.note(&alloc::format!("sgx:   render {done:x?}\n"));
@@ -621,8 +633,17 @@ fn complete_ta(gpu: &Gpu<'_>, cmd: u32) -> u32 {
     let details = w(cmd + 0x38);
     let dst_list = w(cmd + 0x3c);
     let s = cmd + 0x50;
-    // The status words the client polls, {address, value}.
-    for (at, count, max) in [(0xc0, w(s + 0x04), 32), (0x1c0, w(s + 0x08), 4)] {
+    // The status words the client polls, {address, value}. The second list
+    // is the scene's: libGLESv2 tags every texture a draw samples with the
+    // render surface's frame number, and counts the texture idle once that
+    // list's frame word reaches it. A partial TA command carries the same
+    // list as the one that ends the scene, so writing it early declared a
+    // frame finished while it was still being drawn -- the library then
+    // re-specified a texture in place instead of ghosting it, and every
+    // keypad key sampled the last digit uploaded \[strong: a guest-side
+    // trace of that compare, `used 8 done 8` through the whole keypad].
+    let scene = if flags & TA_SCENE_END != 0 { 4 } else { 0 };
+    for (at, count, max) in [(0xc0, w(s + 0x04), 32), (0x1c0, w(s + 0x08), scene)] {
         for i in 0..count.min(max) {
             let (a, v) = (w(s + at + 8 * i), w(s + at + 8 * i + 4));
             if a != 0 {
@@ -866,6 +887,7 @@ impl Sgx {
             irq: Mutex::with_rank(LockRank::LEAF, None),
             bus: Mutex::with_rank(LockRank::LEAF, None),
             requester: Mutex::with_rank(LockRank::LEAF, RequesterId::ANONYMOUS),
+            scenes: Mutex::with_rank(LockRank::LEAF, render::Scenes::default()),
         });
         let region: RegionRef = Arc::new(Region::io(
             "pvr.sgx",
@@ -879,6 +901,27 @@ impl Sgx {
     pub fn attach_space(&self, space: &Arc<AddressSpace>) {
         *self.shared.bus.lock() = Some(Arc::downgrade(space));
     }
+}
+
+/// Snapshot upgrades for `pvr.sgx`:
+///
+/// - **v2 → v3**: the scenes partial TA commands binned, after the reset
+///   flag. A v2 build drew every command whole, so none was in progress.
+///
+/// # Errors
+///
+/// If a step is already registered for this class.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS_NAME, 2, |r, out| {
+        // Registers, the two pending flags, the control block, the three
+        // starts, the three kick counts, the reset flag.
+        let head = WORDS * 4 + 2 + 1 + 4 + 3 + 3 * 4 + 1;
+        out.extend_from_slice(r.take(head)?);
+        out.write_seq_len(0)?;
+        let rest = r.take(r.remaining())?;
+        out.extend_from_slice(rest);
+        Ok(())
+    })
 }
 
 /// The class descriptor.
@@ -991,6 +1034,8 @@ impl Device for Sgx {
             w.write_u32(k)?;
         }
         w.write_bool(s.hw_reset)?;
+        let scenes = self.shared.scenes.lock().clone();
+        scenes.save(w)?;
         let engine = self.shared.engine.lock();
         w.write_bool(engine.is_some())?;
         match engine.as_ref() {
@@ -1017,6 +1062,7 @@ impl Device for Sgx {
             *k = r.read_u32()?;
         }
         let hw_reset = r.read_bool()?;
+        let scenes = render::Scenes::load(r)?;
         let engine = if r.read_bool()? {
             Some(Box::new(hw::Engine::load(r)?))
         } else {
@@ -1037,6 +1083,7 @@ impl Device for Sgx {
             hw_reset,
         };
         *self.shared.engine.lock() = engine;
+        *self.shared.scenes.lock() = scenes;
         self.shared.drive();
         Ok(())
     }
@@ -1238,6 +1285,27 @@ mod tests {
     }
 
     #[test]
+    fn only_the_command_that_ends_a_scene_reports_its_frame() {
+        // A partial TA (flags 0) and then the scene's last command, both
+        // carrying the same frame word: it must move only with the last.
+        let (sgx, space) = started();
+        for (i, flags) in [(0, 0), (1, TA_SCENE_END)] {
+            let cmd = 0x2_0000 + i * 0x300;
+            mw(&space, cmd, 0x300);
+            mw(&space, cmd + 0x1c, flags);
+            mw(&space, cmd + 0x50 + 0x08, 1); // one scene status
+            mw(&space, cmd + 0x50 + 0x1c0, 0xd300);
+            mw(&space, cmd + 0x50 + 0x1c4, 8);
+        }
+        let ctx = context(&space, 0x300);
+        kick(&sgx, &space, CMD_KICK_TA, ctx);
+        assert_eq!(m(&space, 0xd300), 0, "the scene is still being drawn");
+        mw(&space, 0xc100, 0x600);
+        kick(&sgx, &space, CMD_KICK_TA, ctx);
+        assert_eq!(m(&space, 0xd300), 8, "rendered: the frame is done");
+    }
+
+    #[test]
     fn a_transfer_kick_completes_sources_and_destinations() {
         let (sgx, space) = started();
         let s = 0x2_0000 + 0xa8;
@@ -1341,6 +1409,58 @@ mod tests {
             before + 1,
             "a debugger read counts nothing"
         );
+    }
+
+    #[test]
+    fn a_scene_in_progress_survives_a_snapshot() {
+        let (sgx, _) = started();
+        *sgx.shared.scenes.lock() = render::Scenes::sample();
+        let mut shape = MachineShape::new();
+        shape.add_device("sgx", CLASS.name).unwrap();
+        let mut wr = StateWriter::new(shape);
+        {
+            let mut chunk = wr.chunk("sgx", CLASS.name, CLASS.version).unwrap();
+            sgx.save(&mut chunk).unwrap();
+        }
+        let bytes = wr.to_vec().unwrap();
+        let back = Sgx::with_revision(0x01_0205);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("sgx", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        back.load(&mut chunk.reader()).unwrap();
+        assert_eq!(*back.shared.scenes.lock(), render::Scenes::sample());
+    }
+
+    #[test]
+    fn a_v2_snapshot_upgrades_with_no_scene_in_progress() {
+        // A v2 payload: the registers and flags, then no engine.
+        let head = WORDS * 4 + 2 + 1 + 4 + 3 + 3 * 4 + 1;
+        let mut v2 = alloc::vec![0u8; head];
+        v2[0] = 0x5a; // a register, to see it carried over
+        v2.push(0);
+        let mut m = Migrations::new();
+        migrations(&mut m).unwrap();
+        let v3 = m
+            .upgrade(
+                CLASS_NAME,
+                2,
+                STATE_VERSION,
+                alloc::borrow::Cow::Borrowed(&v2),
+            )
+            .unwrap();
+        assert_eq!(&v3[..head], &v2[..head]);
+        assert_eq!(
+            &v3[head..],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "no scenes, no engine"
+        );
+        let back = Sgx::with_revision(0x01_0205);
+        let mut r = crate::core::state::ChunkReader::new(&v3);
+        back.load(&mut r).unwrap();
+        r.end().unwrap();
+        assert!(back.shared.scenes.lock().is_empty());
+        assert_eq!(back.shared.state.lock().regs[0], 0x5a);
     }
 
     #[test]
