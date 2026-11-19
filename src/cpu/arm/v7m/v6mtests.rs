@@ -850,6 +850,16 @@ fn bl_and_the_system_instructions_take_cortex_m0_cycles() {
     let before = m0.cpu.cycles();
     m0.cpu.step();
     assert_eq!(m0.cpu.cycles() - before, 1);
+
+    // WFI and WFE are 2, not counting the sleep (Table 3-1, note f); SEV
+    // is 1. WFE with the event register set does not sleep at all.
+    for (insn, expect) in [(0xbf30u16, 2u64), (0xbf20, 2), (0xbf40, 1)] {
+        let m0 = Harness::m0(&[0xbf40, insn, PARK]);
+        m0.cpu.step();
+        let before = m0.cpu.cycles();
+        m0.cpu.step();
+        assert_eq!(m0.cpu.cycles() - before, expect, "{insn:#06x}");
+    }
 }
 
 // ---------------------------------------------------------------------------

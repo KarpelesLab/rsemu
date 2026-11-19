@@ -2765,7 +2765,9 @@ impl<'a> Exec<'a> {
 /// The cycles a Cortex-M0 charges for an instruction beyond what the shared
 /// timing model already has (Cortex-M0 TRM, Table 3-1): `BL` is 4 rather
 /// than 3, `POP {.., PC}` is 4 + *N* rather than 3 + *N*, and `MRS`, `MSR`,
-/// `DMB`, `DSB` and `ISB` are 4 rather than 1.
+/// `DMB`, `DSB` and `ISB` are 4 rather than 1, and `WFE` and `WFI` are 2
+/// rather than 1 — not counting the time spent asleep, which the step
+/// charges separately.
 const fn v6m_extra_cycles(insn: Insn) -> u64 {
     match insn {
         Insn::BranchLink { .. } => 1,
@@ -2773,6 +2775,9 @@ const fn v6m_extra_cycles(insn: Insn) -> u64 {
             load: true, list, ..
         } if list & 0x8000 != 0 => 1,
         Insn::Mrs { .. } | Insn::Msr { .. } | Insn::Barrier { .. } => 3,
+        Insn::Hint {
+            op: HintOp::Wfe | HintOp::Wfi,
+        } => 1,
         _ => 0,
     }
 }
