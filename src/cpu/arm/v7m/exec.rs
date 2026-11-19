@@ -1058,9 +1058,16 @@ impl<'a> Exec<'a> {
         if addr & !3 == DWT_PCSR {
             return Ok(extract(self.insn_addr, addr, bytes));
         }
-        let Some(word) = self.state.sys.read_word(addr, self.attrs.debug) else {
+        let Some(mut word) = self.state.sys.read_word(addr, self.attrs.debug) else {
             return Err(self.bus_fault(addr, Access::Read));
         };
+        // `AIRCR.ENDIANNESS` reports the data endianness, which is the
+        // core's configuration and not the system block's (DDI 0403D
+        // B3.2.6, DDI 0419E B3.2.6; the Cortex-M0 TRM's Table 4-1 gives
+        // AIRCR as 0x00008000 on a big-endian build).
+        if addr & !3 == 0xe000_ed0c && self.cfg.endian == Endian::Big {
+            word |= 1 << 15;
+        }
         Ok(extract(word, addr, bytes))
     }
 

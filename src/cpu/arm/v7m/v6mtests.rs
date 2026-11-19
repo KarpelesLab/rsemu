@@ -616,6 +616,32 @@ fn the_v6m_register_subset() {
 }
 
 #[test]
+fn aircr_reports_a_big_endian_build() {
+    // LDR r3, [r1] at AIRCR. ENDIANNESS is bit 15 (DDI 0419E B3.2.6); the
+    // Cortex-M0 TRM's Table 4-1 gives 0x00008000 for a big-endian build.
+    let cfg = Config {
+        endian: crate::core::value::Endian::Big,
+        ..Config::CORTEX_M0
+    };
+    let h = Harness::new(cfg, &[0x680b, PARK]);
+    // Data, and so the vector table, is big-endian on this build: put the
+    // reset vectors back the way it reads them and reset.
+    h.ram.write_at(0, &STACK.to_be_bytes()).unwrap();
+    h.ram.write_at(4, &(ENTRY | 1).to_be_bytes()).unwrap();
+    h.cpu.reset(crate::core::device::ResetKind::Warm);
+    h.cpu.step();
+    h.cpu.set_reg(1, 0xe000_ed0c);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.reg(3) & 0xffff, 0x8000);
+
+    let h = Harness::m0(&[0x680b, PARK]);
+    h.cpu.set_reg(1, 0xe000_ed0c);
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(3) & 0xffff, 0);
+}
+
+#[test]
 fn a_cortex_m0_boots_from_zero_whatever_it_is_told() {
     let h = Harness::m0(&[PARK]);
     h.cpu.set_vtor(0x2000);
