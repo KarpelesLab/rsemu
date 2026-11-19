@@ -887,6 +887,35 @@ fn an_exception_from_the_process_stack_returns_with_fffffffd() {
 }
 
 #[test]
+fn exception_entry_clears_spsel_and_the_return_restores_it() {
+    // Thread on the process stack takes an SVC whose handler reads CONTROL
+    // (`MRS r3, control`) and returns. `ExceptionTaken` clears SPSEL
+    // (DDI 0403D B1.5.6); `EXC_RETURN` 0xFFFFFFFD sets it again.
+    let mut code = Vec::new();
+    code.extend_from_slice(&wide(0xf380_8809)); // MSR psp, r0
+    code.extend_from_slice(&wide(0xf381_8814)); // MSR control, r1
+    code.push(0xdf00); // SVC #0
+    code.push(0xe7fe); // B .
+    let h = Harness::m4(&code);
+    h.set_word(11 * 4, 0x301);
+    h.set_word(0x300, 0x8314_f3ef); // MRS r3, control
+    h.set_word(0x304, 0x4770); // BX lr
+    h.cpu.set_reg(0, 0x0c00);
+    h.cpu.set_reg(1, 2);
+    h.cpu.set_reg(3, 0x5555);
+    for _ in 0..4 {
+        h.cpu.step();
+    }
+    assert_eq!(h.cpu.reg(3), 0, "SPSEL reads zero in the handler");
+    h.cpu.step();
+    assert_eq!(
+        h.cpu.regs().control & super::sys::control::SPSEL,
+        super::sys::control::SPSEL
+    );
+    assert_eq!(h.cpu.psp(), 0x0c00);
+}
+
+#[test]
 fn stack_alignment_pads_an_odd_frame_and_records_it() {
     // With `CCR.STKALIGN` set — and it is RAO on this part — an entry from a
     // stack pointer that is only word-aligned pads by four and sets bit 9 of

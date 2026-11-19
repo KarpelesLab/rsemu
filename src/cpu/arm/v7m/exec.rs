@@ -1272,7 +1272,12 @@ impl<'a> Exec<'a> {
         };
         self.state.r[14] = lr;
 
-        // Handler mode, on the main stack, with `ITSTATE` cleared.
+        // Handler mode, on the main stack, with `ITSTATE` cleared. The main
+        // stack is *architecturally* current, not just in use:
+        // `ExceptionTaken` clears `CONTROL.SPSEL` (DDI 0403D B1.5.6,
+        // DDI 0419E B1.5.6), so a handler reads it as zero, and the
+        // `EXC_RETURN` in `LR` is what puts it back.
+        self.state.control &= !control::SPSEL;
         self.state.xpsr = (self.state.xpsr & !(xpsr::EXCEPTION | xpsr::IT_MASK))
             | u32::from(exc.0) & xpsr::EXCEPTION;
         self.state.sync_stack();
