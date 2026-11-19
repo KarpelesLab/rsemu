@@ -40,12 +40,13 @@
 //! | | ARMv6-M, as modelled |
 //! | --- | --- |
 //! | Faults | HardFault only (B1.5.14). The interpreter still raises its usual UsageFault / BusFault / MemManage internally, and because their enables in `SHCSR` cannot be set here every one escalates to HardFault — the outcome B1.5.14's table gives for each cause. The `CFSR`/`HFSR` bits that path records are kept for a debugger ([`Sys`] through `with_sys`) but read as zero from the guest: v6-M has no fault status registers (B3.2.11) |
-//! | Lockup | an `SVC` or `BKPT` at priority −1 or −2 locks up (B1.5.15, Table B1-7) |
+//! | Lockup | an `SVC` or `BKPT` at priority −1 or −2 locks up (B1.5.15, Table B1-7); an NMI ends a lockup that is not inside NMI |
+//! | Lost frames | a fault on the stacking writes pends a HardFault, or locks up from priority −1 (B1.5.11); one on the unstacking reads locks up from the main stack and pends a HardFault from the process stack (B1.5.8) |
 //! | Priority | two bits (`[7:6]`), no `PRIGROUP`, no `BASEPRI`, no `FAULTMASK` (B1.5.4, B4.1.1) |
 //! | `MRS`/`MSR` | `APSR`/`IPSR`/`EPSR` forms, `MSP`, `PSP`, `PRIMASK`, `CONTROL`; anything else reads zero and ignores writes. `MSR APSR` writes `N`, `Z`, `C`, `V` only (B4.2.2, B4.2.3) |
 //! | `CONTROL` | `SPSEL`, and `nPRIV` only with the Unprivileged/Privileged Extension (B1.4.4) |
 //! | `CPS` | `PRIMASK` only — the `F` form has no `FAULTMASK` to reach (B4.2.1) |
-//! | Exception return | the three integer `EXC_RETURN` values; anything else is a HardFault. The stacked `xPSR` restores `N`, `Z`, `C`, `V`, `T` and the exception number and nothing else (B1.5.8 `PopStack`) |
+//! | Exception return | the three integer `EXC_RETURN` values; anything else is a HardFault. The stacked `xPSR` restores `N`, `Z`, `C`, `V`, `T` and, on a return to Handler mode, `IPSR[5:0]`, and nothing else; a return to Thread mode sets `IPSR` to zero whatever the frame says (B1.5.8 `PopStack`) |
 //! | Alignment | `CCR` is read-only with `UNALIGN_TRP` and `STKALIGN` reading one: every unaligned halfword or word access faults, every frame is 8-byte aligned (B3.2.8) |
 //! | NVIC | one word each of `ISER`/`ICER`/`ISPR`/`ICPR` — 32 interrupts — and `IPR0`–`IPR7`; no `IABR`, no `STIR`, no `ICTR` (B3.4.2) |
 //! | SCB | `CPUID`, `ICSR` (no `RETTOBASE`; `ISRPENDING` is debug-only and reads zero), `VTOR` if the part has one, `AIRCR` (no `PRIGROUP`), `SCR`, `CCR`, `SHPR2` (SVCall) and `SHPR3` (PendSV, SysTick), `SHCSR.SVCALLPENDED` (B3.2.2) |
@@ -62,10 +63,11 @@
 //! figures for data processing, single loads and stores, `B`, `MOV PC`,
 //! `LDM`/`STM`/`PUSH`/`POP`. On top of it a v6-M part charges what the
 //! Cortex-M0 TRM's Table 3-1 adds: `BL` is 4 rather than 3, `POP {.., PC}` is
-//! 4 + *N*, and `MRS`, `MSR`, `DMB`, `DSB`, `ISB` are 4. The Cortex-M0+'s
-//! two-stage pipeline (a taken branch is 2, Cortex-M0+ TRM Table 3-1) is
-//! **not** modelled separately: an M0+ runs the M0's figures. `MULS` is
-//! charged as the fast single-cycle multiplier.
+//! 4 + *N*, `MRS`, `MSR`, `DMB`, `DSB`, `ISB` are 4, and `WFE`, `WFI` are 2
+//! (not counting the sleep). The Cortex-M0+'s two-stage pipeline (a taken
+//! branch is 2, Cortex-M0+ TRM Table 3-1) is **not** modelled separately: an
+//! M0+ runs the M0's figures. `MULS` is charged as the fast single-cycle
+//! multiplier.
 //!
 //! # Not modelled, stated plainly
 //!
