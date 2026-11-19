@@ -449,6 +449,36 @@ fn an_svc_that_cannot_preempt_escalates_and_one_in_hardfault_locks_up() {
 }
 
 #[test]
+fn an_nmi_ends_a_lockup_in_hardfault_but_not_one_in_nmi() {
+    // Lock up in HardFault (UDF, then an SVC in the handler).
+    let h = Harness::m0(&[0xde00]);
+    h.handler(&[SVC]);
+    h.steps(2);
+    assert!(h.cpu.is_locked_up());
+
+    // "If locked up at priority -1 and an NMI exception occurs, the NMI is
+    // activated as normal. The NMI return link is the address used for the
+    // Lockup state" (DDI 0419E B1.5.15).
+    h.cpu.set_nmi(true);
+    h.cpu.step();
+    h.cpu.set_nmi(false);
+    assert!(!h.cpu.is_locked_up());
+    assert_eq!(h.cpu.current_exception(), Exception::NMI);
+    assert_eq!(h.cpu.pc(), HANDLER);
+    let sp = h.cpu.regs().msp;
+    assert_eq!(h.word(sp + 0x18), 0xffff_fffe);
+
+    // The same SVC inside NMI locks up at -2, and nothing but a reset (or a
+    // debugger) ends that.
+    h.cpu.step();
+    assert!(h.cpu.is_locked_up());
+    h.cpu.set_nmi(true);
+    h.steps(2);
+    assert!(h.cpu.is_locked_up());
+    assert_eq!(h.cpu.current_exception(), Exception::NMI);
+}
+
+#[test]
 fn cmsis_priority_discovery_finds_two_bits() {
     // STR r0, [r1]; LDR r3, [r1] — through the guest's own word accesses,
     // as CMSIS's `NVIC_SetPriority` probe does.

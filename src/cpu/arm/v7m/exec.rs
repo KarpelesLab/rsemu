@@ -464,6 +464,23 @@ impl<'a> Exec<'a> {
             return self.used;
         }
         if self.state.locked_up {
+            // A lockup below NMI's priority — in HardFault, or at reset —
+            // is ended by an NMI, which is activated as normal with the
+            // lockup address as its return link (DDI 0419E B1.5.15,
+            // DDI 0403D B1.5.15). A lockup inside NMI is not.
+            if nmi {
+                self.state.sys.set_pending(Exception::NMI, true);
+            }
+            if self.state.sys.is_pending(Exception::NMI)
+                && !self.state.sys.is_active(Exception::NMI)
+            {
+                self.state.locked_up = false;
+                let ret = self.state.r[15];
+                self.state.sys.set_pending(Exception::NMI, false);
+                self.exception_entry(Exception::NMI, ret);
+                self.tick_time();
+                return self.used;
+            }
             self.cycle(1);
             self.tick_time();
             return self.used;
