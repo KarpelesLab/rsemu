@@ -740,7 +740,8 @@ const LEDGERS: &[(&str, bool)] = &[
     ("cpu-arm-aprofile-a32", true),
     // ARMv6-M (Cortex-M0/M0+/SC000) in the ARMv7E-M core: no
     // permissively licensed v6-M corpus exists, so this is the list of what
-    // `src/cpu/arm/v7m/v6mtests.rs` deliberately leaves out.
+    // `src/cpu/arm/v7m/v6mtests.rs`, the clang-built v6-M corpus and the
+    // LLVM encoding cross-check deliberately leave out.
     ("cpu-arm-v6m", true),
     // No downloadable VFP corpus exists to key this one to a run: the ARMv7E-M
     // floating-point unit is measured by its in-tree ledger table, its

@@ -56,7 +56,7 @@ use crate::core::value::Width;
 use crate::cpu::arm::aprofile::{self, Arm, Mode, psr, thumb};
 
 use super::isa::{self, Insn};
-use super::{ArmV7m, Config, Regs, xpsr};
+use super::{Arch, ArmV7m, Config, Regs, xpsr};
 
 /// How many failures to print before giving up; forty is enough to see the
 /// shape of a regression without burying it.
@@ -123,12 +123,12 @@ enum Verdict {
 /// address range is deliberate: a decode bug that turns an encoding into the
 /// wrong instruction then shows up as a comparison failure rather than being
 /// waved through by a range check that no longer means what it says.
-fn classify(raw: u16) -> Verdict {
+fn classify(raw: u16, arch: Arch) -> Verdict {
     if isa::is_32bit(raw) {
         return Verdict::Diverge(Why::Wide);
     }
     let v5 = thumb::decode(raw);
-    let v7 = decode_v7m(raw);
+    let v7 = decode_v7m(raw, arch);
     // Anything that raises an exception on the ARMv7-M side goes in the
     // exception class first, `UDF` included: both architectures leave it
     // permanently undefined, so it is not "new in v7-M" even though the
@@ -230,11 +230,18 @@ struct Harness {
     v5_ram: Arc<RamStore>,
     v7: ArmV7m,
     v7_ram: Arc<RamStore>,
+    /// The M-profile part under test.
+    cfg: Config,
     image: Vec<u8>,
 }
 
 impl Harness {
     fn new(seed: u64) -> Harness {
+        Harness::on(seed, Config::CORTEX_M4)
+    }
+
+    /// The same pair with `cfg` as the M-profile side.
+    fn on(seed: u64, cfg: Config) -> Harness {
         let mut rng = Rng(seed);
         let mut image = vec![0u8; RAM_SIZE as usize];
         // Fill RAM with odd words: a `POP {pc}` or `LDM {…, pc}` then lands
@@ -267,7 +274,7 @@ impl Harness {
 
         let v5 = Arm::new(aprofile::Config::ARM926EJS);
         v5.attach_space(v5_space);
-        let v7 = ArmV7m::new(Config::CORTEX_M4);
+        let v7 = ArmV7m::new(cfg);
         v7.attach_space(v7_space);
 
         Harness {
@@ -275,6 +282,7 @@ impl Harness {
             v5_ram,
             v7,
             v7_ram,
+            cfg,
             image,
         }
         // `arm_case` resets both cores itself, so nothing here has to be
@@ -345,12 +353,19 @@ impl Harness {
     }
 }
 
-/// Decode a sixteen-bit encoding as the Cortex-M4 under test executes it.
+/// Decode a sixteen-bit encoding as the part under test executes it.
 ///
 /// With `cpu-arm-v8m` compiled in, a `BX`/`BLX` with `hw[2:0] == 100`
 /// decodes as `BXNS`/`BLXNS`, which an ARMv7-M part runs as the plain
-/// branch — so that is what it is classified as here.
-fn decode_v7m(raw: u16) -> Insn {
+/// branch — so that is what it is classified as here. An ARMv6-M part goes
+/// through its own gate, which also makes `CBZ`/`CBNZ`/`IT` the UNDEFINED
+/// encodings they are there.
+fn decode_v7m(raw: u16, arch: Arch) -> Insn {
+    #[cfg(feature = "cpu-arm-v6m")]
+    if matches!(arch, Arch::V6m) {
+        return isa::decode_for(arch, raw, 0);
+    }
+    let _ = arch;
     match isa::decode_16(raw) {
         #[cfg(feature = "cpu-arm-v8m")]
         Insn::Bxns { link: true, rm } => Insn::Blx { rm },
@@ -362,8 +377,8 @@ fn decode_v7m(raw: u16) -> Insn {
 
 /// Force the target of a `BX`/`BLX` odd on both cores, so the one case where
 /// ARMv5 would enter ARM state does not swamp the comparison.
-fn make_target_thumb(setup: &mut Setup, raw: u16) {
-    if let Insn::Bx { rm } | Insn::Blx { rm } = decode_v7m(raw)
+fn make_target_thumb(setup: &mut Setup, raw: u16, arch: Arch) {
+    if let Insn::Bx { rm } | Insn::Blx { rm } = decode_v7m(raw, arch)
         && rm < 13
     {
         setup.r[rm as usize] |= 1;
@@ -402,7 +417,7 @@ fn run_case(h: &Harness, raw: u16, setup: &Setup, verdict: Verdict) -> Option<St
             Some(format!(
                 "{raw:04x} {} / {}:{detail}",
                 thumb::decode(raw),
-                isa::decode_16(raw)
+                isa::decode_for(h.cfg.arch, raw, 0)
             ))
         }
         Verdict::Diverge(why) => check_divergence(h, raw, why, same_regs && same_ram),
@@ -458,10 +473,30 @@ fn check_divergence(h: &Harness, raw: u16, why: Why, identical: bool) -> Option<
 /// `RSEMU_V7M_DIFF_STRIDE` to sample instead while iterating.
 #[test]
 fn thumb1_matches_the_aprofile_core() {
+    sweep(Config::CORTEX_M4, "ARMv7E-M");
+}
+
+/// The same sweep with a Cortex-M0 on the M-profile side.
+///
+/// ARMv6-M executes the sixteen-bit set ARMv7-M does, less `CBZ`/`CBNZ`
+/// and `IT` — which [`classify`] now files under the exception model,
+/// because on this part they are UNDEFINED and so a HardFault. Nothing else
+/// changes: the pointer shape keeps every access aligned, so the v6-M
+/// alignment rule never fires. The one adjustment is the starting flags:
+/// ARMv6-M has no `Q` (DDI 0419E B1.4.2), and no Thumb instruction sets it
+/// on ARMv5TE, so both sides start with it clear.
+#[cfg(feature = "cpu-arm-v6m")]
+#[test]
+fn thumb1_on_armv6m_matches_the_aprofile_core() {
+    sweep(Config::CORTEX_M0, "ARMv6-M");
+}
+
+/// One full differential sweep with `cfg` as the M-profile side.
+fn sweep(cfg: Config, label: &str) {
     let stride: u32 = option_env!("RSEMU_V7M_DIFF_STRIDE")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let h = Harness::new(0x5eed_1234_abcd_0001);
+    let h = Harness::on(0x5eed_1234_abcd_0001, cfg);
     let mut rng = Rng(0xc0ff_ee00_1234_5678);
 
     let mut compared = 0usize;
@@ -473,7 +508,7 @@ fn thumb1_matches_the_aprofile_core() {
         while raw < 0x1_0000 {
             let encoding = raw as u16;
             raw += stride;
-            let verdict = classify(encoding);
+            let verdict = classify(encoding, cfg.arch);
             // In the arithmetic shape the registers are arbitrary, so a
             // memory instruction would address nothing; skip exactly those,
             // and the thirty-two-bit encodings with them.
@@ -483,7 +518,10 @@ fn thumb1_matches_the_aprofile_core() {
                 continue;
             }
             let mut setup = Setup::build(&mut rng, shape);
-            make_target_thumb(&mut setup, encoding);
+            if cfg.is_v6m() {
+                setup.flags &= !xpsr::Q;
+            }
+            make_target_thumb(&mut setup, encoding, cfg.arch);
             match verdict {
                 Verdict::Same => compared += 1,
                 Verdict::Diverge(why) => diverged[why as usize] += 1,
@@ -511,8 +549,8 @@ fn thumb1_matches_the_aprofile_core() {
             std::println!("FAIL {failure}");
         }
         std::println!(
-            "differential vs cpu::arm::aprofile: {compared} encodings compared, \
-             {} classified as divergent ({} new in v7-M, {} exception model, \
+            "differential {label} vs cpu::arm::aprofile: {compared} encodings compared, \
+             {} classified as divergent ({} new since ARMv5TE, {} exception model, \
              {} interworking, {} STM base-in-list, {} empty list, \
              {} thirty-two-bit in v7-M)",
             diverged.iter().sum::<usize>(),
@@ -525,7 +563,7 @@ fn thumb1_matches_the_aprofile_core() {
         );
     }
     #[cfg(not(feature = "std"))]
-    let _ = (compared, diverged);
+    let _ = (compared, diverged, label);
 
     assert!(
         failures.is_empty(),

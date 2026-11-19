@@ -376,6 +376,116 @@ fn the_disassembler_is_honest_about_the_architecture() {
     assert!(!matches!(listing[1].insn, Insn::Undefined));
 }
 
+/// Every sixteen-bit halfword decodes on ARMv6-M to exactly what it decodes
+/// to on ARMv7-M, except `CBZ`, `CBNZ` and `IT`, which are UNDEFINED there
+/// (DDI 0419E A5.2: "Thumb instructions present in other architecture
+/// variants are UNDEFINED in ARMv6-M"). Exhaustive: all 65,536 values.
+#[test]
+fn every_sixteen_bit_encoding_decodes_as_on_v7m_but_cbz_and_it() {
+    let mut cut = 0usize;
+    for raw in 0..=0xffffu16 {
+        if super::isa::is_32bit(raw) {
+            continue;
+        }
+        let v6 = decode_for(Arch::V6m, raw, 0);
+        let v7 = decode_for(Arch::V7m, raw, 0);
+        match v7 {
+            Insn::Cbz { .. } | Insn::It { .. } => {
+                assert_eq!(v6, Insn::Undefined, "{raw:04x} exists on ARMv6-M");
+                cut += 1;
+            }
+            // Armv8-M's BXNS/BLXNS are a BX/BLX with should-be-zero bits
+            // set on any other architecture.
+            #[cfg(feature = "cpu-arm-v8m")]
+            Insn::Bxns { link, rm } => {
+                let plain = if link {
+                    Insn::Blx { rm }
+                } else {
+                    Insn::Bx { rm }
+                };
+                assert_eq!(v6, plain, "{raw:04x}");
+            }
+            _ => assert_eq!(v6, v7, "{raw:04x} decodes differently on ARMv6-M"),
+        }
+    }
+    // CBZ/CBNZ: op x i x imm5 x Rn = 2 * 2 * 32 * 8 = 1024 encodings; IT:
+    // 16 conditions x 15 non-zero masks = 240. The count is the check that
+    // the cut is exactly those and nothing besides.
+    assert_eq!(cut, 1024 + 240);
+}
+
+/// Of the thirty-two-bit space, ARMv6-M has `BL`, `MSR`, `MRS`, `DSB`,
+/// `DMB`, `ISB` and `UDF.W` (DDI 0419E Tables A5-9 to A5-11); every other
+/// encoding is UNDEFINED, and the permitted ones decode exactly as on
+/// ARMv7-M. Every first halfword against a fixed walk of second halfwords
+/// plus a pseudo-random sample, and the whole second-halfword space behind
+/// the system-instruction first halfwords.
+///
+/// The reference set here is written out again from the tables rather than
+/// by calling `permits_32`, so a transcription error in one shows up as a
+/// disagreement with the other; `conformance::v6m_encoding_set_matches_llvm`
+/// is the third, independent, reading.
+#[test]
+fn every_thirty_two_bit_encoding_outside_the_v6m_set_is_undefined() {
+    // DDI 0419E Table A5-10, read directly: the "branch and miscellaneous
+    // control" class is hw1[15:11] = 11110 with hw2[15] = 1.
+    fn in_v6m(first: u16, second: u16) -> bool {
+        if first >> 11 != 0b11110 || second >> 15 != 1 {
+            return false;
+        }
+        let op1 = (first >> 4) & 0x7f;
+        let op2 = (second >> 12) & 0x7;
+        match op2 {
+            // BL: op2 = 1x1.
+            0b101 | 0b111 => true,
+            // op2 = 0x0: MSR (011100x), MRS (011111x), and Table A5-11
+            // under 0111011 (DSB 0100, DMB 0101, ISB 0110 in hw2[7:4]).
+            0b000 | 0b010 => match op1 {
+                0b011_1000 | 0b011_1001 | 0b011_1110 | 0b011_1111 => true,
+                0b011_1011 => matches!((second >> 4) & 0xf, 0b0100..=0b0110),
+                // UDF.W: op1 = 1111111, op2 = 010.
+                0b111_1111 => op2 == 0b010,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    let check = |first: u16, second: u16| {
+        let v6 = decode_for(Arch::V6m, first, second);
+        if in_v6m(first, second) {
+            assert!(permits_32(first, second), "{first:04x} {second:04x}");
+            assert_eq!(v6, decode(first, second), "{first:04x} {second:04x}");
+            assert_ne!(v6, Insn::Undefined, "{first:04x} {second:04x}");
+        } else {
+            assert!(!permits_32(first, second), "{first:04x} {second:04x}");
+            assert_eq!(v6, Insn::Undefined, "{first:04x} {second:04x} exists");
+        }
+    };
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for first in 0xe800..=0xffffu16 {
+        for op2 in 0..8u16 {
+            for low in [
+                0x0000u16, 0x0f4f, 0x0f5f, 0x0f6f, 0x0f2f, 0x0800, 0x0014, 0x0fff,
+            ] {
+                check(first, (op2 << 12) | low | 0x8000);
+                check(first, (op2 << 12) | low);
+            }
+        }
+        for _ in 0..16 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            check(first, seed as u16);
+        }
+    }
+    for first in [0xf3bfu16, 0xf3ef, 0xf380, 0xf381, 0xf7f0, 0xf7ff, 0xf000] {
+        for second in 0..=0xffffu16 {
+            check(first, second);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The exception model
 // ---------------------------------------------------------------------------

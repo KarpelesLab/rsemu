@@ -2100,3 +2100,1431 @@ cond_fail:
 cond_done:
     b pass
 "#;
+
+// ---------------------------------------------------------------------------
+// ARMv6-M
+//
+// These bodies are assembled with `--target=thumbv6m-none-eabi` against
+// `super::conformance::V6M_PROLOGUE`, whose macros differ from the v7-M ones
+// (low registers only for `LOADC`; `R6`/`R7` are the scratch pair). Every
+// expected value is DDI 0419E's: the A6.7 operation pseudocode for an
+// instruction, B1.5 for the exception model, B3 for the system control
+// space. No emulator source of any licence was consulted (`ROADMAP.md` §1).
+// ---------------------------------------------------------------------------
+
+/// The whole ARMv6-M sixteen-bit data-processing set with its flag results
+/// (DDI 0419E A5.2.1-A5.2.4, A6.7): what each writes, and — as often the
+/// point — what it leaves alone.
+#[cfg(feature = "cpu-arm-v6m")]
+pub(super) const V6M_ALU: &str = r#"
+    @ MSR APSR writes N, Z, C and V; there is no Q to write (B4.2.3), so
+    @ bit 27 reads zero whatever was written to it.
+    SETF 0xf8000000
+    CHECKF 1, 0xf0000000
+
+    @ MOVS #imm8 sets N and Z, keeps C and V (A6.7.39).
+    SETF 0x30000000
+    movs r0, #0
+    CHECKF 2, 0x70000000
+    SETF 0x30000000
+    movs r0, #0x80
+    CHECKF 3, 0x30000000
+    CHECK 4, r0, 0x00000080
+
+    @ MOVS Rd, Rm is LSLS #0: N and Z from the value, C kept (A6.7.40).
+    LOADC r1, 0x80000000
+    SETF 0x20000000
+    movs r2, r1
+    CHECKF 5, 0xa0000000
+    CHECK 6, r2, 0x80000000
+
+    @ MOV with a high register sets no flags at all.
+    SETF 0x00000000
+    mov r8, r1
+    mov r3, r8
+    CHECKF 7, 0x00000000
+    CHECK 8, r3, 0x80000000
+    CHECK 9, r8, 0x80000000
+
+    @ ADDS, all three sixteen-bit forms (A6.7.2, A6.7.3).
+    LOADC r1, 0x7fffffff
+    adds r2, r1, #1
+    CHECKF 10, 0x90000000
+    CHECK 11, r2, 0x80000000
+    movs r2, #0xff
+    adds r2, #1
+    CHECKF 12, 0x00000000
+    CHECK 13, r2, 0x00000100
+    LOADC r1, 0xffffffff
+    movs r2, #1
+    adds r3, r1, r2
+    CHECKF 14, 0x60000000
+    CHECK 15, r3, 0x00000000
+
+    @ ADD Rdn, Rm with a high register: no flags.
+    movs r1, #0x10
+    mov r9, r1
+    movs r2, #0x22
+    SETF 0xf0000000
+    add r2, r9
+    CHECKF 16, 0xf0000000
+    CHECK 17, r2, 0x00000032
+    add r9, r2
+    CHECK 18, r9, 0x00000042
+
+    @ The SP forms: SUB SP, ADD Rd, SP, #imm, ADD SP, #imm, ADD Rd, SP, Rd
+    @ and ADD SP, Rm (A6.7.5, A6.7.6, A6.7.66).
+    sub sp, #16
+    mov r5, sp
+    CHECK 19, r5, 0x2000fff0
+    add r1, sp, #8
+    CHECK 20, r1, 0x2000fff8
+    movs r1, #4
+    add r1, sp, r1
+    CHECK 21, r1, 0x2000fff4
+    add sp, #16
+    mov r5, sp
+    CHECK 22, r5, 0x20010000
+    movs r1, #0
+    subs r1, #8
+    add sp, r1
+    mov r5, sp
+    CHECK 23, r5, 0x2000fff8
+    add sp, #8
+
+    @ ADR is forward-only and word-aligned on ARMv6-M (A6.7.7).
+    adr r1, alu_word
+    ldr r2, [r1]
+    CHECK 24, r2, 0x0badf00d
+    b alu_past
+    .align 2
+alu_word:
+    .word 0x0badf00d
+alu_past:
+
+    @ SUBS, all three forms, with the borrow and overflow cases.
+    movs r1, #5
+    subs r2, r1, #7
+    CHECKF 25, 0x80000000
+    CHECK 26, r2, 0xfffffffe
+    movs r2, #200
+    subs r2, #200
+    CHECKF 27, 0x60000000
+    LOADC r1, 0x80000000
+    movs r2, #1
+    subs r3, r1, r2
+    CHECKF 28, 0x30000000
+    CHECK 29, r3, 0x7fffffff
+
+    @ RSBS Rd, Rn, #0 (NEG): zero has no borrow; the most negative number
+    @ overflows (A6.7.55).
+    movs r1, #0
+    rsbs r2, r1, #0
+    CHECKF 30, 0x60000000
+    movs r1, #1
+    rsbs r2, r1, #0
+    CHECKF 31, 0x80000000
+    CHECK 32, r2, 0xffffffff
+    LOADC r1, 0x80000000
+    rsbs r2, r1, #0
+    CHECKF 33, 0x90000000
+    CHECK 34, r2, 0x80000000
+
+    @ ADCS and SBCS take the carry in.
+    SETF 0x20000000
+    movs r1, #1
+    movs r2, #2
+    adcs r1, r2
+    CHECKF 35, 0x00000000
+    CHECK 36, r1, 0x00000004
+    LOADC r1, 0xffffffff
+    SETF 0x20000000
+    movs r2, #0
+    adcs r1, r2
+    CHECKF 37, 0x60000000
+    CHECK 38, r1, 0x00000000
+    movs r1, #5
+    movs r2, #3
+    SETF 0x00000000
+    sbcs r1, r2
+    CHECKF 39, 0x20000000
+    CHECK 40, r1, 0x00000001
+    movs r1, #3
+    movs r2, #5
+    SETF 0x20000000
+    sbcs r1, r2
+    CHECKF 41, 0x80000000
+    CHECK 42, r1, 0xfffffffe
+    LOADC r1, 0x80000000
+    movs r2, #0
+    SETF 0x00000000
+    sbcs r1, r2
+    CHECKF 43, 0x30000000
+    CHECK 44, r1, 0x7fffffff
+
+    @ CMP: immediate, low registers, and a high register; CMN.
+    movs r1, #5
+    cmp r1, #5
+    CHECKF 45, 0x60000000
+    movs r2, #6
+    cmp r1, r2
+    CHECKF 46, 0x80000000
+    mov r8, r2
+    cmp r8, r1
+    CHECKF 47, 0x20000000
+    movs r1, #1
+    LOADC r2, 0xffffffff
+    cmn r1, r2
+    CHECKF 48, 0x60000000
+    LOADC r1, 0x7fffffff
+    movs r2, #1
+    cmn r1, r2
+    CHECKF 49, 0x90000000
+
+    @ The logical operations set N and Z and keep C and V.
+    LOADC r1, 0xf0f0f0f0
+    LOADC r2, 0xff00ff00
+    mov r3, r1
+    SETF 0x30000000
+    ands r3, r2
+    CHECKF 50, 0xb0000000
+    CHECK 51, r3, 0xf000f000
+    SETF 0x30000000
+    mov r3, r1
+    eors r3, r2
+    CHECKF 52, 0x30000000
+    CHECK 53, r3, 0x0ff00ff0
+    SETF 0x30000000
+    mov r3, r1
+    orrs r3, r2
+    CHECKF 54, 0xb0000000
+    CHECK 55, r3, 0xfff0fff0
+    SETF 0x30000000
+    mov r3, r1
+    bics r3, r2
+    CHECKF 56, 0x30000000
+    CHECK 57, r3, 0x00f000f0
+    SETF 0x30000000
+    mvns r3, r1
+    CHECKF 58, 0x30000000
+    CHECK 59, r3, 0x0f0f0f0f
+    movs r3, #0
+    SETF 0x00000000
+    tst r3, r1
+    CHECKF 60, 0x40000000
+    SETF 0x00000000
+    tst r1, r2
+    CHECKF 61, 0x80000000
+
+    @ MULS sets N and Z and leaves C and V alone (A6.7.44).
+    LOADC r1, 0x00010000
+    mov r2, r1
+    SETF 0x30000000
+    muls r2, r1, r2
+    CHECKF 62, 0x70000000
+    CHECK 63, r2, 0x00000000
+    movs r1, #3
+    LOADC r2, 0xffffffff
+    SETF 0x30000000
+    muls r2, r1, r2
+    CHECKF 64, 0xb0000000
+    CHECK 65, r2, 0xfffffffd
+
+    @ Shifts by an immediate, with the amounts the encoding treats
+    @ specially: LSR #32 and ASR #32 are what an immediate of 0 means
+    @ (A6.7.35, A6.7.37, A6.7.10). V is never touched.
+    LOADC r1, 0x80000001
+    SETF 0x10000000
+    lsls r2, r1, #1
+    CHECKF 66, 0x30000000
+    CHECK 67, r2, 0x00000002
+    LOADC r1, 0x80000000
+    SETF 0x00000000
+    lsrs r2, r1, #32
+    CHECKF 68, 0x60000000
+    CHECK 69, r2, 0x00000000
+    SETF 0x00000000
+    asrs r2, r1, #32
+    CHECKF 70, 0xa0000000
+    CHECK 71, r2, 0xffffffff
+    SETF 0x00000000
+    asrs r2, r1, #4
+    CHECKF 72, 0x80000000
+    CHECK 73, r2, 0xf8000000
+    movs r1, #1
+    SETF 0x00000000
+    lsrs r2, r1, #1
+    CHECKF 74, 0x60000000
+
+    @ Shifts by a register use its bottom byte; zero leaves the value and C
+    @ alone, 32 shifts the last bit into C, more than 32 clears it
+    @ (A6.7.36, A6.7.38, A6.7.11, A6.7.54).
+    movs r1, #1
+    movs r3, #0
+    SETF 0x20000000
+    lsls r1, r3
+    CHECKF 75, 0x20000000
+    CHECK 76, r1, 0x00000001
+    SETF 0x00000000
+    movs r3, #32
+    lsls r1, r3
+    CHECKF 77, 0x60000000
+    movs r1, #1
+    SETF 0x00000000
+    movs r3, #33
+    lsls r1, r3
+    CHECKF 78, 0x40000000
+    movs r1, #1
+    LOADC r3, 0x00000101
+    lsls r1, r3
+    CHECK 79, r1, 0x00000002
+    LOADC r1, 0x80000000
+    SETF 0x00000000
+    movs r3, #32
+    lsrs r1, r3
+    CHECKF 80, 0x60000000
+    LOADC r1, 0x80000000
+    SETF 0x00000000
+    movs r3, #40
+    lsrs r1, r3
+    CHECKF 81, 0x40000000
+    LOADC r1, 0x80000000
+    SETF 0x00000000
+    movs r3, #40
+    asrs r1, r3
+    CHECKF 82, 0xa0000000
+    CHECK 83, r1, 0xffffffff
+    LOADC r1, 0x80000001
+    SETF 0x00000000
+    movs r3, #1
+    rors r1, r3
+    CHECKF 84, 0xa0000000
+    CHECK 85, r1, 0xc0000000
+    LOADC r1, 0x80000001
+    movs r3, #32
+    SETF 0x00000000
+    rors r1, r3
+    CHECKF 86, 0xa0000000
+    CHECK 87, r1, 0x80000001
+    movs r3, #0
+    SETF 0x00000000
+    rors r1, r3
+    CHECKF 88, 0x80000000
+
+    @ The extends and byte reversals: no flags (A6.7.69-75, A6.7.51-53).
+    LOADC r1, 0x1234f680
+    SETF 0x00000000
+    sxtb r2, r1
+    CHECK 89, r2, 0xffffff80
+    sxth r2, r1
+    CHECK 90, r2, 0xfffff680
+    uxtb r2, r1
+    CHECK 91, r2, 0x00000080
+    uxth r2, r1
+    CHECK 92, r2, 0x0000f680
+    LOADC r1, 0x11223344
+    rev r2, r1
+    CHECK 93, r2, 0x44332211
+    rev16 r2, r1
+    CHECK 94, r2, 0x22114433
+    LOADC r1, 0x000012f0
+    revsh r2, r1
+    CHECK 95, r2, 0xfffff012
+"#;
+
+/// Every ARMv6-M load and store addressing form (DDI 0419E A5.2.4, A6.7):
+/// immediate, register and SP-relative offsets at every size, the literal
+/// form, `LDM`/`STM` with their write-back rules, and `PUSH`/`POP`.
+#[cfg(feature = "cpu-arm-v6m")]
+pub(super) const V6M_MEMORY: &str = r#"
+    LOADC r0, 0x20000100
+    LOADC r1, 0x8badf00d
+
+    @ Word, immediate offset: zero and the largest (imm5 * 4 = 124).
+    str r1, [r0]
+    str r1, [r0, #124]
+    ldr r2, [r0, #124]
+    CHECK 1, r2, 0x8badf00d
+
+    @ Halfword and byte, immediate offset; little-endian.
+    strh r1, [r0, #8]
+    ldrh r2, [r0, #8]
+    CHECK 2, r2, 0x0000f00d
+    ldrb r2, [r0, #9]
+    CHECK 3, r2, 0x000000f0
+    strb r1, [r0, #31]
+    ldrb r2, [r0, #31]
+    CHECK 4, r2, 0x0000000d
+
+    @ Register offsets, including the sign-extending loads that have no
+    @ immediate form (A6.7.31, A6.7.32).
+    movs r3, #8
+    ldrsh r2, [r0, r3]
+    CHECK 5, r2, 0xfffff00d
+    movs r3, #9
+    ldrsb r2, [r0, r3]
+    CHECK 6, r2, 0xfffffff0
+    movs r3, #31
+    ldrsb r2, [r0, r3]
+    CHECK 7, r2, 0x0000000d
+    movs r3, #64
+    str r1, [r0, r3]
+    ldr r2, [r0, r3]
+    CHECK 8, r2, 0x8badf00d
+    movs r3, #68
+    strh r1, [r0, r3]
+    ldrh r2, [r0, r3]
+    CHECK 9, r2, 0x0000f00d
+    movs r3, #72
+    strb r1, [r0, r3]
+    ldrb r2, [r0, r3]
+    CHECK 10, r2, 0x0000000d
+    ldr r2, [r0, #72]
+    CHECK 11, r2, 0x0000000d
+
+    @ SP-relative.
+    sub sp, #8
+    str r1, [sp, #4]
+    ldr r2, [sp, #4]
+    CHECK 12, r2, 0x8badf00d
+    add sp, #8
+
+    @ The literal form, aligned down from PC (A6.7.27).
+    ldr r2, mem_lit
+    CHECK 13, r2, 0xcafef00d
+    b mem_past
+    .align 2
+mem_lit:
+    .word 0xcafef00d
+mem_past:
+
+    @ STMIA with write-back: lowest register at the lowest address.
+    movs r1, #1
+    movs r2, #2
+    movs r3, #3
+    mov r4, r0
+    stmia r4!, {r1-r3}
+    CHECK 14, r4, 0x2000010c
+    ldr r5, [r0, #8]
+    CHECK 15, r5, 0x00000003
+    movs r1, #0
+    movs r2, #0
+    movs r3, #0
+    mov r4, r0
+    ldmia r4!, {r1-r3}
+    CHECK 16, r4, 0x2000010c
+    CHECK 17, r1, 0x00000001
+    CHECK 18, r3, 0x00000003
+
+    @ LDM with the base in the list does not write back: the loaded value
+    @ wins (A6.7.25).
+    mov r1, r0
+    ldm r1, {r1, r2}
+    CHECK 19, r1, 0x00000001
+    CHECK 20, r2, 0x00000002
+
+    @ STMIA with the base the lowest register stores its original value
+    @ (A6.7.58).
+    mov r1, r0
+    movs r2, #0x55
+    stmia r1!, {r1, r2}
+    CHECK 21, r1, 0x20000108
+    ldr r3, [r0]
+    CHECK 22, r3, 0x20000100
+    ldr r3, [r0, #4]
+    CHECK 23, r3, 0x00000055
+
+    @ PUSH and POP, with LR: full descending, lowest register lowest.
+    movs r1, #0x11
+    movs r2, #0x22
+    LOADC r3, 0x33333333
+    mov lr, r3
+    push {r1, r2, lr}
+    mov r5, sp
+    CHECK 24, r5, 0x2000fff4
+    ldr r5, [sp]
+    CHECK 25, r5, 0x00000011
+    ldr r5, [sp, #8]
+    CHECK 26, r5, 0x33333333
+    movs r1, #0
+    movs r2, #0
+    pop {r1, r2}
+    pop {r4}
+    CHECK 27, r1, 0x00000011
+    CHECK 28, r2, 0x00000022
+    CHECK 29, r4, 0x33333333
+    mov r5, sp
+    CHECK 30, r5, 0x20010000
+"#;
+
+/// Every branch ARMv6-M has: `B<cond>` under every condition, taken and
+/// not, `B`, `BL`, `BX`, `BLX`, `MOV PC` and `POP {PC}` (DDI 0419E A6.7).
+#[cfg(feature = "cpu-arm-v6m")]
+pub(super) const V6M_BRANCH: &str = r#"
+    .macro TAKEN cond, n
+    b\cond 8000f
+    movs r0, #\n
+    bl fail
+8000:
+    .endm
+    .macro NOTTAKEN cond, n
+    b\cond 8001f
+    b 8002f
+8001:
+    movs r0, #\n
+    bl fail
+8002:
+    .endm
+
+    @ N=1 Z=0 C=1 V=0.
+    SETF 0xa0000000
+    TAKEN ne, 1
+    TAKEN cs, 2
+    TAKEN mi, 3
+    TAKEN vc, 4
+    TAKEN hi, 5
+    TAKEN lt, 6
+    TAKEN le, 7
+    NOTTAKEN eq, 8
+    NOTTAKEN cc, 9
+    NOTTAKEN pl, 10
+    NOTTAKEN vs, 11
+    NOTTAKEN ls, 12
+    NOTTAKEN ge, 13
+    NOTTAKEN gt, 14
+    @ N=0 Z=1 C=0 V=1.
+    SETF 0x50000000
+    TAKEN eq, 15
+    TAKEN cc, 16
+    TAKEN pl, 17
+    TAKEN vs, 18
+    TAKEN ls, 19
+    TAKEN lt, 20
+    TAKEN le, 21
+    NOTTAKEN ne, 22
+    NOTTAKEN cs, 23
+    NOTTAKEN mi, 24
+    NOTTAKEN vc, 25
+    NOTTAKEN hi, 26
+    NOTTAKEN ge, 27
+    NOTTAKEN gt, 28
+    @ N=1 V=1, Z=0: GE and GT hold.
+    SETF 0x90000000
+    TAKEN ge, 29
+    TAKEN gt, 30
+    NOTTAKEN lt, 31
+    NOTTAKEN le, 32
+
+    @ BL sets LR to the next instruction with bit 0 set; BX LR returns.
+    movs r4, #0
+    bl br_sub
+    CHECK 33, r4, 0x00000001
+    @ ...and BLX Rm does the same through a register.
+    movs r4, #0
+    ADDR r2, br_sub
+    blx r2
+br_after_blx:
+    CHECK 34, r4, 0x00000001
+    mov r3, lr
+    ADDR r2, br_after_blx
+    CHECKR 35, r3, r2
+
+    @ BX to an odd address stays in Thumb state.
+    ADDR r2, br_bx_target
+    bx r2
+    movs r0, #36
+    bl fail
+    .align 2
+br_bx_target:
+
+    @ MOV PC, Rm is a branch.
+    ADDR r2, br_mov_target
+    mov pc, r2
+    movs r0, #37
+    bl fail
+    .align 2
+br_mov_target:
+
+    @ POP {PC} returns, interworking on bit 0.
+    movs r5, #0
+    bl br_popper
+    CHECK 38, r5, 0x00000005
+
+    @ An unconditional B backwards.
+    movs r5, #0
+    b br_fwd
+br_back:
+    adds r5, #1
+    b br_done
+br_fwd:
+    adds r5, #2
+    b br_back
+br_done:
+    CHECK 39, r5, 0x00000003
+    b pass
+
+    .align 2
+    .thumb_func
+br_sub:
+    mov r5, lr
+    movs r4, #1
+    ands r4, r5
+    bx lr
+
+    .thumb_func
+br_popper:
+    push {r4, lr}
+    movs r5, #5
+    pop {r4, pc}
+"#;
+
+/// The ARMv6-M system registers and system instructions on a Cortex-M0
+/// (DDI 0419E B3.2, B3.4, B4.2): `MRS`/`MSR` over every special register,
+/// `CPS`, the barriers and hints, `CPUID`, the fixed `CCR`, `AIRCR`, the
+/// two-bit priority probe CMSIS does, the 32-interrupt NVIC, and the
+/// registers a Cortex-M0 does not have.
+#[cfg(feature = "cpu-arm-v6m")]
+pub(super) const V6M_SYSTEM: &str = r#"
+    @ Thread mode: IPSR is zero, EPSR reads as zero through MRS (B4.2.2),
+    @ and xPSR is therefore just the flags.
+    mrs r1, ipsr
+    CHECK 1, r1, 0x00000000
+    mrs r1, epsr
+    CHECK 2, r1, 0x00000000
+    SETF 0x90000000
+    mrs r1, xpsr
+    CHECK 3, r1, 0x90000000
+    SETF 0x90000000
+    mrs r1, iapsr
+    CHECK 4, r1, 0x90000000
+
+    @ PSP and MSP are word-aligned: bits [1:0] read zero (B1.4.2).
+    LOADC r1, 0x20008007
+    msr psp, r1
+    mrs r2, psp
+    CHECK 5, r2, 0x20008004
+    mrs r2, msp
+    CHECK 6, r2, 0x20010000
+
+    @ CONTROL.SPSEL moves Thread mode onto the process stack; a Cortex-M0
+    @ has no nPRIV, so bit 0 does not stick (B1.4.4).
+    LOADC r1, 0x20008000
+    msr psp, r1
+    movs r1, #3
+    msr control, r1
+    isb
+    mrs r2, control
+    CHECK 7, r2, 0x00000002
+    mov r2, sp
+    CHECK 8, r2, 0x20008000
+    movs r1, #0
+    msr control, r1
+    isb
+    mov r2, sp
+    CHECK 9, r2, 0x20010000
+
+    @ PRIMASK is one bit, reached by MSR and by CPS (B4.2.1).
+    movs r1, #0xff
+    msr primask, r1
+    mrs r2, primask
+    CHECK 10, r2, 0x00000001
+    cpsie i
+    mrs r2, primask
+    CHECK 11, r2, 0x00000000
+    cpsid i
+    mrs r2, primask
+    CHECK 12, r2, 0x00000001
+    cpsie i
+
+    @ The barriers and the hints all execute; SEV sets the event register so
+    @ that the WFE after it returns at once (B1.6.1).
+    dmb
+    dsb
+    isb
+    nop
+    yield
+    sev
+    wfe
+
+    @ CPUID: a Cortex-M0 r0p0 (Cortex-M0 TRM Table 4-1).
+    LOADC r0, 0xe000ed00
+    ldr r1, [r0]
+    CHECK 13, r1, 0x410cc200
+
+    @ CCR is read-only with STKALIGN and UNALIGN_TRP set (B3.2.8).
+    LOADC r0, 0xe000ed14
+    ldr r1, [r0]
+    CHECK 14, r1, 0x00000208
+    movs r1, #0
+    str r1, [r0]
+    ldr r1, [r0]
+    CHECK 15, r1, 0x00000208
+
+    @ AIRCR reads VECTKEYSTAT and nothing else: no PRIGROUP, little-endian
+    @ (B3.2.6). A write with the wrong key is ignored.
+    LOADC r0, 0xe000ed0c
+    ldr r1, [r0]
+    CHECK 16, r1, 0xfa050000
+    LOADC r1, 0x00000700
+    str r1, [r0]
+    ldr r1, [r0]
+    CHECK 17, r1, 0xfa050000
+
+    @ The priority probe CMSIS does: write all ones, read back what stuck.
+    @ Two bits, [7:6] (B1.5.4).
+    LOADC r0, 0xe000ed20
+    movs r1, #0
+    mvns r1, r1
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 18, r2, 0xc0c00000
+    movs r1, #0
+    str r1, [r0]
+    LOADC r0, 0xe000ed1c
+    movs r1, #0
+    mvns r1, r1
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 19, r2, 0xc0000000
+    movs r1, #0
+    str r1, [r0]
+    LOADC r0, 0xe000e400
+    movs r1, #0
+    mvns r1, r1
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 20, r2, 0xc0c0c0c0
+    LOADC r0, 0xe000e41c
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 21, r2, 0xc0c0c0c0
+    movs r1, #0
+    str r1, [r0]
+    LOADC r0, 0xe000e400
+    str r1, [r0]
+    @ SHPR1 does not exist: there are no configurable faults (B3.2.10).
+    LOADC r0, 0xe000ed18
+    movs r1, #0
+    mvns r1, r1
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 22, r2, 0x00000000
+
+    @ The NVIC has one word of each register: 32 interrupts, and no IPR8
+    @ (B3.4.2).
+    LOADC r0, 0xe000e100
+    movs r1, #0
+    mvns r1, r1
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 23, r2, 0xffffffff
+    LOADC r0, 0xe000e180
+    str r1, [r0]
+    LOADC r0, 0xe000e100
+    ldr r2, [r0]
+    CHECK 24, r2, 0x00000000
+    LOADC r0, 0xe000e104
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 25, r2, 0x00000000
+    LOADC r0, 0xe000e420
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 26, r2, 0x00000000
+
+    @ ICSR: PendSV pending under PRIMASK shows in PENDSVSET and VECTPENDING,
+    @ and PENDSVCLR takes it back (B3.2.4).
+    cpsid i
+    LOADC r0, 0xe000ed04
+    LOADC r1, 0x10000000
+    str r1, [r0]
+    ldr r2, [r0]
+    LOADC r3, 0x1001f000
+    ands r2, r3
+    CHECK 27, r2, 0x1000e000
+    LOADC r1, 0x08000000
+    str r1, [r0]
+    ldr r2, [r0]
+    ands r2, r3
+    CHECK 28, r2, 0x00000000
+    cpsie i
+
+    @ What a Cortex-M0 does not have reads as zero: VTOR (an option the M0
+    @ does not take), the MPU, the fault status registers, CPACR.
+    LOADC r0, 0xe000ed08
+    LOADC r1, 0x20000000
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 29, r2, 0x00000000
+    LOADC r0, 0xe000ed90
+    ldr r2, [r0]
+    CHECK 30, r2, 0x00000000
+    LOADC r0, 0xe000ed28
+    ldr r2, [r0]
+    CHECK 31, r2, 0x00000000
+    LOADC r0, 0xe000ed2c
+    ldr r2, [r0]
+    CHECK 32, r2, 0x00000000
+    LOADC r0, 0xe000ed88
+    ldr r2, [r0]
+    CHECK 33, r2, 0x00000000
+
+    @ SysTick: RVR is 24 bits, and COUNTFLAG clears on read (B3.3).
+    LOADC r0, 0xe000e014
+    movs r1, #0
+    mvns r1, r1
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 34, r2, 0x00ffffff
+    movs r1, #0x40
+    str r1, [r0]
+    LOADC r0, 0xe000e018
+    str r1, [r0]
+    LOADC r0, 0xe000e010
+    movs r1, #5
+    str r1, [r0]
+sys_tick_wait:
+    ldr r2, [r0]
+    lsrs r2, r2, #17
+    bcc sys_tick_wait
+    ldr r2, [r0]
+    CHECK 35, r2, 0x00000005
+    movs r1, #0
+    str r1, [r0]
+"#;
+
+/// The ARMv6-M exception model (DDI 0419E B1.5): the stacked frame and its
+/// alignment, the three `EXC_RETURN` values, preemption, tail-chaining,
+/// PRIMASK, PendSV, SysTick, and return through `POP {PC}`.
+#[cfg(feature = "cpu-arm-v6m")]
+pub(super) const V6M_EXCEPTIONS: &str = r#"
+    @ Append a low register to the log at 0x20000200; the count is at
+    @ 0x200001fc. Clobbers r1, r2 and the flags.
+    .macro LOGV reg
+    LOADC r1, 0x200001fc
+    ldr r2, [r1]
+    adds r2, #1
+    str r2, [r1]
+    lsls r2, r2, #2
+    adds r2, r2, r1
+    str \reg, [r2]
+    .endm
+    .equ LOGBASE, 0x20000200
+
+    @ ---- SVC: the frame, from Thread mode on the main stack ----
+    INSTALL frame_handler
+    LOADC r0, 0x10101010
+    LOADC r1, 0x11111111
+    LOADC r2, 0x12121212
+    LOADC r3, 0x13131313
+    LOADC r4, 0x1c1c1c1c
+    mov r12, r4
+    LOADC r4, 0x1e1e1e1e
+    mov lr, r4
+    SETF 0x90000000
+    svc #0x5a
+exc_after_svc:
+    @ The frame restored r0-r3, r12, LR and the flags.
+    CHECKF 1, 0x90000000
+    CHECK 2, r0, 0x10101010
+    CHECK 3, r3, 0x13131313
+    CHECK 4, r12, 0x1c1c1c1c
+    CHECK 5, lr, 0x1e1e1e1e
+    LOADC r0, LOGBASE
+    ldr r1, [r0, #0]
+    CHECK 6, r1, 0x0000000b
+    ldr r1, [r0, #4]
+    CHECK 7, r1, 0xfffffff9
+    ldr r1, [r0, #8]
+    CHECK 8, r1, 0x2000ffe0
+    ldr r1, [r0, #12]
+    CHECK 9, r1, 0x10101010
+    ldr r1, [r0, #16]
+    CHECK 10, r1, 0x13131313
+    ldr r1, [r0, #20]
+    CHECK 11, r1, 0x1c1c1c1c
+    ldr r1, [r0, #24]
+    CHECK 12, r1, 0x1e1e1e1e
+    @ The return address is the instruction after the SVC...
+    ldr r1, [r0, #28]
+    ADDR r2, exc_after_svc
+    subs r2, #1
+    CHECKR 13, r1, r2
+    @ ...the stacked xPSR has T and the flags, bit 9 clear because SP was
+    @ already 8-byte aligned...
+    ldr r1, [r0, #32]
+    CHECK 14, r1, 0x91000000
+    @ ...and the immediate is the low byte of the SVC instruction.
+    ldr r1, [r0, #36]
+    CHECK 15, r1, 0x0000005a
+
+    @ ---- An SP that is 4 mod 8 is realigned and bit 9 records it ----
+    @ (B1.5.6: CCR.STKALIGN is always one on ARMv6-M.)
+    bl reset_log
+    sub sp, #4
+    SETF 0x00000000
+    svc #0
+    mov r3, sp
+    CHECK 16, r3, 0x2000fffc
+    add sp, #4
+    LOADC r0, LOGBASE
+    ldr r1, [r0, #8]
+    CHECK 17, r1, 0x2000ffd8
+    ldr r1, [r0, #32]
+    CHECK 18, r1, 0x01000200
+
+    @ ---- From Thread mode on the process stack: 0xFFFFFFFD ----
+    bl reset_log
+    LOADC r1, 0x20008000
+    msr psp, r1
+    movs r1, #2
+    msr control, r1
+    isb
+    svc #1
+    movs r1, #0
+    msr control, r1
+    isb
+    LOADC r0, LOGBASE
+    ldr r1, [r0, #4]
+    CHECK 19, r1, 0xfffffffd
+    @ The handler runs on MSP, and the frame went on PSP.
+    ldr r1, [r0, #8]
+    CHECK 20, r1, 0x20010000
+    mrs r1, psp
+    CHECK 21, r1, 0x20008000
+
+    @ ---- Preemption and tail-chaining ----
+    @ SVCall at 0x80, IRQ0 at 0x40, PendSV at 0xc0. The SVC handler pends
+    @ IRQ0, which preempts it at once (EXC_RETURN 0xFFFFFFF1, a second frame
+    @ below the first), then pends PendSV, which cannot. When the SVC
+    @ returns, PendSV is taken straight away on the same frame -- returning
+    @ to Thread, 0xFFFFFFF9, at the SVC handler's SP -- before the
+    @ instruction after the SVC runs (B1.5.12).
+    bl reset_log
+    INSTALL chain_handler
+    LOADC r0, 0xe000ed1c
+    LOADC r1, 0x80000000
+    str r1, [r0]
+    LOADC r0, 0xe000ed20
+    LOADC r1, 0x00c00000
+    str r1, [r0]
+    LOADC r0, 0xe000e400
+    movs r1, #0x40
+    str r1, [r0]
+    LOADC r0, 0xe000e100
+    movs r1, #1
+    str r1, [r0]
+    svc #2
+    movs r0, #0xee
+    LOGV r0
+    LOADC r0, LOGBASE
+    ldr r1, [r0, #0]
+    CHECK 22, r1, 0x0000000b
+    ldr r1, [r0, #4]
+    CHECK 23, r1, 0xfffffff9
+    ldr r1, [r0, #8]
+    CHECK 24, r1, 0x2000ffe0
+    ldr r1, [r0, #12]
+    CHECK 25, r1, 0x00000010
+    ldr r1, [r0, #16]
+    CHECK 26, r1, 0xfffffff1
+    ldr r1, [r0, #20]
+    CHECK 27, r1, 0x2000ffc0
+    ldr r1, [r0, #24]
+    CHECK 28, r1, 0x000000ff
+    ldr r1, [r0, #28]
+    CHECK 29, r1, 0x0000000e
+    ldr r1, [r0, #32]
+    CHECK 30, r1, 0xfffffff9
+    ldr r1, [r0, #36]
+    CHECK 31, r1, 0x2000ffe0
+    ldr r1, [r0, #40]
+    CHECK 32, r1, 0x000000ee
+    LOADC r0, 0xe000e180
+    movs r1, #1
+    str r1, [r0]
+
+    @ ---- PRIMASK holds PendSV off until CPSIE ----
+    bl reset_log
+    cpsid i
+    LOADC r0, 0xe000ed04
+    LOADC r1, 0x10000000
+    str r1, [r0]
+    isb
+    LOADC r0, 0x200001fc
+    ldr r1, [r0]
+    CHECK 33, r1, 0x00000000
+    cpsie i
+    isb
+    LOADC r0, LOGBASE
+    ldr r1, [r0]
+    CHECK 34, r1, 0x0000000e
+
+    @ ---- SysTick, returning through POP {PC} ----
+    INSTALL tick_handler
+    movs r5, #0
+    LOADC r0, 0xe000e014
+    LOADC r1, 0x00000400
+    str r1, [r0]
+    LOADC r0, 0xe000e018
+    movs r1, #0
+    str r1, [r0]
+    LOADC r0, 0xe000e010
+    movs r1, #7
+    str r1, [r0]
+exc_tick_wait:
+    cmp r5, #0
+    beq exc_tick_wait
+    CHECK 35, r5, 0x0000000f
+    LOADC r0, 0xe000e010
+    movs r1, #0
+    str r1, [r0]
+    LOADC r0, 0xe000ed1c
+    str r1, [r0]
+    LOADC r0, 0xe000ed20
+    str r1, [r0]
+    LOADC r0, 0xe000e400
+    str r1, [r0]
+    b pass
+
+    @ Empty the log.
+    .align 2
+    .thumb_func
+reset_log:
+    LOADC r1, 0x200001fc
+    movs r2, #0
+    str r2, [r1]
+    bx lr
+
+    @ Log IPSR, EXC_RETURN, SP, then the stacked r0, r3, r12, LR, PC and
+    @ xPSR, then the SVC immediate fetched through the stacked PC.
+    .thumb_func
+frame_handler:
+    mrs r0, ipsr
+    LOGV r0
+    mov r0, lr
+    LOGV r0
+    mov r0, sp
+    LOGV r0
+    @ The frame is on whichever stack EXC_RETURN names.
+    mov r3, sp
+    LOADC r0, 0xfffffffd
+    cmp lr, r0
+    bne 1f
+    mrs r3, psp
+1:
+    ldr r0, [r3, #0]
+    LOGV r0
+    ldr r0, [r3, #12]
+    LOGV r0
+    ldr r0, [r3, #16]
+    LOGV r0
+    ldr r0, [r3, #20]
+    LOGV r0
+    ldr r0, [r3, #24]
+    LOGV r0
+    ldr r0, [r3, #28]
+    LOGV r0
+    ldr r0, [r3, #24]
+    subs r0, #2
+    ldrb r0, [r0]
+    LOGV r0
+    bx lr
+
+    @ Log IPSR, EXC_RETURN and SP; in SVCall, pend IRQ0 and PendSV.
+    .thumb_func
+chain_handler:
+    mrs r0, ipsr
+    LOGV r0
+    mov r0, lr
+    LOGV r0
+    mov r0, sp
+    LOGV r0
+    mrs r0, ipsr
+    cmp r0, #11
+    bne 1f
+    LOADC r1, 0xe000e200
+    movs r0, #1
+    str r0, [r1]
+    dsb
+    isb
+    LOADC r1, 0xe000ed04
+    LOADC r0, 0x10000000
+    str r0, [r1]
+    dsb
+    isb
+    movs r0, #0xff
+    LOGV r0
+1:  bx lr
+
+    @ Record the exception number in a register no frame restores, and
+    @ return through POP {PC} with EXC_RETURN (B1.5.8).
+    .thumb_func
+tick_handler:
+    push {r4, lr}
+    mrs r5, ipsr
+    pop {r4, pc}
+"#;
+
+/// ARMv6-M HardFault (DDI 0419E B1.5.14): every fault there is lands in
+/// exception 3 — an UNDEFINED sixteen- or thirty-two-bit encoding, every
+/// v7-M-only encoding, an unaligned access, a branch to ARM state, `BKPT`
+/// without a debugger, and an `SVC` that cannot be taken.
+#[cfg(feature = "cpu-arm-v6m")]
+pub(super) const V6M_FAULTS: &str = r#"
+    @ Check that the last fault was a HardFault at \label.
+    .macro FAULTED n, label
+    movs r0, #3
+    CHECKR \n, r4, r0
+    ADDR r0, \label
+    subs r0, #1
+    CHECKR (\n + 100), r5, r0
+    .endm
+
+    INSTALL skip_handler
+
+    @ The architecturally undefined UDF, and the UDF.W in the one
+    @ thirty-two-bit class ARMv6-M allocates (A6.7.76).
+f_udf:
+    udf #0
+    FAULTED 1, f_udf
+f_udfw:
+    .short 0xf7f0, 0xa000
+    FAULTED 2, f_udfw
+
+    @ CBZ, CBNZ and IT do not exist on ARMv6-M (A5.2).
+f_cbz:
+    .short 0xb100
+    FAULTED 3, f_cbz
+f_cbnz:
+    .short 0xb900
+    FAULTED 4, f_cbnz
+f_it:
+    .short 0xbf08
+    FAULTED 5, f_it
+
+    @ Neither does any thirty-two-bit encoding outside BL, MSR, MRS and the
+    @ barriers: NOP.W, B.W, MOVW, LDR.W, CLREX, SDIV, LDREX (A5.1.1).
+f_nopw:
+    .short 0xf3af, 0x8000
+    FAULTED 6, f_nopw
+f_bw:
+    .short 0xf000, 0xb800
+    FAULTED 7, f_bw
+f_movw:
+    .short 0xf240, 0x0000
+    FAULTED 8, f_movw
+f_ldrw:
+    .short 0xf8d0, 0x0000
+    FAULTED 9, f_ldrw
+f_clrex:
+    .short 0xf3bf, 0x8f2f
+    FAULTED 10, f_clrex
+f_sdiv:
+    .short 0xfb90, 0xf0f1
+    FAULTED 11, f_sdiv
+f_ldrex:
+    .short 0xe850, 0x0f00
+    FAULTED 12, f_ldrex
+
+    @ Every unaligned halfword or word access faults: CCR.UNALIGN_TRP is
+    @ fixed at one (B3.2.8). The store must not happen.
+    LOADC r1, 0x20000100
+    movs r2, #0
+    str r2, [r1]
+    str r2, [r1, #4]
+    adds r1, #1
+f_ldr:
+    ldr r2, [r1]
+    FAULTED 13, f_ldr
+f_ldrh:
+    ldrh r2, [r1]
+    FAULTED 14, f_ldrh
+f_str:
+    str r1, [r1]
+    FAULTED 15, f_str
+f_strh:
+    strh r1, [r1]
+    FAULTED 16, f_strh
+    subs r1, #1
+    ldr r2, [r1]
+    CHECK 17, r2, 0x00000000
+    ldr r2, [r1, #4]
+    CHECK 18, r2, 0x00000000
+    adds r1, #2
+f_ldm:
+    ldm r1!, {r2}
+    FAULTED 19, f_ldm
+    @ A byte access is never unaligned.
+    ldrb r2, [r1]
+    CHECK 20, r2, 0x00000000
+
+    @ BKPT with no debugger attached is a HardFault (C1.5).
+f_bkpt:
+    bkpt #0
+    FAULTED 21, f_bkpt
+
+    @ SVC with PRIMASK set cannot be taken at its own priority, so it
+    @ escalates (B1.5.14). The handler's skip makes the NOP the landing
+    @ site whichever return address the escalation stacks.
+    movs r4, #0
+    cpsid i
+    svc #0
+    nop
+    cpsie i
+    movs r0, #3
+    CHECKR 22, r4, r0
+
+    @ BX to an even address clears EPSR.T, and the next instruction fetch
+    @ faults (B1.4.2): the stacked PC is the target, and the stacked xPSR
+    @ has T clear. The handler sets T and resumes there.
+    INSTALL thumb_handler
+    movs r6, #0
+    ADDR r2, f_arm
+    subs r2, #1
+    bx r2
+    movs r0, #23
+    bl fail
+    .align 2
+f_arm:
+    FAULTED 24, f_arm
+    CHECK 25, r6, 0x00000000
+
+    b pass
+
+    @ Record IPSR and the stacked PC, and step over the instruction there,
+    @ sixteen or thirty-two bits.
+    .align 2
+    .thumb_func
+skip_handler:
+    mrs r4, ipsr
+    ldr r5, [sp, #24]
+    ldrh r0, [r5]
+    lsrs r0, r0, #11
+    movs r1, #2
+    cmp r0, #0x1d
+    blo 1f
+    movs r1, #4
+1:  adds r1, r1, r5
+    str r1, [sp, #24]
+    bx lr
+
+    @ Record IPSR, the stacked PC and the stacked T bit, then set T.
+    .thumb_func
+thumb_handler:
+    mrs r4, ipsr
+    ldr r5, [sp, #24]
+    ldr r0, [sp, #28]
+    lsrs r6, r0, #24
+    movs r1, #1
+    ands r6, r1
+    lsls r1, r1, #24
+    orrs r0, r1
+    str r0, [sp, #28]
+    bx lr
+"#;
+
+/// What a Cortex-M0+ adds to a Cortex-M0, all options built: `VTOR`
+/// (bits `[31:8]`), unprivileged Thread mode, and the eight-region PMSAv6
+/// MPU (DDI 0419E B1.4.4, B3.2.5, B3.5; Cortex-M0+ TRM Table 1-1). An
+/// unprivileged program that reaches for the PPB, the MPU's privileged-only
+/// region, `MSR PRIMASK` or `CPSID` either faults to HardFault or is
+/// ignored, and it climbs back up through SVC.
+#[cfg(feature = "cpu-arm-v6m")]
+pub(super) const V6M_M0PLUS: &str = r#"
+    @ CPUID: a Cortex-M0+ r0p1 (Cortex-M0+ TRM Table 4-2).
+    LOADC r0, 0xe000ed00
+    ldr r1, [r0]
+    CHECK 1, r1, 0x410cc601
+
+    @ VTOR keeps bits [31:8].
+    LOADC r0, 0xe000ed08
+    LOADC r1, 0x200004ff
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 2, r2, 0x20000400
+
+    @ A vector table in SRAM: every entry the trampoline, except SVCall,
+    @ which goes straight to its own handler. VTOR moves the table
+    @ (B1.5.3).
+    LOADC r0, 0x20000400
+    LOADC r1, 0x000000c1
+    movs r2, #48
+1:  str r1, [r0]
+    adds r0, #4
+    subs r2, #1
+    bne 1b
+    LOADC r0, 0x20000400
+    ADDR r1, vt_svc
+    str r1, [r0, #44]
+    movs r4, #0
+    svc #0
+    CHECK 3, r4, 0x0000007e
+    LOADC r0, 0xe000ed08
+    movs r1, #0
+    str r1, [r0]
+    movs r4, #0
+    INSTALL priv_handler
+    svc #0
+    CHECK 4, r4, 0x00000000
+
+    @ The MPU: eight regions, unified (B3.5.4).
+    LOADC r0, 0xe000ed90
+    ldr r1, [r0]
+    CHECK 5, r1, 0x00000800
+
+    @ RBAR keeps ADDR [31:8] and reports the region in [3:0]; VALID writes
+    @ RNR (B3.5.6).
+    LOADC r0, 0xe000ed9c
+    LOADC r1, 0x200003f3
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 6, r2, 0x20000303
+    LOADC r0, 0xe000ed98
+    ldr r2, [r0]
+    CHECK 7, r2, 0x00000003
+
+    @ Region 0 over the whole SRAM, full access for anyone; region 1 over
+    @ 0x20000800-0x200008FF, privileged read/write and no unprivileged
+    @ access (AP = 001). Code at 0 runs from the default map, which
+    @ PRIVDEFENA does not give an unprivileged program -- so region 2
+    @ covers the flash, read-only for anyone (AP = 110).
+    LOADC r0, 0xe000ed9c
+    LOADC r1, 0x20000010
+    str r1, [r0]
+    LOADC r0, 0xe000eda0
+    LOADC r1, 0x0300001f
+    str r1, [r0]
+    LOADC r0, 0xe000ed9c
+    LOADC r1, 0x20000811
+    str r1, [r0]
+    LOADC r0, 0xe000eda0
+    LOADC r1, 0x1100000f
+    str r1, [r0]
+    LOADC r0, 0xe000ed9c
+    LOADC r1, 0x00000012
+    str r1, [r0]
+    LOADC r0, 0xe000eda0
+    LOADC r1, 0x0600001f
+    str r1, [r0]
+    LOADC r0, 0xe000ed94
+    movs r1, #5
+    str r1, [r0]
+    dsb
+    isb
+
+    @ Privileged: region 1 is readable.
+    LOADC r0, 0x20000800
+    LOADC r1, 0x5a5a5a5a
+    str r1, [r0]
+    ldr r2, [r0]
+    CHECK 8, r2, 0x5a5a5a5a
+
+    @ Drop to unprivileged Thread mode on the process stack. nPRIV sticks
+    @ on this part.
+    INSTALL fault_handler
+    LOADC r0, 0x20008000
+    msr psp, r0
+    movs r0, #3
+    msr control, r0
+    isb
+    mrs r1, control
+    CHECK 9, r1, 0x00000003
+
+    @ Unprivileged: region 0 still works, region 1 is a HardFault and the
+    @ load does not happen (B3.5.1).
+    LOADC r0, 0x20000100
+    ldr r2, [r0]
+    movs r4, #0
+    movs r2, #0
+    LOADC r0, 0x20000800
+m_mpu:
+    ldr r2, [r0]
+    movs r0, #3
+    CHECKR 10, r4, r0
+    ADDR r0, m_mpu
+    subs r0, #1
+    CHECKR 11, r5, r0
+    CHECK 12, r2, 0x00000000
+
+    @ An unprivileged store to region 1 is refused as well.
+    movs r4, #0
+    LOADC r0, 0x20000800
+    movs r1, #0
+m_store:
+    str r1, [r0]
+    movs r0, #3
+    CHECKR 13, r4, r0
+
+    @ Any PPB access is a HardFault unprivileged (B3.1.1).
+    movs r4, #0
+    LOADC r0, 0xe000ed00
+m_ppb:
+    ldr r2, [r0]
+    movs r0, #3
+    CHECKR 14, r4, r0
+    ADDR r0, m_ppb
+    subs r0, #1
+    CHECKR 15, r5, r0
+
+    @ MSR PRIMASK and CPSID are ignored unprivileged (B4.2.1, B4.2.3).
+    movs r0, #1
+    msr primask, r0
+    mrs r1, primask
+    CHECK 16, r1, 0x00000000
+    cpsid i
+    mrs r1, primask
+    CHECK 17, r1, 0x00000000
+    @ ...and so is an attempt to clear nPRIV.
+    movs r0, #2
+    msr control, r0
+    isb
+    mrs r1, control
+    CHECK 18, r1, 0x00000003
+
+    @ SVC is the way back up: its handler clears nPRIV.
+    INSTALL priv_handler
+    svc #0
+    mrs r1, control
+    CHECK 19, r1, 0x00000002
+    movs r0, #0
+    msr control, r0
+    isb
+
+    @ Privileged again: region 1 is reachable, the MPU switched off.
+    LOADC r0, 0x20000800
+    ldr r2, [r0]
+    CHECK 20, r2, 0x5a5a5a5a
+    LOADC r0, 0xe000ed94
+    movs r1, #0
+    str r1, [r0]
+    dsb
+    isb
+    b pass
+
+    .align 2
+    .thumb_func
+vt_svc:
+    movs r4, #0x7e
+    bx lr
+
+    @ Clear nPRIV, the privileged half of CONTROL a handler may write.
+    .thumb_func
+priv_handler:
+    mrs r0, control
+    movs r1, #1
+    bics r0, r1
+    msr control, r0
+    bx lr
+
+    @ Record IPSR and the stacked PC (on PSP: the fault came from Thread
+    @ mode on the process stack), and step over the instruction.
+    .thumb_func
+fault_handler:
+    mrs r4, ipsr
+    mrs r3, psp
+    ldr r5, [r3, #24]
+    adds r0, r5, #2
+    str r0, [r3, #24]
+    bx lr
+"#;

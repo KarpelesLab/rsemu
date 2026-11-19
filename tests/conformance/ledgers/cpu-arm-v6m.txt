@@ -4,8 +4,24 @@
 #
 # Like cpu-arm-v8m.txt beside it, this ledger is not keyed by the name of a
 # test in a downloaded suite: there is no permissively licensed ARMv6-M
-# conformance corpus to download. What measures the feature instead is
+# conformance corpus to download as runnable binaries. (Arm's CMSIS-Core
+# CoreValidation, Apache-2.0, lists the Cortex-M0 and M0+, but it is a
+# CMSIS-Toolbox build meant for Arm's FVPs, not a corpus a CPU harness can
+# load; wiring it up needs a board model with a console and is not done.)
+# What measures the feature instead is
 #
+#   * the built corpus (src/cpu/arm/v7m/conformance.rs, bodies in
+#     corpus.rs): self-checking programs assembled with `clang
+#     --target=thumbv6m-none-eabi` and run on a Cortex-M0 and a Cortex-M0+
+#     -- v6m-alu, v6m-memory, v6m-branch, v6m-system, v6m-exceptions,
+#     v6m-faults, and v6m-m0plus (VTOR, PMSAv6, unprivileged Thread mode);
+#   * v6m_encoding_set_matches_llvm (conformance.rs): the set of defined
+#     encodings -- all 16-bit, ~470,000 32-bit -- against `llvm-objdump
+#     --triple=thumbv6m-none-eabi` as a black box, every disagreement
+#     classified as UNPREDICTABLE or behaviourally identical;
+#   * thumb1_on_armv6m_matches_the_aprofile_core (differential.rs): the
+#     whole sixteen-bit space executed on a Cortex-M0 and on the ARMv5TE
+#     core that passes the ARM7TDMI corpus;
 #   * src/cpu/arm/v7m/v6mtests.rs -- one test per mechanism: every v7-M-only
 #     encoding (checked against `llvm-mc -triple=thumbv6m-none-eabi`, which
 #     refuses each of them) UNDEFINED on a Cortex-M0 and executing on a
@@ -24,6 +40,17 @@
 # 2026-11-20: the initial landing.
 #
 #   * v6mtests.rs: all pass.
+#
+# 2026-11-20: the built corpus, the LLVM encoding cross-check and the
+# differential sweep.
+#
+#   * 12 corpus runs (6 bodies on a Cortex-M0, 5 again on a Cortex-M0+, and
+#     v6m-m0plus): all pass. The ledger is unchanged -- no entry above was
+#     closed and none added.
+#   * Two defects found and fixed rather than recorded, both in the shared
+#     M-profile interpreter: a BKPT HardFault stacked the next instruction
+#     instead of the BKPT, and an interworking branch to an even address
+#     faulted on the branch instead of on the next instruction with T clear.
 # ---------------------------------------------------------------------------
 
 sc000.trm                   # The SC000 Technical Reference Manual (DDI 0456)
