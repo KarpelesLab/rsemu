@@ -824,8 +824,10 @@ impl<'a> Exec<'a> {
     fn read_data(&mut self, addr: u32, bytes: u32, privileged: bool) -> Ex<u32> {
         self.cycle(1);
         if in_ppb(addr) {
+            // Before the vendor split: the v6-M rule covers the whole PPB,
+            // the board's window included.
+            self.check_ppb_privilege(addr, Access::Read, privileged)?;
             if !in_vendor_ppb(addr) {
-                self.check_ppb_privilege(addr, Access::Read, privileged)?;
                 return self.read_ppb(addr, bytes);
             }
             // The vendor window: the board decodes it, not the processor. The
@@ -874,8 +876,10 @@ impl<'a> Exec<'a> {
         self.spin.store();
         self.cycle(1);
         if in_ppb(addr) {
+            // Before the vendor split: the v6-M rule covers the whole PPB,
+            // the board's window included.
+            self.check_ppb_privilege(addr, Access::Write, privileged)?;
             if !in_vendor_ppb(addr) {
-                self.check_ppb_privilege(addr, Access::Write, privileged)?;
                 return self.write_ppb(addr, bytes, value);
             }
             // As `read_mem`: the vendor window is the board's.

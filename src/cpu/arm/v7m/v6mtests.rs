@@ -745,6 +745,38 @@ fn unprivileged_ppb_access_is_a_hardfault() {
 }
 
 #[test]
+fn unprivileged_access_to_the_boards_ppb_window_is_a_hardfault_too() {
+    // "The general rules for the PPB, address range 0xE0000000 to
+    // 0xE0100000 ... Unprivileged accesses to the PPB generate a HardFault
+    // error, without causing a PPB access" (DDI 0419E B3.1.1) — including
+    // the part of it a board decodes.
+    const VENDOR: u32 = 0xe004_2000;
+    let run = |privileged: bool| {
+        let h = Harness::m0plus(&code(&[0xf380_8814, 0x680b, u32::from(PARK)]));
+        let vendor = Arc::new(RamStore::new(0x1000));
+        vendor.write_at(0, &0xcafe_f00du32.to_le_bytes()).unwrap();
+        let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::FAULT);
+        space
+            .topology()
+            .map(Region::ram("ram", Arc::clone(&h.ram)), 0)
+            .unwrap();
+        space
+            .topology()
+            .map(Region::ram("vendor", vendor), u64::from(VENDOR))
+            .unwrap();
+        h.cpu.attach_space(Arc::new(space));
+        h.cpu
+            .set_reg(0, if privileged { 0 } else { control::NPRIV });
+        h.cpu.set_reg(1, VENDOR);
+        h.cpu.set_reg(3, 0x5555);
+        h.steps(2);
+        (h.cpu.current_exception(), h.cpu.reg(3))
+    };
+    assert_eq!(run(false), (Exception::HARD_FAULT, 0x5555));
+    assert_eq!(run(true), (Exception::THREAD, 0xcafe_f00d));
+}
+
+#[test]
 fn an_mpu_violation_is_a_hardfault() {
     // Region 0: the low 4 KiB — code, vectors and stack — with full access.
     // Region 1, which wins where they overlap: 256 bytes at DATA,
