@@ -646,6 +646,50 @@ fn exception_return_takes_only_the_v6m_values_and_the_v6m_xpsr() {
 }
 
 #[test]
+fn a_return_to_thread_takes_no_ipsr_from_the_frame() {
+    // MSR CONTROL, r0 (nPRIV), then SVC. The handler returns to
+    // unprivileged Thread mode through a frame whose stacked IPSR claims
+    // SVCall: `PopStack` forces IPSR to zero there (DDI 0419E B1.5.8), so
+    // the forged number must not put the core in Handler mode — which
+    // would also make it privileged.
+    let h = Harness::m0plus(&code(&[0xf380_8814, u32::from(SVC), u32::from(PARK)]));
+    h.handler(&[BX_LR]);
+    h.cpu.set_reg(0, control::NPRIV);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::SVCALL);
+    let sp = h.cpu.regs().msp;
+    h.set_word(sp + 0x1c, xpsr::T | u32::from(Exception::SVCALL.0));
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.xpsr() & xpsr::EXCEPTION, 0);
+    assert_eq!(h.cpu.regs().control & control::NPRIV, control::NPRIV);
+    assert_eq!(h.cpu.pc(), ENTRY + 6);
+}
+
+#[test]
+fn a_return_to_handler_restores_six_bits_of_ipsr() {
+    // SVC, and inside SVCall a second, PendSV, pended through ICSR: PendSV
+    // returns to SVCall through a frame whose stacked xPSR has bits [8:6]
+    // set. ARMv6-M's IPSR is bits [5:0] (DDI 0419E B1.5.8 `PopStack`).
+    let h = Harness::m0(&[SVC, PARK]);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::SVCALL);
+    // Lower SVCall's priority so PendSV (priority 0) can preempt it.
+    h.ppb_write(0xe000_ed1c, 0xc000_0000);
+    h.ppb_write(0xe000_ed04, 1 << 28);
+    h.handler(&[BX_LR]);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::PEND_SV);
+    let sp = h.cpu.regs().msp;
+    h.set_word(sp + 0x1c, xpsr::T | 0x1c0 | u32::from(Exception::SVCALL.0));
+    h.cpu.step();
+    assert_eq!(
+        h.cpu.xpsr() & xpsr::EXCEPTION,
+        u32::from(Exception::SVCALL.0)
+    );
+}
+
+#[test]
 fn bl_and_the_system_instructions_take_cortex_m0_cycles() {
     // BL is 4 on a Cortex-M0 (TRM Table 3-1) and 3 in the shared model.
     let m0 = Harness::m0(&code(&[0xf000_f800, u32::from(PARK)]));

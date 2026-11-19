@@ -1416,8 +1416,17 @@ impl<'a> Exec<'a> {
         // one go; the reserved bits are dropped. ARMv6-M's `PopStack` takes
         // only `APSR[31:28]`, `IPSR` and `EPSR.T` — it has no `Q`, `GE` or
         // `ITSTATE` for a forged frame to smuggle in (DDI 0419E B1.5.8).
+        //
+        // Its `IPSR` is six bits, and a return to Thread mode must not take
+        // one from the frame at all: `PopStack` forces it to zero when
+        // `CONTROL.nPRIV` is set, and any other non-zero value in Thread
+        // mode is UNPREDICTABLE (DDI 0419E B1.5.8). Mode is derived from
+        // `IPSR` here, so honouring a forged one would hand unprivileged
+        // code — which writes its own process-stack frame — Handler mode
+        // and with it privilege. Zero is the value the pseudocode gives.
         let restorable = if self.cfg.is_v6m() {
-            xpsr::N | xpsr::Z | xpsr::C | xpsr::V | xpsr::T | xpsr::EXCEPTION
+            let ipsr = if to_handler { 0x3f } else { 0 };
+            xpsr::N | xpsr::Z | xpsr::C | xpsr::V | xpsr::T | ipsr
         } else {
             xpsr::WRITABLE | xpsr::EXCEPTION
         };
