@@ -841,6 +841,31 @@ fn thread_mode_can_run_on_the_process_stack() {
 }
 
 #[test]
+fn unprivileged_mrs_reads_neither_stack_pointer() {
+    // `MSR control, r1` (nPRIV) ; `MRS r3, msp` ; `MRS r4, psp`. Unprivileged
+    // code reads zero for both (DDI 0403D B5.2.2: the SP accesses are under
+    // `if CurrentModeIsPrivileged()`).
+    let mut code = Vec::new();
+    code.extend_from_slice(&wide(0xf381_8814)); // MSR control, r1
+    code.extend_from_slice(&wide(0xf3ef_8308)); // MRS r3, msp
+    code.extend_from_slice(&wide(0xf3ef_8409)); // MRS r4, psp
+    let h = Harness::m4(&code);
+    h.cpu.set_reg(1, 1);
+    h.cpu.set_reg(3, 0x5555);
+    h.cpu.set_reg(4, 0x5555);
+    for _ in 0..3 {
+        h.cpu.step();
+    }
+    assert_eq!(h.cpu.reg(3), 0);
+    assert_eq!(h.cpu.reg(4), 0);
+
+    // Privileged, `MRS r3, msp` reads it.
+    let h = Harness::m4(&wide(0xf3ef_8308));
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(3), STACK);
+}
+
+#[test]
 fn an_exception_from_the_process_stack_returns_with_fffffffd() {
     let mut code = Vec::new();
     code.extend_from_slice(&wide(0xf380_8809)); // MSR psp, r0

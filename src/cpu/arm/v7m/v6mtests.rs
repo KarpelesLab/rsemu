@@ -563,6 +563,24 @@ fn special_registers_are_the_v6m_subset() {
     h.cpu.set_reg(0, control::NPRIV);
     h.cpu.step();
     assert_eq!(h.cpu.regs().control, control::NPRIV);
+
+    // And then reads zero for both stack pointers: "An unprivileged read of
+    // any register other than APSR or CONTROL returns 0" (DDI 0419E
+    // B4.2.2). MRS r3, MSP; MRS r4, PSP; MRS r5, CONTROL.
+    let h = Harness::m0plus(&code(&[
+        0xf380_8814,
+        0xf3ef_8308,
+        0xf3ef_8409,
+        0xf3ef_8514,
+        u32::from(PARK),
+    ]));
+    h.cpu.set_reg(0, control::NPRIV);
+    h.cpu.set_reg(3, 0x5555);
+    h.cpu.set_reg(4, 0x5555);
+    h.steps(4);
+    assert_eq!(h.cpu.reg(3), 0);
+    assert_eq!(h.cpu.reg(4), 0);
+    assert_eq!(h.cpu.reg(5), control::NPRIV);
 }
 
 #[test]

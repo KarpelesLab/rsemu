@@ -2500,8 +2500,11 @@ impl<'a> Exec<'a> {
             5 => self.state.xpsr & xpsr::EXCEPTION,
             6 => 0,
             7 => self.state.xpsr & xpsr::EXCEPTION,
-            8 => self.state.msp(),
-            9 => self.state.psp(),
+            // Both stack pointers read as zero from unprivileged code
+            // (DDI 0403D B5.2.2, DDI 0419E B4.2.2: "if
+            // CurrentModeIsPrivileged()").
+            8 if privileged => self.state.msp(),
+            9 if privileged => self.state.psp(),
             16 => u32::from(self.state.primask && privileged),
             17 | 18 => {
                 if privileged {
