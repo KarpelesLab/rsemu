@@ -545,6 +545,27 @@ fn a_fault_on_the_unstacking_reads_locks_up_from_msp_and_pends_from_psp() {
 }
 
 #[test]
+fn an_exception_sets_the_event_register_so_wfe_does_not_sleep_through_it() {
+    // SVC (standing in for an interrupt that arrives just before the
+    // `WFE` of a `while (!flag) __WFE();` loop), then WFE. Exception entry
+    // and return both SetEventRegister() (DDI 0419E B1.5.6, B1.5.8), so the
+    // WFE consumes the event and falls through instead of sleeping.
+    let h = Harness::m0(&[SVC, 0xbf20, PARK]);
+    h.handler(&[BX_LR]);
+    h.steps(2);
+    assert_eq!(h.cpu.pc(), ENTRY + 2);
+    h.cpu.step();
+    assert!(!h.cpu.is_asleep());
+    assert_eq!(h.cpu.pc(), ENTRY + 4);
+
+    // With the event consumed, a second WFE sleeps.
+    let h = Harness::m0(&[SVC, 0xbf20, 0xbf20, PARK]);
+    h.handler(&[BX_LR]);
+    h.steps(4);
+    assert!(h.cpu.is_asleep());
+}
+
+#[test]
 fn cmsis_priority_discovery_finds_two_bits() {
     // STR r0, [r1]; LDR r3, [r1] — through the guest's own word accesses,
     // as CMSIS's `NVIC_SetPriority` probe does.

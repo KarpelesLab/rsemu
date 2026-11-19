@@ -1149,6 +1149,9 @@ impl<'a> Exec<'a> {
         // Taking an exception ends a `WFI` or `WFE` whether or not the
         // instruction stream ever gets back to it.
         self.state.asleep = false;
+        // `ExceptionTaken` sets the event register (DDI 0403D B1.5.6,
+        // DDI 0419E B1.5.6): the exception is itself a `WFE` wake-up event.
+        self.state.event = true;
         // And it ends any load streak: a loop waiting on a handler that is
         // legitimately slow is not stuck (`core::spin`).
         self.spin.interrupt();
@@ -1347,6 +1350,10 @@ impl<'a> Exec<'a> {
         }
 
         self.state.sys.set_active(returning, false);
+        // Exception return, like entry, sets the event register, so a `WFE`
+        // that follows an interrupt it was waiting on does not sleep
+        // through it (DDI 0403D B1.5.8, DDI 0419E B1.5.8).
+        self.state.event = true;
         // An external input still asserted as its handler returns pends again
         // now — in time to be tail-chained, which is what the hardware does.
         if let Some(n) = (returning.0 as usize).checked_sub(16)
