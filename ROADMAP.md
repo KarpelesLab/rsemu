@@ -1619,6 +1619,9 @@ Arch::CORTEX_M4F    // v7E-M: thumb2 dsp vfp(V4-SP),       PMSAv7
 ```
 
 Adding a part is then a `const` and its conformance evidence, not a module.
+(`CORTEX_M0` exists in that shape: `Arch::V6m` in `cpu/arm/v7m`, behind
+`cpu-arm-v6m`, with `CORTEX_M0PLUS` and `SC000` beside it and decode gated
+per encoding to the v6-M subset.)
 
 **Decode is gated per entry, not per core.** §6's rule is that instruction
 tables are generated from a declarative description in the same file; each entry

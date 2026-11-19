@@ -2,7 +2,7 @@
 
 Consumed by: `cpu/arm/aprofile` (ARMv5TE, and ARMv7-A's A32 and T32 (Thumb-2)
 instruction sets with VFPv3; NEON to follow),
-`cpu/arm/v7m` (ARMv7E-M and Armv8-M Mainline, Cortex-M3/M4/M7/M33), `cpu/arm/a64` (ARMv8-A AArch64).
+`cpu/arm/v7m` (ARMv6-M, ARMv7E-M and Armv8-M Mainline, Cortex-M0/M0+/SC000/M3/M4/M7/M33), `cpu/arm/a64` (ARMv8-A AArch64).
 
 ## Primary
 
@@ -16,6 +16,9 @@ instruction sets with VFPv3; NEON to follow),
 | GIC Architecture Specification (IHI 0069) | Generic Interrupt Controller v3/v4 — required by any modern ARM board | `developer.arm.com/documentation/ihi0069/latest/` **[browser]** |
 | Arm ARM for ARMv7-M (DDI 0403) | The **M profile**: T32 only, Handler/Thread modes, the exception model and `EXC_RETURN`, the NVIC/SCB/SysTick/MPU register map at `0xE000E000`, PMSAv7, and the **FPv4-SP/FPv5 extension** — A2.5 for `FPSCR` and the data types, A6.4/A7.5 for the encodings, A7.7 for the per-instruction pseudocode, B1.5.7 for `FPCCR`/`FPCAR`/`FPDSCR` and lazy state preservation | `developer.arm.com/documentation/ddi0403/latest/` **[browser]** |
 | Armv8-M ARM (DDI 0553) | The **Cortex-M33's architecture**: the stack-limit checks (`MSPLIM`/`PSPLIM`, `UFSR.STKOF`), the v8-M `EXC_RETURN`, the load-acquire/store-release family, `TT`, PMSAv8 (base/limit regions, `MAIR`), and the Security Extension this repository does not model | `developer.arm.com/documentation/ddi0553/latest/` **[browser]** |
+| ARMv6-M ARM (DDI 0419E) | The **Cortex-M0 family's architecture**: the v6-M Thumb subset (A5's encoding tables), the one-fault exception model (B1.5), the v6-M SCB/NVIC subset, SysTick and PMSAv6 (B3), `MRS`/`MSR`/`CPS` (B4) | `developer.arm.com/documentation/ddi0419/latest/` (a free PDF) |
+| Cortex-M0 TRM (DDI 0432C), Cortex-M0+ TRM (DDI 0484C) | `CPUID`, the implementation options (VTOR, MPU, unprivileged support, SysTick, multiplier), the instruction cycle counts | developer.arm.com |
+| SecurCore SC000 TRM (DDI 0456) | **Not public** (SecurCore NDA). What `Config::SC000` rests on instead is stated in its documentation and in `tests/conformance/ledgers/cpu-arm-v6m.txt` | — |
 | Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489), Cortex-M33 TRM (100230) | The implementation-defined values a guest can see: `CPUID`, `MVFR0`/`MVFR1`/`MVFR2`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
 | PrimeCell UART (PL011), TRM DDI 0183 | The UART every ARM virtual board exposes | developer.arm.com **[browser]** |
 
@@ -127,6 +130,20 @@ secondary reference for the exception model.
   v7-M part, and the v7-M suite runs unchanged with the feature on.
   `src/cpu/arm/v7m/v8m.rs`'s documentation is the precise statement, and
   `tests/conformance/ledgers/cpu-arm-v8m.txt` the list of what is absent.
+- **ARMv6-M is the same core cut down, not a fifth one.** A Cortex-M0 keeps
+  every structural feature of the M profile and loses instructions and
+  registers, so it is `Config::arch = Arch::V6m` behind `cpu-arm-v6m`
+  (`part = "cortex-m0"`, `"cortex-m0plus"`/`"cortex-m0+"`, `"sc000"`). Decode
+  is gated per encoding in front of the shared table — the 16-bit set bar
+  `CBZ`/`CBNZ`/`IT`, plus 32-bit `BL`/`MSR`/`MRS`/`DMB`/`DSB`/`ISB` — so
+  everything else is UNDEFINED, and the disassembler uses the same gate. Every
+  fault is a HardFault (the configurable faults' enables do not exist, so the
+  interpreter's escalation path does it), `CCR` is read-only with
+  `UNALIGN_TRP` set, priorities are two bits, and the SCB/NVIC/MPU maps are
+  the v6-M subsets. The SC000's TRM is not public, so its preset is partly
+  unverified and says so. `src/cpu/arm/v7m/v6m.rs`'s documentation is the
+  precise statement, `tests/conformance/ledgers/cpu-arm-v6m.txt` the list of
+  what is absent.
 - **The boot vector table is the SoC's.** `cpu.arm.v7m`'s `vtor` property is
   `VTOR`'s reset value and where every reset, warm or cold, reads `SP` and
   `PC`. It is zero on a part that boots from zero; an STM32U5 boots from

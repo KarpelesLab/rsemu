@@ -9,9 +9,9 @@
 //! ARM is cut here **by profile rather than by architecture version**, because
 //! that is where the machine actually changes shape:
 //!
-//! | | [`aprofile`] | `v7m` | `a64` |
+//! | | [`aprofile`] | `v7m` (and v6-M, v8-M) | `a64` |
 //! |---|---|---|---|
-//! | instruction sets | A32 and Thumb | Thumb-2 only | A64 only |
+//! | instruction sets | A32 and Thumb | Thumb only (Thumb-2 from v7-M) | A64 only |
 //! | registers | seven modes, banked | one bank, two stack pointers | 31, plus `SP`/`XZR` encodings |
 //! | status | `CPSR`/`SPSR` | `xPSR` | `PSTATE`, which is not a register |
 //! | system regs | CP15, a coprocessor | a memory-mapped SCB | a flat `op0:op1:CRn:CRm:op2` space |
@@ -21,7 +21,10 @@
 //! differ by a construction property. ARMv6 adds ten things to ARMv5TE — media
 //! SIMD, `LDREX`/`STREX`, VMSAv6, TrustZone among them — while keeping all ten
 //! of the rows above, so it belongs in [`aprofile`] rather than in a module of
-//! its own that would be a near-copy. ARMv7E-M keeps none of them.
+//! its own that would be a near-copy. ARMv7E-M keeps none of them. The same
+//! reasoning puts ARMv6-M (the Cortex-M0 family) and Armv8-M Mainline in
+//! `v7m`: both keep every row of its column, and differ by a construction
+//! property and a Cargo feature.
 //!
 //! # Why a version is not an ordering
 //!
