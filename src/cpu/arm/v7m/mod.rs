@@ -32,6 +32,19 @@
 //! v8-M changes keys off [`Config::arch`]; a v7-M part behaves identically
 //! whether or not the feature is compiled in.
 //!
+//! **ARMv6-M** — the Cortex-M0, Cortex-M0+ and SecurCore SC000 — is the same
+//! core cut down, behind the `cpu-arm-v6m` feature and selected by
+//! `Config::CORTEX_M0`, `CORTEX_M0PLUS` or `SC000` (`part = "cortex-m0"`,
+//! `"cortex-m0plus"` / `"cortex-m0+"`, `"sc000"`). Decode is gated per
+//! encoding to the v6-M set — the sixteen-bit instructions bar `CBZ`/`CBNZ`
+//! and `IT`, and of the thirty-two-bit ones only `BL`, `MSR`, `MRS`, `DMB`,
+//! `DSB` and `ISB` — so everything else is UNDEFINED, and the exception model
+//! is v6-M's: HardFault for every fault, no fault status registers, two
+//! priority bits, `PRIMASK` the only mask, a read-only `CCR` that makes every
+//! unaligned access fault, 32 interrupts, an optional `VTOR`, PMSAv6 where
+//! the part has an MPU, and no bit-band. `v6m`'s documentation has the whole
+//! list. It too keys off [`Config::arch`], and a v7-M part is unchanged by it.
+//!
 //! The reset sequence reads `SP` and `PC` from [`Config::reset_vtor`] — the
 //! `vtor` property — which every reset restores. Zero, as DDI 0403 has it,
 //! unless the SoC boots elsewhere; an STM32U5 boots from `0x08000000` with
@@ -85,6 +98,7 @@
 //! | `fp` | the floating-point register file, `FPSCR`, and the Arm rules over [`crate::float`] |
 //! | `fpisa` | the floating-point encodings, and their disassembly |
 //! | `v8m` | Armv8-M Mainline: PMSAv8, the v8-M register map, `EXC_RETURN`, `TT` |
+//! | `v6m` | ARMv6-M: the decode gate, the v6-M register map, PMSAv6's differences |
 //! | `dsp` (private) | the SIMD and extending-move semantics |
 //! | `exec` (private) | the interpreter and its timing model |
 //!
@@ -117,8 +131,9 @@
 //!
 //! *ARMv7-M Architecture Reference Manual*, ARM DDI 0403; the *Armv8-M
 //! Architecture Reference Manual*, Arm DDI 0553, for the Cortex-M33; the
-//! *Cortex-M4*, *Cortex-M7* and *Cortex-M33 Technical Reference Manuals* for
-//! the implementation-defined
+//! *ARMv6-M Architecture Reference Manual*, ARM DDI 0419E, for the Cortex-M0
+//! family; the *Cortex-M0*, *Cortex-M0+*, *Cortex-M4*, *Cortex-M7* and
+//! *Cortex-M33 Technical Reference Manuals* for the implementation-defined
 //! values (`CPUID`, the number of priority bits, MPU region count) and the
 //! instruction timings. No emulator source of any licence was consulted
 //! (`ROADMAP.md` §1).
@@ -141,6 +156,10 @@ mod exec;
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
 pub mod v8m;
 
+#[cfg(feature = "cpu-arm-v6m")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+pub mod v6m;
+
 #[cfg(all(test, feature = "cpu-arm-v7m-fp"))]
 mod fptests;
 
@@ -149,6 +168,9 @@ mod tests;
 
 #[cfg(all(test, feature = "cpu-arm-v8m"))]
 mod v8mtests;
+
+#[cfg(all(test, feature = "cpu-arm-v6m"))]
+mod v6mtests;
 
 // The differential harness runs this core and the A-profile one over the same
 // instruction stream, so it only exists where both are compiled.
@@ -192,6 +214,9 @@ pub use sys::{CPUID_CORTEX_M4, CPUID_CORTEX_M7};
 
 #[cfg(feature = "cpu-arm-v8m")]
 pub use v8m::CPUID_CORTEX_M33;
+
+#[cfg(feature = "cpu-arm-v6m")]
+pub use v6m::{CPUID_CORTEX_M0, CPUID_CORTEX_M0PLUS, CPUID_SC000};
 
 /// `xPSR` bit positions (DDI 0403 B1.4.2).
 ///
@@ -255,8 +280,18 @@ pub struct Extensions {
     /// [`ArmV7m::config`] claim a unit that was not compiled in, so a build
     /// without the feature gets a part with no FPU and a `CPACR` that says so.
     pub fp: FpUnit,
-    /// A PMSAv7 memory protection unit with eight regions.
+    /// A memory protection unit with eight regions: PMSAv7, or PMSAv8 on an
+    /// Armv8-M part, or PMSAv6 on an ARMv6-M one.
     pub mpu: bool,
+    /// Unprivileged Thread mode: whether `CONTROL.nPRIV` exists.
+    ///
+    /// Always there on ARMv7-M and Armv8-M. On ARMv6-M it is the optional
+    /// *Unprivileged/Privileged Extension* (DDI 0419E B1.3.1): a Cortex-M0
+    /// has no unprivileged execution at all, so `nPRIV` is RAZ/WI and every
+    /// instruction runs privileged, and a Cortex-M0+ may be built with or
+    /// without it. PMSAv6 requires it (DDI 0419E B3.5), because an MPU with
+    /// nothing unprivileged to restrict would be a decoration.
+    pub unpriv: bool,
 }
 
 impl Extensions {
@@ -265,12 +300,14 @@ impl Extensions {
         dsp: false,
         fp: FpUnit::None,
         mpu: true,
+        unpriv: true,
     };
     /// A Cortex-M4 or M7 without the floating-point option.
     pub const CORTEX_M4: Extensions = Extensions {
         dsp: true,
         fp: FpUnit::None,
         mpu: true,
+        unpriv: true,
     };
     /// A Cortex-M4**F**: the same part with FPv4-SP-D16.
     pub const CORTEX_M4F: Extensions = Extensions {
@@ -292,14 +329,35 @@ impl Extensions {
     #[cfg(feature = "cpu-arm-v8m")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
     pub const CORTEX_M33F: Extensions = Extensions::CORTEX_M7F;
+    /// A Cortex-M0: no DSP, no FPU, no MPU, and no unprivileged execution —
+    /// "software execution is always privileged" (Cortex-M0 TRM, 3.2).
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    pub const CORTEX_M0: Extensions = Extensions {
+        dsp: false,
+        fp: FpUnit::None,
+        mpu: false,
+        unpriv: false,
+    };
+    /// A Cortex-M0+ with both of its protection options built in: the
+    /// eight-region PMSAv6 MPU and the Unprivileged/Privileged Extension
+    /// that PMSAv6 requires (Cortex-M0+ TRM, Table 1-1).
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    pub const CORTEX_M0PLUS: Extensions = Extensions {
+        mpu: true,
+        unpriv: true,
+        ..Extensions::CORTEX_M0
+    };
 }
 
 /// Which M-profile architecture the part implements.
 ///
 /// One flag rather than a scatter of part checks: everything Armv8-M
 /// Mainline changes — the stack limits, the `EXC_RETURN` format, PMSAv8, the
-/// new instructions — keys off this, so a guest's view and the code that
-/// builds it cannot disagree about which part this is.
+/// new instructions — keys off this, and so does everything ARMv6-M takes
+/// away, so a guest's view and the code that builds it cannot disagree about
+/// which part this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum Arch {
@@ -311,6 +369,13 @@ pub enum Arch {
     #[cfg(feature = "cpu-arm-v8m")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
     V8mMainline,
+    /// ARMv6-M (DDI 0419): the Cortex-M0 family. Not "v7-M with some
+    /// extensions off" — the instruction set is a subset no v7-M extension
+    /// flag describes, and the exception model has one fault — so it is an
+    /// architecture of its own here; see [`v6m`] for what changes.
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    V6m,
 }
 
 /// Which revision of the floating-point extension a part has.
@@ -406,16 +471,19 @@ pub struct Config {
     /// Three on most Cortex-M4 parts, four on many M7s, and eight is the
     /// architectural maximum. CMSIS discovers this by writing `0xFF` to a
     /// priority register and reading it back, so it has to be modelled.
+    /// ARMv6-M fixes it at two (DDI 0419E B1.5.4), and [`ArmV7m::new`]
+    /// holds an ARMv6-M configuration to that.
     pub priority_bits: u8,
     /// Whether this part has the bit-band alias windows.
     ///
-    /// Cortex-M3 and Cortex-M4 do; Cortex-M7 and Cortex-M33 do not, and
-    /// neither do the M0/M0+/M23 parts this core does not model. It is a property of
+    /// Cortex-M3 and Cortex-M4 do; Cortex-M7, Cortex-M33 and the ARMv6-M
+    /// parts do not — ARMv6-M has no bit-band in its address map at all
+    /// (DDI 0419E B3.1). It is a property of
     /// the *core's* bus matrix rather than of a board, which is why it is
     /// here and not a region a `.machine` file has to remember to map — see
     /// [`Config::with_bit_band`], which says why in full.
     pub bit_band: bool,
-    /// Which architecture: ARMv7-M or Armv8-M Mainline.
+    /// Which architecture: ARMv7-M, Armv8-M Mainline or ARMv6-M.
     pub arch: Arch,
     /// `VTOR`'s reset value, and so where the reset sequence reads the
     /// initial `SP` and `PC`.
@@ -428,6 +496,17 @@ pub struct Config {
     /// sets, which is why it is configuration and why every reset, warm or
     /// cold, puts it back. Bits `[6:0]` are zero, as `VTOR`'s are.
     pub reset_vtor: u32,
+    /// Which bits of `VTOR` are implemented, or zero for a part with no
+    /// `VTOR` at all.
+    ///
+    /// `0xFFFFFF80` on every ARMv7-M and Armv8-M part here. ARMv6-M makes
+    /// the register optional and its width IMPLEMENTATION DEFINED
+    /// (DDI 0419E B3.2.5): a Cortex-M0 has none, so `VTOR` is RAZ/WI and the
+    /// vector table is at zero for good; a Cortex-M0+ built with it
+    /// implements bits `[31:8]` (Cortex-M0+ TRM, Table 4-1), so a table must
+    /// be 256-byte aligned. Software discovers the width by writing ones and
+    /// reading back, which is why it is modelled rather than assumed.
+    pub vtor_mask: u32,
 }
 
 impl Config {
@@ -442,6 +521,7 @@ impl Config {
         bit_band: true,
         arch: Arch::V7m,
         reset_vtor: 0,
+        vtor_mask: 0xffff_ff80,
     };
 
     /// A Cortex-M7: the same architecture, a different `CPUID`, and four
@@ -499,6 +579,77 @@ impl Config {
         ..Config::CORTEX_M33
     };
 
+    /// A Cortex-M0 r0p0: ARMv6-M, two priority bits, SysTick, no `VTOR`, no
+    /// MPU, no unprivileged execution and no bit-band.
+    ///
+    /// `CPUID` is `0x410CC200` (Cortex-M0 TRM, Table 4-1); everything else
+    /// is DDI 0419E's fixed answer for the architecture.
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    pub const CORTEX_M0: Config = Config {
+        requester: RequesterId::ANONYMOUS,
+        endian: Endian::Little,
+        ext: Extensions::CORTEX_M0,
+        cpuid: CPUID_CORTEX_M0,
+        priority_bits: 2,
+        bit_band: false,
+        arch: Arch::V6m,
+        reset_vtor: 0,
+        vtor_mask: 0,
+    };
+
+    /// A Cortex-M0+ r0p1 with every option a part usually ships: `VTOR`
+    /// (bits `[31:8]`), the eight-region PMSAv6 MPU and unprivileged Thread
+    /// mode. `CPUID` is `0x410CC601` (Cortex-M0+ TRM, Table 4-2).
+    ///
+    /// The options are the implementer's (Cortex-M0+ TRM, Table 1-1); a board
+    /// whose silicon left the MPU out says `mpu = false`.
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    pub const CORTEX_M0PLUS: Config = Config {
+        ext: Extensions::CORTEX_M0PLUS,
+        cpuid: CPUID_CORTEX_M0PLUS,
+        vtor_mask: 0xffff_ff00,
+        ..Config::CORTEX_M0
+    };
+
+    /// An Arm SecurCore SC000: ARMv6-M with the Cortex-M0's programmers'
+    /// model, plus a `VTOR`.
+    ///
+    /// **Partly unverified.** The SC000 Technical Reference Manual (ARM DDI
+    /// 0456) is not publicly available, so this preset is assembled from
+    /// what is: Arm describes the SC000's programmers' model as the
+    /// Cortex-M0's, and Arm's own CMSIS `core_sc000.h` (Apache-2.0) gives
+    /// its SCB a `VTOR` and its `CONTROL` no `nPRIV`, so it is modelled with
+    /// a full-width `VTOR`, no unprivileged execution and no MPU. Its
+    /// `CPUID` part number is not published at all; [`CPUID_SC000`] carries
+    /// only the two fields DDI 0419E fixes, and a board that knows its
+    /// silicon's value sets [`Config::cpuid`] (or the `cpuid` property).
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    pub const SC000: Config = Config {
+        cpuid: CPUID_SC000,
+        vtor_mask: 0xffff_ff80,
+        ..Config::CORTEX_M0
+    };
+
+    /// Whether this is an ARMv6-M part.
+    ///
+    /// Always `false` in a build without `cpu-arm-v6m`, which is what lets
+    /// the optimiser delete every v6-M branch from a v7-M-only core.
+    #[must_use]
+    #[inline]
+    pub const fn is_v6m(&self) -> bool {
+        #[cfg(feature = "cpu-arm-v6m")]
+        {
+            matches!(self.arch, Arch::V6m)
+        }
+        #[cfg(not(feature = "cpu-arm-v6m"))]
+        {
+            false
+        }
+    }
+
     /// Whether this is an Armv8-M Mainline part.
     ///
     /// Always `false` in a build without `cpu-arm-v8m`, which is what lets
@@ -517,11 +668,11 @@ impl Config {
     }
 
     /// Same configuration, booting from a different vector table — see
-    /// [`Config::reset_vtor`]. Bits `[6:0]` are dropped, as `VTOR` drops
-    /// them.
+    /// [`Config::reset_vtor`]. The bits `VTOR` does not implement are
+    /// dropped, as `VTOR` drops them — all of them on a part with none.
     #[must_use]
     pub const fn with_reset_vtor(mut self, vtor: u32) -> Config {
-        self.reset_vtor = vtor & 0xffff_ff80;
+        self.reset_vtor = vtor & self.vtor_mask;
         self
     }
 
@@ -602,38 +753,32 @@ impl Default for Config {
 /// compiled in, so a board that asks for a Cortex-M4F in a build without the
 /// `cpu-arm-v7m-fp` feature is rejected by the validator with the list of what
 /// it could have said — rather than quietly getting a part with no FPU and
-/// faulting on its first `VMOV`.
-#[cfg(all(feature = "cpu-arm-v7m-fp", not(feature = "cpu-arm-v8m")))]
+/// faulting on its first `VMOV`. The same goes for each architecture: a
+/// `cortex-m33` needs `cpu-arm-v8m` and a `cortex-m0` needs `cpu-arm-v6m`,
+/// and `cortex-m33f` needs both `cpu-arm-v8m` and the FPU.
 const PARTS: &[&str] = &[
+    #[cfg(feature = "cpu-arm-v6m")]
+    "cortex-m0",
+    #[cfg(feature = "cpu-arm-v6m")]
+    "cortex-m0plus",
+    // The spelling Arm's own documents use; `+` is an ordinary character in
+    // a property string.
+    #[cfg(feature = "cpu-arm-v6m")]
+    "cortex-m0+",
+    #[cfg(feature = "cpu-arm-v6m")]
+    "sc000",
     "cortex-m3",
     "cortex-m4",
+    #[cfg(feature = "cpu-arm-v7m-fp")]
     "cortex-m4f",
     "cortex-m7",
+    #[cfg(feature = "cpu-arm-v7m-fp")]
     "cortex-m7f",
-];
-
-/// The part names a `.machine` file may give as `part`, without the
-/// floating-point unit compiled in.
-#[cfg(not(any(feature = "cpu-arm-v7m-fp", feature = "cpu-arm-v8m")))]
-const PARTS: &[&str] = &["cortex-m3", "cortex-m4", "cortex-m7"];
-
-/// The part names, with Armv8-M Mainline and the floating-point unit both
-/// compiled in.
-#[cfg(all(feature = "cpu-arm-v7m-fp", feature = "cpu-arm-v8m"))]
-const PARTS: &[&str] = &[
-    "cortex-m3",
-    "cortex-m4",
-    "cortex-m4f",
-    "cortex-m7",
-    "cortex-m7f",
+    #[cfg(feature = "cpu-arm-v8m")]
     "cortex-m33",
+    #[cfg(all(feature = "cpu-arm-v8m", feature = "cpu-arm-v7m-fp"))]
     "cortex-m33f",
 ];
-
-/// The part names, with Armv8-M Mainline but no floating-point unit — so
-/// `cortex-m33f` is refused by name rather than built without its FPU.
-#[cfg(all(not(feature = "cpu-arm-v7m-fp"), feature = "cpu-arm-v8m"))]
-const PARTS: &[&str] = &["cortex-m3", "cortex-m4", "cortex-m7", "cortex-m33"];
 
 // ---------------------------------------------------------------------------
 // The visible register file
@@ -914,6 +1059,11 @@ impl ArmV7m {
     /// Without the `cpu-arm-v7m-fp` feature, `cfg.ext.fp` is forced back to
     /// [`FpUnit::None`]: the unit is not compiled in, and a configuration that
     /// claimed one would make [`ArmV7m::config`] lie.
+    ///
+    /// An ARMv6-M configuration is held to what the architecture allows
+    /// whatever fields it was built with: two priority bits, no DSP, no FPU,
+    /// no bit-band, and no MPU without the unprivileged extension PMSAv6
+    /// depends on (DDI 0419E B1.5.4, B3.1, B3.5).
     #[must_use]
     pub fn new(cfg: Config) -> ArmV7m {
         #[cfg(not(feature = "cpu-arm-v7m-fp"))]
@@ -923,6 +1073,22 @@ impl ArmV7m {
                 ..cfg.ext
             },
             ..cfg
+        };
+        let cfg = if cfg.is_v6m() {
+            Config {
+                ext: Extensions {
+                    dsp: false,
+                    fp: FpUnit::None,
+                    mpu: cfg.ext.mpu && cfg.ext.unpriv,
+                    ..cfg.ext
+                },
+                priority_bits: 2,
+                bit_band: false,
+                reset_vtor: cfg.reset_vtor & cfg.vtor_mask,
+                ..cfg
+            }
+        } else {
+            cfg
         };
         ArmV7m {
             cfg,
@@ -962,16 +1128,19 @@ impl ArmV7m {
         let mpu_override = r.or("mpu", true)?;
         let fp_override = r.or("fp", true)?;
         let vtor = r.or_range("vtor", 0u64, 0..=0xffff_ff80)?;
+        let cpuid = if props.contains("cpuid") {
+            Some(r.or_range("cpuid", 0u64, 0..=0xffff_ffff)? as u32)
+        } else {
+            None
+        };
         r.finish()?;
-        if vtor & 0x7f != 0 {
-            // Not silently rounded: a vector table the core would then read
-            // from somewhere other than where the board file said is a
-            // reset into the weeds with nothing pointing at the cause.
-            return Err(Error::Property(alloc::format!(
-                "property `vtor`: {vtor:#x} is not 128-byte aligned (VTOR bits [6:0] are zero)"
-            )));
-        }
         let base = match part {
+            #[cfg(feature = "cpu-arm-v6m")]
+            "cortex-m0" => Config::CORTEX_M0,
+            #[cfg(feature = "cpu-arm-v6m")]
+            "cortex-m0plus" | "cortex-m0+" => Config::CORTEX_M0PLUS,
+            #[cfg(feature = "cpu-arm-v6m")]
+            "sc000" => Config::SC000,
             "cortex-m3" => Config::CORTEX_M3,
             "cortex-m4" => Config::CORTEX_M4,
             "cortex-m4f" => Config::CORTEX_M4F,
@@ -984,6 +1153,28 @@ impl ArmV7m {
             // `require_enum` has already rejected anything else.
             _ => Config::CORTEX_M4,
         };
+        if u64::from(base.vtor_mask) & vtor != vtor {
+            // Not silently rounded: a vector table the core would then read
+            // from somewhere other than where the board file said is a
+            // reset into the weeds with nothing pointing at the cause. A
+            // Cortex-M0 has no VTOR at all, so any non-zero value is wrong.
+            return Err(Error::Property(if base.vtor_mask == 0 {
+                alloc::format!("property `vtor`: {part} has no VTOR, so it always boots from 0")
+            } else {
+                alloc::format!(
+                    "property `vtor`: {vtor:#x} is not a value {part}'s VTOR can hold \
+                     (implemented bits {:#010x})",
+                    base.vtor_mask
+                )
+            }));
+        }
+        if base.is_v6m() && priority_bits != 0 && priority_bits != 2 {
+            // ARMv6-M's priority fields are two bits wide by definition
+            // (DDI 0419E B1.5.4); there is no part to model with any other.
+            return Err(Error::Property(alloc::format!(
+                "property `priority-bits`: ARMv6-M ({part}) implements exactly 2, not {priority_bits}"
+            )));
+        }
         let mut cfg = Config {
             endian: if big_endian {
                 Endian::Big
@@ -1002,8 +1193,10 @@ impl ArmV7m {
                     FpUnit::None
                 },
                 mpu: base.ext.mpu && mpu_override,
+                unpriv: base.ext.unpriv,
             },
             reset_vtor: vtor as u32,
+            cpuid: cpuid.unwrap_or(base.cpuid),
             ..base
         };
         if priority_bits != 0 {
@@ -1288,8 +1481,10 @@ impl ArmV7m {
     /// next reset puts back.
     pub fn set_vtor(&self, value: u32) {
         let mut session = self.session.lock();
-        session.state.sys.vtor = value & 0xffff_ff80;
-        session.reset_vtor = value & 0xffff_ff80;
+        // Only the bits this part's `VTOR` implements — none on a
+        // Cortex-M0, whose vector table cannot move.
+        session.state.sys.vtor = value & self.cfg.vtor_mask;
+        session.reset_vtor = value & self.cfg.vtor_mask;
     }
 
     /// Drive external interrupt `irq`'s input. Level-sensitive: it re-pends
@@ -1515,7 +1710,9 @@ impl ArmV7m {
                 addr: pc,
                 raw: (u32::from(first) << 16) | u32::from(second),
                 width: if wide { 4 } else { 2 },
-                insn: isa::decode(first, second),
+                // The configured architecture's decoder, so a listing for a
+                // Cortex-M0 shows `CBZ` as the UNDEFINED it is there.
+                insn: isa::decode_for(self.cfg.arch, first, second),
             });
             pc = pc.wrapping_add(if wide { 4 } else { 2 });
         }
@@ -1570,19 +1767,25 @@ pub static CLASS: DeviceClass = DeviceClass {
     // 2: the snapshot gained `DEMCR` and the DWT's two live registers. 0.0.x,
     // so the old layout is simply gone rather than read behind a shim.
     version: 2,
-    summary: "ARMv7E-M / Armv8-M Mainline (Cortex-M4/M7/M33 class) CPU core with Thumb-2, DSP, NVIC and MPU",
+    summary: "ARMv6-M / ARMv7E-M / Armv8-M Mainline (Cortex-M0/M4/M7/M33 class) CPU core with Thumb-2, DSP, NVIC and MPU",
     properties: &[
         PropertySpec {
             name: "part",
             kind: ValueKind::Str,
             required: false,
-            summary: "which part to model: cortex-m3, cortex-m4[f], cortex-m7[f] or cortex-m33[f]",
+            summary: "which part to model: cortex-m0, cortex-m0plus (cortex-m0+), sc000, cortex-m3, cortex-m4[f], cortex-m7[f] or cortex-m33[f]",
+        },
+        PropertySpec {
+            name: "cpuid",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "the value CPUID reads, for silicon whose revision differs from the part's default",
         },
         PropertySpec {
             name: "vtor",
             kind: ValueKind::Uint,
             required: false,
-            summary: "VTOR's reset value: where every reset reads SP and PC (default 0, 128-byte aligned)",
+            summary: "VTOR's reset value: where every reset reads SP and PC (default 0; only bits the part's VTOR implements, none on a Cortex-M0)",
         },
         PropertySpec {
             name: "fp",
@@ -2009,6 +2212,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("mpu", ValueKind::Bool))
         .prop(PropSchema::new("fp", ValueKind::Bool))
         .prop(PropSchema::new("vtor", ValueKind::Uint).range(0, 0xffff_ff80))
+        .prop(PropSchema::new("cpuid", ValueKind::Uint).range(0, 0xffff_ffff))
         // Inputs only. `irq0`…`irq239` are the NVIC's external lines.
         .port_bank("irq", PortDir::In, IRQ_LINES)
         .port("nmi", PortDir::In)

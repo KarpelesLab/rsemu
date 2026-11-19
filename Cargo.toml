@@ -228,6 +228,7 @@ full = [
     "cpu-arm-v7m",
     "cpu-arm-v7m-fp",
     "cpu-arm-v8m",
+    "cpu-arm-v6m",
     "dev-stm32",
     "dev-stm32-dma",
     "dev-stm32-dmamux",
@@ -1974,6 +1975,23 @@ cpu-arm-v7m-fp = ["cpu-arm-v7m", "float"]
 # parts behave identically with or without it. `no_std + alloc`, no `unsafe`,
 # no dependencies.
 cpu-arm-v8m = ["cpu-arm-v7m"]
+
+# ARMv6-M for `cpu-arm-v7m` -- the Cortex-M0, Cortex-M0+ and SecurCore SC000
+# (src/cpu/arm/v7m/v6m.rs plus feature-gated arms in the shared decoder and
+# interpreter), selected per instance by `part = "cortex-m0"`,
+# `"cortex-m0plus"` (or `"cortex-m0+"`) or `"sc000"`. What it changes against
+# ARMv7-M: decode gated to the v6-M set -- the 16-bit Thumb instructions bar
+# CBZ/CBNZ and IT, plus 32-bit BL, MSR, MRS, DMB, DSB and ISB, with every other
+# encoding UNDEFINED -- and the v6-M system model: HardFault for every fault
+# and no fault status registers, two priority bits and no priority grouping,
+# 32 external interrupts, the v6-M SCB subset (CCR read-only with
+# UNALIGN_TRP and STKALIGN fixed at one, so every unaligned access faults),
+# optional VTOR, optional unprivileged execution, the PMSAv6 MPU on the parts
+# that have one, PRIMASK as the only mask register, and no bit-band. A v7-M
+# part behaves identically with or without it. Written from the ARMv6-M ARM
+# (DDI 0419E) and the Cortex-M0/M0+ TRMs. `no_std + alloc`, no `unsafe`, no
+# dependencies.
+cpu-arm-v6m = ["cpu-arm-v7m"]
 
 # STM32 peripherals (src/dev/stm32): a GPIO port and a USART, as separate
 # classes a `.machine` file places at the addresses its reference manual gives

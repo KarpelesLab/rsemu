@@ -401,6 +401,11 @@ pub struct Sys {
 
     /// `VTOR`: where the vector table is.
     pub vtor: u32,
+    /// Which bits of `VTOR` a write may set: `0xFFFFFF80` on ARMv7-M, and
+    /// on ARMv6-M whatever the part implements — zero for a part without
+    /// the register, which then reads as zero and ignores writes
+    /// (DDI 0419E B3.2.5). Configuration, never written by the guest.
+    pub vtor_mask: u32,
     /// `AIRCR.PRIGROUP`: how many low priority bits are sub-priority and so
     /// do not participate in preemption.
     pub prigroup: u8,
@@ -518,6 +523,16 @@ pub struct Sys {
     #[cfg(feature = "cpu-arm-v8m")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
     pub mpu_mair: [u32; 2],
+
+    /// Whether this is an ARMv6-M part's system block: the v6-M register
+    /// subset, a read-only `CCR`, 32 external interrupts, PMSAv6. See
+    /// `super::v6m`.
+    ///
+    /// Configuration rather than state, like the `v8m` flag: set once by
+    /// [`Sys::with_v6m`] and never written by anything else.
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    pub v6m: bool,
 }
 
 /// How many MPU regions this core has. Eight is the Cortex-M4 and M7 default.
@@ -540,6 +555,7 @@ impl Sys {
             priority: [0; Exception::COUNT],
             priority_bits: priority_bits.clamp(1, 8),
             vtor: 0,
+            vtor_mask: 0xffff_ff80,
             prigroup: 0,
             scr: 0,
             // `STKALIGN` reads as one and is RAO/WI on a Cortex-M4 and M7:
@@ -577,6 +593,8 @@ impl Sys {
             v8m: false,
             #[cfg(feature = "cpu-arm-v8m")]
             mpu_mair: [0; 2],
+            #[cfg(feature = "cpu-arm-v6m")]
+            v6m: false,
         };
         // The exceptions with no enable bit are permanently enabled, so the
         // arbiter never has to special-case them.
@@ -955,6 +973,12 @@ impl Sys {
         {
             return Some(value);
         }
+        #[cfg(feature = "cpu-arm-v6m")]
+        if self.v6m
+            && let Some(value) = self.read_word_v6m(word)
+        {
+            return Some(value);
+        }
         Some(match word {
             // SysTick.
             0xe000_e010 => {
@@ -1068,6 +1092,10 @@ impl Sys {
         if self.v8m && self.write_word_v8m(word, value) {
             return true;
         }
+        #[cfg(feature = "cpu-arm-v6m")]
+        if self.v6m && self.write_word_v6m(word, value) {
+            return true;
+        }
         match word {
             0xe000_e010 => {
                 // COUNTFLAG is read-only.
@@ -1119,7 +1147,7 @@ impl Sys {
             // The vector table is at least 32 words and must be aligned to
             // its own size rounded up to a power of two; the architecture
             // makes bits [6:0] read as zero.
-            0xe000_ed08 => self.vtor = value & 0xffff_ff80,
+            0xe000_ed08 => self.vtor = value & self.vtor_mask,
             0xe000_ed0c => {
                 // Every write needs the key in the top half, or it is
                 // ignored entirely (DDI 0403 B3.2.6).
@@ -1294,7 +1322,7 @@ impl Sys {
     }
 
     /// `ICSR`, assembled from the bitmaps rather than stored.
-    fn icsr(&self) -> u32 {
+    pub(super) fn icsr(&self) -> u32 {
         let mut v = 0u32;
         v |= self.vect_pending() << 12;
         if self.pending.iter().enumerate().any(|(i, w)| {

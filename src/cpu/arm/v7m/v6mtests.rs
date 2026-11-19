@@ -1,0 +1,720 @@
+//! Unit tests for the ARMv6-M half of the core (`super::v6m`).
+//!
+//! Every encoding below was checked against a real assembler (`llvm-mc
+//! -triple=thumbv6m-none-eabi -mcpu=cortex-m0`, and `thumbv7m` for the
+//! Cortex-M3 side, run as a black box) before it was written down — the
+//! v6-M assembler refusing an encoding is the independent confirmation that
+//! it is outside the v6-M set. Every expected behaviour comes from DDI 0419E
+//! as `super::v6m` states it.
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::core::device::Device;
+use crate::core::props::{Props, Value};
+use crate::core::space::{AddressSpace, RamStore, Region, UnassignedPolicy};
+use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+
+use super::isa::{Insn, decode, decode_for};
+use super::sys::{Exception, control, exc_return, shcsr};
+use super::v6m::{CPUID_CORTEX_M0, CPUID_CORTEX_M0PLUS, CPUID_SC000, permits_32};
+use super::{Arch, ArmV7m, Config, xpsr};
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+const ENTRY: u32 = 0x200;
+const HANDLER: u32 = 0x300;
+const STACK: u32 = 0x1000;
+/// An aligned scratch word in RAM, for the loads and stores below.
+const DATA: u32 = 0x800;
+const RAM: u64 = 0x4000;
+
+/// `B .`
+const PARK: u16 = 0xe7fe;
+/// `BX lr`
+const BX_LR: u16 = 0x4770;
+/// `SVC #0`
+const SVC: u16 = 0xdf00;
+/// `NOP`
+const NOP: u16 = 0xbf00;
+
+struct Harness {
+    cpu: Arc<ArmV7m>,
+    ram: Arc<RamStore>,
+}
+
+impl Harness {
+    fn new(cfg: Config, code: &[u16]) -> Harness {
+        let ram = Arc::new(RamStore::new(RAM));
+        ram.write_at(0, &STACK.to_le_bytes()).unwrap();
+        ram.write_at(4, &(ENTRY | 1).to_le_bytes()).unwrap();
+        ram.write_at(u64::from(HANDLER), &PARK.to_le_bytes())
+            .unwrap();
+        for n in 2..48u64 {
+            ram.write_at(n * 4, &(HANDLER | 1).to_le_bytes()).unwrap();
+        }
+        for (i, half) in code.iter().enumerate() {
+            ram.write_at(u64::from(ENTRY) + (i as u64) * 2, &half.to_le_bytes())
+                .unwrap();
+        }
+        let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::FAULT);
+        space
+            .topology()
+            .map(Region::ram("ram", Arc::clone(&ram)), 0)
+            .unwrap();
+        let cpu = Arc::new(ArmV7m::new(cfg));
+        cpu.attach_space(Arc::new(space));
+        cpu.step();
+        // Somewhere harmless for every load/store/divide below to point at.
+        cpu.set_reg(1, DATA);
+        cpu.set_reg(2, 3);
+        Harness { cpu, ram }
+    }
+
+    fn m0(code: &[u16]) -> Harness {
+        Harness::new(Config::CORTEX_M0, code)
+    }
+
+    fn m0plus(code: &[u16]) -> Harness {
+        Harness::new(Config::CORTEX_M0PLUS, code)
+    }
+
+    fn handler(&self, code: &[u16]) {
+        for (i, half) in code.iter().enumerate() {
+            self.ram
+                .write_at(u64::from(HANDLER) + (i as u64) * 2, &half.to_le_bytes())
+                .unwrap();
+        }
+    }
+
+    fn word(&self, addr: u32) -> u32 {
+        let mut v = 0u32;
+        for k in 0..4 {
+            v |= u32::from(self.ram.read_u8(u64::from(addr) + k).unwrap()) << (8 * k);
+        }
+        v
+    }
+
+    fn set_word(&self, addr: u32, value: u32) {
+        self.ram
+            .write_at(u64::from(addr), &value.to_le_bytes())
+            .unwrap();
+    }
+
+    /// A system-block register, read the way a debugger would.
+    fn ppb_read(&self, addr: u32) -> u32 {
+        self.cpu.with_sys(|s| s.read_word(addr, true).unwrap())
+    }
+
+    fn ppb_write(&self, addr: u32, value: u32) {
+        assert!(self.cpu.with_sys(|s| s.write_word(addr, value)));
+    }
+
+    fn steps(&self, n: usize) {
+        for _ in 0..n {
+            self.cpu.step();
+        }
+    }
+}
+
+/// Split a thirty-two-bit encoding into the two halfwords a fetch sees.
+const fn wide(encoding: u32) -> [u16; 2] {
+    [(encoding >> 16) as u16, encoding as u16]
+}
+
+fn code(encodings: &[u32]) -> Vec<u16> {
+    let mut out = Vec::new();
+    for &e in encodings {
+        if e > 0xffff {
+            out.extend_from_slice(&wide(e));
+        } else {
+            out.push(e as u16);
+        }
+    }
+    out
+}
+
+/// Encodings ARMv7-M (without DSP or an FPU) executes and ARMv6-M does not
+/// have, each with what it is.
+const V7M_ONLY: &[(u32, &str)] = &[
+    (0xb100, "CBZ r0"),
+    (0xb900, "CBNZ r0"),
+    (0xbf08, "IT EQ"),
+    (0xf241_2034, "MOVW r0, #0x1234"),
+    (0xf2c5_6078, "MOVT r0, #0x5678"),
+    (0xe851_0f00, "LDREX r0, [r1]"),
+    (0xe841_0200, "STREX r2, r0, [r1]"),
+    (0xfb91_f0f2, "SDIV r0, r1, r2"),
+    (0xfbb1_f0f2, "UDIV r0, r1, r2"),
+    (0xf000_b800, "B.W"),
+    (0xf3bf_8f2f, "CLREX"),
+    (0xf3af_8000, "NOP.W"),
+    (0xf8d1_0004, "LDR.W r0, [r1, #4]"),
+    (0xeb01_0002, "ADD.W r0, r1, r2"),
+    (0xf301_0007, "SSAT r0, #8, r1"),
+    (0xf3c1_1007, "UBFX r0, r1, #4, #8"),
+    (0xfb01_f002, "MUL.W r0, r1, r2"),
+    (0xe9d1_2300, "LDRD r2, r3, [r1]"),
+];
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_presets_carry_the_trm_values() {
+    let m0 = Config::CORTEX_M0;
+    assert_eq!(m0.cpuid, 0x410c_c200);
+    assert_eq!(CPUID_CORTEX_M0, 0x410c_c200);
+    assert_eq!(m0.arch, Arch::V6m);
+    assert!(m0.is_v6m());
+    assert_eq!(m0.priority_bits, 2);
+    assert_eq!(m0.vtor_mask, 0);
+    assert!(!m0.bit_band);
+    assert!(!m0.ext.dsp && !m0.ext.mpu && !m0.ext.unpriv);
+
+    let plus = Config::CORTEX_M0PLUS;
+    assert_eq!(plus.cpuid, 0x410c_c601);
+    assert_eq!(CPUID_CORTEX_M0PLUS, 0x410c_c601);
+    assert_eq!(plus.vtor_mask, 0xffff_ff00);
+    assert!(plus.ext.mpu && plus.ext.unpriv);
+    assert!(plus.is_v6m());
+
+    let sc = Config::SC000;
+    assert!(sc.is_v6m());
+    assert_eq!(sc.cpuid, CPUID_SC000);
+    // Implementer ARM, architecture ARMv6-M: the two fields DDI 0419E fixes.
+    assert_eq!(sc.cpuid >> 24, 0x41);
+    assert_eq!((sc.cpuid >> 16) & 0xf, 0xc);
+    assert_eq!(sc.vtor_mask, 0xffff_ff80);
+    assert!(!sc.ext.unpriv && !sc.ext.mpu);
+
+    assert!(!Config::CORTEX_M4.is_v6m());
+    assert!(!Config::CORTEX_M3.is_v6m());
+}
+
+#[test]
+fn new_holds_a_v6m_configuration_to_the_architecture() {
+    let cfg = Config {
+        priority_bits: 4,
+        bit_band: true,
+        ext: super::Extensions {
+            dsp: true,
+            ..Config::CORTEX_M0.ext
+        },
+        reset_vtor: 0x1000,
+        ..Config::CORTEX_M0
+    };
+    let got = ArmV7m::new(cfg).config();
+    assert_eq!(got.priority_bits, 2);
+    assert!(!got.bit_band);
+    assert!(!got.ext.dsp);
+    // No VTOR, so nowhere to boot from but zero.
+    assert_eq!(got.reset_vtor, 0);
+    // PMSAv6 needs the unprivileged extension; without it there is no MPU.
+    let cfg = Config {
+        ext: super::Extensions {
+            mpu: true,
+            unpriv: false,
+            ..Config::CORTEX_M0.ext
+        },
+        ..Config::CORTEX_M0
+    };
+    assert!(!ArmV7m::new(cfg).config().ext.mpu);
+}
+
+#[test]
+fn from_props_names_every_v6m_part() {
+    for (name, cpuid) in [
+        ("cortex-m0", CPUID_CORTEX_M0),
+        ("cortex-m0plus", CPUID_CORTEX_M0PLUS),
+        ("cortex-m0+", CPUID_CORTEX_M0PLUS),
+        ("sc000", CPUID_SC000),
+    ] {
+        let props = Props::new().with("part", Value::from(name));
+        let cpu = ArmV7m::from_props(&props).unwrap();
+        assert!(cpu.config().is_v6m(), "{name}");
+        assert_eq!(cpu.config().cpuid, cpuid, "{name}");
+        assert_eq!(cpu.config().priority_bits, 2, "{name}");
+    }
+    // A board that knows its SC000's real CPUID says so.
+    let props = Props::new()
+        .with("part", Value::from("sc000"))
+        .with("cpuid", Value::from(0x4100_0000u64 | 0x000c_1234));
+    let cpu = ArmV7m::from_props(&props).unwrap();
+    assert_eq!(cpu.config().cpuid, 0x410c_1234);
+}
+
+#[test]
+fn from_props_refuses_what_the_part_cannot_do() {
+    // A Cortex-M0 has no VTOR.
+    let props = Props::new()
+        .with("part", Value::from("cortex-m0"))
+        .with("vtor", Value::from(0x1000u64));
+    assert!(ArmV7m::from_props(&props).is_err());
+    // A Cortex-M0+'s VTOR holds bits [31:8], so 0x80 is not a table base.
+    let props = Props::new()
+        .with("part", Value::from("cortex-m0plus"))
+        .with("vtor", Value::from(0x80u64));
+    assert!(ArmV7m::from_props(&props).is_err());
+    let props = Props::new()
+        .with("part", Value::from("cortex-m0plus"))
+        .with("vtor", Value::from(0x100u64));
+    assert_eq!(ArmV7m::from_props(&props).unwrap().vtor(), 0x100);
+    // Two priority bits, and no other number.
+    let props = Props::new()
+        .with("part", Value::from("cortex-m0"))
+        .with("priority-bits", Value::from(3u64));
+    assert!(ArmV7m::from_props(&props).is_err());
+    let props = Props::new()
+        .with("part", Value::from("cortex-m0"))
+        .with("priority-bits", Value::from(2u64));
+    assert!(ArmV7m::from_props(&props).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Decode gating
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_v7m_only_encoding_is_a_hardfault_on_m0_and_runs_on_m3() {
+    for &(encoding, name) in V7M_ONLY {
+        let m0 = Harness::m0(&code(&[encoding, u32::from(PARK)]));
+        m0.cpu.step();
+        assert_eq!(
+            m0.cpu.current_exception(),
+            Exception::HARD_FAULT,
+            "{name} must be UNDEFINED on a Cortex-M0"
+        );
+        assert_eq!(m0.cpu.pc(), HANDLER, "{name}");
+        // The stacked return address is the faulting instruction.
+        assert_eq!(m0.word(STACK - 0x20 + 0x18), ENTRY, "{name}");
+
+        let m3 = Harness::new(Config::CORTEX_M3, &code(&[encoding, u32::from(PARK)]));
+        m3.cpu.step();
+        assert_eq!(
+            m3.cpu.current_exception(),
+            Exception::THREAD,
+            "{name} must execute on a Cortex-M3"
+        );
+    }
+}
+
+#[test]
+fn dsp_and_coprocessor_encodings_are_hardfaults_too() {
+    for (encoding, name) in [
+        (0xfa82_f081u32, "QADD r0, r1, r2"),
+        (0xee00_0a10, "VMOV s0, r0"),
+        (0xf7f0_a000, "UDF.W #0"),
+        (0xde00, "UDF #0"),
+    ] {
+        let h = Harness::m0(&code(&[encoding]));
+        h.cpu.step();
+        assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT, "{name}");
+    }
+}
+
+#[test]
+fn the_permitted_32_bit_set_runs() {
+    // BL to the next instruction, MSR/MRS PRIMASK, the three barriers.
+    let h = Harness::m0(&code(&[
+        0xf000_f800, // BL +0
+        0x2001,      // MOVS r0, #1
+        0xf380_8810, // MSR PRIMASK, r0
+        0xf3ef_8310, // MRS r3, PRIMASK
+        0xf3bf_8f5f, // DMB SY
+        0xf3bf_8f4f, // DSB SY
+        0xf3bf_8f6f, // ISB SY
+        u32::from(PARK),
+    ]));
+    h.steps(7);
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.reg(14), (ENTRY + 4) | 1, "BL set LR");
+    assert!(h.cpu.regs().primask);
+    assert_eq!(h.cpu.reg(3), 1);
+    assert_eq!(h.cpu.pc(), ENTRY + 4 + 2 + 4 * 5);
+    for encoding in [
+        0xf000_f800u32,
+        0xf380_8810,
+        0xf3ef_8010,
+        0xf3bf_8f5f,
+        0xf3bf_8f4f,
+        0xf3bf_8f6f,
+        0xf7f0_a000,
+    ] {
+        let [a, b] = wide(encoding);
+        assert!(permits_32(a, b), "{encoding:#010x}");
+    }
+}
+
+#[test]
+fn sixteen_bit_hints_still_decode_and_unallocated_ones_are_nops() {
+    // YIELD, SEV, and a hint number nothing assigns (0xbf70): NOPs all.
+    let h = Harness::m0(&[0xbf10, 0xbf40, 0xbf70, NOP, PARK]);
+    h.steps(4);
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.pc(), ENTRY + 8);
+}
+
+#[test]
+fn the_disassembler_is_honest_about_the_architecture() {
+    assert_eq!(decode_for(Arch::V6m, 0xb100, 0), Insn::Undefined);
+    assert_eq!(decode_for(Arch::V6m, 0xbf08, 0), Insn::Undefined);
+    assert!(matches!(decode_for(Arch::V7m, 0xb100, 0), Insn::Cbz { .. }));
+    let [a, b] = wide(0xf241_2034);
+    assert_eq!(decode_for(Arch::V6m, a, b), Insn::Undefined);
+    assert_eq!(decode_for(Arch::V7m, a, b), decode(a, b));
+    // Permitted encodings decode exactly as the shared table has them.
+    let [a, b] = wide(0xf3ef_8010);
+    assert_eq!(decode_for(Arch::V6m, a, b), decode(a, b));
+
+    let h = Harness::m0(&code(&[0xb100, 0x2042]));
+    let listing = h.cpu.disassemble(ENTRY, 2);
+    assert_eq!(listing[0].insn, Insn::Undefined);
+    assert!(!matches!(listing[1].insn, Insn::Undefined));
+}
+
+// ---------------------------------------------------------------------------
+// The exception model
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_fault_is_a_hardfault_and_the_status_registers_read_zero() {
+    let h = Harness::m0(&code(&[0xb100]));
+    // Software cannot enable the configurable faults: SHCSR's enables do not
+    // exist on ARMv6-M.
+    h.ppb_write(
+        0xe000_ed24,
+        shcsr::USGFAULTENA | shcsr::BUSFAULTENA | shcsr::MEMFAULTENA,
+    );
+    assert_eq!(h.ppb_read(0xe000_ed24), 0);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_eq!(h.cpu.regs().r[14], exc_return::THREAD_MSP);
+    // CFSR, HFSR, MMFAR, BFAR: reserved, so zero to the guest.
+    for addr in [0xe000_ed28u32, 0xe000_ed2c, 0xe000_ed34, 0xe000_ed38] {
+        assert_eq!(h.ppb_read(addr), 0, "{addr:#x}");
+    }
+}
+
+#[test]
+fn unaligned_accesses_always_fault() {
+    // CCR reads 0x208 — STKALIGN and UNALIGN_TRP — and ignores writes.
+    let h = Harness::m0(&[0x6808]); // LDR r0, [r1]
+    assert_eq!(h.ppb_read(0xe000_ed14), 0x208);
+    h.ppb_write(0xe000_ed14, 0);
+    assert_eq!(h.ppb_read(0xe000_ed14), 0x208);
+    h.cpu.set_reg(1, DATA + 2);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+
+    let h = Harness::m0(&[0x8808]); // LDRH r0, [r1]
+    h.cpu.set_reg(1, DATA + 1);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+
+    // A byte access cannot be unaligned.
+    let h = Harness::m0(&[0x7808, PARK]); // LDRB r0, [r1]
+    h.cpu.set_reg(1, DATA + 1);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+}
+
+#[test]
+fn an_svc_that_cannot_preempt_escalates_and_one_in_hardfault_locks_up() {
+    // CPSID i, then SVC: PRIMASK holds the priority at 0 and SVCall is at 0.
+    let h = Harness::m0(&[0xb672, SVC]);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+
+    // Inside HardFault an SVC has nowhere to go: lockup (Table B1-7).
+    let h = Harness::m0(&[0xb100]);
+    h.handler(&[SVC]);
+    h.steps(2);
+    assert!(h.cpu.is_locked_up());
+    assert_eq!(h.cpu.pc(), 0xffff_fffe);
+
+    // So does a BKPT.
+    let h = Harness::m0(&[0xb100]);
+    h.handler(&[0xbe00]);
+    h.steps(2);
+    assert!(h.cpu.is_locked_up());
+
+    // And an ordinary SVC at Thread priority is taken.
+    let h = Harness::m0(&[SVC]);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::SVCALL);
+}
+
+#[test]
+fn cmsis_priority_discovery_finds_two_bits() {
+    // STR r0, [r1]; LDR r3, [r1] — through the guest's own word accesses,
+    // as CMSIS's `NVIC_SetPriority` probe does.
+    for (addr, expect) in [
+        (0xe000_e400u32, 0xc0c0_c0c0u32), // NVIC_IPR0
+        (0xe000_e41c, 0xc0c0_c0c0),       // NVIC_IPR7
+        (0xe000_e420, 0),                 // IPR8: past the 32 interrupts
+        (0xe000_ed1c, 0xc000_0000),       // SHPR2: SVCall only
+        (0xe000_ed20, 0xc0c0_0000),       // SHPR3: PendSV, SysTick
+        (0xe000_ed18, 0),                 // SHPR1: reserved
+    ] {
+        let h = Harness::m0(&[0x6008, 0x680b, PARK]);
+        h.cpu.set_reg(0, 0xffff_ffff);
+        h.cpu.set_reg(1, addr);
+        h.steps(2);
+        assert_eq!(h.cpu.current_exception(), Exception::THREAD, "{addr:#x}");
+        assert_eq!(h.cpu.reg(3), expect, "{addr:#x}");
+    }
+}
+
+#[test]
+fn the_v6m_register_subset() {
+    let h = Harness::m0(&[PARK]);
+    // 32 interrupts: one word of each NVIC bitmap.
+    h.ppb_write(0xe000_e100, 0xffff_ffff);
+    assert_eq!(h.ppb_read(0xe000_e100), 0xffff_ffff);
+    h.ppb_write(0xe000_e104, 0xffff_ffff);
+    assert_eq!(h.ppb_read(0xe000_e104), 0);
+    // No IABR, no STIR, no ICTR, no CPACR, no DEMCR, no DWT cycle counter.
+    h.ppb_write(0xe000_ef00, 3);
+    assert!(!h.cpu.with_sys(|s| s.is_pending(Exception(19))));
+    for addr in [
+        0xe000_e300u32,
+        0xe000_e004,
+        0xe000_ed88,
+        0xe000_edfc,
+        0xe000_1000,
+    ] {
+        h.ppb_write(addr, 0xffff_ffff);
+        assert_eq!(h.ppb_read(addr), 0, "{addr:#x}");
+    }
+    // AIRCR has no PRIGROUP.
+    h.ppb_write(0xe000_ed0c, 0x05fa_0700);
+    assert_eq!(h.ppb_read(0xe000_ed0c) & 0x700, 0);
+    // No VTOR on a Cortex-M0.
+    h.ppb_write(0xe000_ed08, 0xffff_ffff);
+    assert_eq!(h.ppb_read(0xe000_ed08), 0);
+    // No MPU on a Cortex-M0.
+    assert_eq!(h.ppb_read(0xe000_ed90), 0);
+    // ICSR: no RETTOBASE.
+    assert_eq!(h.ppb_read(0xe000_ed04) & (1 << 11), 0);
+    // SHCSR.SVCALLPENDED is the one bit there.
+    h.ppb_write(0xe000_ed24, 1 << 15);
+    assert_eq!(h.ppb_read(0xe000_ed24), 1 << 15);
+    assert!(h.cpu.with_sys(|s| s.is_pending(Exception::SVCALL)));
+
+    let plus = Harness::m0plus(&[PARK]);
+    // A Cortex-M0+ VTOR implements bits [31:8].
+    plus.ppb_write(0xe000_ed08, 0xffff_ffff);
+    assert_eq!(plus.ppb_read(0xe000_ed08), 0xffff_ff00);
+    // Eight PMSAv6 regions, and no RBAR/RASR aliases.
+    assert_eq!(plus.ppb_read(0xe000_ed90), 8 << 8);
+    plus.ppb_write(0xe000_eda4, 0xffff_ffff);
+    assert_eq!(plus.ppb_read(0xe000_eda4), 0);
+    // RBAR.ADDR is bits [31:8].
+    plus.ppb_write(0xe000_ed9c, 0x2000_00f0 | (1 << 4) | 3);
+    assert_eq!(plus.ppb_read(0xe000_ed9c), 0x2000_0003);
+    assert_eq!(plus.ppb_read(0xe000_ed98), 3);
+}
+
+#[test]
+fn a_cortex_m0_boots_from_zero_whatever_it_is_told() {
+    let h = Harness::m0(&[PARK]);
+    h.cpu.set_vtor(0x2000);
+    assert_eq!(h.cpu.vtor(), 0);
+    h.cpu.request_reset();
+    h.cpu.step();
+    assert_eq!(h.cpu.pc(), ENTRY);
+}
+
+#[test]
+fn special_registers_are_the_v6m_subset() {
+    // MSR BASEPRI, r0; MRS r3, FAULTMASK; CPSID f; MSR APSR, r0;
+    // MRS r4, CONTROL — then MSR CONTROL, r0 with nPRIV and SPSEL set.
+    let h = Harness::m0(&code(&[
+        0xf380_8811, // MSR BASEPRI, r0
+        0xf3ef_8313, // MRS r3, FAULTMASK
+        0xb671,      // CPSID f
+        0xf380_8800, // MSR APSR, r0
+        0xf380_8814, // MSR CONTROL, r0
+        u32::from(PARK),
+    ]));
+    h.cpu.set_reg(0, 0xffff_ffff);
+    h.cpu.set_reg(3, 0x1234);
+    h.steps(5);
+    let regs = h.cpu.regs();
+    assert_eq!(regs.basepri, 0);
+    assert!(!regs.faultmask);
+    assert_eq!(h.cpu.reg(3), 0);
+    // N, Z, C, V set; Q and GE are not ARMv6-M's.
+    assert_eq!(
+        regs.xpsr & (xpsr::N | xpsr::Z | xpsr::C | xpsr::V),
+        0xf000_0000
+    );
+    assert_eq!(regs.xpsr & (xpsr::Q | xpsr::GE), 0);
+    // A Cortex-M0 has no nPRIV; SPSEL took.
+    assert_eq!(regs.control, control::SPSEL);
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+
+    // A Cortex-M0+ with the unprivileged extension can drop privilege.
+    let h = Harness::m0plus(&code(&[0xf380_8814, u32::from(PARK)]));
+    h.cpu.set_reg(0, control::NPRIV);
+    h.cpu.step();
+    assert_eq!(h.cpu.regs().control, control::NPRIV);
+}
+
+#[test]
+fn unprivileged_ppb_access_is_a_hardfault() {
+    // MSR CONTROL, r0 (nPRIV); LDR r3, [r1] with r1 at CPUID.
+    let h = Harness::m0plus(&code(&[0xf380_8814, 0x680b, u32::from(PARK)]));
+    h.cpu.set_reg(0, control::NPRIV);
+    h.cpu.set_reg(1, 0xe000_ed00);
+    h.cpu.set_reg(3, 0x5555);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_eq!(h.cpu.reg(3), 0x5555, "the access is not made");
+
+    // Privileged, it reads the CPUID.
+    let h = Harness::m0plus(&[0x680b, PARK]);
+    h.cpu.set_reg(1, 0xe000_ed00);
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(3), CPUID_CORTEX_M0PLUS);
+}
+
+#[test]
+fn an_mpu_violation_is_a_hardfault() {
+    // Region 0: the low 4 KiB — code, vectors and stack — with full access.
+    // Region 1, which wins where they overlap: 256 bytes at DATA,
+    // privileged-only (AP = 001). The MPU on, with the background region for
+    // privileged code.
+    let h = Harness::m0plus(&code(&[0xf380_8814, 0x680b, u32::from(PARK)]));
+    h.ppb_write(0xe000_ed9c, 1 << 4);
+    h.ppb_write(0xe000_eda0, (0b011 << 24) | (11 << 1) | 1);
+    h.ppb_write(0xe000_ed9c, DATA | (1 << 4) | 1);
+    h.ppb_write(0xe000_eda0, (0b001 << 24) | (7 << 1) | 1);
+    h.ppb_write(0xe000_ed94, 0b101);
+    h.cpu.set_reg(0, control::NPRIV);
+    h.cpu.set_reg(1, DATA);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+
+    // The same load from privileged code is permitted: it was the region's
+    // AP that refused it, not anything else.
+    let h = Harness::m0plus(&code(&[0x680b, u32::from(PARK)]));
+    h.ppb_write(0xe000_ed9c, 1 << 4);
+    h.ppb_write(0xe000_eda0, (0b011 << 24) | (11 << 1) | 1);
+    h.ppb_write(0xe000_ed9c, DATA | (1 << 4) | 1);
+    h.ppb_write(0xe000_eda0, (0b001 << 24) | (7 << 1) | 1);
+    h.ppb_write(0xe000_ed94, 0b101);
+    h.set_word(DATA, 0xfeed_f00d);
+    h.cpu.set_reg(1, DATA);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.reg(3), 0xfeed_f00d);
+}
+
+#[test]
+fn exception_return_takes_only_the_v6m_values_and_the_v6m_xpsr() {
+    // An SVC whose handler returns: the round trip works.
+    let h = Harness::m0(&[SVC, PARK]);
+    h.handler(&[BX_LR]);
+    h.steps(3);
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.pc(), ENTRY + 2);
+
+    // An extended-frame EXC_RETURN is not a v6-M value: HardFault.
+    let h = Harness::m0(&[SVC, PARK]);
+    h.handler(&[0x4700 | (2 << 3)]); // BX r2
+    h.cpu.step();
+    h.cpu.set_reg(2, exc_return::THREAD_MSP_FP);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+
+    // A frame whose stacked xPSR carries Q, GE and ITSTATE gets none of
+    // them back.
+    let h = Harness::m0(&[SVC, PARK]);
+    h.handler(&[BX_LR]);
+    h.cpu.step();
+    let sp = h.cpu.regs().msp;
+    let forged = xpsr::T | xpsr::Q | xpsr::GE | (0x3f << 10) | xpsr::N;
+    h.set_word(sp + 0x1c, forged);
+    h.cpu.step();
+    let x = h.cpu.xpsr();
+    assert_eq!(x, xpsr::T | xpsr::N);
+}
+
+#[test]
+fn bl_and_the_system_instructions_take_cortex_m0_cycles() {
+    // BL is 4 on a Cortex-M0 (TRM Table 3-1) and 3 in the shared model.
+    let m0 = Harness::m0(&code(&[0xf000_f800, u32::from(PARK)]));
+    let before = m0.cpu.cycles();
+    m0.cpu.step();
+    assert_eq!(m0.cpu.cycles() - before, 4);
+
+    let m3 = Harness::new(Config::CORTEX_M3, &code(&[0xf000_f800, u32::from(PARK)]));
+    let before = m3.cpu.cycles();
+    m3.cpu.step();
+    assert_eq!(m3.cpu.cycles() - before, 3);
+
+    // DMB is 4; MOVS is 1.
+    let m0 = Harness::m0(&code(&[0xf3bf_8f5f, 0x2001, u32::from(PARK)]));
+    let before = m0.cpu.cycles();
+    m0.cpu.step();
+    assert_eq!(m0.cpu.cycles() - before, 4);
+    let before = m0.cpu.cycles();
+    m0.cpu.step();
+    assert_eq!(m0.cpu.cycles() - before, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
+
+fn snapshot(cpu: &ArmV7m) -> Vec<u8> {
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", super::CLASS.name).unwrap();
+    let mut writer = StateWriter::new(shape);
+    {
+        let mut chunk = writer
+            .chunk("cpu", super::CLASS.name, super::CLASS.version)
+            .unwrap();
+        Device::save(cpu, &mut chunk).unwrap();
+    }
+    writer.to_vec().unwrap()
+}
+
+fn restore(cpu: &ArmV7m, bytes: &[u8]) {
+    let reader = StateReader::new(bytes).unwrap();
+    let migrations = Migrations::new();
+    let chunk = reader
+        .load("cpu", super::CLASS.name, super::CLASS.version, &migrations)
+        .unwrap();
+    Device::load(cpu, &mut chunk.reader()).unwrap();
+}
+
+#[test]
+fn the_v6m_state_round_trips_through_a_snapshot() {
+    let h = Harness::m0plus(&[SVC, PARK]);
+    h.cpu.step();
+    h.ppb_write(0xe000_ed08, 0x0000_0400);
+    h.ppb_write(0xe000_e400, 0x4080_c000);
+    h.ppb_write(0xe000_ed20, 0x8040_0000);
+    h.ppb_write(0xe000_ed9c, 0x2000_0000 | (1 << 4) | 2);
+    h.ppb_write(0xe000_eda0, (0b011 << 24) | (9 << 1) | 1);
+    h.ppb_write(0xe000_e010, 0b11);
+    h.ppb_write(0xe000_e014, 0x1234);
+    h.cpu.set_irq(3, true);
+    let bytes = snapshot(&h.cpu);
+
+    let fresh = Harness::m0plus(&[PARK]);
+    restore(&fresh.cpu, &bytes);
+    assert_eq!(fresh.cpu.current_exception(), Exception::SVCALL);
+    assert_eq!(fresh.cpu.vtor(), 0x400);
+    assert_eq!(fresh.ppb_read(0xe000_e400), 0x4080_c000);
+    assert_eq!(fresh.ppb_read(0xe000_ed20), 0x8040_0000);
+    assert_eq!(fresh.ppb_read(0xe000_ed9c), 0x2000_0002);
+    assert!(fresh.cpu.irq_asserted(3));
+    assert_eq!(snapshot(&fresh.cpu), bytes, "an identical state hash");
+}

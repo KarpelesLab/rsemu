@@ -49,7 +49,7 @@ use crate::core::value::{Endian, Width};
 
 use super::isa::{
     BitfieldOp, Cond, DpOp, DualMulOp, ExtendOp, HalfMulOp, HintOp, Insn, MemOffset, MiscOp,
-    Operand, SatQOp, Shift, ShiftType, Size, decode, is_32bit,
+    Operand, SatQOp, Shift, ShiftType, Size, decode_for, is_32bit,
 };
 use super::sys::{
     Access, BitBand, DWT_PCSR, Exception, MPU_REGIONS, Sys, bit_band_target, ccr, control,
@@ -195,8 +195,11 @@ impl State {
         };
         #[cfg(feature = "cpu-arm-v8m")]
         let sys = if cfg.is_v8m() { sys.with_v8m() } else { sys };
+        #[cfg(feature = "cpu-arm-v6m")]
+        let sys = if cfg.is_v6m() { sys.with_v6m() } else { sys };
         let mut sys = sys;
-        sys.vtor = cfg.reset_vtor & 0xffff_ff80;
+        sys.vtor_mask = cfg.vtor_mask;
+        sys.vtor = cfg.reset_vtor & cfg.vtor_mask;
         State {
             r: [0; 16],
             sp_other: 0,
@@ -805,6 +808,7 @@ impl<'a> Exec<'a> {
         self.cycle(1);
         if in_ppb(addr) {
             if !in_vendor_ppb(addr) {
+                self.check_ppb_privilege(addr, Access::Read, privileged)?;
                 return self.read_ppb(addr, bytes);
             }
             // The vendor window: the board decodes it, not the processor. The
@@ -854,6 +858,7 @@ impl<'a> Exec<'a> {
         self.cycle(1);
         if in_ppb(addr) {
             if !in_vendor_ppb(addr) {
+                self.check_ppb_privilege(addr, Access::Write, privileged)?;
                 return self.write_ppb(addr, bytes, value);
             }
             // As `read_mem`: the vendor window is the board's.
@@ -1005,6 +1010,21 @@ impl<'a> Exec<'a> {
             Ok(()) => Ok(()),
             Err(_) => Err(self.bus_fault(alias, Access::Write)),
         }
+    }
+
+    /// Refuse an unprivileged access to the private peripheral bus on an
+    /// ARMv6-M part: "Unprivileged accesses to the PPB generate a HardFault
+    /// error, without causing a PPB access" (DDI 0419E B3.1.1). It is raised
+    /// as the bus fault it escalates from, so the access is never made.
+    ///
+    /// A no-op on ARMv7-M, whose rules for this are per register and are
+    /// not modelled here.
+    #[inline]
+    fn check_ppb_privilege(&mut self, addr: u32, access: Access, privileged: bool) -> Ex {
+        if self.cfg.is_v6m() && !privileged {
+            return Err(self.bus_fault(addr, access));
+        }
+        Ok(())
     }
 
     /// Read from the private peripheral bus.
@@ -1393,8 +1413,15 @@ impl<'a> Exec<'a> {
         self.leave_fp_context(fp_frame);
 
         // Restore the flags, `GE`, `ITSTATE`, `T` and the exception number in
-        // one go; the reserved bits are dropped.
-        self.state.xpsr = stacked_xpsr & (xpsr::WRITABLE | xpsr::EXCEPTION);
+        // one go; the reserved bits are dropped. ARMv6-M's `PopStack` takes
+        // only `APSR[31:28]`, `IPSR` and `EPSR.T` — it has no `Q`, `GE` or
+        // `ITSTATE` for a forged frame to smuggle in (DDI 0419E B1.5.8).
+        let restorable = if self.cfg.is_v6m() {
+            xpsr::N | xpsr::Z | xpsr::C | xpsr::V | xpsr::T | xpsr::EXCEPTION
+        } else {
+            xpsr::WRITABLE | xpsr::EXCEPTION
+        };
+        self.state.xpsr = stacked_xpsr & restorable;
         self.state.sync_stack();
         self.state.r[15] = frame[6] & !1;
         self.state.exclusive = None;
@@ -1444,7 +1471,9 @@ impl<'a> Exec<'a> {
         // The PC reads as the instruction's address plus four in both widths.
         self.state.r[15] = pc.wrapping_add(4);
 
-        let mut insn = decode(first, second);
+        // Gated by the configured architecture: on ARMv6-M everything
+        // outside its subset is UNDEFINED before execution ever sees it.
+        let mut insn = decode_for(self.cfg.arch, first, second);
         let it = self.state.itstate();
         // The sixteen-bit data-processing encodings have no `S` bit: they set
         // the flags outside an `IT` block and leave them alone inside one
@@ -1486,6 +1515,9 @@ impl<'a> Exec<'a> {
 
         match outcome {
             Ok(()) => {
+                if passed && self.cfg.is_v6m() {
+                    self.cycle(v6m_extra_cycles(insn));
+                }
                 if !self.branched {
                     self.state.r[15] = pc.wrapping_add(width);
                 }
@@ -1961,7 +1993,9 @@ impl<'a> Exec<'a> {
                     if i {
                         self.state.primask = !enable;
                     }
-                    if f {
+                    // ARMv6-M has no `FAULTMASK`; its `CPS` reaches
+                    // `PRIMASK` alone (DDI 0419E B4.2.1).
+                    if f && !self.cfg.is_v6m() {
                         // `FAULTMASK` may only be *set* from a priority above
                         // −1; clearing is always allowed
                         // (DDI 0403 B1.4.3).
@@ -2005,6 +2039,9 @@ impl<'a> Exec<'a> {
                 // HardFault with `DEBUGEVT` (DDI 0403 C1.4.1).
                 self.state.sys.hfsr |= fsr::HF_DEBUGEVT;
                 let ret = self.insn_addr.wrapping_add(2);
+                if self.v6m_locks_up() {
+                    return Ok(());
+                }
                 self.exception_entry(Exception::HARD_FAULT, ret);
                 Ok(())
             }
@@ -2016,6 +2053,9 @@ impl<'a> Exec<'a> {
                     // An `SVC` that cannot preempt the current priority is a
                     // HardFault, not a pending SVCall (DDI 0403 B1.5.4).
                     self.state.sys.hfsr |= fsr::HF_FORCED;
+                    if self.v6m_locks_up() {
+                        return Ok(());
+                    }
                     self.exception_entry(Exception::HARD_FAULT, ret);
                 } else {
                     self.exception_entry(Exception::SVCALL, ret);
@@ -2438,6 +2478,11 @@ impl<'a> Exec<'a> {
     /// deliberately not visible to software this way.
     fn read_special(&self, sysm: u8) -> u32 {
         let privileged = self.state.privileged();
+        // ARMv6-M has no `BASEPRI` or `FAULTMASK`: SYSm 17-19 are reserved
+        // and read as zero (DDI 0419E B4.1.1).
+        if self.cfg.is_v6m() && matches!(sysm, 17..=19) {
+            return 0;
+        }
         match sysm {
             0 => self.state.xpsr & (xpsr::FLAGS | xpsr::GE),
             1 => self.state.xpsr & (xpsr::FLAGS | xpsr::GE | xpsr::EXCEPTION),
@@ -2475,6 +2520,25 @@ impl<'a> Exec<'a> {
     /// architecture makes every other write a no-op rather than a fault.
     fn write_special(&mut self, sysm: u8, mask: u8, value: u32) {
         let privileged = self.state.privileged();
+        let mut value = value;
+        if self.cfg.is_v6m() {
+            match sysm {
+                // `APSR<31:27> = R[n]<31:27>`, and ARMv6-M's APSR has only
+                // `N`, `Z`, `C`, `V` — bit 27 is reserved, RAZ/WI — and no
+                // `GE`, whatever the mask bits say (DDI 0419E B1.4.2,
+                // B4.2.3).
+                0..=3 => {
+                    let nzcv = xpsr::N | xpsr::Z | xpsr::C | xpsr::V;
+                    self.state.xpsr = (self.state.xpsr & !nzcv) | (value & nzcv);
+                    return;
+                }
+                17..=19 => return,
+                // `nPRIV` exists only with the Unprivileged/Privileged
+                // Extension; without it the bit is RAZ/WI (B1.4.4).
+                20 if !self.cfg.ext.unpriv => value &= !control::NPRIV,
+                _ => {}
+            }
+        }
         match sysm {
             0..=3 => {
                 if mask & 0b10 != 0 {
@@ -2595,6 +2659,20 @@ impl<'a> Exec<'a> {
         self.write_mem(at, 4, value, privileged).is_ok()
     }
 
+    /// On an ARMv6-M part, an `SVC` or `BKPT` that would escalate to
+    /// HardFault while the execution priority is already −1 or −2 locks the
+    /// core up instead (DDI 0419E B1.5.15, Table B1-7). Returns whether it
+    /// did; always `false` on ARMv7-M, which keeps its own behaviour.
+    fn v6m_locks_up(&mut self) -> bool {
+        if !self.cfg.is_v6m() || self.state.execution_priority() > -1 {
+            return false;
+        }
+        self.state.locked_up = true;
+        self.state.r[15] = 0xffff_fffe;
+        self.branched = true;
+        true
+    }
+
     /// Decode an `EXC_RETURN` into (to Handler mode, on the process stack,
     /// with an extended frame), or `INVPC`.
     ///
@@ -2617,6 +2695,21 @@ impl<'a> Exec<'a> {
             _ => return Err(Trap::INVPC),
         };
         Ok((to_handler, use_psp, fp_frame))
+    }
+}
+
+/// The cycles a Cortex-M0 charges for an instruction beyond what the shared
+/// timing model already has (Cortex-M0 TRM, Table 3-1): `BL` is 4 rather
+/// than 3, `POP {.., PC}` is 4 + *N* rather than 3 + *N*, and `MRS`, `MSR`,
+/// `DMB`, `DSB` and `ISB` are 4 rather than 1.
+const fn v6m_extra_cycles(insn: Insn) -> u64 {
+    match insn {
+        Insn::BranchLink { .. } => 1,
+        Insn::LoadStoreMultiple {
+            load: true, list, ..
+        } if list & 0x8000 != 0 => 1,
+        Insn::Mrs { .. } | Insn::Msr { .. } | Insn::Barrier { .. } => 3,
+        _ => 0,
     }
 }
 

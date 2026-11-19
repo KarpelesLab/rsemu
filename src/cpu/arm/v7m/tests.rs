@@ -1627,7 +1627,15 @@ fn from_props_names_a_part_and_rejects_a_typo() {
     assert_eq!(cpu.config().cpuid, CPUID_CORTEX_M7);
     assert_eq!(cpu.config().priority_bits, 4);
 
+    // An ARMv6-M part is a name only where `cpu-arm-v6m` is compiled in;
+    // without it the board is refused rather than handed a Thumb-2 core.
     let props = Props::new().with("part", Value::from("cortex-m0"));
+    assert_eq!(
+        ArmV7m::from_props(&props).is_ok(),
+        cfg!(feature = "cpu-arm-v6m")
+    );
+    // And a part nobody models is refused whatever is compiled in.
+    let props = Props::new().with("part", Value::from("cortex-m23"));
     assert!(ArmV7m::from_props(&props).is_err());
 
     // A property nobody accepts is nearly always a typo, and silently

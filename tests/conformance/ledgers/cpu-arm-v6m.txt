@@ -1,0 +1,68 @@
+# Known gaps: cpu-arm-v6m, ARMv6-M (Cortex-M0, Cortex-M0+, SecurCore SC000)
+# in the ARMv7E-M core (src/cpu/arm/v7m/v6m.rs, and the feature-gated arms in
+# isa.rs, exec.rs and sys.rs).
+#
+# Like cpu-arm-v8m.txt beside it, this ledger is not keyed by the name of a
+# test in a downloaded suite: there is no permissively licensed ARMv6-M
+# conformance corpus to download. What measures the feature instead is
+#
+#   * src/cpu/arm/v7m/v6mtests.rs -- one test per mechanism: every v7-M-only
+#     encoding (checked against `llvm-mc -triple=thumbv6m-none-eabi`, which
+#     refuses each of them) UNDEFINED on a Cortex-M0 and executing on a
+#     Cortex-M3, the permitted 32-bit set, HardFault escalation and lockup,
+#     two-bit priority discovery, the v6-M register subset, VTOR width,
+#     MRS/MSR/CPS, unprivileged PPB access, PMSAv6, EXC_RETURN and the
+#     restored xPSR, the Cortex-M0 cycle counts, and the snapshot round trip;
+#   * the whole ARMv7-M suite run with the feature on, which is what says a
+#     v7-M part is unchanged by it.
+#
+# Everything below is a deliberate and stated non-implementation. **This file
+# only ever shrinks**, a defect never goes in it, and every line says what it
+# is declining and what a guest sees instead.
+#
+# ---------------------------------------------------------------------------
+# 2026-11-20: the initial landing.
+#
+#   * v6mtests.rs: all pass.
+# ---------------------------------------------------------------------------
+
+sc000.trm                   # The SC000 Technical Reference Manual (DDI 0456)
+                            # is not public. Its CPUID part number, variant
+                            # and revision read as zero (implementer and
+                            # architecture are real); its anti-tampering
+                            # features and the IMPLEMENTATION DEFINED SFCR at
+                            # 0xE000EF90 that CMSIS names read as zero. The
+                            # preset is the Cortex-M0's programmers' model
+                            # with a VTOR, after CMSIS core_sc000.h. A board
+                            # sets the real CPUID with the `cpuid` property.
+
+systick.optional            # SysTick is an implementation option on every
+                            # v6-M part (DDI 0419E B3.3.2; both TRMs' Table
+                            # 1-1); it is always present here.
+
+timing.cortex-m0plus        # The Cortex-M0+'s two-stage pipeline -- a taken
+                            # branch is 2 cycles, BL 3, MRS/MSR/barriers 3 --
+                            # is not modelled separately: an M0+ runs the
+                            # Cortex-M0's Table 3-1 figures. The single-cycle
+                            # I/O port is the SoC's and not modelled either.
+
+timing.small-multiplier     # MULS is charged as the fast single-cycle
+                            # multiplier; the 32-cycle iterative option is
+                            # not selectable.
+
+ppb.word-access-only        # Byte and halfword accesses to the PPB are
+                            # UNPREDICTABLE on ARMv6-M (B3.1.1); they perform
+                            # the v7-M read-modify-write instead of faulting.
+
+nvic.irq-port-bank          # The `irq` port bank offers 240 lines on every
+                            # part; a line above 31 can be wired on a v6-M
+                            # part but never taken, because its enable bit
+                            # does not exist.
+
+debug-extension             # The v6-M Debug Extension -- DHCSR, DCRSR, DCRDR,
+                            # DEMCR, DFSR, the BPU and DWT comparators -- is
+                            # not modelled; all read as zero and BKPT is a
+                            # HardFault, which is what a part without a
+                            # debugger attached does. ICSR.ISRPENDING,
+                            # ISRPREEMPT and VECTACTIVE (debug-only) read as
+                            # zero.

@@ -1357,6 +1357,23 @@ pub fn decode(first: u16, second: u16) -> Insn {
     }
 }
 
+/// Decode a whole instruction as the given architecture sees it.
+///
+/// The table above is ARMv7-M's (with the Armv8-M additions where that is
+/// compiled in, which the interpreter refuses on a v7-M part). ARMv6-M is a
+/// subset of it, gated per encoding by `super::v6m::decode`, so an
+/// instruction a Cortex-M0 does not have decodes to [`Insn::Undefined`] —
+/// for the interpreter and the disassembler alike (`ROADMAP.md` §6.1.1).
+#[must_use]
+pub fn decode_for(arch: super::Arch, first: u16, second: u16) -> Insn {
+    #[cfg(feature = "cpu-arm-v6m")]
+    if matches!(arch, super::Arch::V6m) {
+        return super::v6m::decode(first, second);
+    }
+    let _ = arch;
+    decode(first, second)
+}
+
 // ---------------------------------------------------------------------------
 // 16-bit encodings (DDI 0403 A5.2)
 // ---------------------------------------------------------------------------
