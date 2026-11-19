@@ -1601,9 +1601,9 @@ impl<'a> Exec<'a> {
             }
             Err(trap) => {
                 // A synchronous fault stacks the *faulting* instruction's
-                // address, so the handler sees what went wrong; `SVC` and
-                // `BKPT` stack the next one and do not come through here
-                // (DDI 0403 B1.5.6).
+                // address, so the handler sees what went wrong; `SVC`
+                // stacks the next one, and it and `BKPT` do not come
+                // through here (DDI 0403 B1.5.6).
                 self.state.r[15] = pc;
                 self.take_trap(trap, pc);
             }
@@ -2113,9 +2113,16 @@ impl<'a> Exec<'a> {
             Insn::Bkpt { imm } => {
                 self.state.last_bkpt = imm;
                 // With no debug monitor and no halting debug, `BKPT` is a
-                // HardFault with `DEBUGEVT` (DDI 0403 C1.4.1).
+                // HardFault with `DEBUGEVT` (DDI 0403 C1.4.1). That fault is
+                // synchronous, so it stacks the address of the `BKPT`
+                // itself, not of the instruction after it (DDI 0403 B1.5.6,
+                // DDI 0419E B1.5.6: a HardFault returns to "the instruction
+                // that caused the fault"; only `SVC` and asynchronous
+                // exceptions return to the next one). It is what a
+                // semihosting HardFault handler relies on when it reads the
+                // halfword at the stacked PC to find `BKPT 0xAB`.
                 self.state.sys.hfsr |= fsr::HF_DEBUGEVT;
-                let ret = self.insn_addr.wrapping_add(2);
+                let ret = self.insn_addr;
                 if self.v6m_locks_up() {
                     return Ok(());
                 }

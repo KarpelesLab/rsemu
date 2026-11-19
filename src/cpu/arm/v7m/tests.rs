@@ -822,6 +822,23 @@ fn a_synchronous_fault_stacks_the_faulting_instruction() {
 }
 
 #[test]
+fn a_bkpt_hardfault_stacks_the_bkpt_itself() {
+    // With no debugger, `BKPT` is a synchronous HardFault, and a HardFault
+    // returns to the instruction that caused it (DDI 0403 B1.5.6) — which is
+    // how a semihosting handler finds `BKPT 0xAB` at the stacked PC. The core
+    // once stacked the instruction after it, as an `SVC` does; the ARMv6-M
+    // built corpus (`v6m-faults`) caught it.
+    let h = Harness::m4(&[0xbeab]);
+    h.set_word(3 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    let sp = h.cpu.msp();
+    assert_eq!(h.word(sp + 24), ENTRY);
+    assert_eq!(h.cpu.last_bkpt(), 0xab);
+}
+
+#[test]
 fn thread_mode_can_run_on_the_process_stack() {
     // `MSR psp, r0` ; `MSR control, r1` ; `ISB` ; `MOV r2, sp`
     let mut code = Vec::new();
