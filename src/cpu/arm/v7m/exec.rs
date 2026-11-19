@@ -1145,6 +1145,9 @@ impl<'a> Exec<'a> {
         // And it ends any load streak: a loop waiting on a handler that is
         // legitimately slow is not stuck (`core::spin`).
         self.spin.interrupt();
+        // The priority being preempted, which decides what a fault on the
+        // stacking writes becomes on ARMv6-M (below).
+        let preempted = self.state.execution_priority();
         // Whether this context's floating-point registers travel with the
         // frame. `CONTROL.FPCA` says the context has used the FPU; `CPACR`
         // has to still allow it, because firmware that turns the coprocessor
@@ -1283,6 +1286,19 @@ impl<'a> Exec<'a> {
                 self.state.sys.hfsr |= fsr::HF_VECTTBL;
                 self.state.locked_up = true;
                 self.state.r[15] = 0xffff_fffe;
+            }
+        }
+        // ARMv6-M has no fault status register to leave `STKERR` in, so a
+        // lost frame has to be visible as what B1.5.11 makes it: a derived
+        // HardFault, pending — and so taken as soon as it can preempt —
+        // when the preempted code ran below HardFault priority, and a
+        // lockup when it ran at HardFault priority or above.
+        if stack_failed && self.cfg.is_v6m() {
+            if preempted <= -1 {
+                self.state.locked_up = true;
+                self.state.r[15] = 0xffff_fffe;
+            } else {
+                self.state.sys.set_pending(Exception::HARD_FAULT, true);
             }
         }
         self.branched = true;
@@ -1451,6 +1467,18 @@ impl<'a> Exec<'a> {
         self.state.sync_stack();
         self.state.r[15] = frame[6] & !1;
         self.state.exclusive = None;
+        // An ARMv6-M unstacking fault is a derived HardFault (B1.5.12), and
+        // with the restored state untrustworthy B1.5.8 pins it down: from
+        // the main stack, a lockup at HardFault priority; from the process
+        // stack, a pending HardFault.
+        if unstack_failed && self.cfg.is_v6m() {
+            if use_psp {
+                self.state.sys.set_pending(Exception::HARD_FAULT, true);
+            } else {
+                self.state.locked_up = true;
+                self.state.r[15] = 0xffff_fffe;
+            }
+        }
         self.branched = true;
         self.cycle(10);
         Ok(())

@@ -478,6 +478,72 @@ fn an_nmi_ends_a_lockup_in_hardfault_but_not_one_in_nmi() {
     assert_eq!(h.cpu.current_exception(), Exception::NMI);
 }
 
+/// Nothing is mapped here: the harness's space faults outside its RAM.
+const NOWHERE: u32 = 0x0010_0000;
+
+fn hardfault_pending(h: &Harness) -> bool {
+    h.cpu.with_sys(|s| s.is_pending(Exception::HARD_FAULT))
+}
+
+#[test]
+fn a_fault_on_the_stacking_writes_is_a_derived_hardfault_or_a_lockup() {
+    // MSR MSP, r0 (nowhere); SVC. The frame is lost: from Thread priority
+    // that is a pending HardFault, taken as soon as it can preempt
+    // (DDI 0419E B1.5.11).
+    let h = Harness::m0(&code(&[0xf380_8808, u32::from(SVC), u32::from(PARK)]));
+    h.cpu.set_reg(0, NOWHERE);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::SVCALL);
+    assert!(hardfault_pending(&h));
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert!(!h.cpu.is_locked_up());
+
+    // From HardFault priority — an NMI entered from a HardFault handler
+    // that lost its stack — it is a lockup (B1.5.11, Table B1-7).
+    let h = Harness::m0(&[0xde00]);
+    h.handler(&code(&[0xf380_8808, u32::from(PARK)]));
+    h.cpu.set_reg(0, NOWHERE);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    h.cpu.set_nmi(true);
+    h.cpu.step();
+    assert!(h.cpu.is_locked_up());
+}
+
+#[test]
+fn a_fault_on_the_unstacking_reads_locks_up_from_msp_and_pends_from_psp() {
+    // The handler points MSP at nothing and returns: "must use the Main
+    // stack, SP_main, a lockup at HardFault priority occurs" (DDI 0419E
+    // B1.5.8).
+    let h = Harness::m0(&[SVC, PARK]);
+    h.handler(&code(&[0xf380_8808, u32::from(BX_LR)]));
+    h.cpu.set_reg(0, NOWHERE);
+    h.steps(3);
+    assert!(h.cpu.is_locked_up());
+    assert_eq!(h.cpu.pc(), 0xffff_fffe);
+
+    // Thread on the process stack (MSR PSP, r0; MSR CONTROL, r1; SVC), and
+    // the handler points PSP at nothing (MSR PSP, r2): "a Pending HardFault
+    // exception is generated".
+    let h = Harness::m0(&code(&[
+        0xf380_8809,
+        0xf381_8814,
+        u32::from(SVC),
+        u32::from(PARK),
+    ]));
+    h.handler(&code(&[0xf382_8809, u32::from(BX_LR)]));
+    h.cpu.set_reg(0, 0x0c00);
+    h.cpu.set_reg(1, control::SPSEL);
+    h.cpu.set_reg(2, NOWHERE);
+    h.steps(5);
+    assert!(!h.cpu.is_locked_up());
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert!(hardfault_pending(&h));
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+}
+
 #[test]
 fn cmsis_priority_discovery_finds_two_bits() {
     // STR r0, [r1]; LDR r3, [r1] — through the guest's own word accesses,
