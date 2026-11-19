@@ -690,16 +690,20 @@ impl<'a> Exec<'a> {
         self.cycle(2);
     }
 
-    /// `BXWritePC`: bit zero must be set, or the core would be asking for ARM
-    /// state, which this architecture does not have. In Handler mode a target
-    /// in the top sixteenth of the address space is an exception return
-    /// instead (DDI 0403 A2.3.1, B1.5.8).
+    /// `BXWritePC`: `EPSR.T` takes bit zero of the target and the branch
+    /// happens either way. A clear bit asks for ARM state, which this
+    /// architecture does not have, so the *next* instruction is the INVSTATE
+    /// fault — stacking the target as its return address and `T` clear in
+    /// the stacked `xPSR`, which is what lets a handler see and repair it.
+    /// In Handler mode a target in the top sixteenth of the address space is
+    /// an exception return instead (DDI 0403 A2.3.1, B1.5.8; DDI 0419E
+    /// A2.3.1).
     fn bx_write_pc(&mut self, target: u32) -> Ex {
         if self.state.in_handler() && exc_return::is_magic(target) {
             return self.exception_return(target);
         }
         if target & 1 == 0 {
-            return Err(Trap::INVSTATE);
+            self.state.xpsr &= !xpsr::T;
         }
         self.state.r[15] = target & !1;
         self.branched = true;

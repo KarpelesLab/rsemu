@@ -650,12 +650,23 @@ fn a_block_transfer_is_always_word_aligned() {
 fn a_branch_to_an_even_address_is_an_invalid_state_fault() {
     // `BX r0` with bit 0 clear asks for ARM state, which this architecture
     // does not have.
+    // `BXWritePC` clears `EPSR.T` and branches; it is the *next*
+    // instruction that faults (DDI 0403 A2.3.1), so the frame holds the
+    // target and a clear `T`, and a handler can see where the branch went.
     let h = Harness::m4(&[0x4700]);
-    h.cpu.set_reg(0, 0x300);
+    h.cpu.set_reg(0, 0x380);
+    h.set_word(6 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
     h.cpu.with_sys(|s| s.shcsr |= shcsr::USGFAULTENA);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.pc(), 0x380);
     h.cpu.step();
     assert_eq!(h.cpu.current_exception(), Exception::USAGE_FAULT);
     assert!(h.cpu.with_sys(|s| s.cfsr & fsr::UF_INVSTATE != 0));
+    let sp = h.cpu.msp();
+    assert_eq!(h.word(sp + 24), 0x380);
+    assert_eq!(h.word(sp + 28) & xpsr::T, 0);
 }
 
 #[test]
