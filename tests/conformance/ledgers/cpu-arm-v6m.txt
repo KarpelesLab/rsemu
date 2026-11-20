@@ -59,9 +59,10 @@ sc000.trm                   # The SC000 Technical Reference Manual (DDI 0456)
                             # architecture are real); its anti-tampering
                             # features and the IMPLEMENTATION DEFINED SFCR at
                             # 0xE000EF90 that CMSIS names read as zero. The
-                            # preset is the Cortex-M0's programmers' model
-                            # with a VTOR, after CMSIS core_sc000.h. A board
-                            # sets the real CPUID with the `cpuid` property.
+                            # preset is a PMSAv6 core -- the MPU, unprivileged
+                            # Thread mode, VTOR [31:7] at 0xE000ED08 -- per
+                            # the project owner. A board sets the real CPUID
+                            # with the `cpuid` property.
 
 systick.optional            # SysTick is an implementation option on every
                             # v6-M part (DDI 0419E B3.3.2; both TRMs' Table

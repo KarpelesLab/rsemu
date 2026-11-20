@@ -81,6 +81,10 @@ impl Harness {
         Harness::new(Config::CORTEX_M0PLUS, code)
     }
 
+    fn sc000(code: &[u16]) -> Harness {
+        Harness::new(Config::SC000, code)
+    }
+
     fn handler(&self, code: &[u16]) {
         for (i, half) in code.iter().enumerate() {
             self.ram
@@ -189,7 +193,8 @@ fn the_presets_carry_the_trm_values() {
     assert_eq!(sc.cpuid >> 24, 0x41);
     assert_eq!((sc.cpuid >> 16) & 0xf, 0xc);
     assert_eq!(sc.vtor_mask, 0xffff_ff80);
-    assert!(!sc.ext.unpriv && !sc.ext.mpu);
+    // A PMSAv6 core: the MPU, and the extension PMSAv6 cannot be without.
+    assert!(sc.ext.unpriv && sc.ext.mpu);
 
     assert!(!Config::CORTEX_M4.is_v6m());
     assert!(!Config::CORTEX_M3.is_v6m());
@@ -916,6 +921,38 @@ fn an_mpu_violation_is_a_hardfault() {
     h.cpu.step();
     assert_eq!(h.cpu.current_exception(), Exception::THREAD);
     assert_eq!(h.cpu.reg(3), 0xfeed_f00d);
+}
+
+#[test]
+fn the_sc000_is_a_pmsav6_core_with_a_vtor() {
+    let h = Harness::sc000(&[PARK]);
+    // VTOR at 0xE000ED08, bits [31:7].
+    h.ppb_write(0xe000_ed08, 0xffff_ffff);
+    assert_eq!(h.ppb_read(0xe000_ed08), 0xffff_ff80);
+    // MPU_TYPE: eight unified regions (DDI 0419E B3.5.5).
+    assert_eq!(h.ppb_read(0xe000_ed90), 8 << 8);
+
+    // An unprivileged load from a privileged-only region is refused by the
+    // MPU and is a HardFault — the same set-up as the Cortex-M0+ test above.
+    let h = Harness::sc000(&code(&[0xf380_8814, 0x680b, u32::from(PARK)]));
+    h.ppb_write(0xe000_ed9c, 1 << 4);
+    h.ppb_write(0xe000_eda0, (0b011 << 24) | (11 << 1) | 1);
+    h.ppb_write(0xe000_ed9c, DATA | (1 << 4) | 1);
+    h.ppb_write(0xe000_eda0, (0b001 << 24) | (7 << 1) | 1);
+    h.ppb_write(0xe000_ed94, 0b101);
+    h.cpu.set_reg(0, control::NPRIV);
+    h.cpu.set_reg(1, DATA);
+    h.cpu.set_reg(3, 0x5555);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_eq!(h.cpu.reg(3), 0x5555, "the access is not made");
+
+    // And unprivileged code cannot reach the PPB to switch the MPU off.
+    let h = Harness::sc000(&code(&[0xf380_8814, 0x680b, u32::from(PARK)]));
+    h.cpu.set_reg(0, control::NPRIV);
+    h.cpu.set_reg(1, 0xe000_ed94);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
 }
 
 #[test]

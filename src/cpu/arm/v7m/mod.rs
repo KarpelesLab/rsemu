@@ -349,6 +349,17 @@ impl Extensions {
         unpriv: true,
         ..Extensions::CORTEX_M0
     };
+    /// An SC000: a PMSAv6 core, so the MPU and with it the
+    /// Unprivileged/Privileged Extension PMSAv6 requires (DDI 0419E B3.5).
+    /// The same options as [`Extensions::CORTEX_M0PLUS`] today, kept apart
+    /// so that a change to one part cannot quietly move the other.
+    #[cfg(feature = "cpu-arm-v6m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
+    pub const SC000: Extensions = Extensions {
+        mpu: true,
+        unpriv: true,
+        ..Extensions::CORTEX_M0
+    };
 }
 
 /// Which M-profile architecture the part implements.
@@ -613,21 +624,24 @@ impl Config {
         ..Config::CORTEX_M0
     };
 
-    /// An Arm SecurCore SC000: ARMv6-M with the Cortex-M0's programmers'
-    /// model, plus a `VTOR`.
+    /// An Arm SecurCore SC000: an ARMv6-M **PMSAv6** core — the eight-region
+    /// PMSAv6 MPU, so unprivileged Thread mode too (DDI 0419E B3.5 makes the
+    /// one require the other), and `VTOR` at `0xE000ED08` holding bits
+    /// `[31:7]`. No MMU and no address remapping: the v6-M default memory
+    /// map, with the MPU the only thing that can refuse an access.
     ///
-    /// **Partly unverified.** The SC000 Technical Reference Manual (ARM DDI
-    /// 0456) is not publicly available, so this preset is assembled from
-    /// what is: Arm describes the SC000's programmers' model as the
-    /// Cortex-M0's, and Arm's own CMSIS `core_sc000.h` (Apache-2.0) gives
-    /// its SCB a `VTOR` and its `CONTROL` no `nPRIV`, so it is modelled with
-    /// a full-width `VTOR`, no unprivileged execution and no MPU. Its
-    /// `CPUID` part number is not published at all; [`CPUID_SC000`] carries
-    /// only the two fields DDI 0419E fixes, and a board that knows its
-    /// silicon's value sets [`Config::cpuid`] (or the `cpuid` property).
+    /// The SC000 Technical Reference Manual (ARM DDI 0456) is not publicly
+    /// available. The PMSAv6 MPU and `VTOR` are the project owner's
+    /// statement of the part; the `VTOR` width is CMSIS `core_sc000.h`'s
+    /// (Apache-2.0). A board whose silicon left the MPU out says
+    /// `mpu = false`. The `CPUID` part number is not published at all;
+    /// [`CPUID_SC000`] carries only the two fields DDI 0419E fixes, and a
+    /// board that knows its silicon's value sets [`Config::cpuid`] (or the
+    /// `cpuid` property).
     #[cfg(feature = "cpu-arm-v6m")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
     pub const SC000: Config = Config {
+        ext: Extensions::SC000,
         cpuid: CPUID_SC000,
         vtor_mask: 0xffff_ff80,
         ..Config::CORTEX_M0
