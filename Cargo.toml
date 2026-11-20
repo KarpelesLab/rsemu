@@ -14,7 +14,29 @@ repository    = "https://github.com/KarpelesLab/rsemu"
 readme        = "README.md"
 keywords      = ["emulator", "emulation", "virtualization", "no_std"]
 categories    = ["emulators", "no-std", "virtualization"]
-exclude       = ["/docs/local", "/.github"]
+# crates.io refuses a .crate over 10 MiB, and the whole tree packs to more
+# than that. What ships is what a dependent compiles: `src/`, plus the
+# `machines/` and `include/rsemu.h` that `src/` pulls in with `include_str!`.
+# The test suites, benchmarks, fuzzers, docs, web front end and project notes
+# stay in the repository; so do the in-tree unit-test files, which are only
+# ever declared under `cfg(test)` and so are never compiled by a dependent.
+exclude = [
+    "/.github",
+    "/benches",
+    "/docs",
+    "/fuzz",
+    "/scripts",
+    "/tests",
+    "/web",
+    "/CLAUDE.md",
+    "/CONTRIBUTING.md",
+    "/ROADMAP.md",
+    "/release-plz.toml",
+    "/src/**/tests.rs",
+    "/src/**/tests/",
+    "/src/**/tests_*.rs",
+    "/src/**/*tests.rs",
+]
 
 [dependencies]
 # PNG and APNG encoding for `host::display::png`: headless frame capture for CI,
