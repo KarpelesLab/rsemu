@@ -60,6 +60,19 @@ impl Client {
         loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => break,
+                // A server that closes with our unread bytes still queued
+                // makes the kernel answer with RST rather than FIN (RFC 1122
+                // §4.2.2.13), so a hang-up can surface as a reset. macOS
+                // reports it on the next read; Linux usually does not get
+                // the chance. Either way it is the peer hanging up.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break;
+                }
                 Ok(n) => self.inbox.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
