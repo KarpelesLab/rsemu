@@ -1074,6 +1074,13 @@ impl<'a> Exec<'a> {
         if addr & !3 == 0xe000_ed0c && self.cfg.endian == Endian::Big {
             word |= 1 << 15;
         }
+        // `ICSR.VECTACTIVE` is the exception number currently executing — i.e.
+        // `IPSR` — which lives in the core's `xPSR`, not in `Sys` (DDI 0403
+        // B3.2.4, DDI 0419E B3.2.4). Inject it here the same way `DWT_PCSR` and
+        // `AIRCR.ENDIANNESS` are: a core value the system block cannot hold.
+        if addr & !3 == 0xe000_ed04 {
+            word |= self.state.xpsr & xpsr::EXCEPTION;
+        }
         Ok(extract(word, addr, bytes))
     }
 

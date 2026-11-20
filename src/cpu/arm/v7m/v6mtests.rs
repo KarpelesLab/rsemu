@@ -1030,6 +1030,25 @@ fn a_return_to_handler_restores_six_bits_of_ipsr() {
 }
 
 #[test]
+fn icsr_vectactive_reports_the_running_exception() {
+    // A guest read of `ICSR` (0xE000ED04) must report `VECTACTIVE` — the
+    // exception number currently executing (DDI 0419E B3.2.4). Inside the
+    // SVCall handler that is 11. The value is the core's `IPSR`, not held in
+    // the system block, so it is injected on the PPB read path.
+    let h = Harness::m0(&[SVC, PARK]);
+    h.handler(&[0x6808, BX_LR]); // LDR r0,[r1] ; BX lr
+    h.cpu.set_reg(1, 0xe000_ed04); // r1 -> ICSR
+    h.cpu.step(); // SVC -> SVCall entry
+    assert_eq!(h.cpu.current_exception(), Exception::SVCALL);
+    h.cpu.step(); // r0 = *ICSR
+    assert_eq!(
+        h.cpu.reg(0) & 0x1ff,
+        u32::from(Exception::SVCALL.0),
+        "ICSR.VECTACTIVE should be the running exception number"
+    );
+}
+
+#[test]
 fn bl_and_the_system_instructions_take_cortex_m0_cycles() {
     // BL is 4 on a Cortex-M0 (TRM Table 3-1) and 3 in the shared model.
     let m0 = Harness::m0(&code(&[0xf000_f800, u32::from(PARK)]));
