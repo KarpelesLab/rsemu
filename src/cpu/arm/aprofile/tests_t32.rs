@@ -894,9 +894,9 @@ fn executing_random_thumb_never_panics() {
         let y = rng.next();
         m.poke(CODE, x);
         let mut regs = m.cpu.regs();
-        for r in 0..13 {
+        for reg in &mut regs.r[..13] {
             // Mostly addresses inside RAM, sometimes anything.
-            regs.r[r] = if rng.next() & 3 == 0 {
+            *reg = if rng.next() & 3 == 0 {
                 rng.next()
             } else {
                 DATA + (rng.next() & 0xfff)

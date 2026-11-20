@@ -2403,12 +2403,12 @@ impl Device for Stm32Spi {
             crc_left: 0,
             crc_in: 0,
         };
-        for i in 0..FIFO_BYTES {
-            state.tx_fifo.bytes[i] = r.read_u8()?;
+        for byte in &mut state.tx_fifo.bytes[..FIFO_BYTES] {
+            *byte = r.read_u8()?;
         }
         state.tx_fifo.len = r.read_u8()?.min(FIFO_BYTES as u8);
-        for i in 0..FIFO_BYTES {
-            state.rx_fifo.bytes[i] = r.read_u8()?;
+        for byte in &mut state.rx_fifo.bytes[..FIFO_BYTES] {
+            *byte = r.read_u8()?;
         }
         state.rx_fifo.len = r.read_u8()?.min(FIFO_BYTES as u8);
         let held = r.read_bool()?;

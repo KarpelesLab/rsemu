@@ -15,7 +15,7 @@
 //! | `0x14` | `MIER`, master interrupt enables | same layout as `MSR` |
 //! | `0x18` | clock control | stored |
 //! | `0x1c` | slave address | stored |
-//! | `0x20` | `MAR`, master address | `address << 1 | R/W̅` |
+//! | `0x20` | `MAR`, master address | `address << 1 \| R/W̅` |
 //! | `0x24` | data | write: the next byte to send; read: the last byte received |
 //! | `0x28`–`0x34` | clock extras | stored |
 //!

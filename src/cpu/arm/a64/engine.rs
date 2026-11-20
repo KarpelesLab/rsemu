@@ -529,8 +529,8 @@ impl Jit {
     /// exclusive, an atomic, a byte written by a trap handler.
     pub(super) fn note_writes(&mut self, exec: &mut Exec<'_>) {
         let mut hit = 0usize;
-        for i in 0..exec.wrote_n as usize {
-            hit += self.disp.cache_mut().note_write(exec.wrote[i], 1);
+        for &addr in &exec.wrote[..exec.wrote_n as usize] {
+            hit += self.disp.cache_mut().note_write(addr, 1);
         }
         exec.wrote_n = 0;
         self.smc = self.smc.wrapping_add(hit as u64);
@@ -1072,8 +1072,8 @@ fn deliver(
 /// Hand what an interpreted instruction wrote to the block cache.
 fn drain(smc: &mut u64, disp: &mut Dispatcher, subset: &mut Subset, exec: &mut Exec<'_>) {
     let mut hit = 0usize;
-    for i in 0..exec.wrote_n as usize {
-        hit += disp.cache_mut().note_write(exec.wrote[i], 1);
+    for &addr in &exec.wrote[..exec.wrote_n as usize] {
+        hit += disp.cache_mut().note_write(addr, 1);
     }
     exec.wrote_n = 0;
     *smc = smc.wrapping_add(hit as u64);

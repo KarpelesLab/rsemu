@@ -1418,8 +1418,8 @@ impl Shared {
     /// The earliest tick a filter is due to accept a sample at.
     fn next_filter_deadline(&self, regs: &Regs) -> u64 {
         let mut best = regs.etr_pend_at;
-        for i in 0..self.cfg.channels {
-            best = best.min(regs.ti_pend_at[i]);
+        for &at in &regs.ti_pend_at[..self.cfg.channels] {
+            best = best.min(at);
         }
         best
     }
@@ -1509,8 +1509,8 @@ impl Shared {
             to_uev.min(mask - cnt + 1)
         };
 
-        for i in 0..self.cfg.channels {
-            let ccr = u64::from(regs.ccr_shadow[i]);
+        for &ccr in &regs.ccr_shadow[..self.cfg.channels] {
+            let ccr = u64::from(ccr);
             let distance = if down {
                 if ccr < cnt { cnt - ccr } else { continue }
             } else if ccr > cnt {
@@ -2509,8 +2509,8 @@ impl Device for Tim {
             w.write_u64(regs.ti_pend_at[i])?;
             w.write_u32(regs.ic_count[i])?;
         }
-        for i in 0..ITR_INPUTS {
-            w.write_bool(regs.itr[i])?;
+        for &itr in &regs.itr[..ITR_INPUTS] {
+            w.write_bool(itr)?;
         }
         w.write_bool(regs.etr_raw)?;
         w.write_bool(regs.etr_filt)?;
@@ -2568,8 +2568,8 @@ impl Device for Tim {
             regs.ti_pend_at[i] = r.read_u64()?;
             regs.ic_count[i] = r.read_u32()?;
         }
-        for i in 0..ITR_INPUTS {
-            regs.itr[i] = r.read_bool()?;
+        for itr in &mut regs.itr[..ITR_INPUTS] {
+            *itr = r.read_bool()?;
         }
         regs.etr_raw = r.read_bool()?;
         regs.etr_filt = r.read_bool()?;

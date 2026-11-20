@@ -4638,11 +4638,11 @@ impl Device for X86 {
         state.sys.cr0 = r.read_u32()?;
         state.sys.cr2 = r.read_u64()?;
         state.sys.cr3 = r.read_u64()?;
-        for i in 0..8 {
-            state.sys.dr[i] = r.read_u64()?;
+        for dr in &mut state.sys.dr[..8] {
+            *dr = r.read_u64()?;
         }
-        for i in 0..8 {
-            state.sys.test[i] = r.read_u32()?;
+        for test in &mut state.sys.test[..8] {
+            *test = r.read_u32()?;
         }
         state.halted = r.read_bool()?;
         state.shutdown = r.read_bool()?;
@@ -4712,10 +4712,10 @@ impl Device for X86 {
         // The floating-point block, in the order `save` wrote it. Nothing here
         // was written twice, so — unlike the wide register block above — the
         // values simply win.
-        for i in 0..8 {
+        for reg in &mut state.x87.regs[..8] {
             let sig = r.read_u64()?;
             let sign_exp = r.read_u16()?;
-            state.x87.regs[i] = crate::float::x87::F80::new(sign_exp, sig);
+            *reg = crate::float::x87::F80::new(sign_exp, sig);
         }
         state.x87.control = r.read_u16()?;
         state.x87.status = r.read_u16()?;
@@ -4729,10 +4729,10 @@ impl Device for X86 {
         state.x87.last_dp = r.read_u64()?;
         state.x87.last_cs = r.read_u16()?;
         state.x87.last_ds = r.read_u16()?;
-        for i in 0..16 {
+        for xmm in &mut state.sse.xmm[..16] {
             let lo = r.read_u64()?;
             let hi = r.read_u64()?;
-            state.sse.xmm[i] = [lo, hi];
+            *xmm = [lo, hi];
         }
         state.sse.mxcsr = r.read_u32()?;
         // The multiprocessor block, in the order `save` wrote it.
@@ -4752,10 +4752,10 @@ impl Device for X86 {
             state.sys.mtrr_fix[i] = r.read_u64()?;
         }
         state.sys.xcr0 = r.read_u64()?;
-        for i in 0..16 {
+        for ymm_hi in &mut state.sse.ymm_hi[..16] {
             let lo = r.read_u64()?;
             let hi = r.read_u64()?;
-            state.sse.ymm_hi[i] = [lo, hi];
+            *ymm_hi = [lo, hi];
         }
         // The translation-lookaside buffer is derived, so it is not in the
         // snapshot and starts empty — which is correct rather than merely

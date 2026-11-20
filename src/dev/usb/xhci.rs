@@ -2031,13 +2031,13 @@ impl Xhci {
             regs.cmd_pending = false;
             return Some(Job::Command);
         }
-        for slot in 1..=MAX_SLOTS {
-            let bits = regs.ep_pending[slot];
+        for (slot, pending) in regs.ep_pending[..=MAX_SLOTS].iter_mut().enumerate().skip(1) {
+            let bits = *pending;
             if bits == 0 {
                 continue;
             }
             let dci = bits.trailing_zeros();
-            regs.ep_pending[slot] &= !(1 << dci);
+            *pending &= !(1 << dci);
             return Some(Job::Transfer(slot as u8, dci));
         }
         None

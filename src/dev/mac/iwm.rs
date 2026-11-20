@@ -2341,8 +2341,8 @@ impl Device for Iwm {
         // a snapshot silently undo the guest's work.
         let mut media = self.shared.media.lock();
         media.flush();
-        for slot in 0..2 {
-            match media.disks[slot].as_ref().filter(|d| d.written()) {
+        for disk in &media.disks[..2] {
+            match disk.as_ref().filter(|d| d.written()) {
                 Some(disk) => {
                     w.write_bool(true)?;
                     w.write_bytes(disk.data())?;
@@ -2382,8 +2382,8 @@ impl Device for Iwm {
         next.mfm.cells = r.read_u32()?;
         next.mfm.phase = r.read_u8()? % MFM_CELLS_PER_BYTE;
         next.mfm.synced = r.read_bool()?;
-        for slot in 0..MFM_FIFO {
-            next.mfm.fifo[slot] = r.read_u8()?;
+        for byte in &mut next.mfm.fifo[..MFM_FIFO] {
+            *byte = r.read_u8()?;
         }
         next.mfm.marks = r.read_u8()?;
         next.mfm.count = r.read_u8()?.min(MFM_FIFO as u8);
@@ -2392,11 +2392,11 @@ impl Device for Iwm {
         next.mode_writes = r.read_u32()?;
         next.writer.on = r.read_bool()?;
         next.writer.mfm = r.read_bool()?;
-        for slot in 0..WRITE_DEPTH {
-            next.writer.fifo[slot] = r.read_u8()?;
+        for byte in &mut next.writer.fifo[..WRITE_DEPTH] {
+            *byte = r.read_u8()?;
         }
-        for slot in 0..WRITE_DEPTH {
-            next.writer.kinds[slot] = WriteKind::from_byte(r.read_u8()?);
+        for kind in &mut next.writer.kinds[..WRITE_DEPTH] {
+            *kind = WriteKind::from_byte(r.read_u8()?);
         }
         next.writer.count = r.read_u8()?.min(WRITE_DEPTH as u8);
         next.writer.cells = r.read_u16()?;
@@ -2419,13 +2419,13 @@ impl Device for Iwm {
             // has not touched.
             let mut media = self.shared.media.lock();
             media.dirty = false;
-            for slot in 0..2 {
+            for entry in &mut media.disks[..2] {
                 if !r.read_bool()? {
                     continue;
                 }
                 let data = r.read_bytes()?.to_vec();
                 let tags = r.read_bytes()?.to_vec();
-                if let Some(disk) = media.disks[slot].as_mut() {
+                if let Some(disk) = entry.as_mut() {
                     disk.set_contents(&data, &tags)?;
                 }
             }

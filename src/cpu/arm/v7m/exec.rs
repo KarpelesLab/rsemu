@@ -293,9 +293,7 @@ impl State {
     pub(super) const fn sync_stack(&mut self) {
         let want_psp = !self.in_handler() && self.control & control::SPSEL != 0;
         if want_psp != self.sp_is_psp {
-            let tmp = self.r[13];
-            self.r[13] = self.sp_other;
-            self.sp_other = tmp;
+            std::mem::swap(&mut self.r[13], &mut self.sp_other);
             self.sp_is_psp = want_psp;
         }
     }

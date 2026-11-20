@@ -1400,8 +1400,7 @@ impl Hba {
     /// The next command to run, with `PxCMD.CCS` moved to its slot.
     fn next_job(&self) -> Option<Job> {
         let mut state = self.state.lock();
-        for index in 0..self.ports.len() {
-            let port = &mut state.ports[index];
+        for (index, port) in state.ports[..self.ports.len()].iter_mut().enumerate() {
             if !port.running() {
                 continue;
             }

@@ -441,8 +441,7 @@ impl Arch {
                 .get(n + 1)
                 .map_or(self.regs.len(), |next| next.first);
             let _ = writeln!(xml, "  <feature name=\"{}\">", feature.name);
-            for i in feature.first..end.min(self.regs.len()) {
-                let reg = self.regs[i];
+            for (i, reg) in self.regs.iter().enumerate().take(end).skip(feature.first) {
                 let _ = writeln!(
                     xml,
                     "    <reg name=\"{}\" bitsize=\"{}\" type=\"{}\" regnum=\"{}\"/>",

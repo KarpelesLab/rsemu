@@ -494,11 +494,11 @@ fn regs_of(node: &Json) -> Regs {
         sr: node.u32_at("sr") as u16,
         ..Regs::default()
     };
-    for i in 0..8 {
-        regs.d[i] = node.u32_at(&format!("d{i}"));
+    for (i, d) in regs.d[..8].iter_mut().enumerate() {
+        *d = node.u32_at(&format!("d{i}"));
     }
-    for i in 0..7 {
-        regs.a[i] = node.u32_at(&format!("a{i}"));
+    for (i, a) in regs.a[..7].iter_mut().enumerate() {
+        *a = node.u32_at(&format!("a{i}"));
     }
     regs.a[7] = if regs.supervisor() {
         regs.ssp

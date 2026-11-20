@@ -2540,8 +2540,8 @@ impl Device for Video {
         state.frame_start = r.read_u64()?;
         state.frames = r.read_u64()?;
         state.crtc_index = r.read_u8()?;
-        for i in 0..VGA_CRTC_REGISTERS {
-            state.crtc[i] = r.read_u8()?;
+        for reg in &mut state.crtc[..VGA_CRTC_REGISTERS] {
+            *reg = r.read_u8()?;
         }
         state.mode = r.read_u8()?;
         state.colour = r.read_u8()?;
@@ -2549,16 +2549,16 @@ impl Device for Video {
         state.vga.enable = r.read_u8()?;
         state.vga.attr_index = r.read_u8()?;
         state.vga.attr_data_next = r.read_bool()?;
-        for i in 0..ATTR_REGISTERS {
-            state.vga.attr[i] = r.read_u8()?;
+        for reg in &mut state.vga.attr[..ATTR_REGISTERS] {
+            *reg = r.read_u8()?;
         }
         state.vga.seq_index = r.read_u8()?;
-        for i in 0..SEQ_REGISTERS {
-            state.vga.seq[i] = r.read_u8()?;
+        for reg in &mut state.vga.seq[..SEQ_REGISTERS] {
+            *reg = r.read_u8()?;
         }
         state.vga.gc_index = r.read_u8()?;
-        for i in 0..GC_REGISTERS {
-            state.vga.gc[i] = r.read_u8()?;
+        for reg in &mut state.vga.gc[..GC_REGISTERS] {
+            *reg = r.read_u8()?;
         }
         state.vga.dac_mask = r.read_u8()?;
         state.vga.dac_read = r.read_u8()?;
@@ -2566,9 +2566,9 @@ impl Device for Video {
         state.vga.dac_read_sub = r.read_u8()?;
         state.vga.dac_write_sub = r.read_u8()?;
         state.vga.dac_reading = r.read_bool()?;
-        for i in 0..DAC_ENTRIES {
-            for c in 0..DAC_COMPONENTS {
-                state.vga.dac[i][c] = r.read_u8()?;
+        for entry in &mut state.vga.dac[..DAC_ENTRIES] {
+            for component in &mut entry[..DAC_COMPONENTS] {
+                *component = r.read_u8()?;
             }
         }
         for slot in &mut state.latch {

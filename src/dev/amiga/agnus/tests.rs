@@ -1555,13 +1555,13 @@ fn eight_planes_are_fetched_with_their_own_pointers_and_the_two_modulos() {
     c.run(PAL_FIELD);
 
     let st = c.agnus.shared.state.lock();
-    for p in 0..8usize {
+    for (p, &ptr) in st.bplpt[..8].iter().enumerate() {
         let base = 0x1_0000 + 0x1000 * p as u32;
         // 256 lines of one word. An odd plane (1, 3, 5, 7 — index 0, 2, 4, 6)
         // adds BPL1MOD = −2 after each two-byte word and comes back to where
         // it started; an even one adds nothing and has walked 512 bytes.
         let want = if p % 2 == 0 { base } else { base + 2 * 256 };
-        assert_eq!(st.bplpt[p], want, "plane {}", p + 1);
+        assert_eq!(ptr, want, "plane {}", p + 1);
     }
 }
 
@@ -1732,11 +1732,11 @@ fn bscan2_takes_the_modulus_from_the_lines_parity() {
     c.run(PAL_FIELD);
 
     let st = c.agnus.shared.state.lock();
-    for p in 0..2usize {
+    for (p, &ptr) in st.bplpt[..2].iter().enumerate() {
         let base = 0x1_0000 + 0x4000 * p as u32;
         // Line $2C is primary (−2 after a two-byte word: no movement); line
         // $2D is alternate (+30 after two bytes: 32 on). Both planes alike.
-        assert_eq!(st.bplpt[p], base + 32, "plane {}", p + 1);
+        assert_eq!(ptr, base + 32, "plane {}", p + 1);
     }
 }
 
@@ -1896,8 +1896,8 @@ fn an_alice_snapshot_round_trips_with_fmode_and_eight_pointers() {
             st.fmode,
             aga::BPAGEM | aga::BPL32 | aga::BSCAN2 | aga::SSCAN2
         );
-        for p in 0..8usize {
-            assert_eq!(st.bplpt[p], 0x1_1000 + 0x100 * p as u32, "plane {p}");
+        for (p, &ptr) in st.bplpt[..8].iter().enumerate() {
+            assert_eq!(ptr, 0x1_1000 + 0x100 * p as u32, "plane {p}");
         }
     }
     // And the two run on identically from there.

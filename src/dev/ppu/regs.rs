@@ -180,9 +180,9 @@ impl IoLatch {
     /// their charge; bits outside `mask` keep both their value and their age.
     pub fn refresh(&mut self, now: u64, value: u8, mask: u8) {
         self.value = (self.value & !mask) | (value & mask);
-        for bit in 0..8 {
+        for (bit, at) in self.refreshed[..8].iter_mut().enumerate() {
             if mask & (1u8 << bit) != 0 {
-                self.refreshed[bit] = now;
+                *at = now;
             }
         }
     }

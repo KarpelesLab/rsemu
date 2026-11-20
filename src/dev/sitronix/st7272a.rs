@@ -1311,11 +1311,11 @@ impl Device for St7272a {
         let state = *self.shared.state.lock();
         w.write_u64(state.ticks)?;
         w.write_u64(state.frames)?;
-        for addr in 0..REGISTER_COUNT {
-            w.write_u8(state.shadow.values[addr])?;
+        for &value in &state.shadow.values[..REGISTER_COUNT] {
+            w.write_u8(value)?;
         }
-        for addr in 0..REGISTER_COUNT {
-            w.write_u8(state.active.values[addr])?;
+        for &value in &state.active.values[..REGISTER_COUNT] {
+            w.write_u8(value)?;
         }
         w.write_u32(state.unlisted)?;
         w.write_bool(state.pending.is_some())?;
@@ -1339,12 +1339,12 @@ impl Device for St7272a {
         let ticks = r.read_u64()?;
         let frames = r.read_u64()?;
         let mut shadow = Registers::new();
-        for addr in 0..REGISTER_COUNT {
-            shadow.values[addr] = r.read_u8()?;
+        for value in &mut shadow.values[..REGISTER_COUNT] {
+            *value = r.read_u8()?;
         }
         let mut active = Registers::new();
-        for addr in 0..REGISTER_COUNT {
-            active.values[addr] = r.read_u8()?;
+        for value in &mut active.values[..REGISTER_COUNT] {
+            *value = r.read_u8()?;
         }
         let unlisted = r.read_u32()?;
         // Both fields are always written, so both are always read: a

@@ -282,18 +282,18 @@ fn banking_moves_sp_and_lr_but_shares_the_rest() {
 fn fiq_banks_five_more_registers_than_anyone_else() {
     let mut r = Regs::new();
     r.write_cpsr(u32::from(Mode::SYSTEM.0));
-    for i in 8..=12 {
-        r.r[i] = 0x1000 + i as u32;
+    for (i, reg) in r.r.iter_mut().enumerate().take(13).skip(8) {
+        *reg = 0x1000 + i as u32;
     }
     r.write_cpsr(u32::from(Mode::FIQ.0));
-    for i in 8..=12 {
-        assert_eq!(r.r[i], 0, "r{i} should be the FIQ bank");
-        r.r[i] = 0xf000 + i as u32;
+    for (i, reg) in r.r.iter_mut().enumerate().take(13).skip(8) {
+        assert_eq!(*reg, 0, "r{i} should be the FIQ bank");
+        *reg = 0xf000 + i as u32;
     }
     // IRQ shares the user bank for r8-r12, which is why only FIQ is "fast".
     r.write_cpsr(u32::from(Mode::IRQ.0));
-    for i in 8..=12 {
-        assert_eq!(r.r[i], 0x1000 + i as u32);
+    for (i, &reg) in r.r.iter().enumerate().take(13).skip(8) {
+        assert_eq!(reg, 0x1000 + i as u32);
     }
     assert_eq!(r.reg_in_mode(Mode::FIQ, 10), 0xf00a);
 }

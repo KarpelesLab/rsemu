@@ -841,8 +841,8 @@ impl Shared {
                 }
             }
             Variant::Channel => {
-                for i in 0..self.units {
-                    let flags = state.unit[i].flags;
+                for (i, unit) in state.unit[..self.units].iter().enumerate() {
+                    let flags = unit.flags;
                     let shift = 4 * i as u32;
                     if flags & (F_TC | F_HT | F_TE) != 0 {
                         out |= 1 << (shift + C_GIF);
@@ -880,7 +880,7 @@ impl Shared {
                 }
             }
             Variant::Channel => {
-                for i in 0..self.units {
+                for (i, unit) in state.unit[..self.units].iter_mut().enumerate() {
                     let shift = 4 * i as u32;
                     // `CGIFx` clears the whole nibble — RM0351 §11.6.2.
                     let mut clear = if value & (1 << (shift + C_GIF)) != 0 {
@@ -893,7 +893,7 @@ impl Shared {
                             clear |= bit;
                         }
                     }
-                    state.unit[i].flags &= !clear;
+                    unit.flags &= !clear;
                 }
             }
         }
@@ -1560,8 +1560,7 @@ impl Device for Dma {
     fn save(&self, w: &mut ChunkWriter<'_>) -> Result<()> {
         let state = self.shared.state.lock().clone();
         w.write_u8(self.shared.units as u8)?;
-        for unit in 0..self.shared.units {
-            let u = &state.unit[unit];
+        for (unit, u) in state.unit[..self.shared.units].iter().enumerate() {
             for value in [
                 u.cr, u.fcr, u.ndtr, u.par, u.m0ar, u.m1ar, u.cur_ndtr, u.cur_par, u.cur_mar,
             ] {

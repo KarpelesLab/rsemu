@@ -1346,8 +1346,8 @@ fn drain(disp: &mut Dispatcher, bound: &mut Boundary, exec: &mut Exec<'_>) {
         disp.cache_mut().flush();
         hit += 1;
     }
-    for i in 0..exec.wrote_n as usize {
-        hit += disp.cache_mut().note_write(exec.wrote[i], 1);
+    for &addr in &exec.wrote[..exec.wrote_n as usize] {
+        hit += disp.cache_mut().note_write(addr, 1);
     }
     exec.wrote_n = 0;
     if hit > 0 {
