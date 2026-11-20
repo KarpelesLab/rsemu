@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/rsemu/compare/v0.0.8...v0.0.9) - 2026-11-20
+
+### Added
+
+- *(cpu-arm)* ARMv6-M for the Cortex-M0, Cortex-M0+ and SC000
+
+### Fixed
+
+- *(cpu-arm)* fault an interworking branch to ARM state on the next instruction
+- *(cpu-arm)* stack the BKPT itself as a BKPT HardFault's return address
+- *(cpu-arm)* refuse unprivileged ARMv6-M access to the whole PPB
+- *(cpu-arm)* set the event register on exception entry and return
+- *(cpu-arm)* clear CONTROL.SPSEL on exception entry
+- *(cpu-arm)* charge WFI and WFE the Cortex-M0's two cycles
+- *(cpu-arm)* report a big-endian build in AIRCR.ENDIANNESS
+- *(cpu-arm)* make a lost ARMv6-M exception frame a HardFault or a lockup
+- *(cpu-arm)* let an NMI end a lockup below NMI priority
+- *(cpu-arm)* read MSP and PSP as zero from unprivileged code
+- *(cpu-arm)* take no IPSR from the frame on an ARMv6-M return to Thread
+- *(dev-sgx)* draw the phone keypad's labels from their own uploads
+- *(dev-sgx)* complete every transfer queued on the ring, not just the first
+
+### Other
+
+- satisfy the Rust 1.100 clippy and rustdoc lints
+- *(vnc)* count a reset as the server hanging up
+- *(cpu-arm)* a built ARMv6-M corpus, an LLVM encoding cross-check and a v6-M differential
+- *(cpu-arm)* bring the v6m module table up to the fixed behaviour
+- record ARMv6-M in the ARM notes, the family table and the roadmap
+
 ## [0.0.8](https://github.com/KarpelesLab/rsemu/compare/v0.0.7...v0.0.8) - 2026-11-06
 
 ### Added
