@@ -2307,9 +2307,12 @@ dev-stm32-rtc = []
 # through an `ExportId::CLOCK_TREE` handle. Every xxENR and xxRSTR bit is an
 # output pin, so a peripheral can be told it has no clock and can be reset by
 # its own xxRST bit. `BDCR` is write-protected until `PWR_CR.DBP` arrives on the
-# `dbp` input. The F4 (RM0090 §7), L4 (RM0351 §6) and U5 (RM0456 §11: MSIS
-# boot, PLL1 with FRACN, CFGR1-3, the LSI in BDCR, APB3) layouts, selected by a
-# construction property. `no_std + alloc`, no `unsafe`, no dependencies.
+# `dbp` input. The F4 (RM0090 §7), L4 (RM0351 §6), U5 (RM0456 §11: MSIS
+# boot, PLL1 with FRACN, CFGR1-3, the LSI in BDCR, APB3) and WB (RM0434: the
+# STM32WB55's CPU2 clock HCLK2 and shared HCLK4, the HPREF/C2HPREF/SHDHPREF
+# handshakes, HSEPRE, LSI1/LSI2, keyed HSECR, CPU2's c2* gate banks) layouts,
+# selected by a construction property. `no_std + alloc`, no `unsafe`, no
+# dependencies.
 dev-stm32-rcc = []
 
 # The STM32 power controller (src/dev/stm32/pwr.rs): DBP, which is what opens

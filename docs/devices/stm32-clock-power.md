@@ -17,6 +17,11 @@ first and an interface contract second.
 | ST **RM0456** (STM32U5), §11 "Reset and clock control", §10 "Power control", and the ICACHE/DCACHE chapters | The U5 tree, MSI ranges (§11.4), RCC map (§11.8); `VOSR`/`SVMSR`, EPOD boost, SMPS/LDO; the cache control blocks | st.com |
 | ST CMSIS **`stm32u585xx.h`** (cmsis-device-u5, Apache-2.0) | `RCC_TypeDef`, `PWR_TypeDef`, `ICACHE_TypeDef`, `DCACHE_TypeDef` offsets, every `_Pos`/`_Msk` | github.com/STMicroelectronics/cmsis-device-u5 |
 | ST **STM32U5 HAL** (stm32u5xx-hal-driver, BSD-3-Clause) | Which flags firmware spins on; `HAL_RCC_DeInit`'s reset values; `SystemCoreClockUpdate`'s PLL1 formula | github.com/STMicroelectronics/stm32u5xx-hal-driver |
+| ST **RM0434** rev 16 (STM32WB55/WB35), §6 "Reset and clock control" and §5 "Power control" | The WB's two-CPU clock tree (§6.2), every RCC register and reset value (§6.4, Table 38), the SMPS (§5.1), CPU2 boot (§5.3, §2.4), every PWR register (§5.6, Table 33) | st.com |
+| ST **DS11929** rev 18 (STM32WB55xx/WB35xx datasheet), §3.10 "Clocks and startup" | The 4 MHz MSI start, MSI ranges, HSE 32 MHz, LSI1/LSI2, the 64 MHz ceiling | st.com |
+| ST CMSIS **`stm32wb55xx.h`** (cmsis-device-wb, Apache-2.0) | `RCC_TypeDef`, `PWR_TypeDef` offsets, every `_Pos`/`_Msk` — cross-checked against RM0434 | github.com/STMicroelectronics/cmsis-device-wb |
+| ST SVD **`STM32WB55_CM4.svd`** (Apache-2.0) | A second reading of the reset values; RM0434 overrules it twice (`AHB1ENR`, `C2AHB1SMENR`) | ST's SVD pack (mirrored in cmsis-svd-data) |
+| ST **STM32WB HAL/LL** (stm32wbxx-hal-driver, BSD-3-Clause) and `system_stm32wbxx.c` | Which flags firmware spins on (`HPREF`, `C2HPREF`, `SHDHPREF`, `VOSF`, `REGLPF`, `SMPSF`/`SMPSBF`); `AHBPrescTable`; the `HSECR` key; `HAL_RCC_GetSysClockFreq`'s `HSEPRE` | github.com/STMicroelectronics/stm32wbxx-hal-driver |
 
 Nothing here was written from an emulator of any licence (`ROADMAP.md` §1).
 Reset values, bit positions and divider tables are facts from the manuals
@@ -262,6 +267,50 @@ to `CMDENDF`. `irq` = `SR & IER`; `FCR` is write-one-to-clear; the monitors
 read zero; `WAYSEL` and `CRRx` are frozen while `EN` is set. Lazily advanced
 like the RCC, with `enable`/`reset` gate inputs (`rcc.ahb1en30` for DCACHE1;
 the ICACHE has no enable bit, so leave it undrawn).
+
+## The WB (`variant = "wb"`)
+
+### `st.rcc`
+
+Map: RM0434 §6.4 and Table 38, decoding `0x188` bytes (through
+`C2APB3SMENR`) at `0x5800_0000`. The module documentation of `src/dev/stm32/rcc.rs` has the
+full account; in short:
+
+- **Boot**: MSI range 6, 4 MHz, `CR` = `0x63` (§6.4.1's `0x61` with
+  `MSIRDY`, which "is read 1 once the MSI is ready"); `CFGR` = `0x0007_0000`
+  and `EXTCFGR` = `0x0003_0000` (every prescaler ÷1 and applied); `PLLCFGR`
+  = `0x2204_0100`; `CSR` = `0x0C00_0000`. Every `*SMENR`/`C2*SMENR` word
+  takes its §6.4.23–§6.4.28/§6.4.42–§6.4.48 value — the only variant that
+  does. `MSIRANGE` 12…15 is write-protected (§6.4.1).
+- **Clocks**: `SYSCLK`; `HCLK` (CPU1, `CFGR.HPRE`); new `ClockOutput::HCLK2`
+  (CPU2, `EXTCFGR.C2HPRE[7:4]`, property `hclk2`) and `ClockOutput::HCLK4`
+  (shared AHB4/flash, `EXTCFGR.SHDHPRE[3:0]`, property `hclk4`), both off
+  `SYSCLK`; `PCLK1`/`PCLK2` and the timer clocks off `HCLK`; `pll48` is PLLQ.
+  The AHB prescalers use the WB table (÷3, ÷5, ÷6, ÷10, ÷32 in the `0xxx`
+  half). `CR.HSEPRE` halves the 32 MHz HSE into `SYSCLK` and the PLL.
+- **PLL**: `src / (M+1) × N / (R+1)`, `PLLM[6:4]`, `PLLN[14:8]`, `PLLR[31:29]`
+  behind `PLLREN[28]`, `PLLQ[27:25]` behind `PLLQEN[24]`.
+- **Handshakes**: changing `HPRE`/`PPRE1`/`PPRE2` clears `HPREF`/`PPRE1F`/
+  `PPRE2F`, changing `C2HPRE`/`SHDHPRE` clears `C2HPREF`/`SHDHPREF`; all come
+  back one tick later. The rates move at once.
+- **Ready bits** (ten): `CR` MSI 0→1, HSI 8→10, HSIKER 9→12, HSE 16→17, PLL
+  24→25, PLLSAI1 26→27; `BDCR` LSE 0→1; `CSR` LSI1 0→1, LSI2 2→3; `CRRCR`
+  HSI48 0→1. `CIFR` flags `0xF7F` (HSI48 at 10, LSI2 at 11). NVIC 5.
+- `SMPSCR.SMPSSWS` (§6.4.9) is `11` while `PWR_CR5.SMPSEN` is clear — it
+  arrives on the new **`smpsen`** input, `wire pwr.smpsen -> rcc.smpsen` —
+  `10` whenever the HSE runs, else the running HSI16/MSI `SMPSSEL` names.
+  `HSECR` unlocks for one write after `0xCAFE_CAFE` (§6.4.33); `CSR.RFRSTS`
+  reads `APB3RSTR.RFRST` (§6.4.16); `LSI2ON` selects LSI2 as the LSI
+  (§6.4.31); `RFWKPSEL`, `CCIPR` and `PLLSAI1CFGR` are storage.
+- **Gate pins**: CPU1's are the L4's names at the L4's offsets, plus
+  `apb3rst<n>` (`APB3RSTR`, `+0x44`, the radio's `RFRST` at 0) and no
+  `apb3en`. CPU2's enable words are `c2ahb1en<n>` (`+0x148`), `c2ahb2en<n>`
+  (`+0x14c`), `c2ahb3en<n>` (`+0x150`), `c2apb1en<n>` (`+0x158`),
+  `c2apb1enb<n>` (`+0x15c`), `c2apb2en<n>` (`+0x160`), `c2apb3en<n>`
+  (`+0x164`); there are no CPU2 reset words. A peripheral both CPUs can
+  clock gets both bits wired to its `enable` — the gate ORs its inputs.
+  Examples: HSEM `ahb3en19`/`c2ahb3en19` (on out of reset), IPCC
+  `ahb3en20`/`c2ahb3en20`, FLASH `ahb3en25`, BLE `c2apb3en0`.
 
 ## Implementation notes
 

@@ -1284,3 +1284,797 @@ fn the_u5_variant_is_a_property() {
         "through PRIVCFGR"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The WB (RM0434; ST CMSIS `stm32wb55xx.h`, `RCC_TypeDef`; reset values from
+// ST's `STM32WB55_CM4.svd`)
+// ---------------------------------------------------------------------------
+
+mod wb {
+    use super::*;
+
+    pub(super) const CR: u64 = 0x00;
+    pub(super) const CFGR: u64 = 0x08;
+    pub(super) const PLLCFGR: u64 = 0x0c;
+    pub(super) const CIER: u64 = 0x18;
+    pub(super) const CIFR: u64 = 0x1c;
+    pub(super) const CICR: u64 = 0x20;
+    pub(super) const SMPSCR: u64 = 0x24;
+    pub(super) const APB3RSTR: u64 = 0x44;
+    pub(super) const AHB3ENR: u64 = 0x50;
+    pub(super) const BDCR: u64 = 0x90;
+    pub(super) const CSR: u64 = 0x94;
+    pub(super) const CRRCR: u64 = 0x98;
+    pub(super) const HSECR: u64 = 0x9c;
+    pub(super) const EXTCFGR: u64 = 0x108;
+    pub(super) const C2AHB3ENR: u64 = 0x150;
+
+    pub(super) const CR_MSIRDY: u32 = 1 << 1;
+    pub(super) const CR_HSION: u32 = 1 << 8;
+    pub(super) const CR_HSIKERON: u32 = 1 << 9;
+    pub(super) const CR_HSIRDY: u32 = 1 << 10;
+    pub(super) const CR_HSIKERDY: u32 = 1 << 12;
+    pub(super) const CR_HSEON: u32 = 1 << 16;
+    pub(super) const CR_HSERDY: u32 = 1 << 17;
+    pub(super) const CR_HSEPRE: u32 = 1 << 20;
+    pub(super) const CR_PLLON: u32 = 1 << 24;
+    pub(super) const CR_PLLRDY: u32 = 1 << 25;
+    pub(super) const CR_PLLSAI1ON: u32 = 1 << 26;
+    pub(super) const CR_PLLSAI1RDY: u32 = 1 << 27;
+
+    pub(super) const HPREF: u32 = 1 << 16;
+    pub(super) const PPRE1F: u32 = 1 << 17;
+    pub(super) const PPRE2F: u32 = 1 << 18;
+    pub(super) const SHDHPREF: u32 = 1 << 16;
+    pub(super) const C2HPREF: u32 = 1 << 17;
+
+    pub(super) fn rcc() -> Rcc {
+        Rcc::with_config(
+            Variant::WB,
+            Frequencies {
+                // The P-NUCLEO-WB55's 32 MHz radio crystal.
+                hse: 32_000_000,
+                ..Frequencies::default()
+            },
+            DELAY,
+        )
+    }
+
+    /// `PLLCFGR` from the HAL's *real* factors: M, Q and R stored as
+    /// value − 1, N as itself, with `PLLQEN` and `PLLREN` set.
+    pub(super) fn pllcfgr(src: u32, m: u32, n: u32, q: u32, r: u32) -> u32 {
+        src | ((m - 1) << 4) | (n << 8) | (1 << 24) | ((q - 1) << 25) | (1 << 28) | ((r - 1) << 29)
+    }
+
+    /// Spin on `reg & mask == want` as a HAL wait loop does, one tick a poll.
+    pub(super) fn wait(rcc: &Rcc, reg: u64, mask: u32, want: u32, what: &str) {
+        let mut spins = 0;
+        while peek(rcc, reg) & mask != want {
+            tick(rcc, 1);
+            spins += 1;
+            assert!(spins < 1000, "{what} never came");
+        }
+    }
+
+    /// `HAL_RCC_ClockConfig`'s order: each prescaler written and its flag
+    /// waited on, then `SW` and a wait on `SWS`.
+    pub(super) fn clock_config(rcc: &Rcc, hpre: u32, c2hpre: u32, shdhpre: u32, sw: u32) {
+        poke(rcc, CFGR, (peek(rcc, CFGR) & !(0xf << 4)) | (hpre << 4));
+        wait(rcc, CFGR, HPREF, HPREF, "HPREF");
+        poke(
+            rcc,
+            EXTCFGR,
+            (peek(rcc, EXTCFGR) & !(0xf << 4)) | (c2hpre << 4),
+        );
+        wait(rcc, EXTCFGR, C2HPREF, C2HPREF, "C2HPREF");
+        poke(rcc, EXTCFGR, (peek(rcc, EXTCFGR) & !0xf) | shdhpre);
+        wait(rcc, EXTCFGR, SHDHPREF, SHDHPREF, "SHDHPREF");
+        poke(rcc, CFGR, peek(rcc, CFGR) & !(0x3f << 8));
+        wait(rcc, CFGR, PPRE1F | PPRE2F, PPRE1F | PPRE2F, "PPRExF");
+        poke(rcc, CFGR, (peek(rcc, CFGR) & !0b11) | sw);
+        wait(rcc, CFGR, 0b1100, sw << 2, "SWS");
+    }
+
+    /// Oscillators on, waited for as `HAL_RCC_OscConfig` waits.
+    pub(super) fn start(rcc: &Rcc, on: u32, rdy: u32) {
+        poke(rcc, CR, peek(rcc, CR) | on);
+        wait(rcc, CR, rdy, rdy, "a ready bit");
+    }
+}
+
+#[test]
+fn a_wb_boots_on_the_4mhz_msi() {
+    let rcc = wb::rcc();
+    for (name, reg, value) in [
+        ("CR", wb::CR, 0x0000_0063),
+        ("ICSCR", 0x04, 0x4000_0000),
+        ("CFGR", wb::CFGR, 0x0007_0000),
+        ("PLLCFGR", wb::PLLCFGR, 0x2204_0100),
+        ("PLLSAI1CFGR", 0x10, 0x2204_0100),
+        ("SMPSCR", wb::SMPSCR, 0x0000_0301),
+        ("AHB3ENR", wb::AHB3ENR, 0x0208_0000),
+        ("APB1ENR1", 0x58, 0x0000_0400),
+        ("AHB1SMENR", 0x68, 0x0001_1207),
+        ("APB1SMENR1", 0x78, 0x85a0_4e01),
+        ("CSR", wb::CSR, 0x0c00_0000),
+        ("HSECR", wb::HSECR, 0x0000_0030),
+        ("EXTCFGR", wb::EXTCFGR, 0x0003_0000),
+        ("C2AHB3ENR", wb::C2AHB3ENR, 0x0208_0000),
+        ("C2APB1ENR1", 0x158, 0x0000_0400),
+        ("C2AHB3SMENR", 0x170, 0x0307_0000),
+        ("C2APB3SMENR", 0x184, 0x0000_0003),
+        // RM0434 over the SVD, both times.
+        ("AHB1ENR", 0x48, 0),
+        ("C2AHB1SMENR", 0x168, 0x0001_1007),
+        ("AHB2SMENR", 0x6c, 0x0001_209f),
+        ("AHB3SMENR", 0x70, 0x0307_0100),
+        ("APB1SMENR2", 0x7c, 0x0000_0021),
+        ("APB2SMENR", 0x80, 0x0026_5800),
+        ("C2AHB2SMENR", 0x16c, 0x0001_209f),
+        ("C2APB1SMENR1", 0x178, 0x85a0_4601),
+        ("C2APB1SMENR2", 0x17c, 0x0000_0021),
+        ("C2APB2SMENR", 0x180, 0x0026_5800),
+        ("C2APB3ENR", 0x164, 0),
+    ] {
+        assert_eq!(peek(&rcc, reg), value, "{name}");
+    }
+    let clocks = rcc.clocks();
+    for out in [
+        ClockOutput::SYSCLK,
+        ClockOutput::HCLK,
+        ClockOutput::HCLK2,
+        ClockOutput::HCLK4,
+        ClockOutput::PCLK1,
+        ClockOutput::PCLK2,
+        ClockOutput::TIMCLK1,
+        ClockOutput::TIMCLK2,
+    ] {
+        assert_eq!(clocks.rate(out), Rational::integer(4_000_000), "{out}");
+    }
+    assert!(clocks.rate(ClockOutput::PCLK3).is_zero(), "no APB3 clock");
+    assert!(clocks.rate(ClockOutput::PLL48).is_zero());
+    // The two new outputs exist only on a WB.
+    assert!(l4().clocks().rate(ClockOutput::HCLK2).is_zero());
+    assert!(f4().clocks().rate(ClockOutput::HCLK4).is_zero());
+}
+
+#[test]
+fn the_wb_msi_range_is_always_cr_s() {
+    let rcc = wb::rcc();
+    // No MSIRGSEL to set: range 11 in `CR` is 48 MHz at once.
+    poke(&rcc, wb::CR, (peek(&rcc, wb::CR) & !0xf0) | (11 << 4));
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(48_000_000)
+    );
+    // 12…15 are "not allowed (hardware write protection)" (RM0434 §6.4.1):
+    // the write's other bits land and the range does not move.
+    poke(
+        &rcc,
+        wb::CR,
+        (peek(&rcc, wb::CR) & !0xf0) | (12 << 4) | wb::CR_HSION,
+    );
+    assert_eq!((peek(&rcc, wb::CR) >> 4) & 0xf, 11);
+    assert_ne!(peek(&rcc, wb::CR) & wb::CR_HSION, 0);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(48_000_000)
+    );
+}
+
+#[test]
+fn every_wb_prescaler_flag_drops_on_a_change_and_comes_back() {
+    let rcc = wb::rcc();
+    let flags = |rcc: &Rcc| peek(rcc, wb::CFGR) & (0b111 << 16);
+    // HPRE ÷2: `HPREF` and only it goes clear, then comes back.
+    poke(&rcc, wb::CFGR, 0x8 << 4);
+    assert_eq!(flags(&rcc), wb::PPRE1F | wb::PPRE2F);
+    tick(&rcc, 1);
+    assert_eq!(flags(&rcc), 0b111 << 16);
+    // PPRE1 and PPRE2 at once.
+    poke(&rcc, wb::CFGR, (0x8 << 4) | (4 << 8) | (5 << 11));
+    assert_eq!(flags(&rcc), wb::HPREF);
+    tick(&rcc, 1);
+    assert_eq!(flags(&rcc), 0b111 << 16);
+    // Writing the fields as they stand is not a change.
+    poke(&rcc, wb::CFGR, (0x8 << 4) | (4 << 8) | (5 << 11));
+    assert_eq!(flags(&rcc), 0b111 << 16);
+    // The flags are the hardware's: `CLEAR_REG(RCC->CFGR)` cannot clear
+    // them, it can only move every prescaler back and so clear all three for
+    // a tick.
+    poke(&rcc, wb::CFGR, 0);
+    assert_eq!(flags(&rcc), 0);
+    tick(&rcc, 1);
+    assert_eq!(peek(&rcc, wb::CFGR), 0b111 << 16);
+
+    // `EXTCFGR`: C2HPRE clears `C2HPREF`, SHDHPRE clears `SHDHPREF`.
+    poke(&rcc, wb::EXTCFGR, 0x8 << 4);
+    assert_eq!(peek(&rcc, wb::EXTCFGR), wb::SHDHPREF | (0x8 << 4));
+    assert_eq!(
+        Device::next_event_tick(&rcc),
+        Some(Device::current_tick(&rcc) + 1),
+        "the flag's return is a scheduled event"
+    );
+    tick(&rcc, 1);
+    assert_eq!(peek(&rcc, wb::EXTCFGR), 0x0003_0000 | (0x8 << 4));
+    poke(&rcc, wb::EXTCFGR, (0x8 << 4) | 0x9);
+    assert_eq!(peek(&rcc, wb::EXTCFGR) & (0b11 << 16), wb::C2HPREF);
+    tick(&rcc, 1);
+    assert_eq!(peek(&rcc, wb::EXTCFGR) & (0b11 << 16), 0b11 << 16);
+    // `RFCSS` is the hardware's too.
+    poke(&rcc, wb::EXTCFGR, peek(&rcc, wb::EXTCFGR) | (1 << 20));
+    assert_eq!(peek(&rcc, wb::EXTCFGR) & (1 << 20), 0);
+}
+
+#[test]
+fn the_wb_ahb_prescalers_have_the_wb_table() {
+    let rcc = wb::rcc();
+    // MSI range 11, 48 MHz, so every divisor in the table divides evenly.
+    poke(&rcc, wb::CR, (peek(&rcc, wb::CR) & !0xf0) | (11 << 4));
+    for (field, div) in [
+        (0b0000, 1),
+        (0b0001, 3),
+        (0b0010, 5),
+        (0b0011, 1),
+        (0b0100, 1),
+        (0b0101, 6),
+        (0b0110, 10),
+        (0b0111, 32),
+        (0b1000, 2),
+        (0b1001, 4),
+        (0b1011, 16),
+        (0b1111, 512),
+    ] {
+        let want = Rational::integer(48_000_000).checked_scale(1, div).unwrap();
+        poke(&rcc, wb::CFGR, field << 4);
+        poke(&rcc, wb::EXTCFGR, (field << 4) | field);
+        let clocks = rcc.clocks();
+        assert_eq!(clocks.rate(ClockOutput::HCLK), want, "HPRE {field:04b}");
+        assert_eq!(clocks.rate(ClockOutput::HCLK2), want, "C2HPRE {field:04b}");
+        assert_eq!(clocks.rate(ClockOutput::HCLK4), want, "SHDHPRE {field:04b}");
+        assert_eq!(
+            clocks.rate(ClockOutput::SYSCLK),
+            Rational::integer(48_000_000)
+        );
+    }
+    // The three are independent: CPU2 and the flash do not follow HPRE.
+    poke(&rcc, wb::CFGR, 0x8 << 4);
+    poke(&rcc, wb::EXTCFGR, (0x9 << 4) | 0x1);
+    let clocks = rcc.clocks();
+    assert_eq!(
+        clocks.rate(ClockOutput::HCLK),
+        Rational::integer(24_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::HCLK2),
+        Rational::integer(12_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::HCLK4),
+        Rational::integer(16_000_000)
+    );
+    // And the APB clocks hang off HCLK1.
+    assert_eq!(
+        clocks.rate(ClockOutput::PCLK1),
+        Rational::integer(24_000_000)
+    );
+}
+
+#[test]
+fn the_wb_vendor_clock_config_reaches_64mhz_from_the_hse() {
+    // CubeMX's P-NUCLEO-WB55 default: HSE 32 MHz into the PLL with M = 2,
+    // N = 8, R = 2 (VCO 128 MHz), Q = 2, CPU2 at ÷2.
+    let rcc = wb::rcc();
+    wb::start(&rcc, wb::CR_HSEON, wb::CR_HSERDY);
+    poke(&rcc, wb::PLLCFGR, wb::pllcfgr(3, 2, 8, 2, 2));
+    wb::start(&rcc, wb::CR_PLLON, wb::CR_PLLRDY);
+    wb::clock_config(&rcc, 0, 0x8, 0, 0b11);
+    let clocks = rcc.clocks();
+    for (out, hz) in [
+        (ClockOutput::SYSCLK, 64_000_000),
+        (ClockOutput::HCLK, 64_000_000),
+        (ClockOutput::HCLK2, 32_000_000),
+        (ClockOutput::HCLK4, 64_000_000),
+        (ClockOutput::PCLK1, 64_000_000),
+        (ClockOutput::PCLK2, 64_000_000),
+        (ClockOutput::TIMCLK1, 64_000_000),
+        (ClockOutput::TIMCLK2, 64_000_000),
+        (ClockOutput::PLL48, 64_000_000),
+    ] {
+        assert_eq!(clocks.rate(out), Rational::integer(hz), "{out}");
+    }
+    // APB1 at ÷4 doubles the timers.
+    poke(&rcc, wb::CFGR, peek(&rcc, wb::CFGR) | (5 << 8));
+    assert_eq!(
+        clocks.rate(ClockOutput::PCLK1),
+        Rational::integer(16_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::TIMCLK1),
+        Rational::integer(32_000_000)
+    );
+}
+
+#[test]
+fn the_wb_pll_reaches_64mhz_from_the_msi() {
+    let rcc = wb::rcc();
+    // MSI 4 MHz, M = 1, N = 32, R = 2.
+    poke(&rcc, wb::PLLCFGR, wb::pllcfgr(1, 1, 32, 4, 2));
+    wb::start(&rcc, wb::CR_PLLON, wb::CR_PLLRDY);
+    wb::clock_config(&rcc, 0, 0x8, 0, 0b11);
+    let clocks = rcc.clocks();
+    assert_eq!(
+        clocks.rate(ClockOutput::SYSCLK),
+        Rational::integer(64_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::HCLK2),
+        Rational::integer(32_000_000)
+    );
+    assert_eq!(
+        clocks.rate(ClockOutput::PLL48),
+        Rational::integer(32_000_000),
+        "Q = 4 off a 128 MHz VCO"
+    );
+    // Without `PLLREN` there is no system output.
+    poke(&rcc, wb::PLLCFGR, wb::pllcfgr(1, 1, 32, 4, 2) & !(1 << 28));
+    assert!(clocks.rate(ClockOutput::SYSCLK).is_zero());
+}
+
+#[test]
+fn hsepre_halves_the_crystal_into_sysclk_and_the_pll() {
+    let rcc = wb::rcc();
+    rcc.set_dbp(true);
+    wb::start(&rcc, wb::CR_HSEON | wb::CR_HSEPRE, wb::CR_HSERDY);
+    poke(&rcc, wb::CFGR, 0b10);
+    tick(&rcc, 1);
+    assert_eq!(peek(&rcc, wb::CFGR) & 0b1100, 0b1000);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(16_000_000)
+    );
+    // The PLL sees 16 MHz too: M = 1, N = 8, R = 2 is 64 MHz, not 128.
+    poke(&rcc, wb::PLLCFGR, wb::pllcfgr(3, 1, 8, 2, 2));
+    wb::start(&rcc, wb::CR_PLLON, wb::CR_PLLRDY);
+    poke(&rcc, wb::CFGR, 0b11);
+    tick(&rcc, 1);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(64_000_000)
+    );
+    // The RTC's HSE ÷ 32 takes the undivided crystal.
+    poke(&rcc, wb::BDCR, (3 << 8) | (1 << 15));
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::RTCCLK),
+        Rational::integer(1_000_000)
+    );
+}
+
+#[test]
+fn a_wb_switch_to_a_source_that_is_not_ready_is_refused() {
+    let rcc = wb::rcc();
+    poke(&rcc, wb::CFGR, 0b11);
+    tick(&rcc, 2);
+    assert_eq!(peek(&rcc, wb::CFGR) & 0b1111, 0, "SW refused, SWS unmoved");
+    poke(&rcc, wb::CFGR, 0b10);
+    tick(&rcc, 2);
+    assert_eq!(peek(&rcc, wb::CFGR) & 0b1111, 0, "no HSE either");
+    wb::start(&rcc, wb::CR_HSION, wb::CR_HSIRDY);
+    poke(&rcc, wb::CFGR, 0b01);
+    tick(&rcc, 1);
+    assert_eq!(peek(&rcc, wb::CFGR) & 0b1111, 0b0101);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::SYSCLK),
+        Rational::integer(16_000_000)
+    );
+}
+
+#[test]
+fn every_wb_oscillator_the_hal_polls_comes_ready() {
+    let rcc = wb::rcc();
+    rcc.set_dbp(true);
+    poke(
+        &rcc,
+        wb::CR,
+        peek(&rcc, wb::CR) | wb::CR_HSION | wb::CR_HSIKERON | wb::CR_PLLSAI1ON,
+    );
+    poke(&rcc, wb::BDCR, 1);
+    poke(&rcc, wb::CSR, (1 << 0) | (1 << 2));
+    poke(&rcc, wb::CRRCR, 1);
+    tick(&rcc, DELAY);
+    let cr = peek(&rcc, wb::CR);
+    for (name, bit) in [
+        ("MSIRDY", wb::CR_MSIRDY),
+        ("HSIRDY", wb::CR_HSIRDY),
+        ("HSIKERDY", wb::CR_HSIKERDY),
+        ("PLLSAI1RDY", wb::CR_PLLSAI1RDY),
+    ] {
+        assert_ne!(cr & bit, 0, "{name}");
+    }
+    assert_ne!(peek(&rcc, wb::BDCR) & (1 << 1), 0, "LSERDY");
+    let csr = peek(&rcc, wb::CSR);
+    assert_ne!(csr & (1 << 1), 0, "LSI1RDY");
+    assert_ne!(csr & (1 << 3), 0, "LSI2RDY");
+    assert_ne!(peek(&rcc, wb::CRRCR) & (1 << 1), 0, "HSI48RDY");
+
+    // `LSI2ON` is "enable and selection" (RM0434 §6.4.31): with both on,
+    // the LSI is LSI2.
+    poke(&rcc, wb::BDCR, 1 | (2 << 8) | (1 << 15));
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::RTCCLK),
+        Rational::integer(32_000)
+    );
+    poke(&rcc, wb::CSR, 1 << 2);
+    assert_eq!(peek(&rcc, wb::CSR) & 0b1111, 0b1100, "LSI1 off, LSI2 on");
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::RTCCLK),
+        Rational::integer(32_000)
+    );
+    // LSI1 running and LSI2 selected but not yet ready: no LSI at all.
+    poke(&rcc, wb::CSR, 1);
+    tick(&rcc, DELAY);
+    poke(&rcc, wb::CSR, 1 | (1 << 2));
+    assert_eq!(peek(&rcc, wb::CSR) & 0b1111, 0b0111);
+    assert!(rcc.clocks().rate(ClockOutput::RTCCLK).is_zero());
+    tick(&rcc, DELAY);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::RTCCLK),
+        Rational::integer(32_000)
+    );
+    // And with LSI2 deselected, LSI1 is the LSI again.
+    poke(&rcc, wb::CSR, 1);
+    assert_eq!(
+        rcc.clocks().rate(ClockOutput::RTCCLK),
+        Rational::integer(32_000)
+    );
+
+    // And each drops the moment its enable does.
+    poke(&rcc, wb::CSR, 0);
+    assert_eq!(peek(&rcc, wb::CSR) & 0b1111, 0);
+    poke(&rcc, wb::CRRCR, 0);
+    assert_eq!(peek(&rcc, wb::CRRCR), 0);
+    poke(&rcc, wb::CR, peek(&rcc, wb::CR) & !wb::CR_HSIKERON);
+    assert_eq!(peek(&rcc, wb::CR) & wb::CR_HSIKERDY, 0);
+    assert!(rcc.clocks().rate(ClockOutput::RTCCLK).is_zero());
+}
+
+#[test]
+fn the_wb_clock_interrupt_has_hsi48_at_ten_and_lsi2_at_eleven() {
+    let rcc = wb::rcc();
+    let (_wire, source, probe) = probe();
+    Device::connect(&rcc, IRQ_PIN, source).unwrap();
+    poke(&rcc, wb::CIER, (1 << 10) | (1 << 11));
+    poke(&rcc, wb::CSR, 1 << 2);
+    poke(&rcc, wb::CRRCR, 1);
+    tick(&rcc, DELAY);
+    assert_eq!(peek(&rcc, wb::CIFR), (1 << 10) | (1 << 11));
+    assert!(probe.is_high());
+    poke(&rcc, wb::CIFR, 0);
+    assert_eq!(peek(&rcc, wb::CIFR), (1 << 10) | (1 << 11), "read-only");
+    poke(&rcc, wb::CICR, 1 << 11);
+    assert_eq!(peek(&rcc, wb::CIFR), 1 << 10);
+    assert!(probe.is_high());
+    poke(&rcc, wb::CICR, 1 << 10);
+    assert_eq!(peek(&rcc, wb::CIFR), 0);
+    assert!(!probe.is_high());
+
+    // LSI1 and the PLL keep the L4's positions, 0 and 5.
+    poke(&rcc, wb::CIER, 1 | (1 << 5));
+    poke(&rcc, wb::CSR, 1);
+    poke(&rcc, wb::PLLCFGR, wb::pllcfgr(1, 1, 32, 2, 2));
+    poke(&rcc, wb::CR, peek(&rcc, wb::CR) | wb::CR_PLLON);
+    tick(&rcc, DELAY);
+    assert_eq!(peek(&rcc, wb::CIFR), 1 | (1 << 5));
+}
+
+#[test]
+fn the_wb_gate_banks_are_where_the_header_puts_them() {
+    let rcc = wb::rcc();
+    for (bank, reg, bit) in [
+        ("ahb1en", 0x48, 0),
+        ("ahb2en", 0x4c, 0),
+        ("ahb3en", wb::AHB3ENR, 20),
+        ("apb1en", 0x58, 21),
+        ("apb1enb", 0x5c, 0),
+        ("apb2en", 0x60, 14),
+        ("ahb1rst", 0x28, 0),
+        ("ahb2rst", 0x2c, 0),
+        ("ahb3rst", 0x30, 20),
+        ("apb1rst", 0x38, 21),
+        ("apb1rstb", 0x3c, 0),
+        ("apb2rst", 0x40, 14),
+        ("apb3rst", wb::APB3RSTR, 0),
+        ("c2ahb1en", 0x148, 9),
+        ("c2ahb2en", 0x14c, 0),
+        ("c2ahb3en", wb::C2AHB3ENR, 20),
+        ("c2apb1en", 0x158, 21),
+        ("c2apb1enb", 0x15c, 0),
+        ("c2apb2en", 0x160, 14),
+        ("c2apb3en", 0x164, 0),
+    ] {
+        let pin = format!("{bank}{bit}");
+        let (_w, source, probe) = probe();
+        Device::connect(&rcc, &pin, source).unwrap_or_else(|e| panic!("{pin}: {e}"));
+        let reset = peek(&rcc, reg);
+        poke(&rcc, reg, 0);
+        assert!(!probe.is_high(), "{pin} low with its bit clear");
+        assert_eq!(rcc.gate(bank, bit), Some(false));
+        poke(&rcc, reg, 1 << bit);
+        assert!(probe.is_high(), "{pin} follows its bit");
+        assert_eq!(rcc.gate(bank, bit), Some(true));
+        poke(&rcc, reg, reset);
+    }
+
+    // HSEM and FLASH are clocked out of reset, for both CPUs, and so is the
+    // RTC's APB interface; IPCC is not.
+    for pin in [
+        "ahb3en19",
+        "ahb3en25",
+        "c2ahb3en19",
+        "c2ahb3en25",
+        "apb1en10",
+    ] {
+        let (_w, source, probe) = probe();
+        Device::connect(&rcc, pin, source).unwrap();
+        assert!(probe.is_high(), "{pin} is on out of reset");
+    }
+    let (_w, source, ipcc) = probe();
+    Device::connect(&rcc, "ahb3en20", source).unwrap();
+    assert!(!ipcc.is_high(), "IPCC is not");
+
+    // CPU2's banks are a WB's, and nobody else has them.
+    for other in [f4(), l4(), u5::rcc()] {
+        let (_w, source, _p) = probe();
+        assert!(Device::connect(&other, "c2ahb3en19", source).is_err());
+    }
+    // A WB has no APB3 enable word and no second AHB2 word.
+    for pin in ["apb3en0", "ahb2enb0"] {
+        let (_w, source, _p) = probe();
+        assert!(Device::connect(&rcc, pin, source).is_err(), "{pin}");
+    }
+    let layout = Variant::WB.layout();
+    assert_ne!(
+        parse_bank_pin(layout, "c2ahb1en3"),
+        parse_bank_pin(layout, "ahb1en3")
+    );
+    assert_ne!(
+        parse_bank_pin(layout, "c2apb1en21"),
+        parse_bank_pin(layout, "c2apb1enb1")
+    );
+    let schema = schema();
+    for pin in ["c2ahb1en0", "c2ahb3en31", "c2apb1enb0", "c2apb3en1"] {
+        assert!(schema.port_named(pin).is_some(), "{pin} is declared");
+    }
+}
+
+#[test]
+fn the_wb_smps_clock_follows_smpsen_the_hse_and_smpssel() {
+    // RM0434 §6.4.9, rule by rule.
+    let rcc = wb::rcc();
+    // "Whenever the SMPS step-down converter is disabled in PWR_CR5.SMPSEN,
+    // no clock is used" — and nothing drives `smpsen` yet.
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x301);
+    poke(&rcc, wb::SMPSCR, 0x10);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x310, "SMPSDIV kept, SWS = none");
+
+    let src = WireId::new(1);
+    let pin = Device::sink(&rcc, SMPSEN_PIN, &[src]).expect("a WB has `smpsen`");
+    pin.sink.set_level(src, pin.line, Level::High);
+    // HSI selected while the HSI is off: no clock.
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x310);
+    wb::start(&rcc, wb::CR_HSION, wb::CR_HSIRDY);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x010, "HSI16");
+    // MSI is running from reset.
+    poke(&rcc, wb::SMPSCR, 0x01);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x101, "MSI");
+    // The status is the hardware's.
+    poke(&rcc, wb::SMPSCR, 0x201);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x101);
+    // The reserved selection is no clock.
+    poke(&rcc, wb::SMPSCR, 0x03);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x303);
+    // "Whenever the HSE is active the HSE is used regardless of the settings
+    // in SMPSSEL."
+    wb::start(&rcc, wb::CR_HSEON, wb::CR_HSERDY);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x203);
+    poke(&rcc, wb::SMPSCR, 0x01);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x201);
+    // The SMPS switched off again: no clock, whatever is running.
+    pin.sink.set_level(src, pin.line, Level::Low);
+    assert_eq!(peek(&rcc, wb::SMPSCR), 0x301);
+
+    // `smpsen` is a WB's pin.
+    assert!(Device::sink(&l4(), SMPSEN_PIN, &[src]).is_none());
+    assert_eq!(
+        schema().port_named(SMPSEN_PIN).map(|p| p.dir),
+        Some(PortDir::In)
+    );
+}
+
+#[test]
+fn the_wb_hsecr_takes_the_key_for_one_write() {
+    let rcc = wb::rcc();
+    poke(&rcc, wb::HSECR, 0x2a << 8);
+    assert_eq!(peek(&rcc, wb::HSECR), 0x30, "locked: dropped");
+    poke(&rcc, wb::HSECR, 0xcafe_cafe);
+    assert_eq!(peek(&rcc, wb::HSECR), 0x31, "UNLOCKED");
+    // `LL_RCC_HSE_SetCapacitorTuning`'s read-modify-write.
+    poke(
+        &rcc,
+        wb::HSECR,
+        (peek(&rcc, wb::HSECR) & !0x3f00) | (0x2a << 8),
+    );
+    assert_eq!(peek(&rcc, wb::HSECR), (0x2a << 8) | 0x30, "landed, locked");
+    poke(&rcc, wb::HSECR, 0);
+    assert_eq!(peek(&rcc, wb::HSECR), (0x2a << 8) | 0x30, "locked again");
+}
+
+#[test]
+fn the_wb_csr_holds_the_radio_reset_and_wakeup_clock() {
+    let rcc = wb::rcc();
+    // `RFWKPSEL` = HSE ÷ 1024 and `LSI2TRIM` are storage.
+    poke(&rcc, wb::CSR, (0b11 << 14) | (0x5 << 8));
+    assert_eq!(peek(&rcc, wb::CSR), 0x0c00_0000 | (0b11 << 14) | (0x5 << 8));
+    // `RFRSTS` cannot be written; it is `APB3RSTR.RFRST`.
+    poke(&rcc, wb::CSR, peek(&rcc, wb::CSR) | (1 << 16));
+    assert_eq!(peek(&rcc, wb::CSR) & (1 << 16), 0);
+    poke(&rcc, wb::APB3RSTR, 1);
+    assert_ne!(peek(&rcc, wb::CSR) & (1 << 16), 0, "the radio is held");
+    poke(&rcc, wb::APB3RSTR, 0);
+    assert_eq!(peek(&rcc, wb::CSR) & (1 << 16), 0, "and released");
+}
+
+#[test]
+fn the_wb_reset_flags_and_rmvf() {
+    let rcc = wb::rcc();
+    assert!(Device::sink(&rcc, "fwrst", &[WireId::new(1)]).is_none());
+    assert!(Device::sink(&rcc, "porrst", &[WireId::new(1)]).is_none());
+    let src = WireId::new(1);
+    for (pin, bit) in [
+        ("oblrst", 25),
+        ("sftrst", 28),
+        ("iwdgrst", 29),
+        ("wwdgrst", 30),
+        ("lpwrrst", 31),
+    ] {
+        let sink = Device::sink(&rcc, pin, &[src]).expect("a reset cause");
+        sink.sink.set_level(src, sink.line, Level::High);
+        assert_ne!(peek(&rcc, wb::CSR) & (1 << bit), 0, "{pin}");
+    }
+    poke(
+        &rcc,
+        wb::CSR,
+        peek(&rcc, wb::CSR) | (1 << 23) | (0b01 << 14),
+    );
+    assert_eq!(
+        peek(&rcc, wb::CSR),
+        0b01 << 14,
+        "every flag gone, RFWKPSEL kept"
+    );
+}
+
+#[test]
+fn a_wb_snapshot_round_trips_to_identical_state() {
+    let saved = wb::rcc();
+    saved.set_dbp(true);
+    wb::start(&saved, wb::CR_HSEON, wb::CR_HSERDY);
+    poke(&saved, wb::PLLCFGR, wb::pllcfgr(3, 2, 8, 2, 2));
+    wb::start(&saved, wb::CR_PLLON, wb::CR_PLLRDY);
+    wb::clock_config(&saved, 0, 0x8, 0, 0b11);
+    poke(&saved, 0x15c, 1);
+    poke(&saved, wb::HSECR, 0xcafe_cafe);
+    // Mid-transition: LSI2 and HSI48 are starting and C2HPREF is clear.
+    poke(&saved, wb::CSR, 1 << 2);
+    poke(&saved, wb::CRRCR, 1);
+    poke(&saved, wb::EXTCFGR, 0x9 << 4);
+    assert_eq!(peek(&saved, wb::EXTCFGR) & wb::C2HPREF, 0);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("rcc", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("rcc", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+
+    let restored = wb::rcc();
+    restored.set_dbp(true);
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("rcc", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+
+    let words = Variant::WB.register_bytes() / 4;
+    let before: Vec<u32> = (0..words).map(|i| peek_debug(&saved, i * 4)).collect();
+    let after: Vec<u32> = (0..words).map(|i| peek_debug(&restored, i * 4)).collect();
+    assert_eq!(before, after);
+    let held = *saved.regs.state.lock();
+    assert_eq!(held, *restored.regs.state.lock(), "deadlines and all");
+    assert_eq!(
+        Device::next_event_tick(&saved),
+        Device::next_event_tick(&restored)
+    );
+    for out in [ClockOutput::SYSCLK, ClockOutput::HCLK2, ClockOutput::HCLK4] {
+        assert_eq!(
+            saved.clocks().rate(out),
+            restored.clocks().rate(out),
+            "{out}"
+        );
+    }
+    assert_eq!(
+        restored.clocks().rate(ClockOutput::HCLK2),
+        Rational::integer(16_000_000)
+    );
+    // The pending work completes on the other side, and the key survived.
+    tick(&restored, DELAY);
+    assert_ne!(peek(&restored, wb::EXTCFGR) & wb::C2HPREF, 0);
+    assert_ne!(peek(&restored, wb::CSR) & (1 << 3), 0);
+    assert_ne!(peek(&restored, wb::CRRCR) & (1 << 1), 0);
+    poke(&restored, wb::HSECR, 0x2a << 8);
+    assert_eq!(peek(&restored, wb::HSECR), 0x2a << 8);
+}
+
+#[test]
+fn the_wb_drives_cpu2_s_clock_domain_against_sysclk() {
+    let rcc = Rcc::with_outputs(
+        Variant::WB,
+        Frequencies {
+            hse: 32_000_000,
+            ..Frequencies::default()
+        },
+        DELAY,
+        alloc::vec![
+            (ClockOutput::SYSCLK, String::from("sysclk")),
+            (ClockOutput::HCLK2, String::from("hclk2")),
+            (ClockOutput::HCLK4, String::from("hclk4")),
+        ],
+    );
+    let mut forest = crate::core::clock::ClockForest::new();
+    let hse = forest
+        .add_oscillator("hse", Rational::integer(32_000_000))
+        .unwrap();
+    let sys = forest.add_domain("sysclk", hse, 1, 8).unwrap();
+    let c2 = forest.add_domain("hclk2", sys, 1, 1).unwrap();
+    let shd = forest.add_domain("hclk4", sys, 1, 1).unwrap();
+    *rcc.regs.domains.lock() = alloc::vec![
+        (ClockOutput::SYSCLK, sys),
+        (ClockOutput::HCLK2, c2),
+        (ClockOutput::HCLK4, shd),
+    ];
+    let control = Arc::new(ClockControl::new());
+    Device::attach_clock_control(&rcc, Arc::clone(&control));
+    let batch = control.take();
+    assert_eq!(batch.len(), 3);
+    assert_eq!(batch[0].ratio(), Rational::new(1, 8).unwrap(), "4 MHz MSI");
+
+    poke(&rcc, wb::EXTCFGR, (0x8 << 4) | 0x1);
+    let batch = control.take();
+    let of = |domain| {
+        batch
+            .iter()
+            .find(|r| r.domain == domain)
+            .expect("a request")
+            .ratio()
+    };
+    assert_eq!(of(c2), Rational::new(1, 2).unwrap(), "CPU2: SYSCLK ÷ 2");
+    assert_eq!(of(shd), Rational::new(1, 3).unwrap(), "the flash: ÷ 3");
+}
+
+#[test]
+fn the_wb_variant_is_a_property() {
+    let props = Props::new()
+        .with("variant", Value::from("wb"))
+        .with("hse", Value::from(32_000_000u64))
+        .with("hclk2", Value::from("cpu2clk"))
+        .with("hclk4", Value::from("flashclk"));
+    let rcc = Rcc::new(&props).unwrap();
+    assert_eq!(rcc.variant(), Variant::WB);
+    assert_eq!(
+        Device::region(&rcc, "").map(|r| r.len()),
+        Some(0x188),
+        "through C2APB3SMENR"
+    );
+    assert_eq!(rcc.regs.named.len(), 2);
+}

@@ -16,7 +16,7 @@
 //! | the switch | `CFGR.SW` is refused outright when the source it names is not ready; when it is accepted, `SWS` follows one tick later |
 //! | the tree | `SYSCLK`, `HCLK`, `PCLK1`, `PCLK2`, the timer clocks and `RTCCLK` are computed as **exact rationals** from the PLL factors and the prescalers, and published through [`Clocks`] |
 //! | gating | every `xxENR` and `xxRSTR` bit is an output pin, and [`gate`](super::gate) is the input a peripheral receives it on |
-//! | interrupts | a ready bit coming true with its `xxRDYIE` set raises `CIR`/`CIFR`'s flag and the `irq` output, which an F4 board wires to NVIC position 5 and a U5 board to position 9 (`RCC_IRQn`) |
+//! | interrupts | a ready bit coming true with its `xxRDYIE` set raises `CIR`/`CIFR`'s flag and the `irq` output, which an F4 or a WB board wires to NVIC position 5 and a U5 board to position 9 (`RCC_IRQn`) |
 //! | the backup domain | `BDCR` is write-protected until `PWR_CR.DBP` arrives on the `dbp` input, and `BDRST` clears the domain |
 //! | reset causes | `CSR`'s `xxRSTF` flags are set by a pulse on the matching input pin and cleared by `RMVF` |
 //!
@@ -84,6 +84,21 @@
 //!   `HAL_RCC_ClockConfig`, `HAL_RCCEx_PeriphCLKConfig`) and the PLL formula
 //!   off `SystemCoreClockUpdate` in `system_stm32u5xx.c`; none of that code
 //!   is reproduced here.
+//! * *Multiprotocol wireless 32-bit MCU Arm-based Cortex-M4 with FPU,
+//!   Bluetooth Low-Energy and 802.15.4 radio solution*, ST **RM0434** rev 16,
+//!   §6 "Reset and clock control (RCC)", for the STM32WB55: §6.2 for the
+//!   tree, §6.4.1–§6.4.48 for every register, its bits and its reset value,
+//!   and Table 38 for the map. The offsets and bit positions agree with ST's
+//!   CMSIS header `stm32wb55xx.h` (`RCC_TypeDef`, `RCC_*_Pos`; Apache-2.0),
+//!   and the reset values with ST's SVD `STM32WB55_CM4.svd` (Apache-2.0)
+//!   except where the module notes say otherwise; the manual wins every
+//!   disagreement. ST **DS11929** rev 18 (the STM32WB55xx/WB35xx datasheet),
+//!   §3.10 "Clocks and startup", confirms the 4 MHz MSI start, the twelve
+//!   MSI ranges, the 32 MHz HSE, the two ~32 kHz LSIs and the 64 MHz ceiling.
+//!   What the WB variant must answer was read off the polling loops of ST's
+//!   BSD-3-Clause WB HAL (`HAL_RCC_OscConfig`, `HAL_RCC_ClockConfig` —
+//!   which waits on `HPREF`, `C2HPREF`, `SHDHPREF`, `PPRE1F` and `PPRE2F` —
+//!   and `HAL_RCC_DeInit`); none of that code is reproduced here.
 //!
 //! No emulator source of any licence was consulted (`ROADMAP.md` §1).
 //!
@@ -126,6 +141,99 @@
 //! * The reset-cause inputs are `oblrst`, `pinrst`, `borrst`, `sftrst`,
 //!   `iwdgrst`, `wwdgrst`, `lpwrrst` (`CSR[31:25]`), `RMVF` is bit 23.
 //!
+//! # The WB variant
+//!
+//! `variant = "wb"` is RM0434's map for the STM32WB55: the L4's register
+//! file with a second CPU bolted on. CPU1 is the Cortex-M4 and reads
+//! [`ClockOutput::HCLK`]; CPU2, the Cortex-M0+ that runs the radio stack, has
+//! a clock and a set of peripheral gates of its own.
+//!
+//! * It boots on the **MSI at 4 MHz**, range 6 in `CR.MSIRANGE` — there is
+//!   no `MSIRGSEL` and no standby range on a WB, so the range is `CR`'s,
+//!   always, and a write of 12…15 is refused ("not allowed (hardware write
+//!   protection)", §6.4.1). `CR` comes up `0x63` (on, ready, range 6): the
+//!   manual's `0x61` is the POR value before `MSIRDY`, which it says "is read
+//!   1 once the MSI is ready", and no access here can land before that.
+//! * The **HSE is the 32 MHz radio crystal** (write `hse = 32000000`), and
+//!   `CR.HSEPRE` (bit 20) halves it on the way to both `SYSCLK` and the PLL's
+//!   M divider — "SYSCLK and PLL M divider input clocks are divided by 2"
+//!   (§6.4.1). The RTC's `HSE / 32` takes the undivided crystal.
+//! * **`HPRE` has the WB's own table** (§6.4.3): `0001` is ÷3, `0010` ÷5,
+//!   `0101` ÷6, `0110` ÷10, `0111` ÷32, `1xxx` the usual ÷2…÷512, others
+//!   ÷1. The same encoding is used by `EXTCFGR.C2HPRE[7:4]`, which divides
+//!   `SYSCLK` into [`ClockOutput::HCLK2`] (CPU2), and by
+//!   `EXTCFGR.SHDHPRE[3:0]`, which divides it into [`ClockOutput::HCLK4`]
+//!   (AHB4, the flash and SRAM2) (§6.4.34). `PCLK1`/`PCLK2` hang off `HCLK1`
+//!   as on an L4.
+//! * **The prescaler handshake.** Each flag is "reset when a new prescaler
+//!   value is programmed … set when the programmed value is actually
+//!   applied" (§6.4.3, §6.4.34). A write that changes `HPRE`, `PPRE1` or
+//!   `PPRE2` clears `CFGR.HPREF`/`PPRE1F`/`PPRE2F` (bits 16–18), and one that
+//!   changes `C2HPRE` or `SHDHPRE` clears `EXTCFGR.C2HPREF`/`SHDHPREF` (17,
+//!   16); one tick of this device's clock later every cleared flag is set
+//!   again. `HAL_RCC_ClockConfig` spins on each, and all five read `1` out of
+//!   reset (`CFGR` = `0x0007_0000`, `EXTCFGR` = `0x0003_0000`). A write that
+//!   leaves the field as it was leaves its flag alone.
+//! * The PLL is `src / (M+1) × N / (R+1)` (§6.4.4) with `PLLM[6:4]`,
+//!   `PLLN[14:8]`, `PLLR[31:29]` behind `PLLREN[28]` and `PLLQ[27:25]`
+//!   (÷ Q+1, the [`ClockOutput::PLL48`] output) behind `PLLQEN[24]` — not the
+//!   L4's `2·(x+1)`. It resets to `0x2204_0100`.
+//! * Ten ready bits: MSI, HSI16, `HSIKERDY` (bit 12, set only by `HSIKERON`,
+//!   as `HSIRDY` is only by `HSION`), HSE, PLL and PLLSAI1 in `CR`; LSE in
+//!   `BDCR`; **LSI1** (0→1) and **LSI2** (2→3) in `CSR`; HSI48 in `CRRCR`.
+//!   `LSI2ON` is "enable *and selection*" (§6.4.31): the LSI the RTC sees is
+//!   LSI2 while it stands and LSI1 otherwise, both at the `lsi` property's
+//!   rate. `CIER`/`CIFR`/`CICR` carry `HSI48RDYF` at 10 and `LSI2RDYF` at 11
+//!   (§6.4.6–§6.4.8); `HSIKERDY` has no flag.
+//! * `SMPSCR` stores `SMPSSEL`/`SMPSDIV` and resets to `0x301`. `SMPSSWS`
+//!   is derived on every read as §6.4.9 states it: `11` (no clock) while
+//!   `PWR_CR5.SMPSEN` is clear — it arrives on the **`smpsen`** input, wired
+//!   `pwr.smpsen -> rcc.smpsen`, and an undrawn wire reads as clear — `10`
+//!   whenever the HSE is running, and otherwise the HSI16 or MSI that
+//!   `SMPSSEL` names if it is running. `CSR.RFWKPSEL` (the radio wake-up
+//!   clock) and `CSR.LSI2TRIM` are storage. `CSR.RFRSTS` reads back
+//!   `APB3RSTR.RFRST`, whose description points there for "the reset status
+//!   of the radio system" (§6.4.16).
+//! * `HSECR` is keyed (§6.4.33): a write of `0xCAFE_CAFE` sets `UNLOCKED`
+//!   (bit 0), the next write lands in `HSES`, `HSEGMC` and `HSETUNE` and
+//!   locks it again, and a write while locked is dropped. It resets to `0x30`.
+//! * Gate banks — CPU1's at the L4's offsets, with `AHB3ENR` holding the
+//!   AHB3 *and* AHB4 clocks and an `APB3RSTR` with nothing in it but the
+//!   radio's `RFRST`; CPU2's from `+0x148` (§6.4.35–§6.4.41), each prefixed
+//!   `c2`:
+//!
+//!   | enable pin | register | reset pin | register |
+//!   | --- | --- | --- | --- |
+//!   | `ahb1en<n>` | `AHB1ENR` `+0x48` | `ahb1rst<n>` | `AHB1RSTR` `+0x28` |
+//!   | `ahb2en<n>` | `AHB2ENR` `+0x4c` | `ahb2rst<n>` | `AHB2RSTR` `+0x2c` |
+//!   | `ahb3en<n>` | `AHB3ENR` `+0x50` | `ahb3rst<n>` | `AHB3RSTR` `+0x30` |
+//!   | `apb1en<n>` | `APB1ENR1` `+0x58` | `apb1rst<n>` | `APB1RSTR1` `+0x38` |
+//!   | `apb1enb<n>` | `APB1ENR2` `+0x5c` | `apb1rstb<n>` | `APB1RSTR2` `+0x3c` |
+//!   | `apb2en<n>` | `APB2ENR` `+0x60` | `apb2rst<n>` | `APB2RSTR` `+0x40` |
+//!   | | | `apb3rst<n>` | `APB3RSTR` `+0x44` |
+//!   | `c2ahb1en<n>` | `C2AHB1ENR` `+0x148` | | |
+//!   | `c2ahb2en<n>` | `C2AHB2ENR` `+0x14c` | | |
+//!   | `c2ahb3en<n>` | `C2AHB3ENR` `+0x150` | | |
+//!   | `c2apb1en<n>` | `C2APB1ENR1` `+0x158` | | |
+//!   | `c2apb1enb<n>` | `C2APB1ENR2` `+0x15c` | | |
+//!   | `c2apb2en<n>` | `C2APB2ENR` `+0x160` | | |
+//!   | `c2apb3en<n>` | `C2APB3ENR` `+0x164` | | |
+//!
+//!   There are no CPU2 reset registers: a peripheral's reset is shared. The
+//!   `c2` prefix starts with a letter no CPU1 prefix does, so no pin reads
+//!   two ways. `<n>` is the bit in RM0434's register description (and the
+//!   header's `RCC_xxxENR_yyyEN_Pos`): HSEM is `ahb3en19`/`c2ahb3en19`, IPCC
+//!   `ahb3en20`/`c2ahb3en20` (and `ahb3rst19`/`ahb3rst20` for their
+//!   resets), FLASH `ahb3en25`, GPIOA `ahb2en0`, USART1 `apb2en14`, LPUART1
+//!   `apb1enb0`, the BLE interface `c2apb3en0` and the radio's reset
+//!   `apb3rst0`. HSEM and FLASH (`AHB3ENR` = `C2AHB3ENR` = `0x0208_0000`,
+//!   §6.4.19, §6.4.37) and the RTC's APB interface (`APB1ENR1`/`C2APB1ENR1`
+//!   = `0x400`) are on out of reset, and every `*SMENR`/`C2*SMENR` word takes
+//!   its §6.4.23–§6.4.28 and §6.4.42–§6.4.48 value — the WB is the one
+//!   variant whose low-power gates reset to the manual's numbers.
+//! * The reset-cause inputs and `RMVF` are the U5's: `oblrst` … `lpwrrst` at
+//!   `CSR[31:25]`, `RMVF` at 23; `CSR` comes up `0x0c00_0000` (pin + BOR).
+//!
 //! # Known deviations
 //!
 //! * The `*LPENR` (F4) and `*SMENR` (L4) low-power gate registers are storage
@@ -159,6 +267,25 @@
 //!   disable–write–enable sequence cannot tell apart. `BDCR.LSIPREDIV`
 //!   divides the LSI on its way to `RTCCLK` only, and `MSIPLLEN` (MSI
 //!   trimmed by the LSE) changes nothing because the MSI is already exact.
+//! * **WB prescalers apply at once; only their flags lag.** The rates follow
+//!   `HPRE`, `PPREx`, `C2HPRE` and `SHDHPRE` the moment they are written, and
+//!   the `xxxF` flag is what takes the tick. A firmware that read the clock
+//!   tree back between the write and the flag could tell; one that waits on
+//!   the flag, as the HAL does, cannot.
+//! * **WB secondaries.** `PLLSAI1`, `HSI48`, `HSIKERON`, `CCIPR`, `SMPSCR`,
+//!   `RFWKPSEL` and `HSECR`'s tuning drive no output — the SMPS step-down
+//!   clock and the RF wake-up clock read back and nothing consumes them.
+//!   `LSI1` and `LSI2` are one rate. `EXTCFGR.RFCSS` (0: the radio's HCLK5
+//!   and APB3 run on HSI16; 1: on HSE ÷ 2) reads zero, because the radio
+//!   that would switch it is not modelled. The factory trims (`MSICAL`,
+//!   `HSICAL`, `HSI48CAL`) read zero where the manual has `X`.
+//! * **The SVD is overruled twice.** `AHB1ENR` resets to `0` (§6.4.17), not
+//!   the SVD's `0x100`, and `C2AHB1SMENR` to `0x0001_1007` (§6.4.42), not
+//!   `0x0001_1207`.
+//! * **CPU2's gates are wires and nothing more.** A peripheral is clocked
+//!   when *either* CPU's enable is set, which a board expresses by wiring
+//!   both bits to the peripheral's `enable` (the [`gate`](super::gate) fan-in
+//!   is an OR). This device does not compute the OR itself.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -188,14 +315,15 @@ const CLASS_NAME: &str = "st.rcc";
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
 ///
 /// Version 2 widened the register file to the U5's seventy words and the
-/// ready-bit table to twelve deadlines; a version-1 chunk is refused rather
-/// than guessed at.
-const STATE_VERSION: u32 = 2;
+/// ready-bit table to twelve deadlines; version 3 widened it again to the
+/// WB's ninety-eight and added the prescaler-flag deadline. An older chunk is
+/// refused rather than guessed at.
+const STATE_VERSION: u32 = 3;
 
-/// How many 32-bit words the widest layout occupies. The U5 map ends at
-/// `PRIVCFGR` (`+0x114`), so seventy words covers every family and the
-/// snapshot encoding is one shape whatever the variant.
-const WORDS: usize = 0x46;
+/// How many 32-bit words the widest layout occupies. The WB map ends at
+/// `C2APB3SMENR` (`+0x184`), so ninety-eight words covers every family and
+/// the snapshot encoding is one shape whatever the variant.
+const WORDS: usize = 0x62;
 
 /// How many `xxxON`/`xxxRDY` pairs the widest layout has — the U5's twelve.
 const MAX_READY: usize = 12;
@@ -214,6 +342,10 @@ const DEFAULT_READY_DELAY: u64 = 16;
 
 /// The name of the `PWR_CR.DBP` input.
 pub const DBP_PIN: &str = "dbp";
+
+/// The name of a WB's `PWR_CR5.SMPSEN` input, which `SMPSCR.SMPSSWS`
+/// depends on (RM0434 §6.4.9).
+pub const SMPSEN_PIN: &str = "smpsen";
 
 /// The name of the RTC clock-enable output (`BDCR.RTCEN`).
 pub const RTCEN_PIN: &str = "rtcen";
@@ -257,12 +389,18 @@ impl ClockOutput {
     pub const RTCCLK: ClockOutput = ClockOutput(6);
     /// The PLL's `Q` output — 48 MHz for USB and the SDIO on a configured F4.
     pub const PLL48: ClockOutput = ClockOutput(7);
-    /// The APB3 clock: `HCLK / CFGR3.PPRE3`. A U5 has one; on an F4 or an L4
-    /// it is always zero.
+    /// The APB3 clock: `HCLK / CFGR3.PPRE3`. A U5 has one; on an F4, an L4
+    /// or a WB it is always zero.
     pub const PCLK3: ClockOutput = ClockOutput(8);
+    /// A WB's CPU2 clock, `HCLK2`: `SYSCLK / EXTCFGR.C2HPRE`. Zero on every
+    /// other family.
+    pub const HCLK2: ClockOutput = ClockOutput(9);
+    /// A WB's shared AHB4 and flash clock, `HCLK4`: `SYSCLK /
+    /// EXTCFGR.SHDHPRE`. Zero on every other family.
+    pub const HCLK4: ClockOutput = ClockOutput(10);
 
     /// How many outputs there are, which is the width of a [`Clocks`] table.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 11;
 
     /// The name this output is known by, for a diagnostic.
     #[must_use]
@@ -277,6 +415,8 @@ impl ClockOutput {
             ClockOutput::RTCCLK => "rtcclk",
             ClockOutput::PLL48 => "pll48",
             ClockOutput::PCLK3 => "pclk3",
+            ClockOutput::HCLK2 => "hclk2",
+            ClockOutput::HCLK4 => "hclk4",
             _ => return None,
         })
     }
@@ -306,12 +446,14 @@ pub const OUTPUT_TREE: &[(ClockOutput, &str)] = &[
     (ClockOutput::TIMCLK1, "timclk1"),
     (ClockOutput::TIMCLK2, "timclk2"),
     (ClockOutput::PCLK3, "pclk3"),
+    (ClockOutput::HCLK2, "hclk2"),
+    (ClockOutput::HCLK4, "hclk4"),
 ];
 
 /// Which output `out` hangs off, or `None` when it hangs off the crystal.
 fn parent_output(out: ClockOutput) -> Option<ClockOutput> {
     Some(match out {
-        ClockOutput::HCLK => ClockOutput::SYSCLK,
+        ClockOutput::HCLK | ClockOutput::HCLK2 | ClockOutput::HCLK4 => ClockOutput::SYSCLK,
         ClockOutput::PCLK1 | ClockOutput::PCLK2 | ClockOutput::PCLK3 => ClockOutput::HCLK,
         ClockOutput::TIMCLK1 => ClockOutput::PCLK1,
         ClockOutput::TIMCLK2 => ClockOutput::PCLK2,
@@ -399,6 +541,10 @@ pub enum Variant {
     /// `DIVR` and a `FRACR`, split `AHB2`/`APB1` enable words, an APB3, and
     /// the LSI moved into `BDCR` at `+0xf0`.
     U5,
+    /// RM0434's STM32WB55 map: the L4's, plus `SMPSCR`, `HSECR`, `EXTCFGR`
+    /// (CPU2's and the shared bus's prescalers) and CPU2's gate banks from
+    /// `+0x148`.
+    WB,
 }
 
 impl Variant {
@@ -409,6 +555,7 @@ impl Variant {
             Variant::F4 => "f4",
             Variant::L4 => "l4",
             Variant::U5 => "u5",
+            Variant::WB => "wb",
         }
     }
 
@@ -423,6 +570,9 @@ impl Variant {
             // Through `PRIVCFGR` at `+0x114` (RM0456 §11.8; ST CMSIS
             // `stm32u585xx.h`, `RCC_TypeDef`).
             Variant::U5 => 0x118,
+            // Through `C2APB3SMENR` at `+0x184` (ST CMSIS `stm32wb55xx.h`,
+            // `RCC_TypeDef`).
+            Variant::WB => 0x188,
         }
     }
 
@@ -431,6 +581,7 @@ impl Variant {
             Variant::F4 => &F4,
             Variant::L4 => &L4,
             Variant::U5 => &U5,
+            Variant::WB => &WB,
         }
     }
 
@@ -439,7 +590,9 @@ impl Variant {
         match self {
             Variant::F4 => F4_CAUSES,
             Variant::L4 => L4_CAUSES,
-            Variant::U5 => U5_CAUSES,
+            // The WB's `CSR[31:25]` is the U5's, flag for flag
+            // (`RCC_CSR_OBLRSTF_Pos` … `RCC_CSR_LPWRRSTF_Pos`).
+            Variant::U5 | Variant::WB => U5_CAUSES,
         }
     }
 }
@@ -447,7 +600,7 @@ impl Variant {
 /// Which oscillator or PLL a ready bit belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Osc {
-    /// The internal high-speed RC — 16 MHz on both families.
+    /// The internal high-speed RC — 16 MHz on every family.
     Hsi,
     /// The external high-speed crystal.
     Hse,
@@ -459,11 +612,11 @@ enum Osc {
     /// A secondary source modelled for its ready bit only — nothing consumes
     /// its output yet: `PLLI2S`/`PLLSAI` on an F4, `PLLSAI1`/`PLLSAI2` on an
     /// L4, and on a U5 `PLL2`, `PLL3`, `MSIK`, `HSI48`, `SHSI` and the
-    /// `LSESYS` path.
+    /// `LSESYS` path; on a WB `PLLSAI1`, `HSI48` and the HSI kernel clock.
     Aux,
     /// The 32.768 kHz backup-domain crystal.
     Lse,
-    /// The internal low-speed RC.
+    /// The internal low-speed RC — a WB's `LSI1` and `LSI2` both.
     Lsi,
 }
 
@@ -638,7 +791,7 @@ struct Layout {
     pllcfgr: u64,
     bdcr: u64,
     csr: u64,
-    /// `RMVF`'s bit in `CSR` — 24 on an F4, 23 on an L4.
+    /// `RMVF`'s bit in `CSR` — 24 on an F4, 23 on an L4, a U5 or a WB.
     rmvf: u32,
     /// The clock-enable banks, in register order.
     enable: &'static [Bank],
@@ -665,9 +818,34 @@ struct Layout {
 /// prefix followed by decimal digits, and `apb1en21` would then be two pins
 /// with one spelling — `APB1ENR1` bit 21 and `APB1ENR2` bit 1. A letter cannot
 /// be read as a digit, so the ambiguity cannot arise.
+///
+/// A WB adds CPU2's enable words as `c2ahb1en` … `c2apb3en`. Every CPU1
+/// prefix starts with an `a`, so a `c2…` pin can never be read as one and
+/// `c2ahb1en3` and `ahb1en3` cannot be confused.
 const ALL_BANKS: &[&str] = &[
-    "ahb1en", "ahb2en", "ahb2enb", "ahb3en", "apb1en", "apb1enb", "apb2en", "apb3en", "ahb1rst",
-    "ahb2rst", "ahb2rstb", "ahb3rst", "apb1rst", "apb1rstb", "apb2rst", "apb3rst",
+    "ahb1en",
+    "ahb2en",
+    "ahb2enb",
+    "ahb3en",
+    "apb1en",
+    "apb1enb",
+    "apb2en",
+    "apb3en",
+    "ahb1rst",
+    "ahb2rst",
+    "ahb2rstb",
+    "ahb3rst",
+    "apb1rst",
+    "apb1rstb",
+    "apb2rst",
+    "apb3rst",
+    "c2ahb1en",
+    "c2ahb2en",
+    "c2ahb3en",
+    "c2apb1en",
+    "c2apb1enb",
+    "c2apb2en",
+    "c2apb3en",
 ];
 
 /// Every reset-cause pin either layout offers, for the schema's union.
@@ -1181,6 +1359,171 @@ static U5: Layout = Layout {
     reset_values: U5_RESET_VALUES,
 };
 
+// -- the WB map (RM0434; ST CMSIS `stm32wb55xx.h`, `RCC_TypeDef`) ------------
+
+/// `RCC_CR` on a WB: the L4's bits, plus `HSIKERDY` at 12 and `HSEPRE` at 20.
+const WB_CR: u64 = 0x00;
+/// `RCC_CFGR`: the L4's fields, plus the `HPREF`/`PPRE1F`/`PPRE2F` flags.
+const WB_CFGR: u64 = 0x08;
+/// `RCC_PLLCFGR`.
+const WB_PLLCFGR: u64 = 0x0c;
+/// `RCC_SMPSCR`: `SMPSSEL[1:0]`, `SMPSDIV[5:4]`, `SMPSSWS[9:8]`.
+const WB_SMPSCR: u64 = 0x24;
+/// `RCC_APB3RSTR`, whose only bit is the radio's `RFRST`.
+const WB_APB3RSTR: u64 = 0x44;
+/// `RCC_BDCR`, at the L4's offset.
+const WB_BDCR: u64 = 0x90;
+/// `RCC_CSR`: `LSI1`/`LSI2`, `RFWKPSEL`, `RFRSTS` and the reset flags.
+const WB_CSR: u64 = 0x94;
+/// `RCC_CRRCR`: `HSI48ON`/`HSI48RDY`.
+const WB_CRRCR: u64 = 0x98;
+/// `RCC_HSECR`, behind its key.
+const WB_HSECR: u64 = 0x9c;
+/// `RCC_EXTCFGR`: `SHDHPRE[3:0]`, `C2HPRE[7:4]` and their applied flags.
+const WB_EXTCFGR: u64 = 0x108;
+
+/// `CR.HSEPRE`: HSE ÷ 2 into `SYSCLK` and the PLL.
+const WB_CR_HSEPRE: u32 = 1 << 20;
+/// `CFGR.HPREF`, `PPRE1F`, `PPRE2F` — "prescaler value applied".
+const WB_CFGR_FLAGS: u32 = 0b111 << 16;
+/// `EXTCFGR.SHDHPREF`, `C2HPREF`.
+const WB_EXTCFGR_FLAGS: u32 = 0b11 << 16;
+/// `EXTCFGR.RFCSS`, the radio's clock source, which the hardware reports.
+const WB_EXTCFGR_RFCSS: u32 = 1 << 20;
+/// `SMPSCR.SMPSSWS`, the step-down converter's clock switch status.
+const WB_SMPSCR_SWS: u32 = 0b11 << 8;
+/// `CSR.RFRSTS` — "the radio system is under reset".
+const WB_CSR_RFRSTS: u32 = 1 << 16;
+/// `HSECR.UNLOCKED`.
+const WB_HSECR_UNLOCKED: u32 = 1;
+/// `HSECR`'s writable fields once unlocked: `HSES[3]`, `HSEGMC[6:4]`,
+/// `HSETUNE[13:8]`.
+const WB_HSECR_FIELDS: u32 = 0x3f78;
+/// The value that unlocks `HSECR` for one write (`HSE_CONTROL_UNLOCK_KEY` in
+/// ST's LL header).
+const WB_HSECR_KEY: u32 = 0xcafe_cafe;
+
+/// The flag bits a WB's `CIFR` has: `LSI1RDYF`…`PLLSAI1RDYF` in `[6:0]`,
+/// `CSSF` at 8, `LSECSSF` at 9, `HSI48RDYF` at 10 and `LSI2RDYF` at 11
+/// (`RCC_CIFR_*` in `stm32wb55xx.h`). Bit 7 is reserved.
+const WB_FLAGS: u32 = 0xf7f;
+
+static WB_ENABLE: &[Bank] = &[
+    bank("ahb1en", 0x48),
+    bank("ahb2en", 0x4c),
+    bank("ahb3en", 0x50),
+    bank("apb1en", 0x58),
+    bank("apb1enb", 0x5c),
+    bank("apb2en", 0x60),
+    // CPU2's own enables. They are enable banks like any other; a board wires
+    // a peripheral's `enable` to both CPUs' bits and the gate ORs them.
+    bank("c2ahb1en", 0x148),
+    bank("c2ahb2en", 0x14c),
+    bank("c2ahb3en", 0x150),
+    bank("c2apb1en", 0x158),
+    bank("c2apb1enb", 0x15c),
+    bank("c2apb2en", 0x160),
+    bank("c2apb3en", 0x164),
+];
+
+static WB_RESET_BANKS: &[Bank] = &[
+    bank("ahb1rst", 0x28),
+    bank("ahb2rst", 0x2c),
+    bank("ahb3rst", 0x30),
+    bank("apb1rst", 0x38),
+    bank("apb1rstb", 0x3c),
+    bank("apb2rst", 0x40),
+    bank("apb3rst", WB_APB3RSTR),
+];
+
+/// Every `xxxON`/`xxxRDY` pair `HAL_RCC_OscConfig` polls, with its `CIFR`
+/// flag (`RCC_CR_*`, `RCC_BDCR_*`, `RCC_CSR_*`, `RCC_CRRCR_*`,
+/// `RCC_CIFR_*` in `stm32wb55xx.h`).
+static WB_READY: &[ReadyBit] = &[
+    ready(WB_CR, 0, 1, 2, Osc::Msi),
+    // `HSION` at 8, `HSIRDY` at 10, exactly as on an L4.
+    ready(WB_CR, 8, 10, 3, Osc::Hsi),
+    // `HSIKERON`/`HSIKERDY`: the HSI kept running for peripheral kernels.
+    ready(WB_CR, 9, 12, NO_FLAG, Osc::Aux),
+    ready(WB_CR, 16, 17, 4, Osc::Hse),
+    ready(WB_CR, 24, 25, 5, Osc::Pll),
+    ready(WB_CR, 26, 27, 6, Osc::Aux),
+    ready(WB_BDCR, 0, 1, 1, Osc::Lse),
+    ready(WB_CSR, 0, 1, 0, Osc::Lsi),
+    ready(WB_CSR, 2, 3, 11, Osc::Lsi),
+    ready(WB_CRRCR, 0, 1, 10, Osc::Aux),
+];
+
+/// The WB's reset values: RM0434 §6.4.1–§6.4.48 ("Reset value") and its
+/// Table 38, cross-checked against ST's `STM32WB55_CM4.svd` and what
+/// `HAL_RCC_DeInit` writes back as the default.
+static WB_RESET_VALUES: &[(u64, u32)] = &[
+    // `CR`: MSI on at range 6 (4 MHz) and ready. RM0434 §6.4.1 gives
+    // `0x61` and says `MSIRDY` "is read 1 once the MSI is ready"; this model
+    // has no instant at which it is not.
+    (WB_CR, 0x0000_0063),
+    // `ICSCR`: `HSITRIM` = 0x40, the value `HAL_RCC_DeInit` restores; the
+    // `MSICAL`/`HSICAL` factory trims read zero.
+    (0x04, 0x4000_0000),
+    // `CFGR`: MSI selected, every prescaler ÷1 and *applied*.
+    (WB_CFGR, 0x0007_0000),
+    // `PLLCFGR` and `PLLSAI1CFGR`: N = 1, P = ÷3, Q = R = ÷2.
+    (WB_PLLCFGR, 0x2204_0100),
+    (0x10, 0x2204_0100),
+    // `SMPSCR`: MSI selected (§6.4.9: "forced by hardware to select MSI" on
+    // a POR); `SMPSSWS` is derived on read, so its stored `11` is never seen.
+    (WB_SMPSCR, 0x0000_0301),
+    // `AHB3ENR`: HSEM (19) and FLASH (25) clocked out of reset.
+    (0x50, 0x0208_0000),
+    // `APB1ENR1`: `RTCAPBEN`.
+    (0x58, 0x0000_0400),
+    // CPU1's `*SMENR`: every implemented peripheral clocked in sleep.
+    (0x68, 0x0001_1207),
+    (0x6c, 0x0001_209f),
+    (0x70, 0x0307_0100),
+    (0x78, 0x85a0_4e01),
+    (0x7c, 0x0000_0021),
+    (0x80, 0x0026_5800),
+    // `CSR`: a power-on sets the pin and BOR flags.
+    (WB_CSR, 0x0c00_0000),
+    // `HSECR`: locked, `HSEGMC` = 3.
+    (WB_HSECR, 0x0000_0030),
+    // `EXTCFGR`: `SHDHPRE` = `C2HPRE` = ÷1, both applied.
+    (WB_EXTCFGR, 0x0003_0000),
+    // CPU2's enables: HSEM, FLASH and the RTC's APB interface, as CPU1's.
+    (0x150, 0x0208_0000),
+    (0x158, 0x0000_0400),
+    // CPU2's `*SMENR`.
+    // RM0434 §6.4.42 gives `0x0001_1007`, `SRAM1SMEN` clear; the SVD's
+    // `0x0001_1207` has it set. The manual is the one taken.
+    (0x168, 0x0001_1007),
+    (0x16c, 0x0001_209f),
+    (0x170, 0x0307_0000),
+    (0x178, 0x85a0_4601),
+    (0x17c, 0x0000_0021),
+    (0x180, 0x0026_5800),
+    (0x184, 0x0000_0003),
+];
+
+static WB: Layout = Layout {
+    cr: WB_CR,
+    cfgr: WB_CFGR,
+    pllcfgr: WB_PLLCFGR,
+    bdcr: WB_BDCR,
+    csr: WB_CSR,
+    rmvf: 23,
+    enable: WB_ENABLE,
+    reset: WB_RESET_BANKS,
+    ready: WB_READY,
+    interrupts: Interrupts::Three {
+        cier: 0x18,
+        cifr: 0x1c,
+        cicr: 0x20,
+        flags: WB_FLAGS,
+    },
+    reset_values: WB_RESET_VALUES,
+};
+
 // ---------------------------------------------------------------------------
 // The declared source frequencies
 // ---------------------------------------------------------------------------
@@ -1264,6 +1607,16 @@ fn hpre_div(field: u32) -> u64 {
     }
 }
 
+/// A WB's `HPRE`, `C2HPRE` and `SHDHPRE` as a divisor (RM0434 §6.4.3, §6.4.34;
+/// the same table as `AHBPrescTable` in
+/// ST's `system_stm32wbxx.c`; the `LL_RCC_SYSCLK_DIV_x` encodings in
+/// `stm32wbxx_ll_rcc.h`).
+///
+/// The `1xxx` half is everyone's table; the `0xxx` half, which is ÷1 on an
+/// F4 or an L4, has ÷3, ÷5, ÷6, ÷10 and ÷32 on a WB, so that a 64 MHz
+/// `SYSCLK` can feed CPU2 its 32 MHz ceiling and the flash its own.
+const WB_HPRE: [u64; 16] = [1, 3, 5, 1, 1, 6, 10, 32, 2, 4, 8, 16, 64, 128, 256, 512];
+
 /// `CFGR.PPREx` as a divisor. `0xx` is one; otherwise `2^(field - 3)`.
 fn ppre_div(field: u32) -> u64 {
     if field < 4 { 1 } else { 1 << (field - 3) }
@@ -1284,6 +1637,9 @@ struct State {
     /// When `SWS` catches up with `SW`, and what it will then say.
     switch_at: u64,
     switch_to: u32,
+    /// When a WB's cleared prescaler flags (`CFGR.HPREF`…, `EXTCFGR.C2HPREF`,
+    /// `SHDHPREF`) come back. Never armed on any other family.
+    presc_at: u64,
     /// The tick this device has been advanced to.
     tick: u64,
 }
@@ -1299,6 +1655,7 @@ impl State {
             ready_at: [NO_DEADLINE; MAX_READY],
             switch_at: NO_DEADLINE,
             switch_to: 0,
+            presc_at: NO_DEADLINE,
             tick: 0,
         }
     }
@@ -1343,6 +1700,9 @@ struct Registers {
     dbp: AtomicU32,
     /// Whether anything is driving `dbp` at all.
     dbp_wired: AtomicU32,
+    /// A WB's `PWR_CR5.SMPSEN`, as it arrives on the `smpsen` input. Low when
+    /// nothing drives it, which is the SMPS's reset state.
+    smpsen: AtomicU32,
     /// The lock-free half of the lazy contract: `current_tick` and
     /// `next_event_tick` are called at [`LockRank::LEAF`] and must not lock.
     tick: AtomicU64,
@@ -1393,7 +1753,7 @@ impl Registers {
     /// Republish what the lock-free lazy surface reads.
     fn republish(&self, state: &State) {
         self.tick.store(state.tick, Ordering::Relaxed);
-        let mut next = state.switch_at;
+        let mut next = state.switch_at.min(state.presc_at);
         for at in state.ready_at {
             next = next.min(at);
         }
@@ -1427,6 +1787,14 @@ impl Registers {
                 let cfgr = state.word_mut(self.layout.cfgr);
                 *cfgr = (*cfgr & !0b1100) | (sws << 2);
             }
+            if state.presc_at <= tick {
+                // "Set by hardware when the prescaler value is applied": every
+                // flag a write cleared comes back together. Setting a flag
+                // that was never cleared changes nothing.
+                state.presc_at = NO_DEADLINE;
+                *state.word_mut(WB_CFGR) |= WB_CFGR_FLAGS;
+                *state.word_mut(WB_EXTCFGR) |= WB_EXTCFGR_FLAGS;
+            }
             self.republish(&state);
         }
         // Outward, after the critical section: the rates may have moved and a
@@ -1441,6 +1809,15 @@ impl Registers {
     /// Whether the source behind `osc` is ready. Anything else is a rate of
     /// zero, which is what "the guest has not switched it on" looks like.
     fn osc_ready(&self, state: &State, osc: Osc) -> bool {
+        if self.variant == Variant::WB && osc == Osc::Lsi {
+            // "LSI2ON: LSI2 oscillator enable and selection … 0: LSI2
+            // oscillator OFF (LSI1 selected on LSI)" (RM0434 §6.4.31): the
+            // LSI is LSI2 while `LSI2ON` stands, ready or not, and LSI1
+            // otherwise.
+            let csr = state.word(WB_CSR);
+            let rdy = if csr & (1 << 2) != 0 { 1 << 3 } else { 1 << 1 };
+            return csr & rdy != 0;
+        }
         self.layout
             .ready
             .iter()
@@ -1455,6 +1832,13 @@ impl Registers {
     /// `ICSCR1` — `MSIRGSEL` at 23, `MSISRANGE[31:28]` — and keeps the
     /// standby range in `CSR.MSISSRANGE[15:12]` (RM0456 §11.8).
     fn msi_hz(&self, state: &State) -> Rational {
+        if self.variant == Variant::WB {
+            // A WB has no `MSIRGSEL` and no standby range: `CR.MSIRANGE[7:4]`
+            // is the range, always. 12…15 are not ranges, and
+            // `MSIRangeTable` answers them with zero, so this does too.
+            let range = (state.word(WB_CR) >> 4) & 0xf;
+            return Rational::integer(MSI_RANGES.get(range as usize).copied().unwrap_or(0));
+        }
         if self.variant == Variant::U5 {
             let icscr1 = state.word(U5_ICSCR1);
             let range = if icscr1 & (1 << 23) != 0 {
@@ -1495,6 +1879,17 @@ impl Registers {
             // Neither is a source in its own right.
             Osc::Pll | Osc::Aux => 0,
         })
+    }
+
+    /// The HSE as `SYSCLK` and the PLL see it: on a WB, halved while
+    /// `CR.HSEPRE` stands (`HAL_RCC_GetSysClockFreq`); everywhere else the
+    /// crystal itself.
+    fn hse_sys_hz(&self, state: &State) -> Rational {
+        let hse = self.source_hz(state, Osc::Hse);
+        if self.variant == Variant::WB && state.word(WB_CR) & WB_CR_HSEPRE != 0 {
+            return hse.checked_scale(1, 2).unwrap_or(Rational::integer(0));
+        }
+        hse
     }
 
     /// The main PLL's system output and its 48 MHz output.
@@ -1612,6 +2007,40 @@ impl Registers {
                 };
                 (sys, out48)
             }
+            Variant::WB => {
+                // `stm32wb55xx.h`, `RCC_PLLCFGR_*`: SRC[1:0] 01 MSI,
+                // 10 HSI16, 11 HSE (after `HSEPRE`); M[6:4] (÷ M+1);
+                // N[14:8]; Q[27:25] (÷ Q+1) behind QEN[24]; R[31:29]
+                // (÷ R+1) behind REN[28] — `SystemCoreClockUpdate`'s
+                // `pllvco / pllr` with `pllr = R + 1`.
+                let src = match cfg & 0x3 {
+                    1 => self.source_hz(state, Osc::Msi),
+                    2 => self.source_hz(state, Osc::Hsi),
+                    3 => self.hse_sys_hz(state),
+                    _ => return (zero, zero),
+                };
+                let m = u64::from((cfg >> 4) & 0x7) + 1;
+                let n = u64::from((cfg >> 8) & 0x7f);
+                let q = u64::from((cfg >> 25) & 0x7) + 1;
+                let r = u64::from((cfg >> 29) & 0x7) + 1;
+                if n == 0 {
+                    return (zero, zero);
+                }
+                let Some(vco) = src.checked_scale(n, m) else {
+                    return (zero, zero);
+                };
+                let sys = if cfg & (1 << 28) != 0 {
+                    vco.checked_scale(1, r).unwrap_or(zero)
+                } else {
+                    zero
+                };
+                let out48 = if cfg & (1 << 24) != 0 {
+                    vco.checked_scale(1, q).unwrap_or(zero)
+                } else {
+                    zero
+                };
+                (sys, out48)
+            }
         }
     }
 
@@ -1633,7 +2062,9 @@ impl Registers {
             (2, _) => self.source_hz(state, Osc::Lsi),
             // An F4 divides HSE by `CFGR.RTCPRE`, and a value below 2 means no
             // clock (RM0090 §7.3.3). An L4 divides it by a fixed 32
-            // (RM0351 §6.4.3), and so does a U5 (RM0456 §11.8).
+            // (RM0351 §6.4.3), and so do a U5 (RM0456 §11.8) and a WB
+            // (`LL_RCC_RTC_CLKSOURCE_HSE_DIV32`) — the undivided crystal,
+            // `HSEPRE` notwithstanding.
             (3, Variant::F4) => {
                 let pre = u64::from((state.word(self.layout.cfgr) >> 16) & 0x1f);
                 if pre < 2 {
@@ -1644,7 +2075,7 @@ impl Registers {
                         .unwrap_or(zero)
                 }
             }
-            (3, Variant::L4 | Variant::U5) => self
+            (3, Variant::L4 | Variant::U5 | Variant::WB) => self
                 .source_hz(state, Osc::Hse)
                 .checked_scale(1, 32)
                 .unwrap_or(zero),
@@ -1668,18 +2099,23 @@ impl Registers {
             (Variant::F4, 2) => pll_sys,
             // RM0351 §6.4.3, and RM0456 §11.8 for a U5's `CFGR1`: 00 MSI(S),
             // 01 HSI16, 10 HSE, 11 PLL(1).
-            (Variant::L4 | Variant::U5, 0) => self.source_hz(state, Osc::Msi),
-            (Variant::L4 | Variant::U5, 1) => self.source_hz(state, Osc::Hsi),
-            (Variant::L4 | Variant::U5, 2) => self.source_hz(state, Osc::Hse),
-            (Variant::L4 | Variant::U5, 3) => pll_sys,
+            // A WB's `CFGR` is the L4's, with `HSEPRE` between the crystal
+            // and the switch.
+            (Variant::L4 | Variant::U5 | Variant::WB, 0) => self.source_hz(state, Osc::Msi),
+            (Variant::L4 | Variant::U5 | Variant::WB, 1) => self.source_hz(state, Osc::Hsi),
+            (Variant::L4 | Variant::U5 | Variant::WB, 2) => self.hse_sys_hz(state),
+            (Variant::L4 | Variant::U5 | Variant::WB, 3) => pll_sys,
             _ => zero,
         };
 
         let (hpre, ppre1, ppre2, ppre3) = match self.variant {
             // RM0090 §7.3.3: HPRE[7:4], PPRE1[12:10], PPRE2[15:13].
             Variant::F4 => ((cfgr >> 4) & 0xf, (cfgr >> 10) & 0x7, (cfgr >> 13) & 0x7, 0),
-            // RM0351 §6.4.3: HPRE[7:4], PPRE1[10:8], PPRE2[13:11].
-            Variant::L4 => ((cfgr >> 4) & 0xf, (cfgr >> 8) & 0x7, (cfgr >> 11) & 0x7, 0),
+            // RM0351 §6.4.3: HPRE[7:4], PPRE1[10:8], PPRE2[13:11] — and a
+            // WB's `CFGR` has them at the same bits.
+            Variant::L4 | Variant::WB => {
+                ((cfgr >> 4) & 0xf, (cfgr >> 8) & 0x7, (cfgr >> 11) & 0x7, 0)
+            }
             // RM0456 §11.8: the prescalers left `CFGR1` for `CFGR2` —
             // HPRE[3:0], PPRE1[6:4], PPRE2[10:8] — and `CFGR3.PPRE3[6:4]`.
             // The encodings are the F4's.
@@ -1694,7 +2130,25 @@ impl Registers {
             }
         };
 
-        let hclk = sysclk.checked_scale(1, hpre_div(hpre)).unwrap_or(zero);
+        let ahb_div = |field: u32| {
+            if self.variant == Variant::WB {
+                WB_HPRE[(field & 0xf) as usize]
+            } else {
+                hpre_div(field)
+            }
+        };
+        let hclk = sysclk.checked_scale(1, ahb_div(hpre)).unwrap_or(zero);
+        // A WB's other two AHB clocks, off `SYSCLK` and not off `HCLK1`
+        // (`__LL_RCC_CALC_HCLK2_FREQ`/`_HCLK4_FREQ` take `SYSCLK`).
+        let (hclk2, hclk4) = if self.variant == Variant::WB {
+            let ext = state.word(WB_EXTCFGR);
+            (
+                sysclk.checked_scale(1, ahb_div(ext >> 4)).unwrap_or(zero),
+                sysclk.checked_scale(1, ahb_div(ext)).unwrap_or(zero),
+            )
+        } else {
+            (zero, zero)
+        };
         let pclk1 = hclk.checked_scale(1, ppre_div(ppre1)).unwrap_or(zero);
         let pclk2 = hclk.checked_scale(1, ppre_div(ppre2)).unwrap_or(zero);
         let pclk3 = if self.variant == Variant::U5 {
@@ -1725,6 +2179,8 @@ impl Registers {
         out[usize::from(ClockOutput::RTCCLK.0)] = self.rtc_hz(state);
         out[usize::from(ClockOutput::PLL48.0)] = pll48;
         out[usize::from(ClockOutput::PCLK3.0)] = pclk3;
+        out[usize::from(ClockOutput::HCLK2.0)] = hclk2;
+        out[usize::from(ClockOutput::HCLK4.0)] = hclk4;
         out
     }
 
@@ -1895,6 +2351,16 @@ impl Registers {
             // The reset flags, which only `RMVF` clears.
             mask |= 0xff00_0000 & !(1 << self.layout.rmvf);
         }
+        if self.variant == Variant::WB {
+            mask |= match offset {
+                WB_CFGR => WB_CFGR_FLAGS,
+                WB_EXTCFGR => WB_EXTCFGR_FLAGS | WB_EXTCFGR_RFCSS,
+                WB_SMPSCR => WB_SMPSCR_SWS,
+                // Derived on read from `APB3RSTR`, never stored.
+                WB_CSR => WB_CSR_RFRSTS,
+                _ => 0,
+            };
+        }
         mask
     }
 
@@ -1904,9 +2370,18 @@ impl Registers {
             return value;
         }
         let value = state.word(offset);
+        if self.variant == Variant::WB && offset == WB_SMPSCR {
+            return (value & !WB_SMPSCR_SWS) | (self.smps_sws(&state) << 8);
+        }
         if offset == self.layout.csr {
             // `RMVF` is "cleared by writing 1" and reads back zero.
-            return value & !(1 << self.layout.rmvf);
+            let mut value = value & !(1 << self.layout.rmvf);
+            if self.variant == Variant::WB && state.word(WB_APB3RSTR) & 1 != 0 {
+                // `RFRSTS`: the radio is under reset while `RFRST` holds it
+                // there.
+                value |= WB_CSR_RFRSTS;
+            }
+            return value;
         }
         value
     }
@@ -1922,6 +2397,8 @@ impl Registers {
 
             if offset == self.layout.bdcr {
                 self.write_bdcr(&mut state, value);
+            } else if self.variant == Variant::WB && offset == WB_HSECR {
+                Self::write_hsecr(&mut state, value);
             } else if self.layout.interrupts.write(&mut state, offset, value) {
                 // One of `CIR`/`CIER`/`CIFR`/`CICR`, whose rules are neither a
                 // plain register's nor `BDCR`'s.
@@ -1940,10 +2417,90 @@ impl Registers {
             if offset == self.layout.cfgr {
                 self.arm_switch(&mut state, before);
             }
+            if self.variant == Variant::WB {
+                self.write_wb(&mut state, offset, before);
+            }
             self.republish(&state);
         }
         self.refresh_outputs();
         self.recompute();
+    }
+
+    /// What a write to one of a WB's own registers implies, after the plain
+    /// read-only-masked store has happened.
+    fn write_wb(&self, state: &mut State, offset: u64, before: u32) {
+        let after = state.word(offset);
+        // Which prescaler fields this register has, and the applied flag
+        // each one answers with (`RCC_CFGR_HPREF_Pos` …,
+        // `RCC_EXTCFGR_SHDHPREF_Pos` …).
+        let fields: &[(u32, u32)] = match offset {
+            WB_CFGR => &[
+                (0xf << 4, 1 << 16),
+                (0x7 << 8, 1 << 17),
+                (0x7 << 11, 1 << 18),
+            ],
+            WB_EXTCFGR => &[(0xf, 1 << 16), (0xf << 4, 1 << 17)],
+            WB_CR => {
+                // "others: not allowed (hardware write protection)"
+                // (RM0434 §6.4.1): a `MSIRANGE` of 12…15 does not land, and
+                // the range in use stays.
+                if (after >> 4) & 0xf >= 12 {
+                    *state.word_mut(WB_CR) = (after & !0xf0) | (before & 0xf0);
+                }
+                return;
+            }
+            _ => return,
+        };
+        let mut cleared = false;
+        for (field, flag) in fields {
+            if (before ^ after) & field != 0 {
+                *state.word_mut(offset) &= !flag;
+                cleared = true;
+            }
+        }
+        if cleared {
+            // One tick, the same as an accepted `SW`: long enough that a loop
+            // which polls the flag sees it clear, short enough never to be
+            // the thing a startup sequence waits on.
+            state.presc_at = state.tick.saturating_add(1);
+        }
+    }
+
+    /// `SMPSSWS`, the SMPS step-down converter's clock, as RM0434 §6.4.9
+    /// states it: "whenever the SMPS step-down converter is disabled in
+    /// `PWR_CR5.SMPSEN`, no clock is used" (`11`); "whenever the HSE is
+    /// active the HSE is used regardless of the settings in `SMPSSEL`" (`10`);
+    /// otherwise `SMPSSEL`'s HSI16 (`00`) or MSI (`01`) if it is running, and
+    /// no clock if it is not or the selection is the reserved `11`.
+    fn smps_sws(&self, state: &State) -> u32 {
+        if self.smpsen.load(Ordering::Relaxed) == 0 {
+            return 3;
+        }
+        if self.osc_ready(state, Osc::Hse) {
+            return 2;
+        }
+        match state.word(WB_SMPSCR) & 0x3 {
+            0 if self.osc_ready(state, Osc::Hsi) => 0,
+            1 if self.osc_ready(state, Osc::Msi) => 1,
+            _ => 3,
+        }
+    }
+
+    /// `HSECR`, which takes `0xCAFE_CAFE` to unlock for a single write.
+    ///
+    /// RM0434 §6.4.33: "Once unlocked a single write access" is allowed, and
+    /// `UNLOCKED` clears when "a write access has been performed".
+    /// `LL_RCC_HSE_SetCapacitorTuning` writes the key and then does a
+    /// read-modify-write of the fields; the second write is the one that
+    /// lands, and it locks the register again behind it.
+    fn write_hsecr(state: &mut State, value: u32) {
+        let word = state.word_mut(WB_HSECR);
+        if value == WB_HSECR_KEY {
+            *word |= WB_HSECR_UNLOCKED;
+        } else if *word & WB_HSECR_UNLOCKED != 0 {
+            *word = value & WB_HSECR_FIELDS;
+        }
+        // Locked, and not the key: dropped.
     }
 
     /// `BDCR`, which is in the backup domain and write-protected by
@@ -2013,10 +2570,10 @@ impl Registers {
             (Variant::F4, 0) => Osc::Hsi,
             (Variant::F4, 1) => Osc::Hse,
             (Variant::F4, 2) => Osc::Pll,
-            (Variant::L4 | Variant::U5, 0) => Osc::Msi,
-            (Variant::L4 | Variant::U5, 1) => Osc::Hsi,
-            (Variant::L4 | Variant::U5, 2) => Osc::Hse,
-            (Variant::L4 | Variant::U5, 3) => Osc::Pll,
+            (Variant::L4 | Variant::U5 | Variant::WB, 0) => Osc::Msi,
+            (Variant::L4 | Variant::U5 | Variant::WB, 1) => Osc::Hsi,
+            (Variant::L4 | Variant::U5 | Variant::WB, 2) => Osc::Hse,
+            (Variant::L4 | Variant::U5 | Variant::WB, 3) => Osc::Pll,
             // An F4's `SW = 11` is reserved.
             _ => {
                 *state.word_mut(self.layout.cfgr) = (cfgr & !0x3) | previous;
@@ -2077,6 +2634,8 @@ impl MemOps for Registers {
 enum InputKind {
     /// `PWR_CR.DBP`, which unlocks `BDCR`.
     Dbp,
+    /// A WB's `PWR_CR5.SMPSEN`, which `SMPSCR.SMPSSWS` reports through.
+    Smpsen,
     /// A reset source, which latches a `CSR` flag on its rising edge.
     Cause(u32),
 }
@@ -2109,6 +2668,11 @@ impl WireSink for InputPin {
                 // One atomic and nothing else: the `BDCR` write path samples
                 // it and there is no outward call to make.
                 self.regs.dbp.store(u32::from(high), Ordering::Relaxed);
+            }
+            InputKind::Smpsen => {
+                // Read back through `SMPSSWS` on the next access; nothing to
+                // republish.
+                self.regs.smpsen.store(u32::from(high), Ordering::Relaxed);
             }
             InputKind::Cause(bit) => {
                 if !high {
@@ -2147,9 +2711,10 @@ impl Rcc {
     /// one this class does not know was given.
     pub fn new(props: &Props) -> Result<Rcc> {
         let mut r = props.reader();
-        let variant = match r.or_enum("variant", "f4", &["f4", "l4", "u5"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "l4", "u5", "wb"])? {
             "l4" => Variant::L4,
             "u5" => Variant::U5,
+            "wb" => Variant::WB,
             _ => Variant::F4,
         };
         let defaults = Frequencies::default();
@@ -2200,6 +2765,7 @@ impl Rcc {
             outputs: Mutex::with_rank(LockRank::WIRE, Vec::new()),
             dbp: AtomicU32::new(0),
             dbp_wired: AtomicU32::new(0),
+            smpsen: AtomicU32::new(0),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
@@ -2332,6 +2898,7 @@ impl Device for Rcc {
         }
         w.write_u64(state.switch_at)?;
         w.write_u32(state.switch_to)?;
+        w.write_u64(state.presc_at)?;
         // The controller's own position in its domain: the scheduler restores
         // the domain, and without this the two would disagree and every
         // pending ready bit would come true at the wrong instant.
@@ -2350,6 +2917,7 @@ impl Device for Rcc {
         }
         state.switch_at = r.read_u64()?;
         state.switch_to = r.read_u32()?;
+        state.presc_at = r.read_u64()?;
         state.tick = r.read_u64()?;
         {
             let mut held = self.regs.state.lock();
@@ -2399,6 +2967,8 @@ impl Device for Rcc {
         let kind = if port == DBP_PIN {
             self.regs.dbp_wired.store(1, Ordering::Relaxed);
             InputKind::Dbp
+        } else if port == SMPSEN_PIN && self.regs.variant == Variant::WB {
+            InputKind::Smpsen
         } else {
             InputKind::Cause(
                 self.regs
@@ -2410,7 +2980,7 @@ impl Device for Rcc {
             )
         };
         let line = match kind {
-            InputKind::Dbp => 0,
+            InputKind::Dbp | InputKind::Smpsen => 0,
             InputKind::Cause(bit) => bit,
         };
         let pin = Arc::new(InputPin {
@@ -2492,7 +3062,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which register layout: \"f4\" (RM0090), \"l4\" (RM0351) or \"u5\" (RM0456)",
+            summary: "which register layout: \"f4\" (RM0090), \"l4\" (RM0351), \"u5\" (RM0456) \
+                      or \"wb\" (RM0434)",
         },
         PropertySpec {
             name: "hse",
@@ -2571,6 +3142,20 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "the object whose clock domain is PCLK3 (a U5's APB3); it must hang off \
                       `hclk`",
         },
+        PropertySpec {
+            name: "hclk2",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is HCLK2 (a WB's CPU2, SYSCLK / C2HPRE); it \
+                      must hang off `sysclk`",
+        },
+        PropertySpec {
+            name: "hclk4",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the object whose clock domain is HCLK4 (a WB's shared AHB4 and flash, \
+                      SYSCLK / SHDHPRE); it must hang off `sysclk`",
+        },
     ],
     construct: |props| Ok(Box::new(Rcc::new(props)?)),
 };
@@ -2597,7 +3182,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     let mut schema = ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "u5"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "u5", "wb"]))
         .prop(PropSchema::new("hse", ValueKind::Uint))
         .prop(PropSchema::new("hsi", ValueKind::Uint))
         .prop(PropSchema::new("lse", ValueKind::Uint))
@@ -2608,7 +3193,9 @@ pub fn schema() -> ClassSchema {
         .port(RTCEN_PIN, PortDir::Out)
         .port(BDRST_PIN, PortDir::Out)
         .port(IRQ_PIN, PortDir::Out)
-        .port(DBP_PIN, PortDir::In);
+        .port(DBP_PIN, PortDir::In)
+        // A WB's `pwr.smpsen -> rcc.smpsen`; another variant refuses it.
+        .port(SMPSEN_PIN, PortDir::In);
     // The driven clock outputs, from the one table that says what they are.
     for (_, prop) in OUTPUT_TREE {
         schema = schema.prop(PropSchema::new(*prop, ValueKind::Str));
