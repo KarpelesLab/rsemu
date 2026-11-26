@@ -156,8 +156,11 @@ impl Instance for Ram {}
 /// The generic counterpart to [`Ram`], and the reason a board with a firmware
 /// image no longer needs a class of its own. `image` names a media slot the
 /// caller binds (`--media firmware=fw.bin`), exactly as `rom = "cart"` does for
-/// a NES cartridge; an unbound `image` is legal and leaves the ROM zeroed,
-/// which is a board whose socket is empty.
+/// a NES cartridge; an unbound `image` is legal and leaves the ROM filled
+/// with `fill` (zero unless the board says otherwise), which is a board whose
+/// socket is empty. `fill = 0xff` is an erased or unprogrammed part — an OTP
+/// block, a blank EPROM — and the part of the ROM an image too short for it
+/// leaves uncovered reads the same.
 ///
 /// A write is **dropped**, not faulted: that is what a ROM on a bus does, and a
 /// guest that stores to one gets no bus error from real silicon either. A board
@@ -181,13 +184,14 @@ impl Rom {
         let image = r
             .optional_media("image")?
             .map(crate::core::props::Media::to_bytes);
+        let fill = r.or_range("fill", 0u64, 0..=0xff)? as u8;
         r.finish()?;
         if size == 0 {
             return Err(Error::Property(alloc::string::String::from(
                 "property `size`: a rom object with no bytes in it cannot be mapped",
             )));
         }
-        let mut bytes = alloc::vec![0u8; usize::try_from(size).map_err(|_| {
+        let mut bytes = alloc::vec![fill; usize::try_from(size).map_err(|_| {
             Error::Property(alloc::string::String::from(
                 "property `size`: a rom larger than this host's address space",
             ))
@@ -272,6 +276,13 @@ pub static ROM_CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the media slot holding the contents, as in `image = \"firmware\"`",
         },
+        PropertySpec {
+            name: "fill",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "the byte every location holds that `image` does not cover (default 0; \
+                      `0xff` for an erased or unprogrammed part)",
+        },
     ],
     construct: |props| Ok(Box::new(Rom::new(props)?)),
 };
@@ -282,6 +293,7 @@ pub fn rom_schema() -> ClassSchema {
     ClassSchema::new(ROM_CLASS_NAME)
         .prop(PropSchema::new("size", ValueKind::Size).required())
         .prop(PropSchema::new("image", ValueKind::Media))
+        .prop(PropSchema::new("fill", ValueKind::Uint).range(0, 0xff))
         .region("")
 }
 
@@ -441,6 +453,29 @@ mod tests {
 
     fn ram(size: u64) -> Ram {
         Ram::new(&Props::new().with("size", Value::Size(size))).expect("a size is all it takes")
+    }
+
+    #[test]
+    fn a_rom_without_an_image_holds_its_fill() {
+        let zero = Rom::new(&Props::new().with("size", Value::Size(16))).unwrap();
+        assert!(
+            zero.store().as_bytes().iter().all(|&b| b == 0),
+            "zero by default"
+        );
+        let blank = Rom::new(
+            &Props::new()
+                .with("size", Value::Size(16))
+                .with("fill", 0xffu64),
+        )
+        .unwrap();
+        assert!(
+            blank.store().as_bytes().iter().all(|&b| b == 0xff),
+            "an unprogrammed part"
+        );
+        let too_wide = Props::new()
+            .with("size", Value::Size(16))
+            .with("fill", 0x100u64);
+        assert!(Rom::new(&too_wide).is_err(), "a fill is one byte");
     }
 
     #[test]
