@@ -50,7 +50,7 @@ fn unlock(flash: &Flash) {
     let keyr = match flash.variant() {
         Variant::F4 => F4_KEYR,
         Variant::U5 => U5_NSKEYR,
-        Variant::L4 | Variant::L4Plus => L4_KEYR,
+        Variant::L4 | Variant::L4Plus | Variant::Wb => L4_KEYR,
     };
     flash.poke(keyr, KEY1).expect("KEY1");
     flash.poke(keyr, KEY2).expect("KEY2");
@@ -61,7 +61,7 @@ fn opt_unlock(flash: &Flash) {
     let reg = match flash.variant() {
         Variant::F4 => F4_OPTKEYR,
         Variant::U5 => U5_OPTKEYR,
-        Variant::L4 | Variant::L4Plus => L4_OPTKEYR,
+        Variant::L4 | Variant::L4Plus | Variant::Wb => L4_OPTKEYR,
     };
     flash.poke(reg, OPTKEY1).expect("OPTKEY1");
     flash.poke(reg, OPTKEY2).expect("OPTKEY2");
@@ -1989,4 +1989,395 @@ fn a_u5_snapshot_round_trips_a_half_filled_quad_word() {
     assert_eq!(save(&restored), bytes);
     settle(&restored);
     assert_eq!(word(&restored, 0x407c), !31u32);
+}
+
+// ---------------------------------------------------------------------------
+// The WB (RM0434 §3; offsets and bits from ST CMSIS `stm32wb55xx.h`)
+// ---------------------------------------------------------------------------
+
+/// A 1 MiB STM32WB55xG: 256 pages of 4 KiB.
+const WB_SIZE: u64 = 1024 * 1024;
+
+/// A WB55 with the default option bytes: the full BLE stack's secure area
+/// from page 0xD0.
+fn wb() -> Flash {
+    build(Variant::Wb, WB_SIZE, None)
+}
+
+/// A WB with no secure area at all (`SFR.FSD` set), for the tests that are
+/// about the program engine rather than about CPU2.
+fn wb_open() -> Flash {
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("wb")))
+        .with("size", Value::Uint(WB_SIZE))
+        .with("sfr", Value::Uint(u64::from(WB_SFR_FSD)));
+    Flash::new(&props).expect("a WB flash")
+}
+
+/// Map the array at its address and read a word through it.
+fn wb_read(flash: &Flash, offset: u64, attrs: MemAttrs) -> MemResult<u64> {
+    let space = AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::FAULT);
+    let region = Device::region(flash, "array").expect("the array region");
+    space.topology().map(region, 0x0800_0000).unwrap();
+    space.read(0x0800_0000 + offset, Width::U32, attrs)
+}
+
+/// Program one double word as HAL's `FLASH_Program_DoubleWord` does.
+fn wb_double(flash: &Flash, offset: u64, low: u32, high: u32) -> MemResult {
+    flash.store(offset, &low.to_le_bytes())?;
+    flash.store(offset + 4, &high.to_le_bytes())
+}
+
+#[test]
+fn a_wb_comes_out_of_reset_as_rm0434_and_the_header_say() {
+    let flash = wb();
+    assert_eq!(flash.variant(), Variant::Wb);
+    assert_eq!(
+        Device::region(&flash, "regs").map(|r| r.len()),
+        Some(0x88),
+        "FLASH_TypeDef runs to SRRVR at +0x84"
+    );
+    assert_eq!(flash.peek(L4_CR), 0xc000_0000, "LOCK and OPTLOCK");
+    assert_eq!(
+        flash.peek(ACR),
+        0x0000_0600 | WB_ACR_EMPTY,
+        "caches on, and an empty part says so"
+    );
+    assert_eq!(flash.peek(WB_C2ACR), 0x0000_0600);
+    let optr = flash.peek(L4_OPTR);
+    assert_eq!(optr & 0xff, 0xaa, "RDP level 0");
+    assert_ne!(optr & WB_OPTR_ESE, 0, "security enabled: FSD is clear");
+    // SFSA = 0xD0 for the full BLE stack on 1 MiB, DDS set; SBRV at SFSA.
+    assert_eq!(flash.peek(WB_SFR), WB_SFR_DDS | 0xd0);
+    assert_eq!(flash.peek(WB_SRRVR) & 0x3_ffff, 0xd_0000 / 4);
+    assert_ne!(
+        flash.peek(WB_SRRVR) & (1 << 31),
+        0,
+        "C2OPT: CPU2 boots from flash"
+    );
+    assert_eq!(flash.peek(L4_WRP1AR), 0x0000_00ff, "no WRP area");
+    // The other sizes ST publishes an install address for.
+    for (size, sfsa) in [(0x8_0000u64, 0x5c), (0x4_0000, 0x1c), (0xa_0000, 0x7c)] {
+        let flash = build(Variant::Wb, size, None);
+        assert_eq!(flash.peek(WB_SFR) & WB_SFR_SFSA, sfsa, "{size:#x}");
+    }
+    // A WB array is whole 4 KiB pages, at most 256 of them.
+    for size in [WB_SIZE + 2048, 2 * WB_SIZE] {
+        let props = Props::new()
+            .with("variant", Value::Str(String::from("wb")))
+            .with("size", Value::Uint(size));
+        assert!(Flash::new(&props).is_err(), "{size}");
+    }
+    // `sfr` is the WB's; `pcrop2sr` is not.
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("l4")))
+        .with("size", Value::Uint(L4_SIZE))
+        .with("sfr", Value::Uint(0x1100));
+    assert!(Flash::new(&props).is_err());
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("wb")))
+        .with("size", Value::Uint(WB_SIZE))
+        .with("pcrop2sr", Value::Uint(0));
+    assert!(Flash::new(&props).is_err());
+}
+
+#[test]
+fn a_wb_key_written_twice_or_wrongly_is_a_bus_error() {
+    let flash = wb_open();
+    unlock(&flash);
+    assert!(flash.unlocked());
+    assert_eq!(
+        flash.poke(L4_KEYR, KEY1),
+        Err(BusError::BadAccess),
+        "after unlocking"
+    );
+    opt_unlock(&flash);
+    assert_eq!(flash.poke(L4_OPTKEYR, OPTKEY1), Err(BusError::BadAccess));
+    // Setting LOCK sets OPTLOCK with it.
+    flash.poke(L4_CR, CR_LOCK).unwrap();
+    assert_eq!(
+        flash.peek(L4_CR) & (CR_LOCK | L4_CR_OPTLOCK),
+        CR_LOCK | L4_CR_OPTLOCK
+    );
+
+    let flash = wb_open();
+    assert_eq!(flash.poke(L4_KEYR, 0x1234_5678), Err(BusError::BadAccess));
+    assert_eq!(
+        flash.poke(L4_KEYR, KEY1),
+        Err(BusError::BadAccess),
+        "until reset"
+    );
+    Device::reset(&flash, ResetKind::Warm);
+    unlock(&flash);
+    assert!(flash.unlocked());
+}
+
+#[test]
+fn a_wb_double_word_sets_cfgbsy_from_the_first_word_and_eop_only_with_eopie() {
+    let flash = wb_open();
+    unlock(&flash);
+    flash.poke(L4_CR, CR_PG).unwrap();
+    flash.store(0x1000, &0x1111_2222u32.to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash), WB_SR_CFGBSY, "the first word is in");
+    assert_eq!(
+        flash.poke(L4_CR, CR_PG | CR_EOPIE),
+        Err(BusError::BadAccess),
+        "CR may not change between the two words"
+    );
+    flash.store(0x1004, &0x3333_4444u32.to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash), SR_BSY | WB_SR_CFGBSY);
+    settle(&flash);
+    assert_eq!(sr(&flash), 0, "done, and no EOP without EOPIE");
+    assert_eq!(word(&flash, 0x1000), 0x1111_2222);
+    assert_eq!(word(&flash, 0x1004), 0x3333_4444);
+    // With EOPIE, EOP; zeroing a programmed double word is allowed.
+    flash.poke(L4_CR, CR_PG | CR_EOPIE).unwrap();
+    wb_double(&flash, 0x1000, 0, 0).unwrap();
+    settle(&flash);
+    assert_eq!(sr(&flash), SR_EOP);
+    assert_eq!(word(&flash, 0x1000), 0);
+    clear_sr(&flash);
+    // Anything else over a programmed double word is PROGERR, and OPERR only
+    // with ERRIE.
+    wb_double(&flash, 0x1000, 1, 1).unwrap();
+    assert_eq!(sr(&flash), SR_PROGERR);
+    // An uncleared program error makes the next program a sequence error.
+    flash.store(0x2000, &0u32.to_le_bytes()).unwrap();
+    assert_eq!(sr(&flash), SR_PROGERR | SR_PGSERR);
+    clear_sr(&flash);
+    flash.poke(L4_CR, CR_PG | CR_ERRIE).unwrap();
+    flash.store(0x2002, &[0, 0]).unwrap();
+    assert_eq!(sr(&flash), L4_SR_SIZERR | SR_OPERR);
+}
+
+#[test]
+fn a_wb_page_erase_is_4_kib_and_a_mass_erase_by_cpu1_is_a_bus_error() {
+    let flash = wb_open();
+    flash.load_image(0x3000, &[0u8; 0x2000]).unwrap();
+    unlock(&flash);
+    flash.poke(L4_CR, L4_CR_PER | (4 << 3) | CR_STRT).unwrap();
+    assert_eq!(sr(&flash), SR_BSY | WB_SR_CFGBSY);
+    settle(&flash);
+    assert_eq!(word(&flash, 0x3ffc), 0, "page 3 untouched");
+    assert_eq!(word(&flash, 0x4000), 0xffff_ffff);
+    assert_eq!(word(&flash, 0x4ffc), 0xffff_ffff);
+    // HAL's FLASH_MassErase from CPU1: ignored, and the bus says so.
+    flash.load_image(0, &[0u8; 8]).unwrap();
+    assert_eq!(
+        flash.poke(L4_CR, WB_CR_MER | CR_STRT),
+        Err(BusError::Protected)
+    );
+    settle(&flash);
+    assert_eq!(word(&flash, 0), 0, "nothing erased");
+    // PER with PG beside it is a sequence error; so is a page past the end.
+    flash.poke(L4_CR, L4_CR_PER | CR_PG | CR_STRT).unwrap();
+    assert_ne!(sr(&flash) & SR_PGSERR, 0);
+    clear_sr(&flash);
+    let small = build(Variant::Wb, 0x8_0000, None);
+    unlock(&small);
+    small
+        .poke(L4_CR, L4_CR_PER | (0xff << 3) | CR_STRT)
+        .unwrap();
+    assert_ne!(sr(&small) & SR_PGSERR, 0, "page 255 of a 512 KiB part");
+}
+
+#[test]
+fn cpu1_is_shut_out_of_the_wb_secure_area() {
+    let flash = wb();
+    let secure = 0xd0 * WB_PAGE;
+    flash
+        .load_image(secure, &0x5157_ac4bu32.to_le_bytes())
+        .unwrap();
+    flash.load_image(0, &0x2000_8000u32.to_le_bytes()).unwrap();
+    // Reads below SFSA are ordinary; reads above it are zeroes and RDERR.
+    assert_eq!(wb_read(&flash, 0, MemAttrs::DEFAULT), Ok(0x2000_8000));
+    assert_eq!(wb_read(&flash, secure, MemAttrs::DEFAULT), Ok(0));
+    assert_ne!(sr(&flash) & L4_SR_RDERR, 0);
+    clear_sr(&flash);
+    let fetch = MemAttrs::DEFAULT.with_purpose(crate::core::space::AccessPurpose::FETCH);
+    assert_eq!(wb_read(&flash, secure, fetch), Ok(0), "no execution either");
+    clear_sr(&flash);
+    // A debugger is refused outright, and moves no flag.
+    assert_eq!(
+        wb_read(&flash, secure, MemAttrs::DEBUG),
+        Err(BusError::Protected)
+    );
+    assert_eq!(sr(&flash) & L4_SR_RDERR, 0);
+    // A program there is a bus error and writes nothing.
+    unlock(&flash);
+    flash.poke(L4_CR, CR_PG).unwrap();
+    assert_eq!(
+        flash.store(secure + 8, &0u32.to_le_bytes()),
+        Err(BusError::Protected)
+    );
+    flash.poke(L4_CR, 0).unwrap();
+    // A page erase of a secure page too, with no WRPERR (RM0434 Table 5).
+    assert_eq!(
+        flash.poke(L4_CR, L4_CR_PER | (0xd0 << 3) | CR_STRT),
+        Err(BusError::Protected)
+    );
+    settle(&flash);
+    assert_eq!(sr(&flash) & SR_WRPERR, 0);
+    assert_eq!(word(&flash, secure), 0x5157_ac4b, "the stack survives");
+    // The page below SFSA is the application's.
+    flash
+        .poke(L4_CR, L4_CR_PER | (0xcf << 3) | CR_STRT)
+        .unwrap();
+    settle(&flash);
+    // SFR and SRRVR are CPU2's to write.
+    assert_eq!(flash.poke(WB_SFR, WB_SFR_FSD), Err(BusError::Protected));
+    assert_eq!(flash.poke(WB_SRRVR, 0), Err(BusError::Protected));
+    assert_eq!(flash.peek(WB_SFR) & WB_SFR_SFSA, 0xd0);
+    // A debugger cannot load there either, though the device's own door can.
+    assert_eq!(
+        flash.shared.program(secure, &[0; 4], MemAttrs::DEBUG),
+        Err(BusError::Protected)
+    );
+    assert!(flash.load_image(secure, &[1, 2, 3, 4]).is_ok());
+}
+
+#[test]
+fn a_wb_pes_suspends_a_new_operation_until_it_clears() {
+    let flash = wb_open();
+    unlock(&flash);
+    flash.poke(ACR, WB_ACR_RESET | WB_ACR_PES).unwrap();
+    assert_ne!(sr(&flash) & WB_SR_PESD, 0);
+    assert_ne!(flash.peek(WB_C2SR) & WB_SR_PESD, 0, "both CPUs see it");
+    flash.poke(L4_CR, CR_PG).unwrap();
+    wb_double(&flash, 0x100, 0xdead_beef, 0x0bad_f00d).unwrap();
+    settle(&flash);
+    assert_eq!(sr(&flash), SR_BSY | WB_SR_CFGBSY | WB_SR_PESD, "held back");
+    assert_eq!(word(&flash, 0x100), 0xffff_ffff);
+    assert_eq!(
+        flash.poke(L4_CR, 0),
+        Err(BusError::BadAccess),
+        "a CR write while PESD holds an operation"
+    );
+    // CPU2's PES holds it too, and only both clear lets it go.
+    flash.poke(WB_C2ACR, WB_ACR_RESET | WB_ACR_PES).unwrap();
+    flash.poke(ACR, WB_ACR_RESET).unwrap();
+    settle(&flash);
+    assert_ne!(sr(&flash) & SR_BSY, 0);
+    flash.poke(WB_C2ACR, WB_ACR_RESET).unwrap();
+    settle(&flash);
+    assert_eq!(sr(&flash), 0);
+    assert_eq!(word(&flash, 0x100), 0xdead_beef);
+}
+
+#[test]
+fn a_wb_wrp_and_pcrop_area_refuse_program_and_erase() {
+    let flash = wb_open();
+    unlock(&flash);
+    opt_unlock(&flash);
+    // WRP area A over pages 2..=3; PCROP area A over 2 KiB units 20..=23
+    // (pages 10 and 11).
+    flash.poke(L4_WRP1AR, (3 << 16) | 2).unwrap();
+    flash.poke(WB_PCROP1ASR, 20).unwrap();
+    flash.poke(WB_PCROP1AER, WB_PCROP_RDP | 23).unwrap();
+    flash.poke(L4_CR, L4_CR_PER | (3 << 3) | CR_STRT).unwrap();
+    assert_ne!(sr(&flash) & SR_WRPERR, 0);
+    clear_sr(&flash);
+    flash.poke(L4_CR, L4_CR_PER | (11 << 3) | CR_STRT).unwrap();
+    assert_ne!(sr(&flash) & SR_WRPERR, 0, "PCROP is erase-protected");
+    clear_sr(&flash);
+    flash.poke(L4_CR, L4_CR_PER | (12 << 3) | CR_STRT).unwrap();
+    settle(&flash);
+    assert_eq!(sr(&flash) & SR_WRPERR, 0);
+    // A PCROP area can grow but not shrink.
+    flash.poke(WB_PCROP1AER, 21).unwrap();
+    assert_eq!(flash.peek(WB_PCROP1AER), WB_PCROP_RDP | 23);
+    flash.poke(WB_PCROP1AER, 30).unwrap();
+    assert_eq!(flash.peek(WB_PCROP1AER), WB_PCROP_RDP | 30);
+    // Start equal to end protects the whole flash (RM0434 Table 15).
+    assert_eq!(wb_pcrop_area(5, 5, WB_SIZE), (0, WB_SIZE));
+    assert_eq!(wb_pcrop_area(6, 5, WB_SIZE), (0, 0));
+    assert_eq!(wb_pcrop_area(2, 3, WB_SIZE), (0x1000, 0x1000));
+}
+
+#[test]
+fn wb_option_bytes_commit_with_optstrt_keep_ese_read_only_and_reload() {
+    let flash = wb();
+    unlock(&flash);
+    opt_unlock(&flash);
+    let optr = flash.peek(L4_OPTR);
+    // ESE cannot be written; BOR_LEV can.
+    flash
+        .poke(L4_OPTR, (optr & !WB_OPTR_ESE) | (2 << 9))
+        .unwrap();
+    assert_ne!(flash.peek(L4_OPTR) & WB_OPTR_ESE, 0);
+    flash.poke(WB_IPCCBR, 0xffff_ffff).unwrap();
+    assert_eq!(flash.peek(WB_IPCCBR), 0x3fff);
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    settle(&flash);
+    Device::reset(&flash, ResetKind::Warm);
+    assert_eq!((flash.peek(L4_OPTR) >> 9) & 7, 2, "committed");
+    assert_eq!(flash.peek(WB_IPCCBR), 0x3fff);
+    assert_eq!(flash.peek(WB_SFR) & WB_SFR_SFSA, 0xd0, "SFR untouched");
+}
+
+#[test]
+fn a_wb_rdp_regression_keeps_the_secure_pages() {
+    // RDP level 1 in the option bytes, with the stack installed.
+    let props = Props::new()
+        .with("variant", Value::Str(String::from("wb")))
+        .with("size", Value::Uint(WB_SIZE))
+        .with("optr", Value::Uint(0x2d8f_70bb));
+    let flash = Flash::new(&props).expect("a WB at RDP 1");
+    let secure = 0xd0 * WB_PAGE;
+    flash.load_image(0, &[0u8; 16]).unwrap();
+    flash.load_image(secure, &[0u8; 16]).unwrap();
+    unlock(&flash);
+    opt_unlock(&flash);
+    let optr = flash.peek(L4_OPTR);
+    flash.poke(L4_OPTR, (optr & !0xff) | 0xaa).unwrap();
+    flash.poke(L4_CR, L4_CR_OPTSTRT).unwrap();
+    settle(&flash);
+    assert_eq!(word(&flash, 0), 0xffff_ffff, "the application is erased");
+    assert_eq!(word(&flash, secure), 0, "CPU2's stack is not");
+    assert_eq!(flash.peek(L4_OPTR) & 0xff, 0xaa);
+}
+
+#[test]
+fn a_wb_empty_check_follows_the_first_double_word_across_a_reset() {
+    let flash = wb_open();
+    assert_ne!(flash.peek(ACR) & WB_ACR_EMPTY, 0);
+    flash.load_image(0, &0x2003_0000u32.to_le_bytes()).unwrap();
+    Device::reset(&flash, ResetKind::Warm);
+    assert_eq!(flash.peek(ACR) & WB_ACR_EMPTY, 0);
+    // Firmware may overwrite it.
+    flash.poke(ACR, WB_ACR_RESET | WB_ACR_EMPTY | 3).unwrap();
+    assert_eq!(flash.peek(ACR), WB_ACR_RESET | WB_ACR_EMPTY | 3);
+    assert_eq!(flash.latency(), 3);
+}
+
+#[test]
+fn a_wb_snapshot_round_trips_a_suspended_operation_and_a_half_double_word() {
+    let saved = wb();
+    unlock(&saved);
+    saved.poke(ACR, WB_ACR_RESET | WB_ACR_PES).unwrap();
+    saved.poke(L4_CR, L4_CR_PER | (7 << 3) | CR_STRT).unwrap();
+    let bytes = save(&saved);
+    let restored = wb();
+    restore(&restored, &bytes);
+    assert_eq!(save(&restored), bytes, "identical state");
+    assert_eq!(sr(&restored), SR_BSY | WB_SR_CFGBSY | WB_SR_PESD);
+    restored.load_image(7 * WB_PAGE, &[0u8; 4]).unwrap();
+    restored.poke(ACR, WB_ACR_RESET).unwrap();
+    settle(&restored);
+    assert_eq!(word(&restored, 7 * WB_PAGE), 0xffff_ffff, "the erase ran");
+
+    let saved = wb_open();
+    unlock(&saved);
+    saved.poke(L4_CR, CR_PG).unwrap();
+    saved.store(0x800, &0x0102_0304u32.to_le_bytes()).unwrap();
+    let bytes = save(&saved);
+    let restored = wb_open();
+    restore(&restored, &bytes);
+    assert_eq!(save(&restored), bytes);
+    restored
+        .store(0x804, &0x0506_0708u32.to_le_bytes())
+        .unwrap();
+    settle(&restored);
+    assert_eq!(word(&restored, 0x800), 0x0102_0304);
+    assert_eq!(word(&restored, 0x804), 0x0506_0708);
 }

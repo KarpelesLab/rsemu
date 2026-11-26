@@ -232,6 +232,82 @@
 //!   (`ACR.PDREQx`, `PDKEYxR`) and the low-power read mode are not modelled:
 //!   `PDREQx` read back zero and `NSSR.PD1`/`PD2` never set.
 //!
+//! # The WB
+//!
+//! `variant = "wb"` is the STM32WB55/WB35 interface (ST **RM0434** §3), at
+//! `0x5800_4000` on those parts. Every offset and bit is `FLASH_TypeDef` and
+//! the `FLASH_*_Pos` definitions in ST CMSIS `stm32wb55xx.h` v1.12.4
+//! (Apache-2.0); ST's STM32WB HAL (`stm32wbxx_hal_flash.c`, BSD-3-Clause) was
+//! read for what firmware polls — `BSY`, then `CFGBSY` — and none of it is
+//! copied here. It keeps the L4's shape for the registers CPU1 drives
+//! (`KEYR` `+0x08`, `SR` `+0x10`, `CR` `+0x14`, `OPTR` `+0x20`) and differs in
+//! what a second core and its wireless stack bring:
+//!
+//! * **One bank of 4 KiB pages** (256 on a 1 MiB WB55, 128 on a 512 KiB WB35;
+//!   RM0434 §3.3.1). `CR.PNB[7:0]` names the page; there is no `BKER` and no
+//!   `MER2`. Double-word programming as on the L4, two 32-bit stores into one
+//!   aligned double word, with the U5's exception: a double word **of all
+//!   zeroes** may be programmed over one already programmed ("except if the
+//!   data to write is 0x0000 0000 0000 0000", `FLASH_SR.PROGERR`). A program
+//!   or erase over an uncleared earlier program error is `PGSERR`.
+//! * **`CFGBSY` and `PESD`.** `SR.CFGBSY` is set "when first word is sent for
+//!   program, or when setting STRT for erase" and cleared when the operation
+//!   ends; HAL's `FLASH_WaitForLastOperation` polls it after `BSY`.
+//!   `ACR.PES` (or CPU2's `C2ACR.PES`) suspends any *new* program or erase:
+//!   `SR.PESD` reads one, an operation requested meanwhile holds `BSY` and
+//!   `CFGBSY` and starts when both `PES` bits clear (RM0434 §3.7).
+//! * **The secure area.** `SFR.SFSA` is the first 4 KiB page of the flash
+//!   that belongs to CPU2's wireless stack, from there to the end of the
+//!   array, unless `SFR.FSD` is set. CPU1 is shut out of it as RM0434 says:
+//!   a **program** there "is ignored and a bus error is generated" (§3.3.8);
+//!   a page **erase** of a secure page is "aborted" with a CPU1 bus error and
+//!   no `WRPERR` (Table 5); a **read** "triggers RDERR" (§3.6.4) and returns
+//!   zeroes, like a `PCROP` data read — instruction fetches included, since
+//!   the area is "protected against execution, read and write from third
+//!   parties"; a **debugger** gets a bus error both ways ("The debugger has
+//!   no access to … the secure … memory areas"). `OPTR.ESE` reads as the
+//!   inverse of `FSD`. The device's own side door ([`Flash::load_image`],
+//!   the `image` property) still writes there, which is how a board installs
+//!   the stack image the CPU2 model runs.
+//! * **What CPU1 may not do at all.** A **mass erase** "by the CPU1 is
+//!   ignored and a bus error is generated" (§3.3.7) — `MER|STRT` is a bus
+//!   fault and nothing is erased. `SFR` and `SRRVR` "can only be written by
+//!   the CPU2. A write access from the CPU1 is ignored and a bus error
+//!   generated" (§3.10.18–19). A `CR` write between the two words of a double
+//!   word, or while `PESD` holds an operation, is a bus error; so are a wrong
+//!   key and any key written after the unlock it was for (§3.3.8,
+//!   "Programming errors causing a bus error"). Setting `LOCK` sets `OPTLOCK`
+//!   too (§3.4.2).
+//! * **`PCROP`** is two areas, A (`PCROP1ASR`/`PCROP1AER`) and B
+//!   (`PCROP1BSR`/`PCROP1BER`), in **2 KiB** units, start above end meaning
+//!   none and start equal to end meaning *the whole flash* (RM0434 Table 15).
+//!   `WRP1AR`/`WRP1BR` are two 4 KiB page ranges. Both are enforced as on the
+//!   L4. An `RDP` 1 → 0 regression erases the non-secure pages (and keeps the
+//!   `PCROP` ones if `PCROP_RDP` is clear) — "except for the pages protected
+//!   by CPU2 security (SFSA)" (§3.6.1, Table 13).
+//! * **CPU2's registers.** `C2ACR`, `C2SR` and `C2CR` are decoded: `C2ACR.PES`
+//!   is live, because it suspends CPU1's operations too, `C2SR` reports
+//!   `PESD`, and `C2CR` is storage. CPU2's own program and erase engine is
+//!   not modelled here; the CPU2 model owns what the stack writes.
+//! * **Option bytes**: `OPTR`, `PCROP1ASR`/`AER`/`BSR`/`BER`, `WRP1AR`/`BR`,
+//!   `IPCCBR`, `SFR` and `SRRVR` are storage committed by `OPTSTRT` and
+//!   loaded by `OBL_LAUNCH`, with `optr`, `sfr` and `srrvr` properties for a
+//!   board's own values. The default `SFR` puts `SFSA` where ST's current
+//!   full BLE stack installs (`stm32wb5x_BLE_Stack_full_fw.bin` v1.25.0 at
+//!   `0x080D_0000` on a 1 MiB part, `0x0805_C000` on 512 KiB and
+//!   `0x0801_C000` on 256 KiB — the STM32CubeWB coprocessor binaries release
+//!   notes, which also give the rule "the maximum flash memory that can be
+//!   used by the application is up to the Secure Flash Start Address"), with
+//!   `DDS` set as on a part with a stack installed. The default `SRRVR`
+//!   points `SBRV` at `SFSA` (`C2OPT` = 1, flash) and secures SRAM2a from
+//!   page `0x0A` and SRAM2b from page `0x0F` — figures reported from a
+//!   working WB55 with the BLE stack (ST community), not from a manual.
+//! * **Not modelled**: ECC (`ECCR` is its reset value plus `ECCIE`), the OTP
+//!   area and the option-byte page in the information block (they are not in
+//!   this array), `MISSERR`/`FASTERR` (fast programming behaves as ordinary
+//!   programming), the bus stall a `CR` write sees while `CFGBSY` is set by
+//!   the other CPU, and the HSI16 the controller switches on by itself.
+//!
 //! # Time
 //!
 //! A program or an erase takes time, and firmware polls `SR.BSY` for it. As in
@@ -344,6 +420,9 @@ pub enum Variant {
     /// RM0456 §7: the STM32U5 — two banks of 8 KiB pages, quad-word
     /// programming, the non-secure register copies of a `TZEN = 0` part.
     U5,
+    /// RM0434 §3: the STM32WB55/WB35 — one bank of 4 KiB pages, the L4's
+    /// double words, and CPU2's secure area at the top of the array.
+    Wb,
 }
 
 impl Variant {
@@ -355,6 +434,7 @@ impl Variant {
             Variant::L4 => "l4",
             Variant::L4Plus => "l4plus",
             Variant::U5 => "u5",
+            Variant::Wb => "wb",
         }
     }
 
@@ -368,19 +448,33 @@ impl Variant {
         matches!(self, Variant::U5)
     }
 
-    /// Whether this is the RM0351/RM0432 layout, the only one with `PCROP`.
+    /// Whether this is the RM0351/RM0432 layout.
     fn is_l4(self) -> bool {
         matches!(self, Variant::L4 | Variant::L4Plus)
     }
 
+    /// Whether this is the RM0434 layout.
+    fn is_wb(self) -> bool {
+        matches!(self, Variant::Wb)
+    }
+
+    /// Whether this variant has `PCROP` areas: the L4 family's and the WB's.
+    fn has_pcrop(self) -> bool {
+        self.is_l4() || self.is_wb()
+    }
+
     /// How many register words a snapshot of this variant carries.
     fn saved_words(self) -> usize {
-        if self.is_u5() { WORDS } else { LEGACY_WORDS }
+        if self.is_u5() || self.is_wb() {
+            WORDS
+        } else {
+            LEGACY_WORDS
+        }
     }
 
     /// How many option words a snapshot of this variant carries.
     fn saved_option_words(self) -> usize {
-        if self.is_u5() {
+        if self.is_u5() || self.is_wb() {
             OPT_WORDS
         } else {
             LEGACY_OPT_WORDS
@@ -406,6 +500,8 @@ impl Variant {
             Variant::L4 | Variant::L4Plus => 0x54,
             // Through `PRIVBB2R4` at `+0xFC` (`FLASH_TypeDef`).
             Variant::U5 => 0x100,
+            // Through `SRRVR` at `+0x84` (`FLASH_TypeDef`, `stm32wb55xx.h`).
+            Variant::Wb => 0x88,
         }
     }
 
@@ -438,6 +534,18 @@ impl Variant {
                 U5_SECWM2R2,
                 U5_WRP2AR,
                 U5_WRP2BR,
+            ],
+            Variant::Wb => &[
+                L4_OPTR,
+                WB_PCROP1ASR,
+                WB_PCROP1AER,
+                L4_WRP1AR,
+                L4_WRP1BR,
+                WB_PCROP1BSR,
+                WB_PCROP1BER,
+                WB_IPCCBR,
+                WB_SFR,
+                WB_SRRVR,
             ],
         }
     }
@@ -578,6 +686,105 @@ const U5_BOOT_LOCK: u32 = 1 << 0;
 const U5_SECWM_R1_MASK: u32 = 0x007f_007f;
 /// U5 `SECWMxR2`: `HDPx_PEND`, `HDPxEN`.
 const U5_SECWM_R2_MASK: u32 = 0x807f_0000;
+
+// -- WB register offsets (ST CMSIS `stm32wb55xx.h`, `FLASH_TypeDef`) ---------
+//
+// `ACR`, `KEYR`, `OPTKEYR`, `SR`, `CR`, `ECCR`, `OPTR` and `WRP1AR`/`WRP1BR`
+// sit where the L4's do, and the `L4_*` names are used for them.
+
+/// WB: `FLASH_PCROP1ASR` — the L4's `PCROP1SR` offset, in 2 KiB units here.
+const WB_PCROP1ASR: u64 = 0x24;
+/// WB: `FLASH_PCROP1AER`, with `PCROP_RDP` in bit 31.
+const WB_PCROP1AER: u64 = 0x28;
+/// WB: `FLASH_PCROP1BSR`.
+const WB_PCROP1BSR: u64 = 0x34;
+/// WB: `FLASH_PCROP1BER`.
+const WB_PCROP1BER: u64 = 0x38;
+/// WB: `FLASH_IPCCBR`, the IPCC mailbox buffer's double-word offset in SRAM2.
+const WB_IPCCBR: u64 = 0x3c;
+/// WB: `FLASH_C2ACR`, CPU2's access control.
+const WB_C2ACR: u64 = 0x5c;
+/// WB: `FLASH_C2SR`, CPU2's status.
+const WB_C2SR: u64 = 0x60;
+/// WB: `FLASH_C2CR`, CPU2's control.
+const WB_C2CR: u64 = 0x64;
+/// WB: `FLASH_SFR`, the secure flash start — CPU2-writable only.
+const WB_SFR: u64 = 0x80;
+/// WB: `FLASH_SRRVR`, secure SRAM2 starts and the CPU2 reset vector.
+const WB_SRRVR: u64 = 0x84;
+
+/// WB `ACR`: `LATENCY[2:0]`, `PRFTEN`, `ICEN`, `DCEN`, `ICRST`, `DCRST`,
+/// `PES`, `EMPTY` (RM0434 §3.10.1).
+const WB_ACR_MASK: u32 = 0x7 | (0x1f << 8) | WB_ACR_PES | WB_ACR_EMPTY;
+/// WB `ACR.PES` / `C2ACR.PES`: suspend new program and erase operations.
+const WB_ACR_PES: u32 = 1 << 15;
+/// WB `ACR.EMPTY`: the first double word of the user flash is erased.
+const WB_ACR_EMPTY: u32 = 1 << 16;
+/// WB `ACR` and `C2ACR` out of reset: both caches on (RM0434 §3.10.1, §3.10.15).
+const WB_ACR_RESET: u32 = 0x0000_0600;
+/// WB `C2ACR`'s writable bits: `PRFTEN`, `ICEN`, `ICRST`, `PES`. Bit 10 is
+/// reserved and keeps its reset value.
+const WB_C2ACR_MASK: u32 = (1 << 8) | (1 << 9) | (1 << 11) | WB_ACR_PES;
+/// WB `C2CR`'s storage bits: `PG`, `PER`, `MER`, `PNB`, `FSTPG`, `EOPIE`,
+/// `ERRIE`, `RDERRIE` (RM0434 §3.10.17). `STRT` is a strobe.
+const WB_C2CR_MASK: u32 = 0x7ff | L4_CR_FSTPG | CR_EOPIE | CR_ERRIE | L4_CR_RDERRIE;
+/// WB `SR.CFGBSY`: a program or erase has its configuration in use.
+const WB_SR_CFGBSY: u32 = 1 << 18;
+/// WB `SR.PESD`: new program/erase operations are suspended.
+const WB_SR_PESD: u32 = 1 << 19;
+/// WB `CR.MER` — the one mass erase, which CPU1 may not start.
+const WB_CR_MER: u32 = 1 << 2;
+/// WB `CR.PNB[7:0]`, at bit 3.
+const WB_CR_PNB: u32 = 0xff << 3;
+/// The `CR` bits a WB keeps as storage while unlocked.
+const WB_CR_STORED: u32 =
+    CR_PG | L4_CR_PER | WB_CR_MER | WB_CR_PNB | L4_CR_FSTPG | CR_EOPIE | CR_ERRIE | L4_CR_RDERRIE;
+/// The WB program errors that, left uncleared, make the next program or
+/// erase a sequence error: `PROGERR`, `WRPERR`, `PGAERR`, `SIZERR`, `PGSERR`,
+/// `MISSERR`, `FASTERR` (RM0434 §3.3.8).
+const WB_PROGRAM_ERRORS: u32 =
+    SR_PROGERR | SR_WRPERR | SR_PGAERR | L4_SR_SIZERR | SR_PGSERR | (1 << 8) | (1 << 9);
+/// WB `OPTR.ESE`: read-only, the inverse of `SFR.FSD`.
+const WB_OPTR_ESE: u32 = 1 << 8;
+/// WB `OPTR`'s writable bits: `RDP`, `BOR_LEV`, the three `nRST_*`, the
+/// watchdog options, `nBOOT1`, `SRAM2_PE`, `SRAM2_RST`, `nSWBOOT0`, `nBOOT0`
+/// and `AGC_TRIM` (RM0434 §3.10.7).
+const WB_OPTR_WRITABLE: u32 = 0xef8f_7eff;
+/// WB `PCROPxySR`/`PCROPxyER`: the 2 KiB page field, `[8:0]`.
+const WB_PCROP_FIELD: u32 = 0x1ff;
+/// WB `PCROP1AER.PCROP_RDP` — the L4's bit, in the same place.
+const WB_PCROP_RDP: u32 = L4_PCROP_RDP;
+/// WB `WRP1xR`: `WRP1x_STRT[7:0]` and `WRP1x_END[23:16]`.
+const WB_WRP_MASK: u32 = 0x00ff_00ff;
+/// WB `IPCCBR.IPCCDBA[13:0]`.
+const WB_IPCCBR_MASK: u32 = 0x3fff;
+/// WB `SFR.FSD`: "System and flash memory non-secure".
+const WB_SFR_FSD: u32 = 1 << 8;
+/// WB `SFR.DDS`: CPU2 debug access disabled.
+const WB_SFR_DDS: u32 = 1 << 12;
+/// WB `SFR.SFSA[7:0]`.
+const WB_SFR_SFSA: u32 = 0xff;
+/// A WB page: 4 KiB (RM0434 §3.3.1), which is also `SFSA`'s and `WRP`'s unit.
+pub const WB_PAGE: u64 = 4 * 1024;
+/// A WB `PCROP` unit: 2 KiB (RM0434 §3.6.2).
+const WB_PCROP_GRAIN: u64 = 2 * 1024;
+
+/// Where ST's full BLE stack v1.25.0 installs, as a page number, by flash
+/// size — and so the default `SFSA` (STM32CubeWB
+/// `Projects/STM32WB_Copro_Wireless_Binaries/STM32WB5x/Release_Notes.html`
+/// and `STM32WB3x/Release_Notes.html`, "Wireless Coprocessor Binary Table",
+/// `stm32wb5x_BLE_Stack_full_fw.bin` / `stm32wb3x_BLE_Stack_full_fw.bin`).
+/// A size not in the table defaults to no secure area at all.
+#[must_use]
+pub fn wb_default_sfsa(size: u64) -> Option<u32> {
+    match size {
+        0x10_0000 => Some(0xd0),
+        0x0a_0000 => Some(0x7c),
+        0x08_0000 => Some(0x5c),
+        0x04_0000 => Some(0x1c),
+        _ => None,
+    }
+}
 
 // -- SR bits -----------------------------------------------------------------
 
@@ -783,6 +990,24 @@ fn pcrop_area(strt: u32, end: u32) -> (u64, u64) {
     (strt * PCROP_GRAIN, (end + 1 - strt) * PCROP_GRAIN)
 }
 
+/// The area a WB `PCROPxySR`/`PCROPxyER` pair describes, as `(offset, len)`
+/// into a `size`-byte array (RM0434 §3.6.2, Table 15): 2 KiB units from
+/// `STRT` to `END` inclusive, none when the start is above the end — and the
+/// **whole flash** when they are equal.
+fn wb_pcrop_area(strt: u32, end: u32, size: u64) -> (u64, u64) {
+    let strt = u64::from(strt & WB_PCROP_FIELD);
+    let end = u64::from(end & WB_PCROP_FIELD);
+    if strt > end {
+        return (0, 0);
+    }
+    if strt == end {
+        return (0, size);
+    }
+    let offset = (strt * WB_PCROP_GRAIN).min(size);
+    let stop = ((end + 1) * WB_PCROP_GRAIN).min(size);
+    (offset, stop - offset)
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -832,6 +1057,9 @@ struct State {
     optkey_error: bool,
     /// The tick this device has been advanced to.
     tick: u64,
+    /// WB: the ticks an operation requested while `PESD` was set still needs
+    /// once the suspension lifts; zero when nothing is suspended.
+    suspended: u64,
 }
 
 impl State {
@@ -845,6 +1073,13 @@ impl State {
             // `ACR` resets to zero wait states with the prefetch off, and
             // `NSCR` with both locks set (RM0456 §7.9).
             words[(U5_NSCR / 4) as usize] = CR_LOCK | L4_CR_OPTLOCK;
+        } else if variant.is_wb() {
+            // "Reset value: 0x0000 0600" for `ACR` and `C2ACR`, "0xC000 0000"
+            // for `CR` (RM0434 §3.10.1, §3.10.5, §3.10.15). `ACR.EMPTY` is the
+            // empty check's and the caller sets it.
+            words[(ACR / 4) as usize] = WB_ACR_RESET;
+            words[(WB_C2ACR / 4) as usize] = WB_ACR_RESET;
+            words[(L4_CR / 4) as usize] = CR_LOCK | L4_CR_OPTLOCK;
         } else {
             // `ACR` comes up with the caches on: "Reset value: 0x0000 0600"
             // (RM0351 §3.7.1).
@@ -867,6 +1102,7 @@ impl State {
             key_error: false,
             optkey_error: false,
             tick: 0,
+            suspended: 0,
         };
         state.load_option_bytes(variant);
         state
@@ -964,8 +1200,49 @@ fn default_option_bytes(variant: Variant) -> [u32; OPT_WORDS] {
             out[10] = 0x8000_007f;
             out[11] = 0x8000_007f;
         }
+        Variant::Wb => {
+            // `OPTR` as ST ships it, "0b001x 1101 1xxx 1111 x111 0001 1010
+            // 1010" with the `x` bits zero: `AGC_TRIM` = 1, `nBOOT0`,
+            // `nSWBOOT0`, `SRAM2_PE` (parity off), `nBOOT1`, both watchdogs in
+            // software mode and running in Stop/Standby, the three `nRST_*`,
+            // `BOR_LEV` = 0, `RDP` = 0xAA. `ESE` (bit 8) is not stored: it
+            // reads back from `SFR.FSD` (RM0434 §3.4.1, §3.10.7).
+            out[0] = 0x2d8f_70aa;
+            // `PCROP` A and B start above where they end — no area — and
+            // `PCROP_RDP` set, as shipped (§3.4.1).
+            out[1] = WB_PCROP_FIELD;
+            out[2] = WB_PCROP_RDP;
+            // `WRP` A and B the same way: start page 0xFF, end page 0.
+            out[3] = 0x0000_00ff;
+            out[4] = 0x0000_00ff;
+            out[5] = WB_PCROP_FIELD;
+            out[6] = 0;
+            // `IPCCBR`: "0bXXXX … XX00 0000 0000 0000", offset zero.
+            out[7] = 0;
+            // `SFR` and `SRRVR` depend on the part's size; `Flash::new`
+            // fills them. Until then, no secure area.
+            out[8] = WB_SFR_DDS | WB_SFR_FSD;
+            out[9] = 0;
+        }
     }
     out
+}
+
+/// The default WB `SFR` and `SRRVR` for a part of `size` bytes: the secure
+/// area where ST's full BLE stack installs (see [`wb_default_sfsa`]), CPU2's
+/// debug disabled, CPU2 booting from `SFSA` in flash, and SRAM2a/SRAM2b secure
+/// from 1 KiB page `0x0A`/`0x0F` (see the module header for where those come
+/// from). A size the table does not know gets no secure area.
+fn wb_default_secure(size: u64) -> (u32, u32) {
+    let Some(sfsa) = wb_default_sfsa(size) else {
+        return (WB_SFR_DDS | WB_SFR_FSD, 0);
+    };
+    let sfr = WB_SFR_DDS | sfsa;
+    // `C2OPT` (31) = flash; `NBRSD` (30) = 0, `SNBRSA[29:25]` = 0x0F; `BRSD`
+    // (23) = 0, `SBRSA[22:18]` = 0x0A; `SBRV[17:0]` the word offset of SFSA.
+    let sbrv = (sfsa << 12) / 4;
+    let srrvr = (1 << 31) | (0x0f << 25) | (0x0a << 18) | sbrv;
+    (sfr, srrvr)
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1273,9 @@ struct Shared {
     pcrop: [AtomicU64; 2],
     /// The `RDP` level in force, likewise published for the read side.
     rdp: AtomicU32,
+    /// WB: the byte offset CPU2's secure area starts at, likewise published;
+    /// `size` when there is none.
+    secure: AtomicU64,
     /// Whether a debugger has the core stopped ([`Device::debug_halt`]).
     ///
     /// Not guest state and not in the snapshot: it belongs to whatever is
@@ -1056,6 +1336,8 @@ impl Shared {
             };
             self.pcrop[bank].store(packed, Ordering::Relaxed);
         }
+        self.secure
+            .store(self.secure_start(state), Ordering::Relaxed);
         self.tick.store(state.tick, Ordering::Relaxed);
         let next = if state.busy_at <= state.tick {
             u64::MAX
@@ -1110,8 +1392,10 @@ impl Shared {
         let sr = self.sr_offset();
         *state.word_mut(sr) &= !SR_BSY;
         // On a U5 "this bit is set only if the end of operation interrupts
-        // are enabled (EOPIE = 1)" (RM0456 §7.9, `FLASH_NSSR`).
-        if !self.variant.is_u5() || state.word(self.cr_offset()) & CR_EOPIE != 0 {
+        // are enabled (EOPIE = 1)" (RM0456 §7.9, `FLASH_NSSR`), and RM0434
+        // §3.10.4 says the same of the WB's `FLASH_SR`.
+        let eop_needs_ie = self.variant.is_u5() || self.variant.is_wb();
+        if !eop_needs_ie || state.word(self.cr_offset()) & CR_EOPIE != 0 {
             *state.word_mut(sr) |= SR_EOP;
         }
     }
@@ -1122,7 +1406,7 @@ impl Shared {
         match self.variant {
             Variant::F4 => F4_SR,
             Variant::U5 => U5_NSSR,
-            Variant::L4 | Variant::L4Plus => L4_SR,
+            Variant::L4 | Variant::L4Plus | Variant::Wb => L4_SR,
         }
     }
 
@@ -1130,7 +1414,7 @@ impl Shared {
         match self.variant {
             Variant::F4 => F4_CR,
             Variant::U5 => U5_NSCR,
-            Variant::L4 | Variant::L4Plus => L4_CR,
+            Variant::L4 | Variant::L4Plus | Variant::Wb => L4_CR,
         }
     }
 
@@ -1139,7 +1423,7 @@ impl Shared {
         match self.variant {
             Variant::F4 => F4_OPTCR,
             Variant::U5 => U5_OPTR,
-            Variant::L4 | Variant::L4Plus => L4_OPTR,
+            Variant::L4 | Variant::L4Plus | Variant::Wb => L4_OPTR,
         }
     }
 
@@ -1147,7 +1431,9 @@ impl Shared {
         match self.variant {
             Variant::F4 => F4_ERRORS,
             Variant::U5 => U5_ERRORS,
-            Variant::L4 | Variant::L4Plus => L4_ERRORS,
+            // The WB's `SR` has the L4's error bits in the L4's places
+            // (RM0434 §3.10.4).
+            Variant::L4 | Variant::L4Plus | Variant::Wb => L4_ERRORS,
         }
     }
 
@@ -1175,7 +1461,8 @@ impl Shared {
     /// only to the smaller parts' single-bank mode, which is not modelled.
     fn dual_bank(&self, state: &State) -> bool {
         match self.variant {
-            Variant::F4 => false,
+            // RM0434 §3.2: "single bank architecture".
+            Variant::F4 | Variant::Wb => false,
             Variant::U5 => true,
             Variant::L4 | Variant::L4Plus => state.word(L4_OPTR) & (1 << 21) != 0,
         }
@@ -1203,6 +1490,15 @@ impl Shared {
     /// An F4 has none — `SPRMOD` is an F42x/F43x bit and this variant decodes
     /// an F405/407 (see the module header).
     fn pcrop_range(&self, state: &State, bank: usize) -> (u64, u64) {
+        if self.variant.is_wb() {
+            // On a WB the two "banks" are areas A and B of the one bank.
+            let (sr, er) = if bank == 0 {
+                (WB_PCROP1ASR, WB_PCROP1AER)
+            } else {
+                (WB_PCROP1BSR, WB_PCROP1BER)
+            };
+            return wb_pcrop_area(state.word(sr), state.word(er), self.size);
+        }
         // A U5 has no `PCROP` at all; its execute-only areas are the secure
         // world's, which a `TZEN = 0` part does not have.
         if !self.variant.is_l4() {
@@ -1253,6 +1549,44 @@ impl Shared {
         })
     }
 
+    /// WB: where CPU2's secure area starts, as a byte offset into the array —
+    /// `SFSA` pages, or the end of the array when `SFR.FSD` is set or on any
+    /// other variant (RM0434 §3.6.4).
+    fn secure_start(&self, state: &State) -> u64 {
+        if !self.variant.is_wb() {
+            return self.size;
+        }
+        let sfr = state.word(WB_SFR);
+        if sfr & WB_SFR_FSD != 0 {
+            return self.size;
+        }
+        (u64::from(sfr & WB_SFR_SFSA) * WB_PAGE).min(self.size)
+    }
+
+    /// Whether `[offset, offset + len)` reaches into CPU2's secure area, from
+    /// the lock-free mirror.
+    fn secure_hit(&self, offset: u64, len: u64) -> bool {
+        offset.saturating_add(len) > self.secure.load(Ordering::Relaxed)
+    }
+
+    /// WB: whether `ACR.PES` or `C2ACR.PES` is set — `SR.PESD`.
+    fn pesd(&self, state: &State) -> bool {
+        self.variant.is_wb() && (state.word(ACR) | state.word(WB_C2ACR)) & WB_ACR_PES != 0
+    }
+
+    /// WB: the empty check the option-byte loader makes, into `ACR.EMPTY`
+    /// (RM0434 §3.3.2): set when the first double word of the user flash is
+    /// erased.
+    fn empty_check(&self, state: &mut State) {
+        if !self.variant.is_wb() {
+            return;
+        }
+        let mut first = [0u8; 8];
+        let _ = self.array.read_at(0, &mut first);
+        let acr = state.word(ACR) & !WB_ACR_EMPTY;
+        *state.word_mut(ACR) = acr | if first == [0xff; 8] { WB_ACR_EMPTY } else { 0 };
+    }
+
     /// Whether a program or an erase is barred because something is debugging.
     ///
     /// "When the memory read protection level is selected (RDP level = 1), it
@@ -1298,6 +1632,20 @@ impl Shared {
     /// two relaxed loads and without the state lock, because this is an
     /// instruction fetch on a Cortex-M board.
     fn read_array(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
+        if self.secure_hit(offset, dst.len() as u64) {
+            // CPU2's secure area. "The debugger has no access to … the secure
+            // … memory areas", and "any CPU1 access to a CPU2 security area
+            // triggers RDERR" (RM0434 §3.6.4): the bytes are zeroes, as for a
+            // `PCROP` data read, and a fetch is no exception — the area is
+            // "protected against execution, read and write from third
+            // parties".
+            if attrs.debug {
+                return Err(BusError::Protected);
+            }
+            dst.fill(0);
+            self.raise_rderr();
+            return Ok(());
+        }
         if attrs.debug && self.rdp.load(Ordering::Relaxed) >= 1 {
             // "In debug mode … the Flash main memory … [is] totally
             // inaccessible. In these modes, a read or write access to the
@@ -1438,8 +1786,15 @@ impl Shared {
     /// The backup registers and SRAM2, which the same sentence erases, are not
     /// this device's to erase and are not modelled — see the module header.
     fn regress_rdp(&self, state: &mut State) {
-        // Only an L4 has `PCROP`, so only an L4 can make this partial.
-        let full = !self.variant.is_l4() || state.word(L4_PCROP1ER) & L4_PCROP_RDP != 0;
+        // Only the L4 family and the WB have `PCROP`, so only they can make
+        // this partial. `PCROP_RDP` lives in the first area's end register on
+        // both (`PCROP1ER` = `PCROP1AER`, `+0x28`).
+        let keep_pcrop = self.variant.has_pcrop() && state.word(L4_PCROP1ER) & L4_PCROP_RDP == 0;
+        // "A requested mass erase performs a partial mass erase (a sequence of
+        // page erases), except for the pages protected by CPU2 security
+        // (SFSA). This is done to keep the CPU2 secure code" (RM0434 §3.6.1).
+        let secure = self.secure_start(state);
+        let full = !keep_pcrop && secure >= self.size;
         if full {
             let _ = self.array.fill(0, self.size, 0xff);
         } else {
@@ -1447,7 +1802,9 @@ impl Shared {
             let mut at = 0;
             while at < self.size {
                 let len = page.min(self.size - at);
-                if !self.pcrop_protected(state, at, len) {
+                let kept = (keep_pcrop && self.pcrop_protected(state, at, len))
+                    || at.saturating_add(len) > secure;
+                if !kept {
                     let _ = self.array.fill(at, len, 0xff);
                 }
                 at += page;
@@ -1459,12 +1816,18 @@ impl Shared {
         } else {
             (stored[0] & !0xff) | RDP_LEVEL0
         };
-        if full && self.variant.is_l4() {
+        if !keep_pcrop && self.variant.has_pcrop() {
             // "PCROP is disable[d]", and `PCROP_RDP` "is reset after a full
             // mass erase due to a change of RDP from Level 1 to Level 0"
             // (§3.7.10) — so the area goes back to the factory shape, whose
-            // start is above its end.
-            for (sr, er) in [(L4_PCROP1SR, L4_PCROP1ER), (L4_PCROP2SR, L4_PCROP2ER)] {
+            // start is above its end. (A WB keeping its secure pages still
+            // erased every `PCROP` page, so its areas go too.)
+            let pairs = if self.variant.is_wb() {
+                [(WB_PCROP1ASR, WB_PCROP1AER), (WB_PCROP1BSR, WB_PCROP1BER)]
+            } else {
+                [(L4_PCROP1SR, L4_PCROP1ER), (L4_PCROP2SR, L4_PCROP2ER)]
+            };
+            for (sr, er) in pairs {
                 if let Some(slot) = self.option_slot(sr) {
                     stored[slot] = 0x0000_ffff;
                 }
@@ -1506,7 +1869,10 @@ impl Shared {
         // difference a model may average away.
         // The U5 has the F4's rule: "This bit is set only if error interrupts
         // are enabled (ERRIE = 1)" (RM0456 §7.9, `FLASH_NSSR`).
-        let operr = if (self.variant.is_f4() || self.variant.is_u5()) && !errie {
+        // So has the WB (RM0434 §3.10.4: "set only if error interrupts are
+        // enabled").
+        let operr_needs_ie = self.variant.is_f4() || self.variant.is_u5() || self.variant.is_wb();
+        let operr = if operr_needs_ie && !errie {
             0
         } else {
             SR_OPERR
@@ -1530,7 +1896,9 @@ impl Shared {
         match self.variant {
             Variant::F4 => self.f4_protected(state, offset, len),
             Variant::U5 => self.u5_protected(state, offset, len),
-            Variant::L4 | Variant::L4Plus => self.l4_protected(state, offset, len),
+            // The WB's `WRP1AR`/`WRP1BR` are the L4's bank-1 pair, 4 KiB pages
+            // and eight-bit fields, in a part with one bank.
+            Variant::L4 | Variant::L4Plus | Variant::Wb => self.l4_protected(state, offset, len),
         }
     }
 
@@ -1671,6 +2039,11 @@ impl Shared {
             // does not start an operation. `MemAttrs::debug`'s rule is that the
             // access must not disturb the device's visible state, and this is
             // the only write that satisfies it.
+            if self.secure_hit(offset, src.len() as u64) {
+                // Except into CPU2's secure area, which a debugger cannot
+                // reach on a WB (RM0434 §3.6.4).
+                return Err(BusError::Protected);
+            }
             return self.array.write_at(offset, src);
         }
         if offset
@@ -1680,16 +2053,108 @@ impl Shared {
             return Err(BusError::BadAccess);
         }
         self.sync(attrs);
-        {
+        let result = {
             let mut state = self.state.lock();
-            match self.variant {
-                Variant::F4 => self.program_f4(&mut state, offset, src),
-                Variant::U5 => self.program_u5(&mut state, offset, src),
-                Variant::L4 | Variant::L4Plus => self.program_l4(&mut state, offset, src),
-            }
+            let result = match self.variant {
+                Variant::F4 => {
+                    self.program_f4(&mut state, offset, src);
+                    Ok(())
+                }
+                Variant::U5 => {
+                    self.program_u5(&mut state, offset, src);
+                    Ok(())
+                }
+                Variant::L4 | Variant::L4Plus => {
+                    self.program_l4(&mut state, offset, src);
+                    Ok(())
+                }
+                Variant::Wb => self.program_wb(&mut state, offset, src),
+            };
             self.republish(&state);
-        }
+            result
+        };
         self.refresh_irq();
+        result
+    }
+
+    /// RM0434 §3.3.8: the L4's double word, with the WB's bus errors.
+    ///
+    /// The one variant whose program path *does* raise bus errors, because
+    /// RM0434 lists them: a program into the secure area "is ignored and a
+    /// bus error is generated", and so is "requesting a new programming
+    /// request, when the previous one has not finished".
+    fn program_wb(&self, state: &mut State, offset: u64, src: &[u8]) -> MemResult {
+        if src.len() == 8 {
+            // A 64-bit store is its two words, in order.
+            self.program_wb(state, offset, &src[..4])?;
+            return self.program_wb(state, offset + 4, &src[4..]);
+        }
+        let cr = state.word(L4_CR);
+        if !self.unlocked(state) || cr & (CR_PG | L4_CR_FSTPG) == 0 {
+            state.latch = None;
+            self.fail(state, SR_PGSERR);
+            return Ok(());
+        }
+        if src.len() != 4 {
+            // "Any attempt to write byte (8 bits) or half-word (16 bits) sets
+            // SIZERR".
+            state.latch = None;
+            self.fail(state, L4_SR_SIZERR);
+            return Ok(());
+        }
+        let value = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+        let Some((first, low)) = state.latch else {
+            if !offset.is_multiple_of(8) {
+                self.fail(state, SR_PGAERR);
+                return Ok(());
+            }
+            if self.secure_hit(offset, 8) {
+                return Err(BusError::Protected);
+            }
+            if self.busy(state) {
+                return Err(BusError::BadAccess);
+            }
+            if state.word(L4_SR) & WB_PROGRAM_ERRORS != 0 {
+                // "PGSERR is set also if PROGERR, SIZERR, PGAERR, WRPERR,
+                // MISSERR, FASTERR, or PGSERR is set due to a previous
+                // programming error."
+                self.fail(state, SR_PGSERR);
+                return Ok(());
+            }
+            if self.protected(state, offset, 8) || self.debug_locked(state) {
+                self.fail(state, SR_WRPERR);
+                return Ok(());
+            }
+            // The first word sets `CFGBSY` (read back from the latch) and
+            // nothing else; the second one starts the program.
+            state.latch = Some((offset, value));
+            return Ok(());
+        };
+        state.latch = None;
+        if offset != first.wrapping_add(4) {
+            self.fail(state, SR_PGAERR);
+            return Ok(());
+        }
+        let mut old = [0u8; 8];
+        let _ = self.array.read_at(first, &mut old);
+        if old != [0xff; 8] && (low != 0 || value != 0) {
+            // "PROGERR … except if the data to write is 0x0000 0000 0000
+            // 0000" (RM0434 §3.10.4).
+            self.fail(state, SR_PROGERR);
+            return Ok(());
+        }
+        let mut bytes = [0u8; PROGRAM_MAX];
+        bytes[..4].copy_from_slice(&low.to_le_bytes());
+        bytes[4..8].copy_from_slice(&value.to_le_bytes());
+        self.start(
+            state,
+            Pending::Program {
+                offset: first,
+                bytes,
+                len: 8,
+            },
+            self.program_time,
+        );
         Ok(())
     }
 
@@ -1913,7 +2378,25 @@ impl Shared {
         let sr = self.sr_offset();
         *state.word_mut(sr) |= SR_BSY;
         state.pending = pending;
+        if self.pesd(state) {
+            // "All new requested program and erase operations are not
+            // started, but suspended" until both `PES` bits clear, with
+            // `BSY` and `CFGBSY` asserted meanwhile (RM0434 §3.7, §3.10.5).
+            state.suspended = ticks.max(1);
+            state.busy_at = NO_DEADLINE;
+            return;
+        }
         state.busy_at = state.tick.saturating_add(ticks.max(1));
+    }
+
+    /// WB: a `PES` bit moved. If neither is set any more, a suspended
+    /// operation starts now.
+    fn resume(&self, state: &mut State) {
+        if state.suspended == 0 || self.pesd(state) {
+            return;
+        }
+        state.busy_at = state.tick.saturating_add(state.suspended);
+        state.suspended = 0;
     }
 
     // -- the register block --------------------------------------------------
@@ -1933,9 +2416,38 @@ impl Shared {
             Variant::L4 | Variant::L4Plus => {
                 offset == L4_KEYR || offset == L4_OPTKEYR || offset == L4_PDKEYR
             }
+            Variant::Wb => offset == L4_KEYR || offset == L4_OPTKEYR,
         };
         if write_only {
             return 0;
+        }
+        if self.variant.is_wb() {
+            let pesd = if self.pesd(&state) { WB_SR_PESD } else { 0 };
+            match offset {
+                L4_SR => {
+                    // `CFGBSY` is "set when first word is sent for program, or
+                    // when setting STRT for erase" and reset when the
+                    // operation ends: the latch, or `BSY`.
+                    let cfgbsy = if self.busy(&state) || state.latch.is_some() {
+                        WB_SR_CFGBSY
+                    } else {
+                        0
+                    };
+                    return state.word(L4_SR) | cfgbsy | pesd;
+                }
+                WB_C2SR => return state.word(WB_C2SR) | pesd,
+                L4_OPTR => {
+                    // `ESE` "indicates whether the system security is enabled
+                    // user flash memory FSD = 0".
+                    let ese = if state.word(WB_SFR) & WB_SFR_FSD == 0 {
+                        WB_OPTR_ESE
+                    } else {
+                        0
+                    };
+                    return (state.word(L4_OPTR) & !WB_OPTR_ESE) | ese;
+                }
+                _ => {}
+            }
         }
         state.word(offset)
     }
@@ -1950,6 +2462,7 @@ impl Shared {
                     .map(|()| After::default()),
                 Variant::U5 => self.write_u5(&mut state, offset, value),
                 Variant::L4 | Variant::L4Plus => self.write_l4(&mut state, offset, value),
+                Variant::Wb => self.write_wb(&mut state, offset, value),
             };
             self.republish(&state);
             result?
@@ -2362,6 +2875,202 @@ impl Shared {
         self.start(state, Pending::Erase { offset, len }, time);
     }
 
+    fn write_wb(&self, state: &mut State, offset: u64, value: u32) -> MemResult<After> {
+        let mut after = After::default();
+        match offset {
+            ACR => {
+                *state.word_mut(ACR) = value & WB_ACR_MASK;
+                self.resume(state);
+            }
+            L4_KEYR => self.write_key(state, value)?,
+            L4_OPTKEYR => self.write_optkey(state, value)?,
+            L4_SR => {
+                // Write one to clear; `BSY`, `CFGBSY`, `PESD` and `OPTNV` are
+                // hardware's.
+                let clear = value & (SR_EOP | L4_ERRORS);
+                *state.word_mut(L4_SR) &= !clear;
+            }
+            L4_CR => after = self.write_cr_wb(state, value)?,
+            L4_ECCR => {
+                // `ECCIE` is a plain enable; `ECCC` and `ECCD` are
+                // write-1-to-clear and nothing here sets them.
+                let eccr = state.word(L4_ECCR);
+                *state.word_mut(L4_ECCR) =
+                    ((eccr & !(1 << 24)) | (value & (1 << 24))) & !(value & 0xc000_0000);
+            }
+            L4_OPTR | WB_PCROP1ASR | WB_PCROP1AER | L4_WRP1AR | L4_WRP1BR | WB_PCROP1BSR
+            | WB_PCROP1BER | WB_IPCCBR
+                if self.opt_unlocked(state) =>
+            {
+                self.write_option_wb(state, offset, value);
+            }
+            WB_C2ACR => {
+                // CPU2's, but a `PES` here suspends CPU1's operations too.
+                let old = state.word(WB_C2ACR);
+                *state.word_mut(WB_C2ACR) = (value & WB_C2ACR_MASK) | (old & !WB_C2ACR_MASK);
+                self.resume(state);
+            }
+            WB_C2CR => {
+                // Storage: CPU2's own program and erase engine is not modelled
+                // here (see the module header). `STRT` is a strobe.
+                *state.word_mut(WB_C2CR) = value & WB_C2CR_MASK;
+            }
+            WB_SFR | WB_SRRVR => {
+                // "This register provides write access security and can only
+                // be written by the CPU2. A write access from the CPU1 is
+                // ignored and a bus error generated" (RM0434 §3.10.18–19).
+                return Err(BusError::Protected);
+            }
+            // `C2SR`'s flags are CPU2's to clear, and nothing sets them here.
+            _ => {}
+        }
+        Ok(after)
+    }
+
+    /// A WB option register, kept to its defined bits, with the L4's rules on
+    /// `RDP` level 2 and on shrinking a `PCROP` area.
+    fn write_option_wb(&self, state: &mut State, offset: u64, value: u32) {
+        if self.rdp_level(state) == 2 {
+            // "When attempting to modify the options bytes, the protection
+            // error flag WRPERR is set" (RM0434 §3.6.1).
+            self.fail(state, SR_WRPERR);
+            return;
+        }
+        let old = state.word(offset);
+        let new = match offset {
+            L4_OPTR => (old & !WB_OPTR_WRITABLE) | (value & WB_OPTR_WRITABLE),
+            L4_WRP1AR | L4_WRP1BR => value & WB_WRP_MASK,
+            WB_IPCCBR => value & WB_IPCCBR_MASK,
+            WB_PCROP1AER => {
+                // `PCROP_RDP` is set-only (`rs`).
+                (value & (WB_PCROP_FIELD | WB_PCROP_RDP)) | (old & WB_PCROP_RDP)
+            }
+            _ => value & WB_PCROP_FIELD,
+        };
+        let new = match offset {
+            WB_PCROP1ASR | WB_PCROP1AER | WB_PCROP1BSR | WB_PCROP1BER => {
+                // "If the user options modification tries to clear PCROP or to
+                // decrease the PCROP areas, the options programming is
+                // launched but PCROP areas stays unchanged" (RM0434 §3.6.2).
+                let (sr, er) = if offset == WB_PCROP1ASR || offset == WB_PCROP1AER {
+                    (WB_PCROP1ASR, WB_PCROP1AER)
+                } else {
+                    (WB_PCROP1BSR, WB_PCROP1BER)
+                };
+                let (old_start, old_len) = wb_pcrop_area(state.word(sr), state.word(er), self.size);
+                let (strt, end) = if offset == sr {
+                    (new, state.word(er))
+                } else {
+                    (state.word(sr), new)
+                };
+                let (start, len) = wb_pcrop_area(strt, end, self.size);
+                let grows = old_len == 0
+                    || (len != 0 && start <= old_start && start + len >= old_start + old_len);
+                if grows {
+                    new
+                } else {
+                    // The set-only bit still sticks.
+                    old | (new & WB_PCROP_RDP)
+                }
+            }
+            _ => new,
+        };
+        *state.word_mut(offset) = new;
+    }
+
+    fn write_cr_wb(&self, state: &mut State, value: u32) -> MemResult<After> {
+        let mut after = After::default();
+        if state.latch.is_some() {
+            // "FLASH_CR register write between the two accesses of a double
+            // word programming" is a bus error (RM0434 §3.3.8).
+            return Err(BusError::BadAccess);
+        }
+        if self.pesd(state) && self.busy(state) {
+            // "When the PESD bit … is set and a program or an erase operation
+            // is ongoing, the register write access causes a bus error"
+            // (§3.10.5).
+            return Err(BusError::BadAccess);
+        }
+        let before = state.word(L4_CR);
+        if before & CR_LOCK != 0 {
+            // "After reset, write is not allowed in the FLASH_CR" until the
+            // key sequence (§3.3.6); `LOCK` is already set, and it implies
+            // `OPTLOCK`, so there is nothing a write could do.
+            return Ok(after);
+        }
+        let opt_locked = before & L4_CR_OPTLOCK != 0;
+        let mut next = (before & !WB_CR_STORED) | (value & WB_CR_STORED);
+        // Both locks are set-only; "If LOCK is set by software, OPTLOCK is
+        // automatically set as well" (§3.4.2).
+        if value & CR_LOCK != 0 {
+            next |= CR_LOCK | L4_CR_OPTLOCK;
+        }
+        if value & L4_CR_OPTLOCK != 0 {
+            next |= L4_CR_OPTLOCK;
+        }
+        *state.word_mut(L4_CR) = next & !(CR_STRT | L4_CR_OPTSTRT | L4_CR_OBL_LAUNCH);
+
+        if value & CR_STRT != 0 {
+            self.erase_wb(state, value)?;
+        }
+        if value & L4_CR_OPTSTRT != 0 && !opt_locked {
+            self.start_options(state);
+        }
+        if value & L4_CR_OBL_LAUNCH != 0 && !opt_locked {
+            if self.busy(state) {
+                self.fail(state, SR_PGSERR);
+            } else {
+                state.load_option_bytes(self.variant);
+                after.reset = true;
+            }
+        }
+        Ok(after)
+    }
+
+    /// `CR.STRT` on a WB: a page erase. CPU1 cannot mass-erase, nor erase a
+    /// secure page.
+    fn erase_wb(&self, state: &mut State, value: u32) -> MemResult {
+        if value & WB_CR_MER != 0 {
+            // "A flash memory mass erase by the CPU1 is ignored and a bus
+            // error is generated" (RM0434 §3.3.7, Table 6).
+            return Err(BusError::Protected);
+        }
+        if self.busy(state)
+            || state.word(L4_SR) & WB_PROGRAM_ERRORS != 0
+            || value & (CR_PG | L4_CR_FSTPG) != 0
+            || value & L4_CR_PER == 0
+        {
+            // Over a running operation, over an uncleared program error, with
+            // `PG`/`FSTPG` beside `PER`, or with nothing selected.
+            self.fail(state, SR_PGSERR);
+            return Ok(());
+        }
+        let page = u64::from((value & WB_CR_PNB) >> 3);
+        let offset = page * WB_PAGE;
+        if offset + WB_PAGE > self.size {
+            self.fail(state, SR_PGSERR);
+            return Ok(());
+        }
+        if self.secure_hit(offset, WB_PAGE) {
+            // A secure page "requested by CPU1": "Page erase aborted (no page
+            // erase started)", a CPU1 bus error and no `WRPERR` (Table 5).
+            return Err(BusError::Protected);
+        }
+        if self.protected(state, offset, WB_PAGE) || self.debug_locked(state) {
+            self.fail(state, SR_WRPERR);
+            return Ok(());
+        }
+        self.start(
+            state,
+            Pending::Erase {
+                offset,
+                len: WB_PAGE,
+            },
+            self.erase_time,
+        );
+        Ok(())
+    }
+
     /// `KEYR`: `KEY1` then `KEY2` clears `LOCK`.
     fn write_key(&self, state: &mut State, value: u32) -> MemResult {
         if state.key_error {
@@ -2375,7 +3084,13 @@ impl Shared {
         }
         let cr = self.cr_offset();
         if state.word(cr) & CR_LOCK == 0 {
-            return Ok(());
+            // A WB makes "any subsequent write to FLASH_KEYR … after
+            // unlocking the respective feature" a bus error (RM0434 §3.3.8).
+            return if self.variant.is_wb() {
+                Err(BusError::BadAccess)
+            } else {
+                Ok(())
+            };
         }
         match (state.key_step, value) {
             (0, KEY1) => state.key_step = 1,
@@ -2385,9 +3100,14 @@ impl Shared {
             }
             _ => {
                 // "In case of a wrong key sequence … the FLASH_CR register is
-                // locked until the next reset."
+                // locked until the next reset." A WB faults on the wrong key
+                // itself: "a bus error is detected and a hard fault interrupt
+                // is generated" (RM0434 §3.3.6).
                 state.key_step = 0;
                 state.key_error = true;
+                if self.variant.is_wb() {
+                    return Err(BusError::BadAccess);
+                }
             }
         }
         Ok(())
@@ -2403,7 +3123,11 @@ impl Shared {
             };
         }
         if self.opt_unlocked(state) {
-            return Ok(());
+            return if self.variant.is_wb() {
+                Err(BusError::BadAccess)
+            } else {
+                Ok(())
+            };
         }
         match (state.optkey_step, value) {
             (0, OPTKEY1) => state.optkey_step = 1,
@@ -2419,6 +3143,9 @@ impl Shared {
             _ => {
                 state.optkey_step = 0;
                 state.optkey_error = true;
+                if self.variant.is_wb() {
+                    return Err(BusError::BadAccess);
+                }
             }
         }
         Ok(())
@@ -2437,7 +3164,7 @@ impl Shared {
             let eop = sr & SR_EOP != 0 && cr & CR_EOPIE != 0;
             // On an L4 `RDERR` is enabled by `RDERRIE` and by nothing else
             // (RM0351 Table 16); an F4 has no such bit and `ERRIE` covers it.
-            let (errors, rderr) = if !self.variant.is_l4() {
+            let (errors, rderr) = if !self.variant.has_pcrop() {
                 (self.errors_mask(), false)
             } else {
                 (
@@ -2608,10 +3335,11 @@ impl Flash {
     /// that does not fit.
     pub fn new(props: &Props) -> Result<Flash> {
         let mut r = props.reader();
-        let variant = match r.or_enum("variant", "f4", &["f4", "l4", "l4plus", "u5"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "l4", "l4plus", "u5", "wb"])? {
             "l4" => Variant::L4,
             "l4plus" => Variant::L4Plus,
             "u5" => Variant::U5,
+            "wb" => Variant::Wb,
             _ => Variant::F4,
         };
         let size = r.require_size("size")?;
@@ -2625,6 +3353,8 @@ impl Flash {
             r.optional::<u64>("pcrop2sr")?,
             r.optional::<u64>("pcrop2er")?,
         ];
+        let sfr = r.optional::<u64>("sfr")?;
+        let srrvr = r.optional::<u64>("srrvr")?;
         let read_guard = r.or("read-guard", false)?;
         let program_time = r.or("program-time", DEFAULT_PROGRAM_TIME)?;
         let erase_time = r.or("erase-time", DEFAULT_ERASE_TIME)?;
@@ -2646,6 +3376,17 @@ impl Flash {
             return Err(config(format!(
                 "a U5 array is two banks of up to 128 8 KiB pages (RM0456 §7.3.1), and {size} \
                  byte(s) is not"
+            )));
+        }
+        if variant.is_wb() && (!size.is_multiple_of(WB_PAGE) || size > 256 * WB_PAGE) {
+            return Err(config(format!(
+                "a WB array is one bank of up to 256 4 KiB pages (RM0434 §3.3.1), and {size} \
+                 byte(s) is not"
+            )));
+        }
+        if !variant.is_wb() && (sfr.is_some() || srrvr.is_some()) {
+            return Err(config(String::from(
+                "`sfr` and `srrvr` are the WB's secure option registers; only `wb` has them",
             )));
         }
         if variant.is_f4() && size > 2 * BANK {
@@ -2686,6 +3427,12 @@ impl Flash {
                     "`{name}` is an L4 option register; a U5 has no PCROP"
                 )));
             }
+            if variant.is_wb() && name.starts_with("pcrop2") {
+                return Err(config(format!(
+                    "`{name}` is the L4's second bank; a WB's areas are PCROP1A (`pcrop1sr`, \
+                     `pcrop1er`) and PCROP1B, which only firmware programs here"
+                )));
+            }
             let value = u32::try_from(value).map_err(|_| {
                 config(format!(
                     "`{name}` is a 32-bit register and {value:#x} is not"
@@ -2714,7 +3461,30 @@ impl Flash {
             Variant::L4Plus if dual => 4096,
             Variant::L4Plus => 8192,
             Variant::U5 => U5_PAGE,
+            Variant::Wb => WB_PAGE,
         };
+        if variant.is_wb() {
+            let (default_sfr, default_srrvr) = wb_default_secure(size);
+            let word = |name: &str, value: Option<u64>, default: u32| -> Result<u32> {
+                value.map_or(Ok(default), |v| {
+                    u32::try_from(v).map_err(|_| {
+                        config(format!(
+                            "`{name}` is a 32-bit option register and {v:#x} is not"
+                        ))
+                    })
+                })
+            };
+            let slot = |offset: u64| {
+                variant
+                    .option_words()
+                    .iter()
+                    .position(|&o| o == offset)
+                    .expect("SFR and SRRVR are WB option words")
+            };
+            stored[slot(WB_SFR)] =
+                word("sfr", sfr, default_sfr)? & (WB_SFR_DDS | WB_SFR_FSD | WB_SFR_SFSA);
+            stored[slot(WB_SRRVR)] = word("srrvr", srrvr, default_srrvr)? & !(1 << 24);
+        }
         if variant.is_u5() && stored[0] & U5_OPTR_TZEN != 0 {
             return Err(config(String::from(
                 "`optr` sets TZEN, and this model is a TZEN = 0 part: TrustZone's secure flash \
@@ -2742,7 +3512,14 @@ impl Flash {
             || (variant.is_l4()
                 && [(L4_PCROP1SR, L4_PCROP1ER), (L4_PCROP2SR, L4_PCROP2ER)]
                     .into_iter()
-                    .any(|(sr, er)| pcrop_area(state.word(sr), state.word(er)).1 != 0));
+                    .any(|(sr, er)| pcrop_area(state.word(sr), state.word(er)).1 != 0))
+            // A WB with a secure area judges every read, because CPU1 may not
+            // read it; so does one whose option bytes arm a PCROP area.
+            || (variant.is_wb()
+                && (state.word(WB_SFR) & WB_SFR_FSD == 0
+                    || [(WB_PCROP1ASR, WB_PCROP1AER), (WB_PCROP1BSR, WB_PCROP1BER)]
+                        .into_iter()
+                        .any(|(sr, er)| wb_pcrop_area(state.word(sr), state.word(er), size).1 != 0)));
 
         let shared = Arc::new(Shared {
             state: Mutex::with_rank(LockRank::DEVICE, state),
@@ -2757,6 +3534,7 @@ impl Flash {
             irq_out: Mutex::with_rank(LockRank::WIRE, None),
             pcrop: [AtomicU64::new(0), AtomicU64::new(0)],
             rdp: AtomicU32::new(0),
+            secure: AtomicU64::new(size),
             halted: AtomicBool::new(false),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
@@ -2766,7 +3544,8 @@ impl Flash {
         // The read side's lock-free mirror starts out agreeing with the option
         // bytes rather than with zero.
         {
-            let state = shared.state.lock();
+            let mut state = shared.state.lock();
+            shared.empty_check(&mut state);
             shared.republish(&state);
         }
 
@@ -2940,6 +3719,7 @@ impl Device for Flash {
             let stored = state.stored;
             *state = State::reset(self.shared.variant, stored);
             state.tick = tick;
+            self.shared.empty_check(&mut state);
             self.shared.republish(&state);
         }
         self.shared.refresh_irq();
@@ -3013,6 +3793,10 @@ impl Device for Flash {
             w.write_u32(state.wbuf_mask)?;
             w.write_all(&state.wbuf)?;
         }
+        if variant.is_wb() {
+            // An operation `PES` is holding back, which starts when it lifts.
+            w.write_u64(state.suspended)?;
+        }
         Ok(())
         // The wire handles are the machine's wiring, not the chip's state.
     }
@@ -3073,6 +3857,9 @@ impl Device for Flash {
             state.wbuf_base = r.read_u64()?;
             state.wbuf_mask = r.read_u32()?;
             state.wbuf.copy_from_slice(r.take(PROGRAM_MAX)?);
+        }
+        if variant.is_wb() {
+            state.suspended = r.read_u64()?;
         }
 
         self.shared
@@ -3164,8 +3951,9 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which manual: \"f4\" (RM0090 sectors), \"l4\" (RM0351 pages), \"l4plus\" \
-                      or \"u5\" (RM0456 quad-word programming)",
+            summary: "which manual: \"f4\" (RM0090 sectors), \"l4\" (RM0351 pages), \"l4plus\", \
+                      \"u5\" (RM0456 quad-word programming) or \"wb\" (RM0434, CPU2's secure \
+                      area)",
         },
         PropertySpec {
             name: "size",
@@ -3208,6 +3996,19 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "L4 FLASH_PCROP2ER: bank 2's PCROP end",
+        },
+        PropertySpec {
+            name: "sfr",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "WB FLASH_SFR as the option bytes hold it: SFSA, FSD, DDS (default: SFSA where \
+                      ST's full BLE stack installs for this size, DDS set)",
+        },
+        PropertySpec {
+            name: "srrvr",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "WB FLASH_SRRVR: the secure SRAM2a/2b starts and CPU2's reset vector",
         },
         PropertySpec {
             name: "read-guard",
@@ -3260,7 +4061,9 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "l4plus", "u5"]))
+        .prop(
+            PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "l4plus", "u5", "wb"]),
+        )
         .prop(PropSchema::new("size", ValueKind::Uint).required())
         .prop(PropSchema::new("image", ValueKind::Media))
         .prop(PropSchema::new("optr", ValueKind::Uint))
@@ -3268,6 +4071,8 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("pcrop1er", ValueKind::Uint))
         .prop(PropSchema::new("pcrop2sr", ValueKind::Uint))
         .prop(PropSchema::new("pcrop2er", ValueKind::Uint))
+        .prop(PropSchema::new("sfr", ValueKind::Uint))
+        .prop(PropSchema::new("srrvr", ValueKind::Uint))
         .prop(PropSchema::new("read-guard", ValueKind::Bool))
         .prop(PropSchema::new("program-time", ValueKind::Uint))
         .prop(PropSchema::new("erase-time", ValueKind::Uint))

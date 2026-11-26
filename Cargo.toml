@@ -2260,9 +2260,14 @@ dev-stm32-hash = []
 # modelled. `variant = "u5"` adds the STM32U575/U585 (RM0456 §7): two banks of
 # 8 KiB pages, 128-bit quad-word (and 8-quad-word burst) programming through a
 # write buffer with NSSR.WDW, and the non-secure register copies of a TZEN = 0
-# part. Written from ST RM0090 §3, ST RM0351 §3 and ST RM0456 §7 with the ST
-# CMSIS stm32u585xx.h offsets (Apache-2.0); no emulator source was consulted
-# (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no dependencies.
+# part. `variant = "wb"` is the STM32WB55/WB35 (RM0434 §3): one bank of 4 KiB
+# pages, the L4 double word with CFGBSY and the PES/PESD suspension, two PCROP
+# areas in 2 KiB units, and CPU2's secure area from SFR.SFSA to the end of the
+# array, which CPU1 cannot read (zeroes and RDERR), program, erase or debug
+# (bus errors), defaulting to where ST's full BLE stack installs. Written from
+# ST RM0090 §3, ST RM0351 §3, ST RM0456 §7 and ST RM0434 §3 with the ST CMSIS
+# stm32u585xx.h and stm32wb55xx.h offsets (Apache-2.0); no emulator source was
+# consulted (ROADMAP.md §1). `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-flash = []
 # The STM32 real-time clock (src/dev/stm32/rtc.rs): one class, `st.rtc`, and
 # the only peripheral on the die that keeps its state across a system reset --
