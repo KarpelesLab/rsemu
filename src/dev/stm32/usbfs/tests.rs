@@ -45,7 +45,12 @@ fn fixture() -> Fixture {
     let dev = UsbfsPeripheral::with_bus(Arc::clone(&bus));
     let regs = io(&Device::region(&dev, "regs").expect("the register block"));
     let pma = io(&Device::region(&dev, "pma").expect("the packet memory"));
-    Fixture { dev, bus, regs, pma }
+    Fixture {
+        dev,
+        bus,
+        regs,
+        pma,
+    }
 }
 
 impl Fixture {
@@ -55,7 +60,9 @@ impl Fixture {
 
     fn rd(&self, offset: u64) -> u16 {
         let mut b = [0u8; 2];
-        self.regs.read(offset, &mut b, MemAttrs::DEFAULT).expect("read");
+        self.regs
+            .read(offset, &mut b, MemAttrs::DEFAULT)
+            .expect("read");
         u16::from_le_bytes(b)
     }
     fn wr(&self, offset: u64, value: u16) {
@@ -70,11 +77,15 @@ impl Fixture {
         self.wr(n * 4, value);
     }
     fn pma_write(&self, off: u64, bytes: &[u8]) {
-        self.pma.write(off, bytes, MemAttrs::DEFAULT).expect("pma write");
+        self.pma
+            .write(off, bytes, MemAttrs::DEFAULT)
+            .expect("pma write");
     }
     fn pma_read(&self, off: u64, len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
-        self.pma.read(off, &mut v, MemAttrs::DEFAULT).expect("pma read");
+        self.pma
+            .read(off, &mut v, MemAttrs::DEFAULT)
+            .expect("pma read");
         v
     }
     fn stat_rx(&self, n: usize) -> u16 {
@@ -158,7 +169,11 @@ fn istr_flags_are_write_zero_to_clear_and_ctr_is_computed() {
         s.ep[2] = EP_CTR_RX | 3; // a pending RX, EA 3, in register 2
     }
     let istr = f.rd(OFF_ISTR);
-    assert_eq!(istr & ISTR_CTR, ISTR_CTR, "CTR is the OR over the endpoints");
+    assert_eq!(
+        istr & ISTR_CTR,
+        ISTR_CTR,
+        "CTR is the OR over the endpoints"
+    );
     assert_eq!(istr & ISTR_DIR, ISTR_DIR, "DIR: the pending one is an RX");
     assert_eq!(istr & 0x000f, 2, "EP_ID names the register, not the EA");
     // Clear RESET, keep SOF: write ones everywhere but RESET.
@@ -173,7 +188,11 @@ fn a_word_read_sees_the_register_in_the_low_half_and_the_high_half_is_inert() {
     f.wr(OFF_DADDR, 0x005a);
     let mut b = [0u8; 4];
     f.regs.read(OFF_DADDR, &mut b, MemAttrs::DEFAULT).unwrap();
-    assert_eq!(u32::from_le_bytes(b), 0x0000_005a, "register low, reserved high");
+    assert_eq!(
+        u32::from_le_bytes(b),
+        0x0000_005a,
+        "register low, reserved high"
+    );
     assert_eq!(f.rd(OFF_DADDR + 2), 0, "the reserved half reads zero");
     f.regs
         .write(OFF_DADDR + 2, &0xffffu16.to_le_bytes(), MemAttrs::DEFAULT)
@@ -271,7 +290,8 @@ fn a_setup_lands_in_the_rx_buffer_and_raises_the_interrupt() {
 fn a_control_in_moves_the_descriptor_the_firmware_staged() {
     let f = fixture();
     f.enumerate_ready();
-    f.bus.setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18));
+    f.bus
+        .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18));
     // Firmware stages the descriptor and arms TX.
     let descriptor: Vec<u8> = (0..18u8).collect();
     f.pma_write(0x20, &descriptor);
@@ -284,7 +304,11 @@ fn a_control_in_moves_the_descriptor_the_firmware_staged() {
     assert_eq!(c.len, 18);
     assert_eq!(&buf[..18], &descriptor[..]);
     assert_eq!(f.ep(0) & EP_CTR_TX, EP_CTR_TX, "CTR_TX set");
-    assert_eq!(f.stat_tx(0), STAT_NAK, "TX back to NAK — firmware must re-arm");
+    assert_eq!(
+        f.stat_tx(0),
+        STAT_NAK,
+        "TX back to NAK — firmware must re-arm"
+    );
     // The debug peek shows the same without draining or re-raising.
     f.set_stat_tx(0, STAT_VALID);
     let mut peek = [0u8; 64];
@@ -303,7 +327,11 @@ fn an_out_lands_in_the_rx_buffer_with_its_count() {
     assert_eq!(f.pma_read(0x40, 20), payload);
     let count_rx = u16::from_le_bytes(f.pma_read(0x06, 2).try_into().unwrap());
     assert_eq!(count_rx & COUNT_MASK, 20, "the byte count");
-    assert_eq!(count_rx & !COUNT_MASK, 0x8400 & !COUNT_MASK, "block size untouched");
+    assert_eq!(
+        count_rx & !COUNT_MASK,
+        0x8400 & !COUNT_MASK,
+        "block size untouched"
+    );
     assert_eq!(f.ep(0) & EP_CTR_RX, EP_CTR_RX);
     assert_eq!(f.ep(0) & EP_SETUP, 0, "an OUT is not a SETUP");
     assert_eq!(f.stat_rx(0), STAT_NAK);
@@ -395,7 +423,8 @@ fn a_bus_reset_returns_the_device_to_address_zero_and_raises_the_flag() {
 fn a_snapshot_round_trips() {
     let f = fixture();
     f.enumerate_ready();
-    f.bus.setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18));
+    f.bus
+        .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18));
     let marker: Vec<u8> = (0..32u8).collect();
     f.pma_write(0x80, &marker);
 
@@ -419,7 +448,11 @@ fn a_snapshot_round_trips() {
         assert_eq!(restored.rd(off), f.rd(off), "register {off:#x}");
     }
     assert_eq!(restored.pma_read(0x80, 32), marker);
-    assert_eq!(restored.pma_read(0x40, 8), f.pma_read(0x40, 8), "the setup buffer");
+    assert_eq!(
+        restored.pma_read(0x40, 8),
+        f.pma_read(0x40, 8),
+        "the setup buffer"
+    );
 }
 
 #[test]
@@ -427,7 +460,10 @@ fn the_class_registers_and_constructs() {
     let mut reg = Registry::new();
     register(&mut reg).unwrap();
     assert!(register(&mut reg).is_err(), "twice is a collision");
-    assert!(reg.create(CLASS_NAME, &Props::new()).is_err(), "`bus` is required");
+    assert!(
+        reg.create(CLASS_NAME, &Props::new()).is_err(),
+        "`bus` is required"
+    );
     let props = Props::new().with("bus", Value::from("usb0"));
     let device = reg.create(CLASS_NAME, &props).unwrap();
     assert_eq!(device.class().name, CLASS_NAME);
@@ -438,7 +474,10 @@ fn the_schema_and_the_device_agree_about_regions_and_pins() {
     let f = fixture();
     let schema = schema();
     for region in ["", "regs", "pma", "sram"] {
-        assert!(Device::region(&f.dev, region).is_some(), "region {region:?}");
+        assert!(
+            Device::region(&f.dev, region).is_some(),
+            "region {region:?}"
+        );
     }
     assert!(Device::region(&f.dev, "nope").is_none());
     assert!(schema.port_named(pin::IRQ).is_some());

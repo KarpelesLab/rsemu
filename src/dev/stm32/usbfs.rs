@@ -6,7 +6,7 @@
 //! draw their buffers from, and a buffer-descriptor table that says where each
 //! buffer is. It is a **peripheral, never a host** — there is no `HPRT`, no
 //! channel list, nothing that drives a bus — so it plugs into
-//! [`UsbBus`](crate::bus::usb::UsbBus) as a [`UsbDevice`](crate::bus::usb::UsbDevice)
+//! [`UsbBus`] as a [`UsbDevice`]
 //! and a modelled host enumerates it, exactly the way the [`dwc2`](super::super::usb::dwc2)
 //! gadget does. That is the whole reason it belongs here rather than being
 //! faked: the firmware under test is a USB device stack, and the thing it talks
@@ -63,7 +63,7 @@
 //!
 //! # On the bus
 //!
-//! A [`UsbDevice`](crate::bus::usb::UsbDevice). The host's `SETUP`, `IN` and
+//! A [`UsbDevice`]. The host's `SETUP`, `IN` and
 //! `OUT` transactions are matched to an endpoint register by its `EA` field —
 //! not by the register's position — exactly as the token's address field is
 //! matched on silicon, and the matched register's `STAT` decides the handshake:
@@ -76,7 +76,7 @@
 //! # The clock, the interrupt
 //!
 //! `enable` and `reset` arrive from the reset and clock controller, as
-//! [`gate`](super::gate) describes; an unwired `enable` leaves the block
+//! [`gate`] describes; an unwired `enable` leaves the block
 //! clocked, so a board written before the gate existed does not change. One
 //! `irq` output carries the low-priority USB interrupt — level, the OR of the
 //! enabled `ISTR` flags under `CNTR`'s mask — and the board wires it to its
@@ -389,7 +389,11 @@ impl Usbfs {
                 .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                let gadget = self.gadget.lock().clone().expect("the gadget is built in `new`");
+                let gadget = self
+                    .gadget
+                    .lock()
+                    .clone()
+                    .expect("the gadget is built in `new`");
                 if self
                     .bus
                     .attach(self.port, gadget as Arc<dyn UsbDevice>)
@@ -506,7 +510,10 @@ impl Usbfs {
         let (_, _, addr_rx, count_rx) = state.descr(n);
         state.pma_write(addr_rx, src);
         let cr = state.pma_u16(count_rx);
-        state.set_pma_u16(count_rx, (cr & !COUNT_MASK) | (src.len() as u16 & COUNT_MASK));
+        state.set_pma_u16(
+            count_rx,
+            (cr & !COUNT_MASK) | (src.len() as u16 & COUNT_MASK),
+        );
         state.ep[n] = (state.ep[n] | EP_CTR_RX) & !EP_SETUP;
         state.set_stat_rx(n, STAT_NAK);
         Completion::ack(src.len() as u64)
@@ -682,7 +689,9 @@ impl MemOps for Regs {
         }
         // Gated off: the whole block reads as zero ([`gate`]).
         let value = if self.core.gate.live() {
-            self.core.read_reg(offset & !0x3).ok_or(BusError::BadAccess)?
+            self.core
+                .read_reg(offset & !0x3)
+                .ok_or(BusError::BadAccess)?
         } else {
             0
         };
@@ -927,7 +936,10 @@ impl Device for UsbfsPeripheral {
         if port != pin::IRQ {
             return Err(Error::Config {
                 at: String::from(port),
-                message: format!("a USB device peripheral drives `{}` and nothing else", pin::IRQ),
+                message: format!(
+                    "a USB device peripheral drives `{}` and nothing else",
+                    pin::IRQ
+                ),
             });
         }
         self.core.connect_irq(source);
@@ -978,7 +990,9 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// If the class is already bound.
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
-    bindings.bind(CLASS_NAME, |props| Ok(Arc::new(UsbfsPeripheral::new(props)?)))
+    bindings.bind(CLASS_NAME, |props| {
+        Ok(Arc::new(UsbfsPeripheral::new(props)?))
+    })
 }
 
 /// What the validator should know about `st.usbfs`.
