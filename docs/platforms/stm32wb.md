@@ -86,6 +86,9 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 | TIM1, TIM2 (32-bit), TIM16, TIM17 | `st.tim` | TIM16/17 share TIM1's vectors 25/26 |
 | DMA1, DMA2, DMAMUX1 | `st.dma` `channel`, `st.dmamux` | fourteen DMAMUX channels, 64 request IDs |
 | RTC, IWDG, WWDG, CRC, RNG, DBGMCU | `st.rtc`, `st.iwdg`, `st.wwdg`, `st.crc`, `st.rng`, `st.dbgmcu` | `DEV_ID = 0x495` |
+| I2C1, I2C3 | `st.i2c-v2`, `link = "wired"` | the `TIMINGR` block; nothing on the bus, so a transfer is NACKed; `tx-drq`/`rx-drq` reach DMAMUX1 as requests 10–13 |
+| SPI1, SPI2 (WB55 only) | `stm32.spi`, `variant = "f7"`, `link = "wired"` | nothing attached; no DMA request outputs yet |
+| OTP area | `rom`, `fill = 0xff` | 1 KiB at `0x1FFF7000`, blank as from the factory; programming it is not modelled |
 | Device signature | `st.devinfo` | `FLASH_SIZE`, both UIDs (seeded) and the package code at `0x1FFF7500` |
 
 ## Proof
@@ -114,15 +117,18 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 - **Thread, Zigbee and 802.15.4**: the mailbox tables exist, CPU2 does not
   serve them.
 - **ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD** have
-  no class in the tree; **SPI1/2, I2C1/3 and the USB device** have classes
-  but are not placed yet. An access to any of these addresses is a BusFault.
-- **DMA requests from anything but the U(S)ARTs.** DMAMUX1's request
-  inputs 14–17 are wired; the timers, SPI, I2C, SAI, ADC, QUADSPI and AES
+  no class in the tree; **the USB device** has one but is not placed yet. An
+  access to any of these addresses is a BusFault. I2C1/3 and SPI1/2 are
+  placed with **nothing on their buses**.
+- **DMA requests from anything but the U(S)ARTs and I2Cs.** DMAMUX1's
+  request inputs 10–17 are wired; the timers, SPI, SAI, ADC, QUADSPI and AES
   requests are not, so a channel pointed at one of them never moves.
+- **Programming the OTP area.** It reads blank; `FLASH_CR.PG` writes to it
+  are not modelled.
 - **CPU2's view of the shared peripherals**: its own interrupt vectors,
   `SYSCFG_C2IMRx` and `DBGMCU`'s CPU2 freeze bits are storage.
 - **The secure SRAM2 pages** (`SRRVR.SBRSA`/`SNBRSA`) are not enforced, and
   their default page numbers come from a forum report rather than a manual.
 - **Low-power modes** (Stop 0–2, Standby, Shutdown) and the CPU2 wake-up
   events are register storage only.
-- The system bootloader at `0x1FFF0000` and the OTP area are not present.
+- The system bootloader at `0x1FFF0000` is not present.

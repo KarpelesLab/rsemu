@@ -42,10 +42,11 @@
 # What is not here
 # ---------------------------------------------------------------------------
 #
-# ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD, the
-# USB device, SPI and I2C. The first ten have no class in the tree; the last
-# three have classes but are not placed yet. An access to any of their
-# addresses is a BusFault.
+# ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD and the
+# USB device. The first eleven have no class in the tree; the USB device has
+# one but is not placed yet. An access to any of their addresses is a
+# BusFault. I2C1, I2C3 and the SPIs are placed with nothing on their buses;
+# the SPIs drive no DMA request.
 
 machine "stm32wb55" {
   param console = "console"     # USART1 — the ST-LINK virtual COM port
@@ -176,6 +177,19 @@ machine "stm32wb55" {
   object rng  "st.rng"  { clock = hse, seed = seed, ced = true }
   object rtc  "st.rtc"  { clock = lse, epoch = "2024-01-01T00:00:00" }
 
+  # The 1 KiB OTP area of the information block (RM0434 §3.3.1), as a
+  # part straight from the factory has it: blank, 0xFF. Read-only here:
+  # programming it through FLASH_CR.PG is not modelled.
+  object otp "rom" { size = 1K, fill = 0xff }
+
+  # I2C1 and I2C3 (the v2 block, TIMINGR; RM0434 §34) and SPI1 (SPI2 on the
+  # WB55 only): placed with nothing on their buses, so a driver initialises
+  # them and a transfer finds an empty bus, as on a bare board.
+  object i2c1 "st.i2c-v2" { clock = pclk1, link = "wired" }
+  object i2c3 "st.i2c-v2" { clock = pclk1, link = "wired" }
+  object spi1 "stm32.spi" { clock = pclk2, variant = "f7", link = "wired" }
+  object spi2 "stm32.spi" { clock = pclk1, variant = "f7", link = "wired" }
+
   # DMA1/DMA2, seven channels each, routed by DMAMUX1's fourteen channels
   # (RM0434 §13–14).
   object dma1   "st.dma"    { clock = hclk, space = mem, variant = "channel" }
@@ -192,6 +206,7 @@ machine "stm32wb55" {
   map mem sram2b-base           size 32K   = sram2b
   map mem sram2-mirror          size 32K   = sram2a
   map mem sram2-mirror + 0x8000 size 32K   = sram2b
+  map mem 0x1fff7000            size 1K    = otp       # OTP_AREA_BASE
   map mem 0x1fff7500            size 0xe2  = devinfo   # PACKAGE_BASE
 
   map mem apb1-base + 0x0000 size 0x64  = tim2
@@ -199,6 +214,10 @@ machine "stm32wb55" {
   map mem apb1-base + 0x2c00 size 0x0c  = wwdg
   map mem apb1-base + 0x3000 size 0x14  = iwdg
   map mem apb1-base + 0x8000 size 0x34  = lpuart1
+  map mem apb1-base + 0x3800 size 0x400 = spi2
+  map mem apb1-base + 0x5400 size 0x2c  = i2c1
+  map mem apb1-base + 0x5c00 size 0x2c  = i2c3
+  map mem apb2-base + 0x3000 size 0x400 = spi1
   map mem apb2-base + 0x0000 size 0x114 = syscfg
   map mem apb2-base + 0x2c00 size 0x64  = tim1
   map mem apb2-base + 0x3800 size 0x34  = usart1
@@ -253,8 +272,14 @@ machine "stm32wb55" {
   wire tim1.irq-trg  -> cpu.irq26  # TIM1_TRG_COM_TIM17
   wire tim1.irq-cc   -> cpu.irq27  # TIM1_CC
   wire tim2.irq      -> cpu.irq28  # TIM2
+  wire i2c1.ev       -> cpu.irq30  # I2C1_EV
+  wire i2c1.er       -> cpu.irq31  # I2C1_ER
+  wire i2c3.ev       -> cpu.irq32  # I2C3_EV
+  wire i2c3.er       -> cpu.irq33  # I2C3_ER
+  wire spi1.irq      -> cpu.irq34  # SPI1
   wire usart1.irq    -> cpu.irq36  # USART1
   wire lpuart1.irq   -> cpu.irq37  # LPUART1
+  wire spi2.irq      -> cpu.irq35  # SPI2
   wire tim16.irq     -> cpu.irq25  # shared with TIM1 (TIM16)
   wire tim16.irq-up  -> cpu.irq25  # shared with TIM1 (TIM16)
   wire tim16.irq-trg -> cpu.irq25  # shared with TIM1 (TIM16)
@@ -307,7 +332,12 @@ machine "stm32wb55" {
   for n in 0..7 { wire dmamux.ch${n + 7} -> dma2.req${n + 1} }
 
   # Peripheral requests into DMAMUX1, numbered as DMAREQ_ID numbers them
-  # (RM0434 Table 64). Only the U(S)ARTs drive one so far.
+  # (RM0434 Table 64): the I2Cs and the U(S)ARTs. The SPI model has no
+  # request outputs yet.
+  wire i2c1.rx-drq    -> dmamux.req10   # I2C1_RX
+  wire i2c1.tx-drq    -> dmamux.req11   # I2C1_TX
+  wire i2c3.rx-drq    -> dmamux.req12   # I2C3_RX
+  wire i2c3.tx-drq    -> dmamux.req13   # I2C3_TX
   wire usart1.dma-rx  -> dmamux.req14   # USART1_RX
   wire usart1.dma-tx  -> dmamux.req15   # USART1_TX
   wire lpuart1.dma-rx -> dmamux.req16   # LPUART1_RX
@@ -363,6 +393,18 @@ machine "stm32wb55" {
   wire rcc.apb1rst0 -> tim2.reset
   wire rcc.apb1en11 -> wwdg.enable
   wire rcc.c2apb1en11 -> wwdg.enable
+  wire rcc.apb1en21 -> i2c1.enable
+  wire rcc.c2apb1en21 -> i2c1.enable
+  wire rcc.apb1rst21 -> i2c1.reset
+  wire rcc.apb1en23 -> i2c3.enable
+  wire rcc.c2apb1en23 -> i2c3.enable
+  wire rcc.apb1rst23 -> i2c3.reset
+  wire rcc.apb2en12 -> spi1.enable
+  wire rcc.c2apb2en12 -> spi1.enable
+  wire rcc.apb2rst12 -> spi1.reset
+  wire rcc.apb1en14 -> spi2.enable
+  wire rcc.c2apb1en14 -> spi2.enable
+  wire rcc.apb1rst14 -> spi2.reset
   wire rcc.apb1enb0 -> lpuart1.enable
   wire rcc.c2apb1enb0 -> lpuart1.enable
   wire rcc.apb1rstb0 -> lpuart1.reset

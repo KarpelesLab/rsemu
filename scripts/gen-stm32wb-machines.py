@@ -108,10 +108,11 @@ def header(name, p):
 # What is not here
 # ---------------------------------------------------------------------------
 #
-# ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD, the
-# USB device, SPI and I2C. The first ten have no class in the tree; the last
-# three have classes but are not placed yet. An access to any of their
-# addresses is a BusFault.
+# ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD and the
+# USB device. The first eleven have no class in the tree; the USB device has
+# one but is not placed yet. An access to any of their addresses is a
+# BusFault. I2C1, I2C3 and the SPIs are placed with nothing on their buses;
+# the SPIs drive no DMA request.
 """
 
 
@@ -247,6 +248,20 @@ def body(name, p):
     w("  object rng  \"st.rng\"  { clock = hse, seed = seed, ced = true }")
     w("  object rtc  \"st.rtc\"  { clock = lse, epoch = \"2024-01-01T00:00:00\" }")
     w("")
+    w("  # The 1 KiB OTP area of the information block (RM0434 §3.3.1), as a")
+    w("  # part straight from the factory has it: blank, 0xFF. Read-only here:")
+    w("  # programming it through FLASH_CR.PG is not modelled.")
+    w("  object otp \"rom\" { size = 1K, fill = 0xff }")
+    w("")
+    w("  # I2C1 and I2C3 (the v2 block, TIMINGR; RM0434 §34) and SPI1 (SPI2 on the")
+    w("  # WB55 only): placed with nothing on their buses, so a driver initialises")
+    w("  # them and a transfer finds an empty bus, as on a bare board.")
+    w("  object i2c1 \"st.i2c-v2\" { clock = pclk1, link = \"wired\" }")
+    w("  object i2c3 \"st.i2c-v2\" { clock = pclk1, link = \"wired\" }")
+    w("  object spi1 \"stm32.spi\" { clock = pclk2, variant = \"f7\", link = \"wired\" }")
+    if not p["wb35"]:
+        w("  object spi2 \"stm32.spi\" { clock = pclk1, variant = \"f7\", link = \"wired\" }")
+    w("")
     w("  # DMA1/DMA2, seven channels each, routed by DMAMUX1's fourteen channels")
     w("  # (RM0434 §13–14).")
     w("  object dma1   \"st.dma\"    { clock = hclk, space = mem, variant = \"channel\" }")
@@ -263,6 +278,7 @@ def body(name, p):
     w("  map mem sram2b-base           size 32K   = sram2b")
     w("  map mem sram2-mirror          size 32K   = sram2a")
     w("  map mem sram2-mirror + 0x8000 size 32K   = sram2b")
+    w("  map mem 0x1fff7000            size 1K    = otp       # OTP_AREA_BASE")
     w("  map mem 0x1fff7500            size 0xe2  = devinfo   # PACKAGE_BASE")
     w("")
     w("  map mem apb1-base + 0x0000 size 0x64  = tim2")
@@ -270,6 +286,11 @@ def body(name, p):
     w("  map mem apb1-base + 0x2c00 size 0x0c  = wwdg")
     w("  map mem apb1-base + 0x3000 size 0x14  = iwdg")
     w("  map mem apb1-base + 0x8000 size 0x34  = lpuart1")
+    if not p["wb35"]:
+        w("  map mem apb1-base + 0x3800 size 0x400 = spi2")
+    w("  map mem apb1-base + 0x5400 size 0x2c  = i2c1")
+    w("  map mem apb1-base + 0x5c00 size 0x2c  = i2c3")
+    w("  map mem apb2-base + 0x3000 size 0x400 = spi1")
     w("  map mem apb2-base + 0x0000 size 0x114 = syscfg")
     w("  map mem apb2-base + 0x2c00 size 0x64  = tim1")
     w("  map mem apb2-base + 0x3800 size 0x34  = usart1")
@@ -312,9 +333,16 @@ def body(name, p):
         ("tim1.irq-trg", 26, "TIM1_TRG_COM_TIM17"),
         ("tim1.irq-cc", 27, "TIM1_CC"),
         ("tim2.irq", 28, "TIM2"),
+        ("i2c1.ev", 30, "I2C1_EV"),
+        ("i2c1.er", 31, "I2C1_ER"),
+        ("i2c3.ev", 32, "I2C3_EV"),
+        ("i2c3.er", 33, "I2C3_ER"),
+        ("spi1.irq", 34, "SPI1"),
         ("usart1.irq", 36, "USART1"),
         ("lpuart1.irq", 37, "LPUART1"),
     ]
+    if not p["wb35"]:
+        irqs.append(("spi2.irq", 35, "SPI2"))
     for t, v in (("tim16", 25), ("tim17", 26)):
         for pin in ("irq", "irq-up", "irq-trg", "irq-cc"):
             irqs.append((f"{t}.{pin}", v, f"shared with TIM1 ({t.upper()})"))
@@ -354,7 +382,12 @@ def body(name, p):
     w("  for n in 0..7 { wire dmamux.ch${n + 7} -> dma2.req${n + 1} }")
     w("")
     w("  # Peripheral requests into DMAMUX1, numbered as DMAREQ_ID numbers them")
-    w("  # (RM0434 Table 64). Only the U(S)ARTs drive one so far.")
+    w("  # (RM0434 Table 64): the I2Cs and the U(S)ARTs. The SPI model has no")
+    w("  # request outputs yet.")
+    w("  wire i2c1.rx-drq    -> dmamux.req10   # I2C1_RX")
+    w("  wire i2c1.tx-drq    -> dmamux.req11   # I2C1_TX")
+    w("  wire i2c3.rx-drq    -> dmamux.req12   # I2C3_RX")
+    w("  wire i2c3.tx-drq    -> dmamux.req13   # I2C3_TX")
     w("  wire usart1.dma-rx  -> dmamux.req14   # USART1_RX")
     w("  wire usart1.dma-tx  -> dmamux.req15   # USART1_TX")
     w("  wire lpuart1.dma-rx -> dmamux.req16   # LPUART1_RX")
@@ -380,6 +413,13 @@ def body(name, p):
         ("ahb3", 20, "ipcc", True),
         ("apb1", 0, "tim2", True),
         ("apb1", 11, "wwdg", False),
+        ("apb1", 21, "i2c1", True),
+        ("apb1", 23, "i2c3", True),
+        ("apb2", 12, "spi1", True),
+    ]
+    if not p["wb35"]:
+        gates.append(("apb1", 14, "spi2", True))
+    gates += [
         ("apb1b", 0, "lpuart1", True),
         ("apb2", 11, "tim1", True),
         ("apb2", 14, "usart1", True),

@@ -304,3 +304,50 @@ fn usart1_receives_into_a_circular_dma_ring_through_dmamux() {
         assert_eq!(rd(&m, CNDTR1), 6, "{board}: ten bytes into a ring of eight");
     }
 }
+
+#[test]
+fn the_otp_area_reads_blank() {
+    for board in ["stm32wb55", "stm32wb35"] {
+        let m = boot(board);
+        // Issue #47: firmware reading factory OTP got a BusFault.
+        assert_eq!(rd(&m, 0x1FFF_7000), 0xFFFF_FFFF, "{board}");
+        assert_eq!(rd(&m, 0x1FFF_73FC), 0xFFFF_FFFF, "{board}: the last word");
+    }
+}
+
+#[test]
+fn i2c_and_spi_are_placed_gated_and_take_an_init() {
+    const APB1ENR1: u64 = 0x5800_0058;
+    const APB2ENR: u64 = 0x5800_0060;
+    const I2C1: u64 = 0x4000_5400;
+    const I2C3: u64 = 0x4000_5C00;
+    const SPI1: u64 = 0x4001_3000;
+    const SPI2: u64 = 0x4000_3800;
+    for board in ["stm32wb55", "stm32wb35"] {
+        let m = boot(board);
+        // Issue #48: HAL_I2C_Init's first access BusFaulted. Out of reset
+        // the clocks are off, so the registers read zero and keep nothing.
+        wr(&m, I2C1 + 0x10, 0x1090_9CEC);
+        assert_eq!(rd(&m, I2C1 + 0x10), 0, "{board}: I2C1 is gated");
+        wr(&m, APB1ENR1, rd(&m, APB1ENR1) | 1 << 21 | 1 << 23);
+        wr(&m, APB2ENR, rd(&m, APB2ENR) | 1 << 12);
+        // HAL_I2C_Init: PE off, TIMINGR, CR2, then PE on.
+        for i2c in [I2C1, I2C3] {
+            wr(&m, i2c, rd(&m, i2c) & !1);
+            wr(&m, i2c + 0x10, 0x1090_9CEC);
+            wr(&m, i2c + 0x04, 1 << 25 | 1 << 15);
+            wr(&m, i2c, rd(&m, i2c) | 1);
+            assert_eq!(rd(&m, i2c + 0x10), 0x1090_9CEC, "{board}: TIMINGR");
+            assert_eq!(rd(&m, i2c) & 1, 1, "{board}: PE");
+        }
+        // HAL_SPI_Init's CR1/CR2 for a master, 8-bit frames.
+        wr(&m, SPI1 + 0x04, 0x0700);
+        wr(&m, SPI1, 1 << 2 | 1 << 9 | 1 << 8);
+        assert_eq!(rd(&m, SPI1) & 0x304, 0x304, "{board}: SPI1 CR1");
+        assert_eq!(
+            try_rd(&m, SPI2).is_some(),
+            board == "stm32wb55",
+            "{board}: SPI2"
+        );
+    }
+}
