@@ -273,6 +273,8 @@ full = [
     "machine-stm32f407",
     "machine-stm32u575",
     "machine-stm32u585",
+    "machine-stm32wb55",
+    "machine-stm32wb35",
     "cpu-z80",
     "machine-z80-mini",
     "machine-usb-mini",
@@ -2503,6 +2505,42 @@ machine-stm32u575 = [
 # HASH processor is modelled; AES, SAES, PKA and OTFDEC are not. Adds no
 # dependencies.
 machine-stm32u585 = ["machine-stm32u575", "dev-stm32-hash"]
+
+# The STM32WB55 board (machines/stm32wb55.machine, generated with its WB35
+# sibling by scripts/gen-stm32wb-machines.py): an STM32WB55RG as on ST's
+# NUCLEO-WB55RG -- a Cortex-M4F at up to 64 MHz, 1 MiB of flash, 256 KiB of
+# SRAM -- with its radio coprocessor. CPU2 is `st.wb-cpu2`, a model of ST's
+# wireless stack behind the IPCC mailbox: firmware boots it, initialises BLE,
+# builds a GATT database and advertises, and nothing ever goes on the air.
+# docs/platforms/stm32wb.md has the account. Adds `purecrypto` (through
+# `dev-stm32-wb-cpu2`, for LE_Encrypt).
+machine-stm32wb55 = [
+    "cpu-arm-v7m",
+    # FPv4-SP-D16: `part = "cortex-m4f"`, which firmware built
+    # `-mfloat-abi=hard` needs from its first function call.
+    "cpu-arm-v7m-fp",
+    "dev-stm32",
+    "dev-stm32-rcc",
+    "dev-stm32-pwr",
+    "dev-stm32-flash",
+    "dev-stm32-exti",
+    "dev-stm32-tim",
+    "dev-stm32-wdg",
+    "dev-stm32-dbgmcu",
+    "dev-stm32-crc",
+    "dev-stm32-rng",
+    "dev-stm32-rtc",
+    "dev-stm32-dma",
+    "dev-stm32-dmamux",
+    "dev-stm32-ipcc",
+    "dev-stm32-hsem",
+    "dev-stm32-wb-cpu2",
+]
+
+# The STM32WB35 board (machines/stm32wb35.machine): an STM32WB35CE -- the WB55
+# with 512 KiB of flash, 32 KiB of SRAM1, and no GPIOD, LCD, SPI2 or TSC. The
+# same classes as the WB55, so it is that feature under a second name.
+machine-stm32wb35 = ["machine-stm32wb55"]
 
 # The Zilog Z80 core (src/cpu/z80): a cycle-accurate interpreter covering the
 # base, CB, ED, DD/FD and DDCB/FDCB pages, the undocumented IX/IY halves, SLL

@@ -561,6 +561,16 @@ built by `scripts/fetch-testdata.sh stm32u5-hal`: clock configuration to
 SHA-256, each checked. `docs/platforms/stm32u5.md` lists what is not there yet,
 DMA and the RTC first.
 
+`stm32wb55` and `stm32wb35` are the dual-core wireless parts: an **STM32WB55RG**
+(the NUCLEO-WB55RG's) and an **STM32WB35CE**, a Cortex-M4F with a Cortex-M0+
+radio coprocessor. That second core runs ST's encrypted wireless stack on the
+silicon, so here it is a model of that stack behind the IPCC mailbox: firmware
+boots CPU2, initialises BLE, builds its GATT database and advertises, and gets
+every answer in ST's formats — with no radio, so nothing is ever on the air.
+The test is ST's own STM32WB HAL plus a mailbox client of ours, fetched and
+built by `scripts/fetch-testdata.sh stm32wb-ble`. `docs/platforms/stm32wb.md`
+has the account.
+
 `amiga-a500` is the one that boots a **desktop**. A
 68000, the full custom chipset — Agnus with the copper, the blitter and the
 beam, Denise, Paula, two 8520s, Gary's address decode — and a 3.5-inch drive on

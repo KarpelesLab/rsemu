@@ -74,6 +74,8 @@ the question never arises.
 | [`platforms/arm64-virt.md`](platforms/arm64-virt.md) | The AArch64 `virt` board: a GICv2, a PL011, PSCI, and a generated device tree |
 | [`platforms/stm32f407.md`](platforms/stm32f407.md) | The `stm32f407` microcontroller board, its peripherals, and how an M-profile interrupt is wired |
 | [`platforms/stm32u5.md`](platforms/stm32u5.md) | The `stm32u575` and `stm32u585` boards: a Cortex-M33 with TrustZone off, a live clock tree, gated peripheral clocks, and ST's own HAL as the test |
+| [`platforms/stm32wb.md`](platforms/stm32wb.md) | The `stm32wb55` and `stm32wb35` boards: a Cortex-M4F and a BLE coprocessor modelled as ST's wireless stack behind the IPCC mailbox, with no radio; ST's own HAL as the test |
+| [`platforms/stm32wb-inventory.md`](platforms/stm32wb-inventory.md) | Every STM32WB peripheral's base, size, class, vector and RCC bit, and the exact WB35-vs-WB55 diff the board generator is drawn from |
 
 #### Which board boots what, and how far
 

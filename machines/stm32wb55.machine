@@ -1,0 +1,396 @@
+# stm32wb55 — an STMicroelectronics STM32WB55RGV6.
+#
+#   rsemu run stm32wb55 --media firmware=app.bin
+#
+# A Cortex-M4 with FPv4-SP-D16 and a Cortex-M0+ radio coprocessor, 1 MiB of
+# flash, 192 KiB of SRAM1 and 64 KiB of SRAM2 (2a + 2b), in the VFQFPN68
+# package used on ST's NUCLEO-WB55RG. The WB35 is the same family with
+# less memory and fewer peripherals: see machines/stm32wb35.machine.
+#
+# Generated, with its sibling, by scripts/gen-stm32wb-machines.py: the two
+# parts come from one description and cannot drift. Edit the script, not this
+# file.
+#
+# Sources: ST **RM0434** rev 16 (STM32WB55xx/WB35xx reference manual) for the
+# memory map (Table 1), the vector table (Table 72), the EXTI lines (Table 74)
+# and every peripheral placed below; ST's CMSIS device headers
+# `stm32wb55xx.h` / `stm32wb35xx.h` (Apache-2.0, cmsis-device-wb v1.12.4) for
+# every base address, `IRQn_Type` and `RCC_*ENR_*EN_Pos`; ST **DS11929** rev
+# 18 for the per-part memory sizes. No emulator source of any licence was
+# consulted (ROADMAP.md §1). docs/platforms/stm32wb.md has the full account
+# and docs/platforms/stm32wb-inventory.md the table this file is drawn from.
+#
+# ---------------------------------------------------------------------------
+# The two cores
+# ---------------------------------------------------------------------------
+#
+# * **CPU1** is `cpu`, the Cortex-M4 your firmware runs on.
+# * **CPU2** is `cpu2`, and it is **not an executing core**. On the silicon it
+#   is a Cortex-M0+ running ST's encrypted wireless stack, which cannot be run
+#   here; `st.wb-cpu2` is a bus master that behaves like that stack instead
+#   (docs/devices/stm32wb-cpu2.md). Firmware sets `PWR_CR4.C2BOOT`, CPU2 reads
+#   the mailbox reference table at the start of SRAM2a, posts the system READY
+#   event through IPCC channel 2, and from then on answers SHCI commands and
+#   the BLE HCI/ACI command set — GAP, GATT, advertising — exactly in ST's
+#   formats. **There is no radio**: advertising goes nowhere, no peer ever
+#   connects, and no scan ever reports anything.
+# * The flash's secure area — where ST's stack would sit — is real: `SFR`
+#   defaults to where the full BLE stack v1.25 installs, and CPU1 cannot read,
+#   program or erase above it.
+#
+# ---------------------------------------------------------------------------
+# What is not here
+# ---------------------------------------------------------------------------
+#
+# ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD, the
+# USB device, SPI and I2C. The first ten have no class in the tree; the last
+# three have classes but are not placed yet. An access to any of their
+# addresses is a BusFault.
+
+machine "stm32wb55" {
+  param console = "console"     # USART1 — the ST-LINK virtual COM port
+  param flash   = 1M
+  param seed    = 1
+
+  # The memory map, RM0434 Table 1.
+  param flash-base   = 0x08000000
+  param sram1-base   = 0x20000000
+  param sram2a-base  = 0x20030000   # the mailbox reference table is its first word
+  param sram2b-base  = 0x20038000
+  param sram2-mirror = 0x10000000   # CPU1's alias of SRAM2a + SRAM2b
+  param apb1-base    = 0x40000000
+  param apb2-base    = 0x40010000
+  param ahb1-base    = 0x40020000
+  param ahb2-base    = 0x48000000
+  param ahb4-base    = 0x58000000   # RCC, PWR, EXTI, IPCC, RNG, HSEM, FLASH: shared by both CPUs
+  param dbgmcu-base  = 0xE0042000
+
+  # The reference oscillator is the 32 MHz radio crystal every WB board fits
+  # (RM0434 §6.2.2: HSE32 is required for the RF). The MSI's reset 4 MHz is
+  # hse / 8; every internal source is an exact ratio of it
+  # (docs/techniques/clock-control.md, "It does not reparent").
+  osc hse = 32000000 Hz
+  osc lsi = 32000 Hz
+  osc lse = 32768 Hz
+  # One tick of a USART's domain is one character time: 115200 baud, 10
+  # bits a character. The baud rate the firmware programs is not modelled.
+  osc uartclk = 11520 Hz
+
+  # The clock tree RCC drives, at its reset values: SYSCLK on the MSI at
+  # 4 MHz, every prescaler at /1. HCLK2 is CPU2's (EXTCFGR.C2HPRE), HCLK4
+  # the shared AHB4 and flash (EXTCFGR.SHDHPRE). RCC re-rates these.
+  object sysclk  "clock" { clock = hse / 8 }
+  object hclk    "clock" { clock = sysclk }
+  object hclk2   "clock" { clock = sysclk }
+  object hclk4   "clock" { clock = sysclk }
+  object pclk1   "clock" { clock = hclk }
+  object pclk2   "clock" { clock = hclk }
+  object timclk1 "clock" { clock = pclk1 }
+  object timclk2 "clock" { clock = pclk2 }
+
+  space mem { width = 32 }
+
+  # CPU1. `__NVIC_PRIO_BITS` is 4; 63 external interrupts (RM0434 §15.1).
+  object cpu "cpu.arm.v7m" {
+    clock         = hclk
+    space         = mem
+    part          = "cortex-m4f"
+    priority-bits = 4
+  }
+
+  # CPU2 and its wireless stack, as a bus master on the same map: it reads
+  # the reference table CPU1 left at SRAM2a and talks through IPCC's
+  # processor-2 registers. `seed` makes its static random address and
+  # LE_Rand repeatable.
+  object cpu2 "st.wb-cpu2" { clock = hclk2, space = mem, seed = seed }
+
+  object eflash "st.flash" {
+    clock   = hclk4
+    variant = "wb"
+    size    = flash
+    image   = "firmware"
+  }
+  object sram1  "ram" { size = 192K }
+  object sram2a "ram" { size = 32K }
+  object sram2b "ram" { size = 32K }
+
+  object rcc "st.rcc" {
+    clock   = hse
+    variant = "wb"
+    hse     = 32000000
+    lsi     = 32000
+    lse     = 32768
+    sysclk  = "sysclk", hclk = "hclk", hclk2 = "hclk2", hclk4 = "hclk4"
+    pclk1   = "pclk1", pclk2 = "pclk2"
+    timclk1 = "timclk1", timclk2 = "timclk2"
+  }
+  object pwr "st.pwr" { clock = hse, variant = "wb" }
+
+  # MEM_MODE (RM0434 §11.2.1): 0 flash, 1 system memory, 3 SRAM1, 6 QUADSPI.
+  # There is no system-bootloader image and no QUADSPI here, so those are 0
+  # ("no such memory") and a fetch through them faults.
+  object syscfg "st.syscfg" {
+    variant      = "wb"
+    ports        = 8
+    space        = mem
+    boot-size    = flash
+    boot-sources = [ flash-base, 0, 0, sram1-base ]
+  }
+  object exti "st.exti" { variant = "wb" }
+  object ipcc "st.ipcc" { }
+  object hsem "st.hsem" { }
+
+  # The factory signature at 0x1FFF7500: PACKAGE (+0), UID64 (+0x80, which
+  # ST's stack builds the public BD address from), UID96 (+0x90) and
+  # FLASH_SIZE (+0xE0). The UIDs are drawn from `seed`.
+  object devinfo "st.devinfo" {
+    size = 0xe2, flash-kb = 1024, seed = seed, package = 0x13
+    package-offset = 0x0, uid64-offset = 0x80, uid-offset = 0x90, flash-size-offset = 0xe0
+  }
+  object dbgmcu "st.dbgmcu" { variant = "wb" }
+
+  # GPIO A, B, C, D, E, H. Reset values: RM0434 §10.5.
+  object gpioa "st.gpio" { variant = "wb", moder-reset = 0xabffffff, ospeedr-reset = 0x0c000000, pupdr-reset = 0x64000000 }
+  object gpiob "st.gpio" { variant = "wb", moder-reset = 0xfffffebf, ospeedr-reset = 0x000000c0, pupdr-reset = 0x00000100 }
+  object gpioc "st.gpio" { variant = "wb", moder-reset = 0xffffffff }
+  object gpiod "st.gpio" { variant = "wb", moder-reset = 0xffffffff }
+  object gpioe "st.gpio" { variant = "wb", moder-reset = 0x000003ff }
+  object gpioh "st.gpio" { variant = "wb", moder-reset = 0x000000cf }
+
+  # USART1 is the console (PB6/PB7 on the Nucleo, the ST-LINK VCP).
+  object usart1  "st.usart" { clock = uartclk, variant = "u5", port = console }
+  object lpuart1 "st.usart" { clock = uartclk, variant = "u5", port = "lpuart1", lpuart = true }
+
+  # Timers: the L4 register map (`layout = "f4"`). TIM2 is 32-bit; TIM16
+  # and TIM17 have RCR/BDTR, so they are one-channel advanced timers.
+  object tim1  "st.tim" { clock = timclk2, variant = "advanced", channels = 4 }
+  object tim2  "st.tim" { clock = timclk1, variant = "general", channels = 4, width = 32 }
+  object tim16 "st.tim" { clock = timclk2, variant = "advanced", channels = 1 }
+  object tim17 "st.tim" { clock = timclk2, variant = "advanced", channels = 1 }
+
+  object iwdg "st.iwdg" { clock = lsi, window = true }
+  # WWDG_CFR.WDGTB is three bits at 13:11 (RM0434 §33).
+  object wwdg "st.wwdg" { clock = pclk1, wdgtb-shift = 11, wdgtb-width = 3 }
+  object crc  "st.crc"  { variant = "u5" }
+  # The RNG has its own clock; its numbers come from `seed`, not the host.
+  object rng  "st.rng"  { clock = hse, seed = seed, ced = true }
+  object rtc  "st.rtc"  { clock = lse, epoch = "2024-01-01T00:00:00" }
+
+  # DMA1/DMA2, seven channels each, routed by DMAMUX1's fourteen channels
+  # (RM0434 §13–14).
+  object dma1   "st.dma"    { clock = hclk, space = mem, variant = "channel" }
+  object dma2   "st.dma"    { clock = hclk, space = mem, variant = "channel" }
+  object dmamux "st.dmamux" { channels = 14, requests = 64 }
+
+  # ---------------------------------------------------------------------
+  # The map
+  # ---------------------------------------------------------------------
+  map mem 0x00000000            size flash = syscfg.boot
+  map mem flash-base            size flash = eflash.array
+  map mem sram1-base            size 192K = sram1
+  map mem sram2a-base           size 32K   = sram2a
+  map mem sram2b-base           size 32K   = sram2b
+  map mem sram2-mirror          size 32K   = sram2a
+  map mem sram2-mirror + 0x8000 size 32K   = sram2b
+  map mem 0x1fff7500            size 0xe2  = devinfo   # PACKAGE_BASE
+
+  map mem apb1-base + 0x0000 size 0x64  = tim2
+  map mem apb1-base + 0x2800 size 0xd0  = rtc
+  map mem apb1-base + 0x2c00 size 0x0c  = wwdg
+  map mem apb1-base + 0x3000 size 0x14  = iwdg
+  map mem apb1-base + 0x8000 size 0x34  = lpuart1
+  map mem apb2-base + 0x0000 size 0x114 = syscfg
+  map mem apb2-base + 0x2c00 size 0x64  = tim1
+  map mem apb2-base + 0x3800 size 0x34  = usart1
+  map mem apb2-base + 0x4400 size 0x64  = tim16
+  map mem apb2-base + 0x4800 size 0x64  = tim17
+  map mem ahb1-base + 0x0000 size 0xac  = dma1
+  map mem ahb1-base + 0x0400 size 0xac  = dma2
+  map mem ahb1-base + 0x0800 size 0x148 = dmamux
+  map mem ahb1-base + 0x3000 size 0x18  = crc
+  map mem ahb2-base + 0x0000 size 0x2c  = gpioa
+  map mem ahb2-base + 0x0400 size 0x2c  = gpiob
+  map mem ahb2-base + 0x0800 size 0x2c  = gpioc
+  map mem ahb2-base + 0x0c00 size 0x2c  = gpiod
+  map mem ahb2-base + 0x1000 size 0x2c  = gpioe
+  map mem ahb2-base + 0x1c00 size 0x2c  = gpioh
+  map mem ahb4-base + 0x0000 size 0x188 = rcc
+  map mem ahb4-base + 0x0400 size 0x8c = pwr
+  map mem ahb4-base + 0x0800 size 0x400 = exti
+  map mem ahb4-base + 0x0c00 size 0x400 = ipcc
+  map mem ahb4-base + 0x1000 size 0x0c  = rng
+  map mem ahb4-base + 0x1400 size 0x400 = hsem
+  map mem ahb4-base + 0x4000 size 0x88  = eflash
+  map mem dbgmcu-base        size 0x54  = dbgmcu
+
+  # ---------------------------------------------------------------------
+  # Interrupts: RM0434 Table 72 / `IRQn_Type`, interrupt n -> cpu.irq{n}
+  # ---------------------------------------------------------------------
+  wire wwdg.ewi      -> cpu.irq0   # WWDG
+  wire exti.irq18    -> cpu.irq2   # TAMP_STAMP_LSECSS
+  wire exti.irq19    -> cpu.irq3   # RTC_WKUP
+  wire eflash.irq    -> cpu.irq4   # FLASH
+  wire rcc.irq       -> cpu.irq5   # RCC
+  wire exti.irq0     -> cpu.irq6   # EXTI0
+  wire exti.irq1     -> cpu.irq7   # EXTI1
+  wire exti.irq2     -> cpu.irq8   # EXTI2
+  wire exti.irq3     -> cpu.irq9   # EXTI3
+  wire exti.irq4     -> cpu.irq10  # EXTI4
+  wire dma1.irq1     -> cpu.irq11  # DMA1_Channel1
+  wire dma1.irq2     -> cpu.irq12  # DMA1_Channel2
+  wire dma1.irq3     -> cpu.irq13  # DMA1_Channel3
+  wire dma1.irq4     -> cpu.irq14  # DMA1_Channel4
+  wire dma1.irq5     -> cpu.irq15  # DMA1_Channel5
+  wire dma1.irq6     -> cpu.irq16  # DMA1_Channel6
+  wire dma1.irq7     -> cpu.irq17  # DMA1_Channel7
+  wire exti.irq5     -> cpu.irq23  # EXTI9_5
+  wire exti.irq6     -> cpu.irq23  # EXTI9_5
+  wire exti.irq7     -> cpu.irq23  # EXTI9_5
+  wire exti.irq8     -> cpu.irq23  # EXTI9_5
+  wire exti.irq9     -> cpu.irq23  # EXTI9_5
+  wire tim1.irq      -> cpu.irq24  # TIM1_BRK
+  wire tim1.irq-up   -> cpu.irq25  # TIM1_UP_TIM16
+  wire tim1.irq-trg  -> cpu.irq26  # TIM1_TRG_COM_TIM17
+  wire tim1.irq-cc   -> cpu.irq27  # TIM1_CC
+  wire tim2.irq      -> cpu.irq28  # TIM2
+  wire usart1.irq    -> cpu.irq36  # USART1
+  wire lpuart1.irq   -> cpu.irq37  # LPUART1
+  wire tim16.irq     -> cpu.irq25  # shared with TIM1 (TIM16)
+  wire tim16.irq-up  -> cpu.irq25  # shared with TIM1 (TIM16)
+  wire tim16.irq-trg -> cpu.irq25  # shared with TIM1 (TIM16)
+  wire tim16.irq-cc  -> cpu.irq25  # shared with TIM1 (TIM16)
+  wire tim17.irq     -> cpu.irq26  # shared with TIM1 (TIM17)
+  wire tim17.irq-up  -> cpu.irq26  # shared with TIM1 (TIM17)
+  wire tim17.irq-trg -> cpu.irq26  # shared with TIM1 (TIM17)
+  wire tim17.irq-cc  -> cpu.irq26  # shared with TIM1 (TIM17)
+  wire exti.irq10    -> cpu.irq40  # EXTI15_10
+  wire exti.irq11    -> cpu.irq40  # EXTI15_10
+  wire exti.irq12    -> cpu.irq40  # EXTI15_10
+  wire exti.irq13    -> cpu.irq40  # EXTI15_10
+  wire exti.irq14    -> cpu.irq40  # EXTI15_10
+  wire exti.irq15    -> cpu.irq40  # EXTI15_10
+  wire exti.irq17    -> cpu.irq41  # RTC_Alarm
+  wire ipcc.c1-rx    -> cpu.irq44  # IPCC_C1_RX
+  wire ipcc.c1-tx    -> cpu.irq45  # IPCC_C1_TX
+  wire hsem.c1-irq   -> cpu.irq46  # HSEM
+  wire rng.irq       -> cpu.irq53  # RNG
+  wire dma2.irq1     -> cpu.irq55  # DMA2_Channel1
+  wire dma2.irq2     -> cpu.irq56  # DMA2_Channel2
+  wire dma2.irq3     -> cpu.irq57  # DMA2_Channel3
+  wire dma2.irq4     -> cpu.irq58  # DMA2_Channel4
+  wire dma2.irq5     -> cpu.irq59  # DMA2_Channel5
+  wire dma2.irq6     -> cpu.irq60  # DMA2_Channel6
+  wire dma2.irq7     -> cpu.irq61  # DMA2_Channel7
+  wire dmamux.irq    -> cpu.irq62  # DMAMUX1_OVR
+
+  # CPU2's side of the mailbox, and the bit that boots it.
+  wire pwr.c2boot  -> cpu2.boot
+  wire ipcc.c2-rx  -> cpu2.ipcc-rx
+  wire ipcc.c2-tx  -> cpu2.ipcc-tx
+
+  # The RTC's three events are EXTI lines 17–19 (RM0434 Table 74).
+  wire rtc.alarm  -> exti.line17
+  wire rtc.stamp  -> exti.line18
+  wire rtc.wakeup -> exti.line19
+
+  # The GPIO mux: every pin into SYSCFG, EXTICR picks one port per line.
+  for n in 0..16 { wire gpioa.p${n} -> syscfg.pa${n} }
+  for n in 0..16 { wire gpiob.p${n} -> syscfg.pb${n} }
+  for n in 0..16 { wire gpioc.p${n} -> syscfg.pc${n} }
+  for n in 0..16 { wire gpiod.p${n} -> syscfg.pd${n} }
+  for n in 0..16 { wire gpioe.p${n} -> syscfg.pe${n} }
+  for n in 0..16 { wire gpioh.p${n} -> syscfg.ph${n} }
+  for n in 0..16 { wire syscfg.exti${n} -> exti.line${n} }
+
+  # DMAMUX1 channels 0–6 drive DMA1 channels 1–7, 7–13 drive DMA2's.
+  for n in 0..7 { wire dmamux.ch${n} -> dma1.req${n + 1} }
+  for n in 0..7 { wire dmamux.ch${n + 7} -> dma2.req${n + 1} }
+
+  # ---------------------------------------------------------------------
+  # Clock enables and resets, RCC -> peripheral. Bit numbers are the
+  # header's RCC_xxxENR_yyyEN_Pos. CPU2's own enable (C2xxxENR) is ORed
+  # onto the same pin: either core's bit clocks a shared block.
+  # SYSCFG and EXTI have no enable bit on a WB; IWDG runs on the LSI.
+  # ---------------------------------------------------------------------
+  wire rcc.ahb1en0 -> dma1.enable
+  wire rcc.c2ahb1en0 -> dma1.enable
+  wire rcc.ahb1rst0 -> dma1.reset
+  wire rcc.ahb1en1 -> dma2.enable
+  wire rcc.c2ahb1en1 -> dma2.enable
+  wire rcc.ahb1rst1 -> dma2.reset
+  wire rcc.ahb1en2 -> dmamux.enable
+  wire rcc.c2ahb1en2 -> dmamux.enable
+  wire rcc.ahb1rst2 -> dmamux.reset
+  wire rcc.ahb1en12 -> crc.enable
+  wire rcc.c2ahb1en12 -> crc.enable
+  wire rcc.ahb1rst12 -> crc.reset
+  wire rcc.ahb2en0 -> gpioa.enable
+  wire rcc.c2ahb2en0 -> gpioa.enable
+  wire rcc.ahb2rst0 -> gpioa.reset
+  wire rcc.ahb2en1 -> gpiob.enable
+  wire rcc.c2ahb2en1 -> gpiob.enable
+  wire rcc.ahb2rst1 -> gpiob.reset
+  wire rcc.ahb2en2 -> gpioc.enable
+  wire rcc.c2ahb2en2 -> gpioc.enable
+  wire rcc.ahb2rst2 -> gpioc.reset
+  wire rcc.ahb2en3 -> gpiod.enable
+  wire rcc.c2ahb2en3 -> gpiod.enable
+  wire rcc.ahb2rst3 -> gpiod.reset
+  wire rcc.ahb2en4 -> gpioe.enable
+  wire rcc.c2ahb2en4 -> gpioe.enable
+  wire rcc.ahb2rst4 -> gpioe.reset
+  wire rcc.ahb2en7 -> gpioh.enable
+  wire rcc.c2ahb2en7 -> gpioh.enable
+  wire rcc.ahb2rst7 -> gpioh.reset
+  wire rcc.ahb3en18 -> rng.enable
+  wire rcc.c2ahb3en18 -> rng.enable
+  wire rcc.ahb3rst18 -> rng.reset
+  wire rcc.ahb3en19 -> hsem.enable
+  wire rcc.c2ahb3en19 -> hsem.enable
+  wire rcc.ahb3rst19 -> hsem.reset
+  wire rcc.ahb3en20 -> ipcc.enable
+  wire rcc.c2ahb3en20 -> ipcc.enable
+  wire rcc.ahb3rst20 -> ipcc.reset
+  wire rcc.apb1en0 -> tim2.enable
+  wire rcc.c2apb1en0 -> tim2.enable
+  wire rcc.apb1rst0 -> tim2.reset
+  wire rcc.apb1en11 -> wwdg.enable
+  wire rcc.c2apb1en11 -> wwdg.enable
+  wire rcc.apb1enb0 -> lpuart1.enable
+  wire rcc.c2apb1enb0 -> lpuart1.enable
+  wire rcc.apb1rstb0 -> lpuart1.reset
+  wire rcc.apb2en11 -> tim1.enable
+  wire rcc.c2apb2en11 -> tim1.enable
+  wire rcc.apb2rst11 -> tim1.reset
+  wire rcc.apb2en14 -> usart1.enable
+  wire rcc.c2apb2en14 -> usart1.enable
+  wire rcc.apb2rst14 -> usart1.reset
+  wire rcc.apb2en17 -> tim16.enable
+  wire rcc.c2apb2en17 -> tim16.enable
+  wire rcc.apb2rst17 -> tim16.reset
+  wire rcc.apb2en18 -> tim17.enable
+  wire rcc.c2apb2en18 -> tim17.enable
+  wire rcc.apb2rst18 -> tim17.reset
+
+  # The RTC: BDCR.RTCEN and the backup-domain reset.
+  wire rcc.rtcen -> rtc.rtcen
+  wire rcc.bdrst -> rtc.bdrst
+
+  # Backup-domain write protection, and the SMPS enable RCC's SMPSSWS reads.
+  wire pwr.dbp    -> rcc.dbp
+  wire pwr.smpsen -> rcc.smpsen
+
+  # Resets. Each watchdog latches its own cause in RCC_CSR; they meet at a
+  # wire.or so firmware can still tell which one rebooted it.
+  # OBL_LAUNCH reloads the option bytes, which is a reset too.
+  object sysreset "wire.or" { inputs = 3 }
+  wire iwdg.reset   -> rcc.iwdgrst
+  wire iwdg.reset   -> sysreset.in0
+  wire wwdg.reset   -> rcc.wwdgrst
+  wire wwdg.reset   -> sysreset.in1
+  wire eflash.reset -> rcc.oblrst
+  wire eflash.reset -> sysreset.in2
+  wire sysreset.out -> cpu.reset
+  wire dbgmcu.iwdg  -> iwdg.freeze
+  wire dbgmcu.wwdg  -> wwdg.freeze
+}

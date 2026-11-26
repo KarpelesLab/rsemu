@@ -546,6 +546,31 @@ pub static STM32U585: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/stm32u585.machine"),
 };
 
+/// An STM32WB55RG, as on ST's NUCLEO-WB55RG: a Cortex-M4F with its radio
+/// coprocessor modelled as ST's wireless stack behind the IPCC mailbox, so
+/// BLE firmware boots CPU2, builds its GATT database and advertises — with no
+/// radio, so nothing is ever on the air. The `firmware` slot takes the flash
+/// image.
+#[cfg(feature = "machine-stm32wb55")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-stm32wb55")))]
+pub static STM32WB55: CatalogEntry = CatalogEntry {
+    name: "stm32wb55",
+    summary: "STM32WB55RG: Cortex-M4F at 64 MHz, 1 MiB flash, 256 KiB SRAM, and a BLE coprocessor with no radio",
+    media: &["firmware"],
+    source: include_str!("../../machines/stm32wb55.machine"),
+};
+
+/// An STM32WB35CE: the WB55 with 512 KiB of flash, 32 KiB of SRAM1 and no
+/// GPIOD, LCD, SPI2 or TSC.
+#[cfg(feature = "machine-stm32wb35")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-stm32wb35")))]
+pub static STM32WB35: CatalogEntry = CatalogEntry {
+    name: "stm32wb35",
+    summary: "STM32WB35CE: the STM32WB55 with 512 KiB flash and 96 KiB SRAM, no LCD, SPI2 or GPIOD",
+    media: &["firmware"],
+    source: include_str!("../../machines/stm32wb35.machine"),
+};
+
 /// A minimal Z80 board, when this build has a Z80.
 ///
 /// A synthetic board rather than a product: ROM at the reset vector, RAM above
@@ -1092,6 +1117,10 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&STM32U575);
     #[cfg(feature = "machine-stm32u585")]
     out.push(&STM32U585);
+    #[cfg(feature = "machine-stm32wb55")]
+    out.push(&STM32WB55);
+    #[cfg(feature = "machine-stm32wb35")]
+    out.push(&STM32WB35);
     #[cfg(feature = "machine-usb-mini")]
     out.push(&USB_MINI);
     #[cfg(feature = "machine-xhci-mini")]
@@ -2669,6 +2698,15 @@ mod tests {
             #[cfg(feature = "machine-stm32u575")]
             ("stm32u575" | "stm32u585", "firmware") => &[
                 0x00, 0x00, 0x03, 0x20, // SP = 0x20030000, the top of SRAM1
+                0x09, 0x00, 0x00, 0x08, // PC = 0x08000008 | 1
+                0xfe, 0xe7, // b .
+            ],
+            // The same for a WB, which boots through the alias at zero onto
+            // flash like an F4; the stack is the top of the smaller part's
+            // SRAM1 (32 KiB on a WB35).
+            #[cfg(feature = "machine-stm32wb55")]
+            ("stm32wb55" | "stm32wb35", "firmware") => &[
+                0x00, 0x80, 0x00, 0x20, // SP = 0x20008000
                 0x09, 0x00, 0x00, 0x08, // PC = 0x08000008 | 1
                 0xfe, 0xe7, // b .
             ],
