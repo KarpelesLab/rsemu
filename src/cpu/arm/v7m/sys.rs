@@ -387,6 +387,17 @@ pub const CPUID_CORTEX_M7: u32 = 0x411f_c271;
 /// [`Config::cpuid`](super::Config::cpuid) or the `cpuid` property.
 pub const CPUID_SC300: u32 = 0x410f_0000;
 
+/// The default `SYST_CALIB`: `NOREF` and `SKEW` set, `TENMS` zero.
+///
+/// The register is not the core's to decide: the Cortex-M TRMs drive it from
+/// the `STCALIB` integration input, so its value is the SoC's. Without a
+/// board that states it, the reference clock is not modelled and the
+/// calibration is unknown, which is exactly what those two bits say
+/// (DDI 0403E B3.3.6, DDI 0419E B3.3.5). [`Config::syst_calib`] overrides it.
+///
+/// [`Config::syst_calib`]: super::Config::syst_calib
+pub const SYST_CALIB_UNKNOWN: u32 = (1 << 31) | (1 << 30);
+
 /// Everything behind `0xE000E000`, plus the exception bookkeeping the NVIC
 /// and the SCB share.
 #[derive(Debug, Clone)]
@@ -477,9 +488,10 @@ pub struct Sys {
     pub syst_rvr: u32,
     /// `SYST_CVR`, 24 bits.
     pub syst_cvr: u32,
-    /// `SYST_CALIB`. `NOREF` and `SKEW` set, `TENMS` zero: the reference
-    /// clock is not modelled and calibration is unknown, which is exactly
-    /// what those bits mean.
+    /// `SYST_CALIB`, read-only: [`Config::syst_calib`], by default
+    /// [`SYST_CALIB_UNKNOWN`].
+    ///
+    /// [`Config::syst_calib`]: super::Config::syst_calib
     pub syst_calib: u32,
 
     /// `DEMCR` at `0xE000EDFC` (DDI 0403 C1.6.5).
@@ -591,7 +603,7 @@ impl Sys {
             syst_rvr: 0,
             syst_cvr: 0,
             // NOREF | SKEW.
-            syst_calib: (1 << 31) | (1 << 30),
+            syst_calib: SYST_CALIB_UNKNOWN,
             demcr: 0,
             dwt_ctrl: DWT_CTRL_FIXED,
             dwt_cyccnt: 0,

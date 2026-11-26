@@ -252,6 +252,39 @@ fn from_props_names_every_v6m_part() {
 }
 
 #[test]
+fn syst_calib_is_the_boards_and_survives_a_reset() {
+    // No board statement: NOREF and SKEW, calibration unknown.
+    let props = Props::new().with("part", Value::from("sc000"));
+    let cpu = ArmV7m::from_props(&props).unwrap();
+    assert_eq!(
+        cpu.with_sys(|s| s.read_word(0xe000_e01c, true)),
+        Some(super::SYST_CALIB_UNKNOWN)
+    );
+
+    // What SC000 silicon read: NOREF only. Read-only, and every reset
+    // puts the board's value back rather than the default.
+    let props = Props::new()
+        .with("part", Value::from("sc000"))
+        .with("syst-calib", Value::from(0x8000_0000u64));
+    let cpu = ArmV7m::from_props(&props).unwrap();
+    assert_eq!(cpu.config().syst_calib, 0x8000_0000);
+    cpu.with_sys(|s| {
+        assert!(s.write_word(0xe000_e01c, 0x1234));
+        assert_eq!(s.read_word(0xe000_e01c, true), Some(0x8000_0000));
+    });
+    for kind in [
+        crate::core::device::ResetKind::Warm,
+        crate::core::device::ResetKind::Cold,
+    ] {
+        Device::reset(&cpu, kind);
+        assert_eq!(
+            cpu.with_sys(|s| s.read_word(0xe000_e01c, true)),
+            Some(0x8000_0000)
+        );
+    }
+}
+
+#[test]
 fn from_props_refuses_what_the_part_cannot_do() {
     // A Cortex-M0 has no VTOR.
     let props = Props::new()

@@ -215,7 +215,7 @@ use crate::machine::validate::port_index;
 use exec::{Exec, State};
 use sys::{Exception, Sys};
 
-pub use sys::{CPUID_CORTEX_M4, CPUID_CORTEX_M7, CPUID_SC300};
+pub use sys::{CPUID_CORTEX_M4, CPUID_CORTEX_M7, CPUID_SC300, SYST_CALIB_UNKNOWN};
 
 #[cfg(feature = "cpu-arm-v8m")]
 pub use v8m::CPUID_CORTEX_M33;
@@ -533,6 +533,14 @@ pub struct Config {
     /// be 256-byte aligned. Software discovers the width by writing ones and
     /// reading back, which is why it is modelled rather than assumed.
     pub vtor_mask: u32,
+    /// The value `SYST_CALIB` (`0xE000E01C`) reads.
+    ///
+    /// The SoC's, not the core's: it comes from the `STCALIB` integration
+    /// input, so two boards on the same part can differ — SC000 silicon the
+    /// project owner read gives `0x80000000` (`NOREF`, no `SKEW`, `TENMS`
+    /// zero). Every preset uses [`SYST_CALIB_UNKNOWN`]; a board sets its
+    /// own with the `syst-calib` property.
+    pub syst_calib: u32,
 }
 
 impl Config {
@@ -548,6 +556,7 @@ impl Config {
         arch: Arch::V7m,
         reset_vtor: 0,
         vtor_mask: 0xffff_ff80,
+        syst_calib: SYST_CALIB_UNKNOWN,
     };
 
     /// A Cortex-M7: the same architecture, a different `CPUID`, and four
@@ -622,6 +631,7 @@ impl Config {
         arch: Arch::V6m,
         reset_vtor: 0,
         vtor_mask: 0,
+        syst_calib: SYST_CALIB_UNKNOWN,
     };
 
     /// A Cortex-M0+ r0p1 with every option a part usually ships: `VTOR`
@@ -1190,6 +1200,8 @@ impl ArmV7m {
         } else {
             None
         };
+        let syst_calib =
+            r.or_range("syst-calib", u64::from(SYST_CALIB_UNKNOWN), 0..=0xffff_ffff)? as u32;
         r.finish()?;
         let base = match part {
             #[cfg(feature = "cpu-arm-v6m")]
@@ -1255,6 +1267,7 @@ impl ArmV7m {
             },
             reset_vtor: vtor as u32,
             cpuid: cpuid.unwrap_or(base.cpuid),
+            syst_calib,
             ..base
         };
         if priority_bits != 0 {
@@ -1840,6 +1853,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "the value CPUID reads, for silicon whose revision differs from the part's default",
         },
         PropertySpec {
+            name: "syst-calib",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "the value SYST_CALIB reads: the SoC's STCALIB input (default 0xC0000000, NOREF and SKEW, TENMS unknown)",
+        },
+        PropertySpec {
             name: "vtor",
             kind: ValueKind::Uint,
             required: false,
@@ -2271,6 +2290,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("fp", ValueKind::Bool))
         .prop(PropSchema::new("vtor", ValueKind::Uint).range(0, 0xffff_ff80))
         .prop(PropSchema::new("cpuid", ValueKind::Uint).range(0, 0xffff_ffff))
+        .prop(PropSchema::new("syst-calib", ValueKind::Uint).range(0, 0xffff_ffff))
         // Inputs only. `irq0`…`irq239` are the NVIC's external lines.
         .port_bank("irq", PortDir::In, IRQ_LINES)
         .port("nmi", PortDir::In)

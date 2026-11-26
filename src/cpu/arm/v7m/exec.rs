@@ -200,6 +200,7 @@ impl State {
         let mut sys = sys;
         sys.vtor_mask = cfg.vtor_mask;
         sys.vtor = cfg.reset_vtor & cfg.vtor_mask;
+        sys.syst_calib = cfg.syst_calib;
         State {
             r: [0; 16],
             sp_other: 0,
