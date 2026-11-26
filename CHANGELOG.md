@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/KarpelesLab/rsemu/compare/v0.0.10...v0.0.11) - 2026-11-26
+
+### Added
+
+- *(machine)* wire the WB U(S)ARTs' DMA requests into DMAMUX1
+- *(dev-stm32)* st.usart drives its DMA requests, and takes bridged narrow accesses
+- *(machine)* the stm32wb55 and stm32wb35 boards
+- *(dev-pwr)* the STM32WB55 power controller
+- *(dev-rcc)* the STM32WB55 reset and clock controller
+- *(dev-stm32)* st.devinfo grows the WB's UID64
+- *(dev-stm32-dbgmcu)* a "wb" variant with CPU2's freeze registers
+- *(dev-stm32-dmamux)* a `requests` property for the WB's six-bit DMAREQ_ID
+- *(dev-stm32)* a "wb" GPIO port, the F4 register file plus BRR
+- *(dev-stm32-exti)* a "wb" SYSCFG with the CPU2 pre-masks and VREFBUF
+- *(dev-stm32-flash)* a "wb" variant with CPU2's secure area
+- *(dev-stm32-exti)* a "wb" variant with the CPU2 mask bank
+- *(dev-stm32)* st.wb-cpu2, the WB wireless coprocessor and its BLE stack
+- *(dev-stm32)* st.hsem, the WB hardware semaphore
+- *(dev-stm32)* st.ipcc, the WB inter-processor mailbox doorbells
+- *(cpu-arm)* SYST_CALIB as configuration, the `syst-calib` property
+
+### Fixed
+
+- *(dev-stm32)* recheck st.wb-cpu2's BLE command table against AN5270 rev 36
+- *(dev-stm32-dmamux)* SYNC_ID is five bits, not three
+- *(dev-stm32)* st.ipcc takes byte and halfword accesses without a fault
+- *(dev-stm32)* st.hsem sets CxISR on every free, enabled or not
+- *(dev-stm32)* build st.usbfs without std
+- *(cpu-arm)* give the SC000 its real CPUID, 0x410CC300
+
+### Other
+
+- *(machine)* ST's WB HAL and a BLE mailbox client on the WB boards
+- the STM32WB55/WB35 peripheral inventory for the board files
+
 ## [0.0.10](https://github.com/KarpelesLab/rsemu/compare/v0.0.9...v0.0.10) - 2026-11-26
 
 ### Added
