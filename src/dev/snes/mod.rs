@@ -3,10 +3,15 @@
 //! | Module | Class | Covers |
 //! | --- | --- | --- |
 //! | [`cart`] | `snes.cart` | the cartridge: LoROM/HiROM/ExHiROM decoding, SRAM, header detection |
+//! | [`wram`] | `snes.wram` | 128 KiB of work RAM and its `WMDATA`/`WMADD` port on the B-bus |
 
 #[cfg(feature = "dev-snes-cart")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-cart")))]
 pub mod cart;
+
+#[cfg(feature = "dev-snes-cart")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-cart")))]
+pub mod wram;
 
 use alloc::vec::Vec;
 
@@ -20,6 +25,8 @@ use crate::core::error::Result;
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     #[cfg(feature = "dev-snes-cart")]
     cart::register(registry)?;
+    #[cfg(feature = "dev-snes-cart")]
+    wram::register(registry)?;
     Ok(())
 }
 
@@ -31,6 +38,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     #[cfg(feature = "dev-snes-cart")]
     cart::bind(bindings)?;
+    #[cfg(feature = "dev-snes-cart")]
+    wram::bind(bindings)?;
     Ok(())
 }
 
@@ -40,6 +49,6 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schemas() -> Vec<crate::machine::validate::ClassSchema> {
     let mut out = Vec::new();
     #[cfg(feature = "dev-snes-cart")]
-    out.push(cart::schema());
+    out.extend([cart::schema(), wram::schema()]);
     out
 }
