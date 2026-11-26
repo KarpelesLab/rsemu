@@ -1340,6 +1340,8 @@ fn install_capture(
     rsemu::host::display::gb::capture::install(options)?;
     #[cfg(feature = "dev-sms")]
     rsemu::host::display::sms::capture::install(options)?;
+    #[cfg(feature = "dev-snes-ppu")]
+    rsemu::host::display::snes::capture::install(options)?;
     #[cfg(feature = "dev-lcdc")]
     rsemu::host::display::lcd::capture::install(options)?;
     #[cfg(feature = "dev-amiga-denise")]
@@ -1463,6 +1465,10 @@ fn take_scanout(
     }
     #[cfg(feature = "dev-sms")]
     if let Some(s) = rsemu::host::display::sms::capture::take_vdp(hosts) {
+        return Some(Box::new(s));
+    }
+    #[cfg(feature = "dev-snes-ppu")]
+    if let Some(s) = rsemu::host::display::snes::capture::take(hosts) {
         return Some(Box::new(s));
     }
     // Denise needs the machine for the same reason `lcd` does: its frame

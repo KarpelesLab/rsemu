@@ -23,7 +23,7 @@
 //! ```
 //!
 //! The device side is one small adapter per display device — [`nes`], [`lcd`], `rcar`, `amiga`,
-//! [`pc`], [`sms`] and [`gb`] — and the host side never learns which machine it
+//! [`pc`], [`sms`], `snes` and [`gb`] — and the host side never learns which machine it
 //! is looking at. A virtio-gpu adds an adapter and nothing else changes.
 //!
 //! # Why a callback-free `Surface` rather than a borrowed slice
@@ -115,6 +115,10 @@ pub mod rcar;
 #[cfg(feature = "dev-sms")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
 pub mod sms;
+
+#[cfg(feature = "dev-snes-ppu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-ppu")))]
+pub mod snes;
 
 #[cfg(feature = "display-png")]
 #[cfg_attr(docsrs, doc(cfg(feature = "display-png")))]
