@@ -8,13 +8,14 @@
 //!
 //! # Sources
 //!
-//! * ST **AN5270** rev 35 — every opcode, every input and output parameter
-//!   size, the "Events generated" list that decides Command Complete against
-//!   Command Status, the status codes (§4.1), the Tx power table (§4.2) and the
-//!   configuration-data offsets and reset values (§4.3, §2.3.1, §2.3.2).
-//!   [`COMMANDS`] was extracted from that document's tables mechanically and
-//!   then checked by hand; the handful of places where it and the Core
-//!   Specification disagree are listed on the table.
+//! * ST **AN5270** rev 36 (November 2026) — every opcode, every input and
+//!   output parameter size, the "Events generated" list that decides Command
+//!   Complete against Command Status, the status codes (§4.1), the Tx power
+//!   table (§4.2) and the configuration-data offsets and reset values (§4.3,
+//!   §2.3.1, §2.3.2). [`COMMANDS`] was extracted from that document's tables
+//!   mechanically and then checked by hand; the handful of places where it and
+//!   the Core Specification disagree are listed on the table. It was first
+//!   written from rev 35; what rev 36 changed is listed there too.
 //! * ST **AN5289** rev 18 §8.6.5 — the `SHCI_C2_BLE_Init` parameter block, and
 //!   the attribute-record accounting ("increased by 9 … standard attribute
 //!   profile and GAP service characteristics") that fixes the handles the GATT
@@ -38,7 +39,7 @@ use crate::core::rand::Stream;
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 
 // ---------------------------------------------------------------------------
-// Status codes (AN5270 §4.1, Table 467)
+// Status codes (AN5270 §4.1, Table 468)
 // ---------------------------------------------------------------------------
 
 /// Success.
@@ -54,7 +55,7 @@ pub(crate) const DISALLOWED: u8 = 0x0C;
 pub(crate) const UNSUPPORTED: u8 = 0x11;
 /// Invalid HCI command parameters: a packet shorter than its own layout.
 pub(crate) const INVALID_HCI_PARAMS: u8 = 0x12;
-/// Invalid handle (an ACI code, AN5270 Table 467).
+/// Invalid handle (an ACI code, AN5270 Table 468).
 pub(crate) const INVALID_HANDLE: u8 = 0x60;
 /// Out of handles: a service's reserved range is full.
 pub(crate) const OUT_OF_HANDLES: u8 = 0x61;
@@ -81,6 +82,13 @@ pub(crate) const EVT_VENDOR: u8 = 0xFF;
 const LE_CONNECTION_COMPLETE: u8 = 0x01;
 /// `ACI_GAP_PROC_COMPLETE_EVENT` (AN5270 Table 410).
 const ACI_GAP_PROC_COMPLETE: u16 = 0x0407;
+
+/// `ACI_GAP_START_SCAN`'s procedures (AN5270 rev 36 Table 273). The first two
+/// are Table 415's bits; `GAP_GENERIC_SCAN_PROC` is the general and selective
+/// connection-establishment and observation bits together.
+const GAP_LIMITED_DISCOVERY: u8 = 0x01;
+const GAP_GENERAL_DISCOVERY: u8 = 0x02;
+const GAP_GENERIC_SCAN: u8 = 0xB0;
 
 /// `Num_HCI_Command_Packets` in every Command Complete and Command Status the
 /// BLE channel carries: one, because the mailbox has exactly one command
@@ -132,19 +140,22 @@ const fn row(opcode: u16, name: &'static str, reply: Reply, ret: u8, conn: bool)
 
 use Reply::{Complete as CC, Silent as NONE, Status as CS};
 
-/// Every command AN5270 rev 35 lists, with how it is answered.
+/// Every command AN5270 rev 36 lists, with how it is answered.
 ///
 /// Extracted from AN5270's command tables (§2.1–§2.7: the opcode lists,
 /// the "output parameters" tables and each section's "Events generated"),
 /// then corrected by hand where the extraction or the document itself is
 /// wrong:
 ///
-/// * `ACI_GAP_ALLOW_REBOND` is listed as `ACI_HAL_ALLOW_REBOND` in Table 176;
-///   0xFC95 either way.
-/// * `ACI_GAP_SET_NON_CONNECTABLE` and `ACI_GATT_DISC_PRIMARY_SERVICE_BY_UUID`
-///   lose their "Events generated" heading to a page break; the first is a
-///   Command Complete like its siblings, the second a Command Status like
-///   every other GATT client procedure.
+/// * `ACI_GAP_ALLOW_REBOND` is listed as `ACI_HAL_ALLOW_REBOND` in Table 176
+///   (still, in rev 36); 0xFC95 either way.
+/// * `ACI_GAP_SET_NON_CONNECTABLE` loses its "Events generated" heading to a
+///   page break; the bullet under it says Command Complete.
+/// * `ACI_GATT_DISC_PRIMARY_SERVICE_BY_UUID` (§2.6.19) and
+///   `ACI_GATT_READ_MULTIPLE_VAR_CHAR_VALUE` (§2.6.43) are Command Complete,
+///   unlike every other GATT client procedure. Both revisions say so, and
+///   for an ACI command AN5270 is the only authority. (This table answered
+///   both with Command Status until it was rechecked against rev 36.)
 /// * AN5270 says Command Complete for `HCI_LE_READ_REMOTE_FEATURES_PAGE_0`,
 ///   `HCI_LE_EXTENDED_CREATE_CONNECTION` and `HCI_LE_GENERATE_DHKEY_V2`, and
 ///   Command Status for `HCI_LE_TRANSMITTER_TEST`. The Core Specification
@@ -154,8 +165,34 @@ use Reply::{Complete as CC, Silent as NONE, Status as CS};
 /// * `ACI_GAP_CHECK_BONDED_DEVICE`'s `Id_Address` is six octets, not the one
 ///   the table prints; `ACI_GAP_GET_BONDED_DEVICES` and the variable-length
 ///   rows are answered by their own handlers, not from `ret`.
-/// * `ACI_HAL_GET_FW_BUILD_NUMBER` (0xFC00 in older revisions) is **not** in
-///   rev 35 and is therefore an unknown command here.
+/// * `ACI_HAL_GET_FW_BUILD_NUMBER` (0xFC00) is an unknown command here: rev
+///   31 removed it (Table 472, the revision history, "Removed former Section
+///   2.3.1: ACI_HAL_GET_FW_BUILD_NUMBER"), along with
+///   `ACI_HAL_GET_PM_DEBUG_INFO` and `ACI_HAL_STACK_RESET`.
+///
+/// What rev 36 changed against rev 35, besides renumbering every table from
+/// 447 on by one:
+///
+/// * 0xFCD0 is renamed `ACI_GAP_START_SCAN` (was `ACI_GAP_EXT_START_SCAN`)
+///   and its `Procedure` is now 0x01 limited discovery, 0x02 general
+///   discovery or 0xB0 `GAP_GENERIC_SCAN_PROC` (Table 273), ended by
+///   `ACI_GAP_TERMINATE_GAP_PROC` with that same code (§2.5.52). The four
+///   older discovery and connection-establishment procedures are marked
+///   deprecated in its favour (§2.5.22, §2.5.25, §2.5.26, §2.5.32).
+/// * `Service_Handle`/`Serv_Handle` is "Deprecated; this parameter is ignored
+///   by the BLE stack" in `ACI_GATT_ADD_CHAR_DESC`, `_UPDATE_CHAR_VALUE`,
+///   `_DEL_CHAR`, `_DEL_INCLUDE_SERVICE`, `_SET_SECURITY_PERMISSION`,
+///   `_SET_DESC_VALUE`, `_UPDATE_CHAR_VALUE_EXT` and `_SET_ACCESS_PERMISSION`
+///   (Tables 285, 287, 289, 293, 345, 347, 353, 355): the characteristic
+///   handle alone finds the characteristic. `ACI_GATT_ADD_CHAR` still uses it.
+/// * A new event, `ACI_GATT_NOTIFICATION_LL_ACK_EVENT` (0x0C1C, §3.4.27,
+///   `GATT_Evt_Mask` bit 0x0080_0000); `ACI_RESET`'s options gain 0x400 "no
+///   NRPA timeout" (Table 169); `ACI_WARNING_EVENT` gains type 0x08 "GATT
+///   database saving issue" (Table 467). None is reachable without a radio,
+///   an NRPA timer or an NVM.
+/// * Parameter renames to the Core Specification's spelling (`TX_Channel`,
+///   `Test_Data_Length`, `Max_Latency`, `Handle` in `HCI_READ_RSSI`, …): no
+///   size, opcode or reply kind changed.
 #[rustfmt::skip]
 pub(crate) static COMMANDS: &[Command] = &[
     // §2.1 HCI commands
@@ -316,7 +353,7 @@ pub(crate) static COMMANDS: &[Command] = &[
     row(0xFCC4, "ACI_GAP_ADV_REMOVE_SET", CC, 1, false),
     row(0xFCC5, "ACI_GAP_ADV_CLEAR_SETS", CC, 1, false),
     row(0xFCC6, "ACI_GAP_ADV_SET_RANDOM_ADDRESS", CC, 1, false),
-    row(0xFCD0, "ACI_GAP_EXT_START_SCAN", CS, 1, false),
+    row(0xFCD0, "ACI_GAP_START_SCAN", CS, 1, false),
     row(0xFCD1, "ACI_GAP_EXT_CREATE_CONNECTION", CS, 1, false),
     // §2.6 GATT/ATT commands
     row(0xFD01, "ACI_GATT_INIT", CC, 1, false),
@@ -337,7 +374,7 @@ pub(crate) static COMMANDS: &[Command] = &[
     row(0xFD10, "ACI_ATT_PREPARE_WRITE_REQ", CS, 1, true),
     row(0xFD11, "ACI_ATT_EXECUTE_WRITE_REQ", CS, 1, true),
     row(0xFD12, "ACI_GATT_DISC_ALL_PRIMARY_SERVICES", CS, 1, true),
-    row(0xFD13, "ACI_GATT_DISC_PRIMARY_SERVICE_BY_UUID", CS, 1, true),
+    row(0xFD13, "ACI_GATT_DISC_PRIMARY_SERVICE_BY_UUID", CC, 1, true),
     row(0xFD14, "ACI_GATT_FIND_INCLUDED_SERVICES", CS, 1, true),
     row(0xFD15, "ACI_GATT_DISC_ALL_CHAR_OF_SERVICE", CS, 1, true),
     row(0xFD16, "ACI_GATT_DISC_CHAR_BY_UUID", CS, 1, true),
@@ -361,7 +398,7 @@ pub(crate) static COMMANDS: &[Command] = &[
     row(0xFD2E, "ACI_GATT_SET_ACCESS_PERMISSION", CC, 1, false),
     row(0xFD30, "ACI_GATT_STORE_DB", CC, 1, false),
     row(0xFD31, "ACI_GATT_SET_MULT_NOTIFICATION", CC, 1, true),
-    row(0xFD32, "ACI_GATT_READ_MULTIPLE_VAR_CHAR_VALUE", CS, 1, true),
+    row(0xFD32, "ACI_GATT_READ_MULTIPLE_VAR_CHAR_VALUE", CC, 1, true),
     row(0xFD40, "ACI_GATT_WRITE_WITHOUT_RESP_EXT", CC, 1, true),
     row(0xFD41, "ACI_GATT_WRITE_WITH_RESP_EXT", CS, 1, true),
     // §2.7 L2CAP commands
@@ -420,8 +457,8 @@ static SUPPORTED: &[(u16, u8, u8)] = &[
 const LE_FEATURES: u64 = 0x41FF;
 
 /// The `HCI_Version`/`LMP_Version` assigned number reported: 0x0D, Core 5.4.
-/// Unverified against a real part; AN5270 rev 35 is written against Core 6.2
-/// but says nothing about what the controller claims.
+/// Unverified against a real part; AN5270 rev 36 is written against Core 6.3
+/// (rev 35: 6.2) but Table 16 only says "see Bluetooth assigned numbers".
 const HCI_VERSION: u8 = 0x0D;
 
 /// `Company_Identifier`: 0x0030, STMicroelectronics (AN5270 Table 16).
@@ -616,12 +653,13 @@ impl Gatt {
         self.attrs.insert(handle, attr);
     }
 
-    /// The characteristic whose declaration is at `decl`, if it is one in
-    /// `service`.
-    fn char_decl(&self, service: u16, decl: u16) -> Option<&Attr> {
+    /// The characteristic whose declaration is at `decl`, whatever service
+    /// it is in: the commands that take one name the service too, but AN5270
+    /// rev 36 says the stack ignores that (Tables 285, 287, 289, 347, 353).
+    fn char_decl(&self, decl: u16) -> Option<&Attr> {
         self.attrs
             .get(&decl)
-            .filter(|a| a.kind == AttrKind::CharDecl && a.service == service)
+            .filter(|a| a.kind == AttrKind::CharDecl)
     }
 
     /// Add a characteristic: the declaration, its value at the next handle,
@@ -706,8 +744,8 @@ impl Gatt {
     }
 
     /// The handle holding `decl`'s value.
-    fn value_of(&self, service: u16, decl: u16) -> core::result::Result<u16, u8> {
-        self.char_decl(service, decl).ok_or(INVALID_HANDLE)?;
+    fn value_of(&self, decl: u16) -> core::result::Result<u16, u8> {
+        self.char_decl(decl).ok_or(INVALID_HANDLE)?;
         Ok(decl.wrapping_add(1))
     }
 
@@ -737,10 +775,10 @@ impl Gatt {
     }
 
     /// Remove `decl` and everything up to the next declaration in its service.
-    fn del_char(&mut self, service: u16, decl: u16) -> u8 {
-        if self.char_decl(service, decl).is_none() {
+    fn del_char(&mut self, decl: u16) -> u8 {
+        let Some(service) = self.char_decl(decl).map(|a| a.service) else {
             return INVALID_HANDLE;
-        }
+        };
         let doomed: Vec<u16> = self
             .attrs
             .range(decl..)
@@ -971,6 +1009,10 @@ pub(crate) struct Ble {
     create_pending: bool,
     /// The GAP procedures running, as AN5270 Table 415's procedure codes.
     gap_procs: u8,
+    /// The `Procedure` an `ACI_GAP_START_SCAN` is running (0x01, 0x02 or
+    /// 0xB0), zero for none. Kept apart from `gap_procs` because 0xB0 is not
+    /// one bit, and it ends only by that whole code (AN5270 §2.5.52).
+    scan_proc: u8,
     /// `ACI_HAL_SET_TX_POWER_LEVEL`'s `PA_Level`.
     pa_level: u8,
     /// `HCI_LE_Write_Suggested_Default_Data_Length`.
@@ -1011,6 +1053,7 @@ impl Ble {
             scanning: false,
             create_pending: false,
             gap_procs: 0,
+            scan_proc: 0,
             pa_level: 0x1F,
             suggested: (0x001B, 0x0148),
             gatt: Gatt::fresh(),
@@ -1033,7 +1076,7 @@ impl Ble {
         );
     }
 
-    /// The configuration data structure's reset values (AN5270 Table 469).
+    /// The configuration data structure's reset values (AN5270 Table 470).
     fn reset_config(&mut self) {
         self.config = vec![0; config::SIZE];
         self.config[config::PUBLIC_ADDRESS..config::PUBLIC_ADDRESS + 6]
@@ -1060,6 +1103,7 @@ impl Ble {
         self.scanning = false;
         self.create_pending = false;
         self.gap_procs = 0;
+        self.scan_proc = 0;
         self.suggested = (0x001B, 0x0148);
     }
 
@@ -1178,16 +1222,40 @@ impl Ble {
             0xFC9B => self.start_proc(0x20),
             0xFC9C => self.start_proc(0x40),
             0xFCA2 => self.start_proc(0x80),
+            0xFCD0 => self.start_scan(p),
             // Extended scanning and connection: accepted, nothing heard.
             _ => OK,
         }
     }
 
     fn start_proc(&mut self, code: u8) -> u8 {
-        if self.gap_procs & code != 0 {
+        if (self.gap_procs | self.scan_proc) & code != 0 {
             return DISALLOWED;
         }
         self.gap_procs |= code;
+        OK
+    }
+
+    /// `ACI_GAP_START_SCAN`: `Scan_Mode`(1), `Procedure`(1), … (AN5270 rev
+    /// 36 Table 273). The procedure runs until `ACI_GAP_TERMINATE_GAP_PROC`
+    /// names it. A discovery procedure's 10.24 s timeout (§2.5.52) is not
+    /// modelled: nothing here keeps time. A `Procedure` outside the three the
+    /// table lists gets Invalid Parameters — an inference, the table being
+    /// silent on it.
+    fn start_scan(&mut self, p: &[u8]) -> u8 {
+        let Some(&code) = p.get(1) else {
+            return INVALID_HCI_PARAMS;
+        };
+        if !matches!(
+            code,
+            GAP_LIMITED_DISCOVERY | GAP_GENERAL_DISCOVERY | GAP_GENERIC_SCAN
+        ) {
+            return INVALID_PARAMS;
+        }
+        if self.scan_proc != 0 || self.gap_procs & code != 0 {
+            return DISALLOWED;
+        }
+        self.scan_proc = code;
         OK
     }
 
@@ -1221,6 +1289,12 @@ impl Ble {
                 OK
             }
             0x1001 => {
+                // AN5270 Table 16: HCI_Subversion is "the BLE stack reduced
+                // version number" — which reduction is unverified; this one
+                // packs major.minor.sub into 4+4+4 bits. LMP_Subversion should
+                // be the HW version in its high byte and the FW version in
+                // its low byte; neither is documented, so it repeats
+                // HCI_Subversion. Both unverified.
                 let major = (self.stack_version >> 24) & 0xF;
                 let minor = (self.stack_version >> 16) & 0xF;
                 let sub = (self.stack_version >> 8) & 0xF;
@@ -1391,7 +1465,7 @@ impl Ble {
                 OK
             }
             0x204B => {
-                // Min and max Tx power: AN5270 Table 468's ends, -40 and +6 dBm.
+                // Min and max Tx power: AN5270 Table 469's ends, -40 and +6 dBm.
                 ret[1] = (-40i8) as u8;
                 ret[2] = 6;
                 OK
@@ -1422,8 +1496,13 @@ impl Ble {
                 OK
             }
             0xFF01 => {
-                // Version (8) is the stack version word, little-endian, then
-                // zeros; Options (4) is BLE_Init's options. Both unverified.
+                // AN5270 Table 171: Status, Version (8), Options (4),
+                // Debug_info (12). Options' bits 0–4 and 7 mean what
+                // CFG_BLE_OPTIONS' do (AN5289 §8.6.5), so BLE_Init's options
+                // byte goes there; bits 8–9 have no BLE_Init source and stay
+                // clear. What fills the eight Version octets is not
+                // documented: the stack version word, little-endian, then
+                // zeros, is a guess. Debug_info is zeros.
                 ret[1..5].copy_from_slice(&self.stack_version.to_le_bytes());
                 ret[9..13].copy_from_slice(&u32::from(self.init.options).to_le_bytes());
                 OK
@@ -1452,6 +1531,11 @@ impl Ble {
                 None => INVALID_HCI_PARAMS,
             },
             0xFC9D => match p.first() {
+                Some(&code) if code != 0 && code == self.scan_proc => {
+                    self.scan_proc = 0;
+                    events.push(Ble::vendor(ACI_GAP_PROC_COMPLETE, &[code, OK, 0]));
+                    OK
+                }
                 Some(&code) if self.gap_procs & code != 0 && code.count_ones() == 1 => {
                     self.gap_procs &= !code;
                     // AN5270 §3.3.6: the procedure reports that it ended.
@@ -1467,7 +1551,7 @@ impl Ble {
                 ret[1] = 0;
                 OK
             }
-            0xFCA4 => 0x5C, // "Device not found in DB" (Table 467)
+            0xFCA4 => 0x5C, // "Device not found in DB" (Table 468)
             0xFCAA => 0x5C,
             0xFD01 => self.gatt_init(),
             0xFD02 => return self.add_service(p),
@@ -1475,8 +1559,9 @@ impl Ble {
             0xFD04 => return self.add_char(p),
             0xFD05 => return self.add_char_desc(p),
             0xFD06 => self.update_char_value(p),
+            // Serv_Handle(2) — ignored, AN5270 rev 36 Table 289 — Char_Handle(2).
             0xFD07 => match (le_u16(p, 0), le_u16(p, 2)) {
-                (Some(s), Some(c)) => self.gatt.del_char(s, c),
+                (Some(_), Some(c)) => self.gatt.del_char(c),
                 _ => INVALID_HCI_PARAMS,
             },
             0xFD08 => match le_u16(p, 0) {
@@ -1539,7 +1624,7 @@ impl Ble {
     }
 
     fn set_discoverable(&mut self, p: &[u8]) -> u8 {
-        // AN5270 Table 186/188: Advertising_Type(1), Interval_Min(2),
+        // AN5270 Table 178/180: Advertising_Type(1), Interval_Min(2),
         // Interval_Max(2), Own_Address_Type(1), Filter_Policy(1),
         // Local_Name_Length(1), Local_Name(n), Service_Uuid_length(1),
         // Service_Uuid_List(n), Conn_Interval_Min(2), Conn_Interval_Max(2).
@@ -1784,9 +1869,10 @@ impl Ble {
         // Char_Desc_Uuid_Type(1), UUID(2|16), Char_Desc_Value_Max_Length(1),
         // Char_Desc_Value_Length(1), Char_Desc_Value(n),
         // Security_Permissions(1), Access_Permissions(1), GATT_Evt_Mask(1),
-        // Enc_Key_Size(1), Is_Variable(1).
+        // Enc_Key_Size(1), Is_Variable(1). Rev 36 marks Service_Handle
+        // ignored: the descriptor goes into the characteristic's service.
         let fail = |s: u8| vec![s, 0, 0];
-        let (Some(svc), Some(decl)) = (le_u16(p, 0), le_u16(p, 2)) else {
+        let (Some(_), Some(decl)) = (le_u16(p, 0), le_u16(p, 2)) else {
             return fail(INVALID_HCI_PARAMS);
         };
         let Some((uuid, at)) = uuid_at(p, 4) else {
@@ -1804,9 +1890,9 @@ impl Ble {
         if len > max {
             return fail(INVALID_PARAMS);
         }
-        if self.gatt.char_decl(svc, decl).is_none() {
+        let Some(svc) = self.gatt.char_decl(decl).map(|a| a.service) else {
             return fail(INVALID_HANDLE);
-        }
+        };
         if self.records_full(1) {
             return fail(INSUFFICIENT_RESOURCES);
         }
@@ -1832,9 +1918,9 @@ impl Ble {
     }
 
     fn update_char_value(&mut self, p: &[u8]) -> u8 {
-        // AN5270 Table 287: Service_Handle(2), Char_Handle(2), Val_Offset(1),
-        // Char_Value_Length(1), Char_Value(n).
-        let (Some(svc), Some(decl), Some(&offset), Some(&len)) =
+        // AN5270 Table 287: Service_Handle(2) (ignored since rev 36),
+        // Char_Handle(2), Val_Offset(1), Char_Value_Length(1), Char_Value(n).
+        let (Some(_), Some(decl), Some(&offset), Some(&len)) =
             (le_u16(p, 0), le_u16(p, 2), p.get(4), p.get(5))
         else {
             return INVALID_HCI_PARAMS;
@@ -1842,17 +1928,17 @@ impl Ble {
         let Some(value) = p.get(6..6 + usize::from(len)) else {
             return INVALID_HCI_PARAMS;
         };
-        match self.gatt.value_of(svc, decl) {
+        match self.gatt.value_of(decl) {
             Ok(h) => self.gatt.write_value(h, usize::from(offset), value, None),
             Err(s) => s,
         }
     }
 
     fn update_char_value_ext(&mut self, p: &[u8]) -> u8 {
-        // Conn_Handle_To_Notify(2), Service_Handle(2), Char_Handle(2),
-        // Update_Type(1), Char_Length(2), Value_Offset(2), Value_Length(1),
-        // Value(n).
-        let (Some(svc), Some(decl), Some(total), Some(offset), Some(&len)) = (
+        // AN5270 Table 353: Conn_Handle_To_Notify(2), Service_Handle(2)
+        // (ignored since rev 36), Char_Handle(2), Update_Type(1),
+        // Char_Length(2), Value_Offset(2), Value_Length(1), Value(n).
+        let (Some(_), Some(decl), Some(total), Some(offset), Some(&len)) = (
             le_u16(p, 2),
             le_u16(p, 4),
             le_u16(p, 7),
@@ -1864,7 +1950,7 @@ impl Ble {
         let Some(value) = p.get(12..12 + usize::from(len)) else {
             return INVALID_HCI_PARAMS;
         };
-        match self.gatt.value_of(svc, decl) {
+        match self.gatt.value_of(decl) {
             Ok(h) => self
                 .gatt
                 .write_value(h, usize::from(offset), value, Some(usize::from(total))),
@@ -1873,9 +1959,10 @@ impl Ble {
     }
 
     fn set_desc_value(&mut self, p: &[u8]) -> u8 {
-        // Serv_Handle(2), Char_Handle(2), Char_Desc_Handle(2), Val_Offset(2),
+        // AN5270 Table 347: Serv_Handle(2) (ignored since rev 36),
+        // Char_Handle(2), Char_Desc_Handle(2), Val_Offset(2),
         // Char_Desc_Value_Length(1), Char_Desc_Value(n).
-        let (Some(svc), Some(decl), Some(desc), Some(offset), Some(&len)) = (
+        let (Some(_), Some(decl), Some(desc), Some(offset), Some(&len)) = (
             le_u16(p, 0),
             le_u16(p, 2),
             le_u16(p, 4),
@@ -1887,9 +1974,9 @@ impl Ble {
         let Some(value) = p.get(9..9 + usize::from(len)) else {
             return INVALID_HCI_PARAMS;
         };
-        if self.gatt.char_decl(svc, decl).is_none() {
+        let Some(svc) = self.gatt.char_decl(decl).map(|a| a.service) else {
             return INVALID_HANDLE;
-        }
+        };
         match self.gatt.attrs.get(&desc) {
             Some(a) if a.kind == AttrKind::Descriptor && a.service == svc && desc > decl => {}
             _ => return INVALID_HANDLE,
@@ -1943,6 +2030,7 @@ impl Ble {
         w.write_bool(self.scanning)?;
         w.write_bool(self.create_pending)?;
         w.write_u8(self.gap_procs)?;
+        w.write_u8(self.scan_proc)?;
         w.write_u8(self.pa_level)?;
         w.write_u16(self.suggested.0)?;
         w.write_u16(self.suggested.1)?;
@@ -1984,6 +2072,7 @@ impl Ble {
         self.scanning = r.read_bool()?;
         self.create_pending = r.read_bool()?;
         self.gap_procs = r.read_u8()?;
+        self.scan_proc = r.read_u8()?;
         self.pa_level = r.read_u8()?;
         self.suggested = (r.read_u16()?, r.read_u16()?);
         self.gatt = Gatt::load(r)?;

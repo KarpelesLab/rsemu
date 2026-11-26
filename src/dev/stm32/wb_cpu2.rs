@@ -131,7 +131,7 @@
 //! # The stack
 //!
 //! The `ble` submodule answers HCI and ACI commands from a table extracted from AN5270
-//! rev 35: Command Complete or Command Status exactly as that table (or, where
+//! rev 36: Command Complete or Command Status exactly as that table (or, where
 //! the two disagree, the Core Specification) says; generic return parameters
 //! zero-filled at the documented size; and real behaviour where there is state
 //! — the configuration data, the GATT database with ST's handle allocation,
@@ -163,7 +163,8 @@
 //!
 //! * **No radio, no peers, no connections.** Advertising and scanning are
 //!   state; no advertising report, connection, pairing, GATT client response
-//!   or notification is ever produced. A GAP procedure runs until terminated.
+//!   or notification is ever produced. A GAP procedure runs until terminated,
+//!   even a discovery that the part would end after 10.24 s (AN5270 §2.5.52).
 //! * The Thread, 802.15.4, Zigbee, trace and LLD tables and channels 3 and 5.
 //! * The local P-256 key and DH key commands answer Unsupported Feature.
 //! * HSEM, RNG, flash and clock interaction: real CPU2 takes semaphores, fills
@@ -179,18 +180,20 @@
 //! likely to notice: the 268-byte pool slot and the placement of BLE command
 //! responses (inferred, above); the wireless stack's answer to
 //! `FUS_GET_STATE` (state and error both 0xFE); `HCI_Version` 0x0D; the
-//! `HCI_Subversion` derivation; LE buffer size 251 × 8; list sizes of 8; the
-//! LE feature and supported-state masks; `ACI_GET_INFORMATION`'s layout;
-//! the memory-size words; and the status codes chosen for an exhausted
-//! attribute pool (0x64) or a full service range (0x61).
+//! `HCI_Subversion` and `LMP_Subversion` values; LE buffer size 251 × 8;
+//! list sizes of 8; the LE feature and supported-state masks; what fills
+//! `ACI_GET_INFORMATION`'s eight Version octets; the memory-size words'
+//! values and byte order; and the status codes chosen for an exhausted
+//! attribute pool (0x64) or a full service range (0x61). AN5270 rev 36 and
+//! AN5289 rev 18 were searched for each; neither settles them.
 //!
 //! # Sources
 //!
 //! | Document | Answers |
 //! | --- | --- |
-//! | ST **AN5289** rev 18 | §4.10 the wireless device information table and version format, §5.2 CPU2 start-up, §8.6.5 `SHCI_C2_BLE_Init`, §14.2 the mailbox interface and which events are returned |
+//! | ST **AN5289** rev 18 | §4.10 the wireless device information table and version format, §5.2 CPU2 start-up, §8.6.5 `SHCI_C2_BLE_Init` and `CFG_BLE_OPTIONS`, §14.2 the mailbox interface and which events are returned, §14.5 the memory-size word |
 //! | ST **AN5185** rev 15 | §6.1 the FUS device information table and the system table, §6.2 channels, §6.3 packet indicators, READY, FUS commands and responses, §2.3 FUS/wireless switching |
-//! | ST **AN5270** rev 35 | every HCI/ACI opcode, parameter layout, reply kind, status code and configuration offset |
+//! | ST **AN5270** rev 36 | every HCI/ACI opcode, parameter layout, reply kind, status code and configuration offset; Table 472 for what earlier revisions removed |
 //! | ST **RM0434** rev 16 | §9 IPCC (C2CR, C2MR reset 0xFFFFFFFF, C2SCR, C2TOC1SR), §6 `PWR_CR4.C2BOOT` |
 //! | Bluetooth **Core Specification** Vol 4 Part E | HCI event formats, unknown-command handling, LE_Encrypt byte order |
 //! | Apache **NuttX** `arch/arm/src/stm32wb/stm32wb_mbox*.{c,h}`, `stm32wb_blehci.c` (Apache-2.0, ASF) | the reference/BLE/system/memory-manager table field order, list node layout, channel numbers, packet type values, `SHCI` opcodes |
@@ -231,7 +234,7 @@ pub use ble::{Advertising, AttrKind};
 pub const CLASS_NAME: &str = "st.wb-cpu2";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// The engine lock's rank: above every bus fabric this device may cross and
 /// below [`LockRank::DEVICE`], because an IPCC register write takes IPCC's
@@ -242,7 +245,7 @@ pub const ENGINE_RANK: LockRank = LockRank::new(0x4c90);
 pub const DEFAULT_IPCC: u64 = 0x5800_0C00;
 /// SRAM2a's start, where the reference table is unless `IPCCDBA` moves it.
 pub const DEFAULT_REF_TABLE: u64 = 0x2003_0000;
-/// PWR's reset value for the public address: AN5270 Table 469, 0x0280E1000000.
+/// PWR's reset value for the public address: AN5270 Table 470, 0x0280E1000000.
 pub const DEFAULT_BD_ADDR: u64 = 0x0280_E100_0000;
 
 // IPCC, processor-2 view (RM0434 §9.4).
@@ -302,8 +305,9 @@ const SHCI_FUS_START_WS: u16 = 0xFC5A;
 const SHCI_BLE_INIT: u16 = 0xFC66;
 
 /// The wireless-stack memory-size word: SRAM2b, SRAM2a 1 KB sectors and flash
-/// 4 KB sectors (AN5289 Figure 12). A placeholder, not a real stack's
-/// footprint.
+/// 4 KB sectors, in AN5289 Figure 12's order (SRAM2b in bits 31:24, SRAM2a in
+/// 23:16, flash in 7:0). AN5289's own §14.5 swaps the two SRAM2 bytes, so
+/// the order is unsettled too. A placeholder, not a real stack's footprint.
 const WS_MEMORY: u32 = 0x0A0E_0032;
 /// The same for FUS. A placeholder.
 const FUS_MEMORY: u32 = 0x0000_0008;
@@ -1739,7 +1743,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "bd-addr",
             kind: ValueKind::Uint,
             required: false,
-            summary: "the public address a reset restores (default 0x0280E1000000, AN5270 Table 469)",
+            summary: "the public address a reset restores (default 0x0280E1000000, AN5270 Table 470)",
         },
         PropertySpec {
             name: "latency",

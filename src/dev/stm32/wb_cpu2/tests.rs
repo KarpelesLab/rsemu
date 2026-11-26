@@ -484,6 +484,31 @@ fn command_status_commands_get_a_command_status_in_the_cs_buffer() {
 }
 
 #[test]
+fn start_scan_runs_until_terminated_by_its_own_procedure_code() {
+    // AN5270 rev 36 §2.5.52 / Table 273: Scan_Mode, Procedure, then the scan
+    // parameters, which this model does not read.
+    let rig = Rig::new();
+    rig.ble_up();
+    let start = |proc_code: u8| {
+        let mut p = vec![0x00, proc_code];
+        p.resize(20, 0);
+        rig.ble(0xFCD0, &p)[0].body.clone()
+    };
+    assert_eq!(start(0xB0), [0x04, 0x0F, 4, 0x00, 1, 0xD0, 0xFC]);
+    assert_eq!(start(0x02)[3], 0x0C, "one scan at a time");
+    // Neither legacy observation (one of 0xB0's bits) nor a lone bit of it
+    // ends nor overlaps the generic scan.
+    assert_eq!(rig.ble(0xFCA2, &[0; 7])[0].body[3], 0x0C);
+    assert_eq!(rig.cc(0xFC9D, &[0x80]), [0x0C]);
+    let got = rig.ble(0xFC9D, &[0xB0]);
+    assert_eq!(got[0].body, [0x04, 0x0E, 4, 1, 0x9D, 0xFC, 0x00]);
+    assert_eq!(got[1].body, [0x04, 0xFF, 5, 0x07, 0x04, 0xB0, 0x00, 0x00]);
+    // A procedure Table 273 does not list.
+    assert_eq!(start(0x10)[3], 0x92);
+    assert_eq!(start(0x01)[3], 0x00, "limited discovery");
+}
+
+#[test]
 fn cancelling_a_create_connection_reports_unknown_connection() {
     let rig = Rig::new();
     rig.ble_up();
@@ -525,7 +550,7 @@ fn local_information_is_well_formed() {
     assert_eq!(
         bd,
         [0, 0x00, 0x00, 0x00, 0xE1, 0x80, 0x02],
-        "AN5270 Table 469"
+        "AN5270 Table 470"
     );
     let cmds = rig.cc(0x1002, &[]);
     assert_eq!(cmds.len(), 65);
@@ -609,14 +634,65 @@ fn gap_and_gatt_build_a_database_with_st_handles() {
     // The declaration reads as properties, value handle, UUID.
     let decl = rig.cc(0xFD2A, &[0x0D, 0x00, 0, 0, 0x10, 0]);
     assert_eq!(decl[5..], [0x10, 0x0E, 0x00, 0x37, 0x2A]);
-    // A characteristic that is not in that service.
-    assert_eq!(rig.cc(0xFD06, &[0x0C, 0x00, 0x06, 0x00, 0, 1, 0])[0], 0x60);
+    // A handle that is not a characteristic declaration.
+    assert_eq!(rig.cc(0xFD06, &[0x0C, 0x00, 0x0E, 0x00, 0, 1, 0])[0], 0x60);
 
     let db = rig.cpu2.gatt();
     assert!(
         db.iter()
             .any(|(h, k, _, _)| *h == 0x0F && *k == AttrKind::Descriptor)
     );
+}
+
+#[test]
+fn gatt_commands_ignore_the_service_handle() {
+    // AN5270 rev 36 Tables 285, 287, 289, 347, 353: "Deprecated; this
+    // parameter is ignored by the BLE stack". The characteristic handle alone
+    // decides.
+    let rig = Rig::new();
+    rig.ble_up();
+    rig.cc(0xFD01, &[]);
+    rig.cc(0xFC8A, &[0x01, 0x00, 0x08]);
+    assert_eq!(
+        rig.cc(0xFD02, &[0x01, 0x0D, 0x18, 0x01, 7]),
+        [0, 0x0C, 0x00]
+    );
+    let ch = rig.cc(
+        0xFD04,
+        &[0x0C, 0x00, 0x01, 0x37, 0x2A, 4, 0, 0x10, 0, 0, 7, 0],
+    );
+    assert_eq!(ch, [0, 0x0D, 0x00], "decl 0x0D, value 0x0E, CCCD 0x0F");
+
+    // A descriptor added under a nonsense service lands in the
+    // characteristic's own range.
+    let d = rig.cc(
+        0xFD05,
+        &[
+            0x34, 0x12, 0x0D, 0x00, 0x01, 0x01, 0x29, 4, 2, b'h', b'i', 0, 1, 0, 7, 1,
+        ],
+    );
+    assert_eq!(d, [0, 0x10, 0x00]);
+    assert_eq!(
+        rig.cc(0xFD29, &[0, 0, 0x0D, 0, 0x10, 0, 0, 0, 2, b'o', b'k']),
+        [0],
+        "ACI_GATT_SET_DESC_VALUE"
+    );
+    assert_eq!(rig.cpu2.attribute_value(0x10), Some(b"ok".to_vec()));
+    assert_eq!(
+        rig.cc(0xFD06, &[0xFF, 0xFF, 0x0D, 0x00, 0, 2, 0x06, 0x48]),
+        [0],
+        "ACI_GATT_UPDATE_CHAR_VALUE"
+    );
+    assert_eq!(rig.cpu2.attribute_value(0x0E), Some(vec![0x06, 0x48, 0, 0]));
+    assert_eq!(
+        rig.cc(0xFD2C, &[0, 0, 0, 0, 0x0D, 0, 0, 4, 0, 0, 0, 2, 1, 2]),
+        [0],
+        "ACI_GATT_UPDATE_CHAR_VALUE_EXT"
+    );
+    assert_eq!(rig.cpu2.attribute_value(0x0E), Some(vec![1, 2, 0, 0]));
+    assert_eq!(rig.cc(0xFD07, &[0, 0, 0x0D, 0]), [0], "ACI_GATT_DEL_CHAR");
+    assert_eq!(rig.cc(0xFD06, &[0x0C, 0x00, 0x0D, 0x00, 0, 1, 0])[0], 0x60);
+    assert_eq!(rig.cpu2.attribute_value(0x0E), None);
 }
 
 #[test]
@@ -718,6 +794,9 @@ fn a_command_naming_a_connection_fails_with_unknown_connection() {
     // A GATT client procedure is a Command Status.
     let got = rig.ble(0xFD12, &[0x00, 0x00]);
     assert_eq!(got[0].body, [0x04, 0x0F, 4, 0x02, 1, 0x12, 0xFD]);
+    // Except the two AN5270 (§2.6.19, §2.6.43) answers by Command Complete.
+    assert_eq!(rig.cc(0xFD13, &[0x00, 0x00, 0x01, 0x0D, 0x18]), [0x02]);
+    assert_eq!(rig.cc(0xFD32, &[0x00, 0x00, 2, 3, 0, 5, 0]), [0x02]);
 }
 
 // ---------------------------------------------------------------------------
