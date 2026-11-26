@@ -10,19 +10,56 @@
 //!
 //! # The registers
 //!
-//! Written from two manuals, because ST changed the block between families and
-//! `variant` selects which (RM0090 §9.2 for `"f4"`, RM0351 §9.2 for `"l4"`):
+//! Written from three manuals, because ST changed the block between families
+//! and `variant` selects which (RM0090 §9.2 for `"f4"`, RM0351 §9.2 for
+//! `"l4"`, RM0434 §11.2 for `"wb"`):
 //!
-//! | Offset | `"f4"` | `"l4"` |
-//! | --- | --- | --- |
-//! | `0x00` | `MEMRMP` | `MEMRMP` |
-//! | `0x04` | `PMC` | `CFGR1` |
-//! | `0x08`–`0x14` | `EXTICR1`–`EXTICR4` | `EXTICR1`–`EXTICR4` |
-//! | `0x18` | — | `SCSR` |
-//! | `0x1c` | — | `CFGR2` |
-//! | `0x20` | `CMPCR` | `SWPR` |
-//! | `0x24` | — | `SKR` |
-//! | `0x28` | — | `SWPR2` |
+//! | Offset | `"f4"` | `"l4"` | `"wb"` |
+//! | --- | --- | --- | --- |
+//! | `0x00` | `MEMRMP` | `MEMRMP` | `MEMRMP` |
+//! | `0x04` | `PMC` | `CFGR1` | `CFGR1` |
+//! | `0x08`–`0x14` | `EXTICR1`–`EXTICR4` | `EXTICR1`–`EXTICR4` | `EXTICR1`–`EXTICR4` |
+//! | `0x18` | — | `SCSR` | `SCSR` |
+//! | `0x1c` | — | `CFGR2` | `CFGR2` |
+//! | `0x20` | `CMPCR` | `SWPR` | `SWPR1` |
+//! | `0x24` | — | `SKR` | `SKR` |
+//! | `0x28` | — | `SWPR2` | `SWPR2` |
+//! | `0x30`/`0x34` | — | — | `VREFBUF_CSR`/`VREFBUF_CCR` |
+//! | `0x100`–`0x10c` | — | — | `IMR1`, `IMR2`, `C2IMR1`, `C2IMR2` |
+//! | `0x110` | — | — | `SIPCR` |
+//!
+//! # The WB
+//!
+//! The STM32WB55/WB35 block (RM0434 §11; `SYSCFG_TypeDef` in ST CMSIS
+//! `stm32wb55xx.h`, Apache-2.0) is the L4's with a second CPU's worth of
+//! registers on top. What `variant = "wb"` changes:
+//!
+//! * **`EXTICR` fields are three bits** (`EXTI0[2:0]`…), so bit 3 of each
+//!   nibble reads zero; field `7` is port **H** and `5`/`6` are reserved — a
+//!   board gives `ports = 8` and simply wires no `pf`/`pg` pins, so those
+//!   encodings select nothing.
+//! * `MEMRMP.MEM_MODE` is three bits and alone (no `FB_MODE`); `CFGR1`
+//!   resets to `0x7C00_0001` (`FPU_IE[4:0]` set) and has no firewall bit —
+//!   bit 0 is reserved and reads one, and `fwdis` is refused.
+//! * **`SCSR`**: `SRAM2ER` can only be set "after the correct key sequence is
+//!   written in the SYSCFG_SKR register" (`0xCA`, then `0x53`; a wrong key
+//!   "reactivates the write protection"). The erase completes at once and,
+//!   as on the L4, erases nothing — SRAM2 belongs to another object — so
+//!   `SRAM2BSY` always reads zero. `C2RFD` (bit 31) is set-only until a reset.
+//! * **The interrupt pre-masks.** `IMR1`/`IMR2` mask peripheral interrupts
+//!   on their way to CPU1, `C2IMR1`/`C2IMR2` to CPU2 (RM0434 §11.2.12–15, and
+//!   Table 72's "(C1IMR1\[25:21\])" annotations). They are **stored, not
+//!   enforced**: every interrupt in this tree wires straight to its NVIC. A
+//!   reset value of zero is "forwarded", which is what such a board does.
+//! * **`SIPCR`** "can only be written by the CPU2. A write access from the
+//!   CPU1 is ignored and a bus error is generated" (§11.2.16): this model is
+//!   CPU1's view, so a write is a bus error and the register reads zero.
+//! * **VREFBUF lives in this window** — `VREFBUF_BASE` is `SYSCFG_BASE +
+//!   0x30` in `stm32wb55xx.h` — so its two registers are decoded here rather
+//!   than overlapping a second device's map: `CSR` (`ENVR`, `HIZ` reset one,
+//!   `VRS`, and `VRR`, which reads as `ENVR` because there is no settling time
+//!   to wait out) and `CCR.TRIM[5:0]` (the factory trim is not modelled;
+//!   it resets to zero). RM0434 §20.5.
 //!
 //! `EXTICR{k}` holds four four-bit fields, one per line, each naming a port:
 //! `0` is A, `1` is B, and so on up to `ports - 1`. A field naming a port the
@@ -128,8 +165,9 @@
 //!
 //! # Sources
 //!
-//! ST **RM0090** rev 21 §9 "System configuration controller (SYSCFG)" and ST
-//! **RM0351** rev 9 §9 for the L4 block. No emulator source of any licence was
+//! ST **RM0090** rev 21 §9 "System configuration controller (SYSCFG)", ST
+//! **RM0351** rev 9 §9 for the L4 block, and ST **RM0434** rev 16 §11 and §20
+//! with ST CMSIS `stm32wb55xx.h` v1.12.4 (Apache-2.0) for the WB. No emulator source of any licence was
 //! consulted (`ROADMAP.md` §1).
 //!
 //! [`AddressSpace::topology`]: crate::core::space::AddressSpace::topology
@@ -195,6 +233,39 @@ const F4_BYTES: u64 = 0x24;
 /// How many bytes an L4's occupy: up to and including `SWPR2`.
 const L4_BYTES: u64 = 0x2c;
 
+/// How many bytes a WB's occupy: up to and including `SIPCR` at `+0x110`.
+const WB_BYTES: u64 = 0x114;
+
+/// WB `CFGR1` out of reset: `FPU_IE[4:0]` and the reserved bit 0 (RM0434
+/// §11.2.2, "Reset value: 0x7C00 0001").
+const WB_CFGR1_RESET: u32 = 0x7c00_0001;
+
+/// WB `EXTICRx`: four three-bit fields (`EXTI0[2:0]` at 2:0 … `EXTI3[2:0]` at
+/// 14:12; RM0434 §11.2.3).
+const WB_EXTICR_MASK: u32 = 0x7777;
+
+/// WB `SCSR.C2RFD`: CPU2 may not fetch from SRAM.
+const WB_SCSR_C2RFD: u32 = 1 << 31;
+
+/// The `SKR` key sequence that unlocks `SRAM2ER` (RM0434 §11.2.10).
+const SKR_KEY1: u32 = 0xca;
+/// Its second half.
+const SKR_KEY2: u32 = 0x53;
+
+/// The WB pre-mask registers' defined bits, in register order: `IMR1`
+/// (EXTI5–15, TIM1/16/17), `IMR2` (PVM1, PVM3, PVD), `C2IMR1`, `C2IMR2`
+/// (RM0434 §11.2.12–15).
+const WB_IMR_MASKS: [u32; 4] = [0xffe0_e000, 0x0015_0000, 0xffff_1f79, 0x0075_ff7f];
+
+/// WB `VREFBUF_CSR`: `ENVR`, `HIZ`, `VRS` writable; `VRR` read-only.
+const VREF_CSR_RW: u32 = 0b0111;
+/// `VREFBUF_CSR.VRR`: the buffer output is ready.
+const VREF_CSR_VRR: u32 = 1 << 3;
+/// `VREFBUF_CSR` out of reset: `HIZ` (RM0434 §20.5.1, "0x0000 0002").
+const VREF_CSR_RESET: u32 = 1 << 1;
+/// `VREFBUF_CCR.TRIM[5:0]`.
+const VREF_CCR_TRIM: u32 = 0x3f;
+
 /// `CFGR2`'s single-write-one-to-clear flag: SRAM2 parity error (RM0351
 /// §9.2.6).
 const CFGR2_SPF: u32 = 1 << 8;
@@ -232,6 +303,9 @@ pub enum Variant {
     /// The L4 block: `MEMRMP`, `CFGR1`, `EXTICR`, `SCSR`, `CFGR2`, `SWPR`,
     /// `SKR`, `SWPR2`.
     L4,
+    /// The WB block: the L4's, three-bit `EXTICR` fields, the CPU1/CPU2
+    /// interrupt pre-masks, `SIPCR`, and VREFBUF in the same window.
+    Wb,
 }
 
 impl Variant {
@@ -241,7 +315,13 @@ impl Variant {
         match self {
             Variant::F4 => "f4",
             Variant::L4 => "l4",
+            Variant::Wb => "wb",
         }
+    }
+
+    /// Whether this map has the L4's `SCSR`…`SWPR2` block, which the WB keeps.
+    const fn has_sram2(self) -> bool {
+        matches!(self, Variant::L4 | Variant::Wb)
     }
 
     /// How many bytes of registers the block decodes.
@@ -250,6 +330,7 @@ impl Variant {
         match self {
             Variant::F4 => F4_BYTES,
             Variant::L4 => L4_BYTES,
+            Variant::Wb => WB_BYTES,
         }
     }
 
@@ -263,6 +344,8 @@ impl Variant {
         match self {
             Variant::F4 => 0x0000_0003,
             Variant::L4 => 0x0000_0107,
+            // `MEM_MODE[2:0]` and nothing else (RM0434 §11.2.1).
+            Variant::Wb => 0x0000_0007,
         }
     }
 
@@ -276,6 +359,17 @@ impl Variant {
         match self {
             Variant::F4 => 0x0087_0000,
             Variant::L4 => 0xfc7f_0100,
+            // `FPU_IE[5:0]`, `I2C3_FMP`, `I2C1_FMP`, `I2C_PB9..PB6_FMP`,
+            // `BOOSTEN` (RM0434 §11.2.2) — no `I2C2_FMP`, no firewall.
+            Variant::Wb => 0xfc5f_0100,
+        }
+    }
+
+    /// `EXTICRx`'s writable bits: four four-bit fields, or the WB's three.
+    const fn exticr_mask(self) -> u32 {
+        match self {
+            Variant::F4 | Variant::L4 => 0xffff,
+            Variant::Wb => WB_EXTICR_MASK,
         }
     }
 }
@@ -296,6 +390,17 @@ struct State {
     cfgr2: u32,
     swpr: u32,
     swpr2: u32,
+    /// WB `SCSR.C2RFD`, the one stored bit of `SCSR`.
+    c2rfd: bool,
+    /// WB `SKR`: how far through the key sequence the guest is (0, 1), and
+    /// whether it has unlocked `SRAM2ER`.
+    skr_step: u8,
+    skr_unlocked: bool,
+    /// WB `IMR1`, `IMR2`, `C2IMR1`, `C2IMR2`.
+    imr: [u32; 4],
+    /// WB `VREFBUF_CSR` (its writable bits) and `VREFBUF_CCR`.
+    vref_csr: u32,
+    vref_ccr: u32,
     /// One bit per pin, per port: the level that port is driving pin *n* at.
     ///
     /// **Saved**, and for the reason `st.exti` saves its own input latch: this
@@ -436,6 +541,12 @@ impl Registers {
             cfgr1: match self.variant {
                 Variant::F4 => 0,
                 Variant::L4 => CFGR1_FWDIS,
+                Variant::Wb => WB_CFGR1_RESET,
+            },
+            vref_csr: if self.variant == Variant::Wb {
+                VREF_CSR_RESET
+            } else {
+                0
             },
             ..State::default()
         }
@@ -542,11 +653,31 @@ impl Registers {
             // SRAM2ER self-clears the moment the erase is done, and here the
             // erase is not done at all, so both it and SRAM2BSY read zero.
             (Variant::L4, 0x18) => 0,
-            (Variant::L4, 0x1c) => state.cfgr2,
-            (Variant::L4, 0x20) => state.swpr,
+            (Variant::Wb, 0x18) => {
+                if state.c2rfd {
+                    WB_SCSR_C2RFD
+                } else {
+                    0
+                }
+            }
+            (v, 0x1c) if v.has_sram2() => state.cfgr2,
+            (v, 0x20) if v.has_sram2() => state.swpr,
             // "SKR: SRAM2 write protection key register" is write-only.
-            (Variant::L4, 0x24) => 0,
-            (Variant::L4, 0x28) => state.swpr2,
+            (v, 0x24) if v.has_sram2() => 0,
+            (v, 0x28) if v.has_sram2() => state.swpr2,
+            (Variant::Wb, 0x30) => {
+                // `VRR` follows `ENVR`: the buffer is ready the moment it is
+                // enabled, there being no settling time to model.
+                let vrr = if state.vref_csr & 1 != 0 {
+                    VREF_CSR_VRR
+                } else {
+                    0
+                };
+                state.vref_csr | vrr
+            }
+            (Variant::Wb, 0x34) => state.vref_ccr,
+            (Variant::Wb, 0x100..=0x10c) => state.imr[((offset - 0x100) / 4) as usize],
+            // `SIPCR`: CPU1 can never have set a bit of it.
             _ => 0,
         }
     }
@@ -572,6 +703,11 @@ impl Registers {
                     // nothing.
                     next |= state.cfgr1 & CFGR1_FWDIS & value;
                 }
+                if self.variant == Variant::Wb {
+                    // Bit 0 is reserved on a WB and "must be kept at reset
+                    // value", which is one.
+                    next |= WB_CFGR1_RESET & 1;
+                }
                 let moved = next != state.cfgr1;
                 state.cfgr1 = next;
                 if moved && self.variant == Variant::L4 {
@@ -584,21 +720,50 @@ impl Registers {
                 }
             }
             (_, 0x08..=0x14) if offset.is_multiple_of(4) => {
-                state.exticr[((offset - 0x08) / 4) as usize] = value & 0xffff;
+                state.exticr[((offset - 0x08) / 4) as usize] = value & self.variant.exticr_mask();
                 return true;
             }
             (Variant::F4, 0x20) => state.cmp_pd = value & CMPCR_CMP_PD != 0,
             // The erase is a no-op, so there is nothing to start.
             (Variant::L4, 0x18) => {}
-            (Variant::L4, 0x1c) => {
+            (Variant::Wb, 0x18) => {
+                // `C2RFD`: "Software writing 'b0 has no effect." `SRAM2ER` is
+                // honoured only after the key, and an honoured erase finishes
+                // at once and erases nothing (see the module header) — so
+                // either way it reads back zero and `SRAM2BSY` never holds.
+                state.c2rfd |= value & WB_SCSR_C2RFD != 0;
+            }
+            (v, 0x1c) if v.has_sram2() => {
                 // The four lock bits are set-only; `SPF` is write-one-to-clear.
                 let locks = (state.cfgr2 | value) & CFGR2_LOCKS;
                 let spf = state.cfgr2 & CFGR2_SPF & !(value & CFGR2_SPF);
                 state.cfgr2 = locks | spf;
             }
-            (Variant::L4, 0x20) => state.swpr |= value,
+            (v, 0x20) if v.has_sram2() => state.swpr |= value,
             (Variant::L4, 0x24) => {}
-            (Variant::L4, 0x28) => state.swpr2 |= value,
+            (Variant::Wb, 0x24) => {
+                // "Write 0xCA … write 0x53 … Writing a wrong key reactivates
+                // the write protection" (RM0434 §11.2.10).
+                let key = value & 0xff;
+                match (state.skr_step, key) {
+                    (0, SKR_KEY1) => state.skr_step = 1,
+                    (1, SKR_KEY2) => {
+                        state.skr_step = 0;
+                        state.skr_unlocked = true;
+                    }
+                    _ => {
+                        state.skr_step = 0;
+                        state.skr_unlocked = false;
+                    }
+                }
+            }
+            (v, 0x28) if v.has_sram2() => state.swpr2 |= value,
+            (Variant::Wb, 0x30) => state.vref_csr = value & VREF_CSR_RW,
+            (Variant::Wb, 0x34) => state.vref_ccr = value & VREF_CCR_TRIM,
+            (Variant::Wb, 0x100..=0x10c) => {
+                let index = ((offset - 0x100) / 4) as usize;
+                state.imr[index] = value & WB_IMR_MASKS[index];
+            }
             _ => {}
         }
         false
@@ -669,6 +834,11 @@ impl MemOps for Registers {
             // write, as firmware experiences it.
             return Ok(());
         }
+        if self.variant == Variant::Wb && offset & !3 == 0x110 {
+            // `SIPCR`: "A write access from the CPU1 is ignored and a bus error
+            // is generated" (RM0434 §11.2.16).
+            return Err(BusError::Protected);
+        }
         let value = u32::from_le_bytes([*a, *b, *c, *d]);
         if self.write_register(offset & !3, value) {
             self.refresh();
@@ -709,9 +879,10 @@ impl Syscfg {
         let variant = match r.or_str("variant", "f4")? {
             "f4" => Variant::F4,
             "l4" => Variant::L4,
+            "wb" => Variant::Wb,
             other => {
                 return Err(Error::Property(format!(
-                    "`variant` is `f4` or `l4`, not `{other}`"
+                    "`variant` is `f4`, `l4` or `wb`, not `{other}`"
                 )));
             }
         };
@@ -945,6 +1116,7 @@ impl Device for Syscfg {
         w.write_u8(match self.regs.variant {
             Variant::F4 => 0,
             Variant::L4 => 1,
+            Variant::Wb => 2,
         })?;
         w.write_u32(self.regs.ports)?;
         w.write_u32(state.memrmp)?;
@@ -960,6 +1132,17 @@ impl Device for Syscfg {
         for value in state.inputs {
             w.write_u16(value)?;
         }
+        if self.regs.variant == Variant::Wb {
+            // Only a WB writes these, so the F4 and L4 chunks keep their shape.
+            w.write_bool(state.c2rfd)?;
+            w.write_u8(state.skr_step)?;
+            w.write_bool(state.skr_unlocked)?;
+            for value in state.imr {
+                w.write_u32(value)?;
+            }
+            w.write_u32(state.vref_csr)?;
+            w.write_u32(state.vref_ccr)?;
+        }
         Ok(())
     }
 
@@ -967,6 +1150,7 @@ impl Device for Syscfg {
         let variant = match r.read_u8()? {
             0 => Variant::F4,
             1 => Variant::L4,
+            2 => Variant::Wb,
             other => {
                 return Err(Error::State(format!(
                     "snapshot has SYSCFG variant {other}, which this build does not know"
@@ -1002,6 +1186,16 @@ impl Device for Syscfg {
         }
         for value in &mut state.inputs {
             *value = r.read_u16()?;
+        }
+        if variant == Variant::Wb {
+            state.c2rfd = r.read_bool()?;
+            state.skr_step = r.read_u8()?;
+            state.skr_unlocked = r.read_bool()?;
+            for value in &mut state.imr {
+                *value = r.read_u32()?;
+            }
+            state.vref_csr = r.read_u32()?;
+            state.vref_ccr = r.read_u32()?;
         }
         *self.regs.state.lock() = state;
         // The window is derived state and is never in the chunk: it is
@@ -1097,7 +1291,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which family's register map: `f4` (default) or `l4`",
+            summary: "which family's register map: `f4` (default), `l4` or `wb` (RM0434)",
         },
         PropertySpec {
             name: "ports",
@@ -1149,7 +1343,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 #[must_use]
 pub fn schema() -> ClassSchema {
     let mut schema = ClassSchema::new(CLASS_NAME)
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "l4", "wb"]))
         .prop(PropSchema::new("ports", ValueKind::Uint).range(1, u64::from(MAX_PORTS)))
         .prop(PropSchema::new("memrmp-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("boot-size", ValueKind::Size))
@@ -1868,5 +2062,155 @@ mod tests {
         assert!(Device::region(&s, "").is_some());
         assert!(Device::region(&s, "regs").is_some());
         assert!(Device::region(&s, "mux").is_none());
+    }
+
+    // -- the WB -------------------------------------------------------------
+
+    /// A wire with one source, so an output has something to drive.
+    fn dummy_source() -> WireSource {
+        let id = WireId::new(9);
+        WireSource::new(Wire::builder().source(id).build_shared(), id)
+    }
+
+    /// A WB55's SYSCFG: ports A–H behind the mux (F and G are never wired).
+    fn wb() -> Syscfg {
+        Syscfg::build(Variant::Wb, 8, 0)
+    }
+
+    #[test]
+    fn a_wb_has_the_rm0434_map_and_reset_values() {
+        let s = wb();
+        assert_eq!(s.variant().register_bytes(), 0x114, "through SIPCR");
+        assert_eq!(peek(&s, 0x04), 0x7c00_0001, "CFGR1: FPU_IE[4:0], bit 0");
+        assert_eq!(peek(&s, 0x30), 0x0000_0002, "VREFBUF_CSR: HIZ");
+        for offset in [0x00, 0x18, 0x1c, 0x34, 0x100, 0x104, 0x108, 0x10c, 0x110] {
+            assert_eq!(peek(&s, offset), 0, "{offset:#x}");
+        }
+        // MEM_MODE is three bits and alone; CFGR1 keeps its reserved bit 0.
+        poke(&s, 0x00, u32::MAX);
+        assert_eq!(peek(&s, 0x00), 0x7);
+        poke(&s, 0x04, 0);
+        assert_eq!(peek(&s, 0x04), 1);
+        poke(&s, 0x04, u32::MAX);
+        assert_eq!(peek(&s, 0x04), 0xfc5f_0101);
+        // There is no firewall to switch on.
+        assert!(s.connect(FWDIS_PIN, dummy_source()).is_err());
+        let built = Syscfg::new(&Props::new().with("variant", Value::from("wb")));
+        assert_eq!(built.map(|s| s.variant()).ok(), Some(Variant::Wb));
+    }
+
+    #[test]
+    fn wb_exticr_fields_are_three_bits_and_seven_is_port_h() {
+        let s = wb();
+        poke(&s, 0x08, 0xffff_ffff);
+        assert_eq!(peek(&s, 0x08), 0x7777, "EXTI0[2:0]…EXTI3[2:0]");
+        poke(&s, 0x08, 0x0007);
+        assert_eq!(s.selected_port(0), Some(7), "PH0");
+        s.set_pin(7, 0, true);
+        assert!(s.line_level(0));
+    }
+
+    #[test]
+    fn wb_sram2_erase_needs_the_key_and_c2rfd_is_set_only() {
+        let s = wb();
+        // Without the key the erase does not start; with it, it is done at
+        // once, so SRAM2BSY never holds a polling loop.
+        poke(&s, 0x18, 1);
+        assert_eq!(peek(&s, 0x18), 0);
+        poke(&s, 0x24, 0xca);
+        poke(&s, 0x24, 0x53);
+        assert!(s.regs.state.lock().skr_unlocked);
+        poke(&s, 0x18, 1);
+        assert_eq!(peek(&s, 0x18) & 0b11, 0);
+        // A wrong key re-protects it.
+        poke(&s, 0x24, 0x11);
+        assert!(!s.regs.state.lock().skr_unlocked);
+        poke(&s, 0x18, 1 << 31);
+        poke(&s, 0x18, 0);
+        assert_eq!(peek(&s, 0x18), 1 << 31, "C2RFD: writing 0 has no effect");
+        Device::reset(&s, ResetKind::Warm);
+        assert_eq!(peek(&s, 0x18), 0);
+    }
+
+    #[test]
+    fn wb_premasks_keep_their_defined_bits_and_sipcr_is_cpu2_s() {
+        let s = wb();
+        for (offset, mask) in [
+            (0x100, 0xffe0_e000u32),
+            (0x104, 0x0015_0000),
+            (0x108, 0xffff_1f79),
+            (0x10c, 0x0075_ff7f),
+        ] {
+            poke(&s, offset, u32::MAX);
+            assert_eq!(peek(&s, offset), mask, "{offset:#x}");
+        }
+        assert_eq!(
+            s.regs
+                .write(0x110, &u32::MAX.to_le_bytes(), MemAttrs::DEFAULT),
+            Err(BusError::Protected),
+            "CPU1 may not write SIPCR"
+        );
+        assert_eq!(peek(&s, 0x110), 0);
+    }
+
+    #[test]
+    fn wb_vrefbuf_is_ready_as_soon_as_it_is_enabled() {
+        let s = wb();
+        // HAL_SYSCFG_EnableVREFBUF: clear HIZ, set ENVR, wait for VRR.
+        poke(&s, 0x30, 0b0001);
+        assert_eq!(peek(&s, 0x30), 0b1001);
+        poke(&s, 0x30, u32::MAX);
+        assert_eq!(peek(&s, 0x30), 0b1111);
+        poke(&s, 0x34, u32::MAX);
+        assert_eq!(peek(&s, 0x34), 0x3f, "TRIM[5:0]");
+        poke(&s, 0x30, 0);
+        assert_eq!(peek(&s, 0x30), 0);
+    }
+
+    #[test]
+    fn a_wb_snapshot_round_trips_to_identical_state() {
+        let saved = wb();
+        poke(&saved, 0x04, 0x0010_0100);
+        poke(&saved, 0x0c, 0x0000_7071);
+        poke(&saved, 0x18, 1 << 31);
+        poke(&saved, 0x20, 0x0000_ff00);
+        poke(&saved, 0x24, 0xca);
+        poke(&saved, 0x30, 0b0101);
+        poke(&saved, 0x34, 0x21);
+        poke(&saved, 0x100, 0x0020_e000);
+        poke(&saved, 0x10c, 0x0040_0001);
+        saved.set_pin(7, 7, true);
+
+        let save = |s: &Syscfg| {
+            let mut shape = MachineShape::new();
+            shape.add_device("syscfg", CLASS_NAME).unwrap();
+            let mut w = StateWriter::new(shape);
+            {
+                let mut chunk = w.chunk("syscfg", CLASS_NAME, STATE_VERSION).unwrap();
+                Device::save(s, &mut chunk).unwrap();
+            }
+            w.to_vec().unwrap()
+        };
+        let load = |s: &Syscfg, bytes: &[u8]| {
+            let reader = StateReader::new(bytes).unwrap();
+            let chunk = reader
+                .load("syscfg", CLASS_NAME, STATE_VERSION, &Migrations::new())
+                .unwrap();
+            Device::load(s, &mut chunk.reader())
+        };
+        let bytes = save(&saved);
+        let restored = wb();
+        load(&restored, &bytes).unwrap();
+        assert_eq!(save(&restored), bytes, "identical state");
+        for offset in [
+            0x04, 0x0c, 0x18, 0x20, 0x30, 0x34, 0x100, 0x104, 0x108, 0x10c,
+        ] {
+            assert_eq!(peek(&saved, offset), peek(&restored, offset), "{offset:#x}");
+        }
+        // Half a key sequence came across too.
+        poke(&restored, 0x24, 0x53);
+        assert!(restored.regs.state.lock().skr_unlocked);
+        // An L4 does not load it.
+        assert!(load(&Syscfg::build(Variant::L4, 8, 0), &bytes).is_err());
     }
 }

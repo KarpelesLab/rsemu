@@ -2111,7 +2111,10 @@ dev-stm32-dmamux = []
 # on an L4), one interrupt output pin per line so the board -- not the device
 # -- decides that lines 5-9 share IRQ 23, and one `event` pin for the pulse
 # `WFE` waits on. `st.syscfg` adds MEMRMP, PMC/CFGR1 and the F4's CMPCR or the
-# L4's SCSR/CFGR2/SWPR/SKR/SWPR2, selected by a `variant` property. MEMRMP
+# L4's SCSR/CFGR2/SWPR/SKR/SWPR2, selected by a `variant` property (`wb`
+# adds the STM32WB's three-bit EXTICR fields, the SKR-keyed SRAM2 erase, the
+# CPU1/CPU2 interrupt pre-masks, the CPU2-only SIPCR and the VREFBUF registers
+# that share its window, RM0434 S11 and S20). MEMRMP
 # **moves the memory**: the block publishes a `boot` region a board maps where
 # the alias at address zero belongs, and MEM_MODE picks which of the board's
 # `boot-sources` answers through it, so a bootloader that remaps SRAM to zero
