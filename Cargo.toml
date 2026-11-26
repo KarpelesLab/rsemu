@@ -259,6 +259,7 @@ full = [
     "dev-stm32-wdg",
     "dev-stm32-dbgmcu",
     "dev-stm32-crc",
+    "dev-stm32-usbfs",
     "dev-stm32-hash",
     "dev-stm32-flash",
     "dev-stm32-rtc",
@@ -2194,6 +2195,17 @@ dev-stm32-dbgmcu = []
 # ST RM0351 S14; no emulator source was consulted (ROADMAP.md S1).
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-crc = []
+
+# The STM32 USB full-speed device peripheral (src/dev/stm32/usbfs.rs): one
+# class, `st.usbfs`, the USB_FS block the F0x2/F1/F3/L0 carry — eight endpoint
+# registers, a linear packet-buffer memory and a buffer-descriptor table. A
+# device, never a host: it is a `UsbDevice` on the USB bus, which a modelled
+# host enumerates, the same way the dwc2 gadget is. SETUP/IN/OUT matched to an
+# endpoint register by its EA field, the EPnR rc_w0/toggle access rules, the
+# computed ISTR CTR/DIR/EP_ID, a clock gate and a level interrupt. Written from
+# ST RM0091 S30; no emulator source was consulted (ROADMAP.md S1). Needs
+# `bus-usb`. `no_std + alloc`, no `unsafe`, no dependencies beyond the bus.
+dev-stm32-usbfs = ["bus-usb"]
 
 # The STM32 HASH processor (src/dev/stm32/hash.rs): one class, `st.hash`, the
 # block that hashes a 512-bit message block without the core touching a rotate.
