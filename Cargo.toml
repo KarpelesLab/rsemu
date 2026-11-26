@@ -2323,7 +2323,10 @@ dev-stm32-rcc = []
 # like the RCC, so a regulator transition costs virtual time and no host time.
 # Five layouts -- f4, f42x, l4, l4plus from RM0090 §5 and RM0351 §5, and u5
 # from RM0456 §10, whose VOSR.VOSRDY/SVMSR.ACTVOSRDY, EPOD BOOSTRDY, SMPS/LDO
-# SVMSR.REGS and DBPR.DBP are what ST's U5 HAL spins on.
+# SVMSR.REGS and DBPR.DBP are what ST's U5 HAL spins on -- and wb from RM0434,
+# the STM32WB55: SR2.VOSF/REGLPF/SMPSF, CPU2's C2CR1/C2CR3 and EXTSCR, a
+# `c2boot` output that follows CR4.C2BOOT for the CPU2 model's boot input and
+# an `smpsen` output (CR5.SMPSEN) that the RCC's SMPSSWS reads.
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-pwr = []
 

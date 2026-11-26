@@ -640,3 +640,303 @@ fn a_u5_snapshot_round_trips_to_identical_state() {
     let props = Props::new().with("variant", Value::from("u5"));
     assert_eq!(Pwr::new(&props).unwrap().variant(), Variant::U5);
 }
+
+// ---------------------------------------------------------------------------
+// The WB (RM0434; ST CMSIS `stm32wb55xx.h`, `PWR_TypeDef`; reset values from
+// ST's `STM32WB55_CM4.svd`)
+// ---------------------------------------------------------------------------
+
+/// Connect `c2boot` to a probe and hand it back.
+fn watch_c2boot(pwr: &Pwr) -> Arc<Probe> {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let sink = Arc::new(Probe::default());
+    let wire = Wire::builder()
+        .source(id)
+        .sink(Arc::clone(&sink) as Arc<dyn crate::core::wire::WireSink>, 0)
+        .build_shared();
+    Device::connect(pwr, C2BOOT_PIN, WireSource::new(wire, id)).expect("c2boot");
+    sink
+}
+
+/// A WB's `C2CR1`.
+const WB_C2CR1: u64 = 0x80;
+
+#[test]
+fn a_wb_comes_out_of_reset_as_the_svd_says() {
+    let pwr = pwr(Variant::WB);
+    for (name, reg, value) in [
+        ("CR1", CR, 0x0000_0200),
+        ("CR2", L4_CR2, 0),
+        ("CR3", L4_CR3, 0x0000_8000),
+        ("CR4", WB_CR4, 0),
+        ("SR1", L4_SR1, 0),
+        ("SR2", L4_SR2, WB_SR2_SMPSBF),
+        ("SCR", L4_SCR, 0),
+        ("CR5", WB_CR5, 0x0000_4270),
+        ("C2CR1", WB_C2CR1, 0),
+        ("C2CR3", WB_C2CR3, 0x0000_8000),
+        ("EXTSCR", WB_EXTSCR, 0),
+    ] {
+        assert_eq!(peek(&pwr, reg), value, "{name}");
+    }
+    assert!(!pwr.dbp());
+    assert!(!pwr.c2boot());
+    assert_eq!(
+        Device::region(&pwr, "").map(|r| r.len()),
+        Some(0x8c),
+        "through EXTSCR"
+    );
+}
+
+#[test]
+fn the_wb_voltage_scaling_sequence_terminates() {
+    // `HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE2)`, then
+    // back to range 1: write `VOS`, spin while `VOSF` is set.
+    let pwr = pwr(Variant::WB);
+    for vos in [0b10, 0b01] {
+        poke(&pwr, CR, (peek(&pwr, CR) & !(0b11 << 9)) | (vos << 9));
+        assert_ne!(peek(&pwr, L4_SR2) & L4_SR2_VOSF, 0, "changing");
+        let mut spins = 0;
+        while peek(&pwr, L4_SR2) & L4_SR2_VOSF != 0 {
+            tick(&pwr, 1);
+            spins += 1;
+            assert!(spins < 100, "VOSF never cleared");
+        }
+        assert_eq!(spins, DELAY);
+        assert_eq!((peek(&pwr, CR) >> 9) & 0b11, vos);
+    }
+    // `SR2` is the hardware's.
+    poke(&pwr, L4_SR2, 0xffff_ffff);
+    assert_eq!(peek(&pwr, L4_SR2), WB_SR2_SMPSBF);
+}
+
+#[test]
+fn the_wb_low_power_run_regulator_answers_reglpf() {
+    let pwr = pwr(Variant::WB);
+    // `HAL_PWREx_EnableLowPowerRunMode`: `LPR` set, nobody waits, but the
+    // flag gets there.
+    poke(&pwr, CR, peek(&pwr, CR) | WB_CR1_LPR);
+    assert_eq!(peek(&pwr, L4_SR2) & WB_SR2_REGLPF, 0);
+    tick(&pwr, DELAY);
+    assert_ne!(peek(&pwr, L4_SR2) & WB_SR2_REGLPF, 0);
+    // `HAL_PWREx_DisableLowPowerRunMode`: `LPR` clear, spin on `REGLPF`.
+    poke(&pwr, CR, peek(&pwr, CR) & !WB_CR1_LPR);
+    let mut spins = 0;
+    while peek(&pwr, L4_SR2) & WB_SR2_REGLPF != 0 {
+        tick(&pwr, 1);
+        spins += 1;
+        assert!(spins < 100, "REGLPF never cleared");
+    }
+    // The voltage scaling flag was never involved.
+    assert_eq!(peek(&pwr, L4_SR2) & L4_SR2_VOSF, 0);
+}
+
+#[test]
+fn the_wb_smps_mode_is_reported_by_sr2() {
+    let pwr = pwr(Variant::WB);
+    // `LL_PWR_SMPS_SetMode(LL_PWR_SMPS_STEP_DOWN)`.
+    poke(&pwr, WB_CR5, peek(&pwr, WB_CR5) | WB_CR5_SMPSEN);
+    assert_eq!(peek(&pwr, L4_SR2) & 0b11, WB_SR2_SMPSBF, "not there yet");
+    tick(&pwr, DELAY);
+    assert_eq!(peek(&pwr, L4_SR2) & 0b11, WB_SR2_SMPSF, "stepping down");
+    // The trims are storage and move no flag.
+    poke(&pwr, WB_CR5, WB_CR5_SMPSEN | 0x0000_0127);
+    assert_eq!(peek(&pwr, WB_CR5), WB_CR5_SMPSEN | 0x0000_0127);
+    assert_eq!(Device::next_event_tick(&pwr), None);
+    // And back to bypass.
+    poke(&pwr, WB_CR5, 0x0000_4270);
+    tick(&pwr, DELAY);
+    assert_eq!(peek(&pwr, L4_SR2) & 0b11, WB_SR2_SMPSBF);
+}
+
+#[test]
+fn the_wb_dbp_drives_the_wire_the_rcc_reads() {
+    let pwr = pwr(Variant::WB);
+    let sink = watch_dbp(&pwr);
+    // `HAL_PWR_EnableBkUpAccess`, then the WB RCC HAL's own spin on
+    // `PWR->CR1 & DBP`.
+    poke(&pwr, CR, peek(&pwr, CR) | (1 << 8));
+    assert_ne!(peek(&pwr, CR) & (1 << 8), 0);
+    assert!(pwr.dbp());
+    assert!(sink.is_high());
+    poke(&pwr, CR, peek(&pwr, CR) & !(1 << 8));
+    assert!(!sink.is_high());
+}
+
+#[test]
+fn c2boot_follows_cr4_and_nothing_else_drives_it() {
+    let pwr = pwr(Variant::WB);
+    let boot = watch_c2boot(&pwr);
+    assert!(!boot.is_high(), "CPU2 is held out of reset");
+    // The rest of `CR4` is storage and does not boot anything.
+    poke(&pwr, WB_CR4, 0x31f);
+    assert!(!boot.is_high());
+    assert_eq!(peek(&pwr, WB_CR4), 0x31f);
+    // `HAL_PWREx_ReleaseCore(PWR_CORE_CPU2)`.
+    poke(&pwr, WB_CR4, peek(&pwr, WB_CR4) | WB_CR4_C2BOOT);
+    assert!(boot.is_high());
+    assert!(pwr.c2boot());
+    // `HAL_PWREx_HoldCore` clears it. The level falls with the bit; that a
+    // booted CPU2 keeps running is its model's to honour — it takes the edge.
+    poke(&pwr, WB_CR4, peek(&pwr, WB_CR4) & !WB_CR4_C2BOOT);
+    assert!(!boot.is_high());
+    assert_eq!(peek(&pwr, WB_CR4), 0x31f);
+    // A system reset holds CPU2 again.
+    poke(&pwr, WB_CR4, WB_CR4_C2BOOT);
+    assert!(boot.is_high());
+    Device::reset(&pwr, ResetKind::Warm);
+    assert!(!boot.is_high());
+    assert_eq!(peek(&pwr, WB_CR4), 0);
+}
+
+#[test]
+fn only_a_wb_has_a_c2boot_pin() {
+    for variant in [Variant::F4, Variant::L4, Variant::U5] {
+        let pwr = pwr(variant);
+        let ids = WireIdAllocator::new();
+        let id = ids.alloc();
+        let wire = Wire::builder().source(id).build_shared();
+        assert!(
+            Device::connect(&pwr, C2BOOT_PIN, WireSource::new(wire, id)).is_err(),
+            "{variant:?}"
+        );
+        assert!(!pwr.c2boot());
+    }
+    let pwr = pwr(Variant::WB);
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let wire = Wire::builder().source(id).build_shared();
+    assert!(Device::connect(&pwr, "c3boot", WireSource::new(wire, id)).is_err());
+    assert_eq!(
+        schema().port_named(C2BOOT_PIN).map(|p| p.dir),
+        Some(PortDir::Out)
+    );
+}
+
+#[test]
+fn the_wb_status_and_clear_registers() {
+    let pwr = pwr(Variant::WB);
+    // Nothing raises these, so plant them as the hardware would.
+    {
+        let mut state = pwr.regs.state.lock();
+        *state.word_mut(L4_SR1) = 0xff9f;
+        *state.word_mut(WB_EXTSCR) = 0xef00;
+    }
+    // `SR1` is read-only.
+    poke(&pwr, L4_SR1, 0);
+    assert_eq!(peek(&pwr, L4_SR1), 0xff9f);
+    // `SCR` clears what it names, and `WUFI` (15) is not among them.
+    poke(&pwr, L4_SCR, 0x0003);
+    assert_eq!(peek(&pwr, L4_SR1), 0xff9c);
+    poke(&pwr, L4_SCR, 0xffff_ffff);
+    assert_eq!(peek(&pwr, L4_SR1), 1 << 15);
+    assert_eq!(peek(&pwr, L4_SCR), 0, "write-only");
+
+    // `EXTSCR`: C1CSSF, C2CSSF and CCRPF each clear their own.
+    poke(&pwr, WB_EXTSCR, 0xffff_0000);
+    assert_eq!(peek(&pwr, WB_EXTSCR), 0xef00, "the flags are read-only");
+    poke(&pwr, WB_EXTSCR, 1);
+    assert_eq!(peek(&pwr, WB_EXTSCR), 0xec00, "C1SBF and C1STOPF");
+    poke(&pwr, WB_EXTSCR, 2);
+    assert_eq!(peek(&pwr, WB_EXTSCR), 0xe000, "C2SBF and C2STOPF");
+    poke(&pwr, WB_EXTSCR, 4);
+    assert_eq!(peek(&pwr, WB_EXTSCR), 0xc000, "CRPF; C1DS/C2DS stay");
+
+    // CPU2's low-power settings are storage.
+    poke(&pwr, WB_C2CR1, 0xc034);
+    poke(&pwr, WB_C2CR3, 0x961f);
+    assert_eq!(peek(&pwr, WB_C2CR1), 0xc034);
+    assert_eq!(peek(&pwr, WB_C2CR3), 0x961f);
+    // And so are the pulls, port H included.
+    poke(&pwr, 0x58, 0x3);
+    assert_eq!(peek(&pwr, 0x58), 0x3);
+}
+
+#[test]
+fn a_wb_snapshot_round_trips_to_identical_state() {
+    let saved = pwr(Variant::WB);
+    poke(
+        &saved,
+        CR,
+        (peek(&saved, CR) | (1 << 8) | WB_CR1_LPR) & !(0b11 << 9) | (0b10 << 9),
+    );
+    poke(&saved, WB_CR4, WB_CR4_C2BOOT | 1);
+    poke(&saved, WB_CR5, peek(&saved, WB_CR5) | WB_CR5_SMPSEN);
+    poke(&saved, WB_C2CR1, 0x4);
+    tick(&saved, DELAY / 2);
+    // Mid-transition: VOSF, REGLPF and the SMPS flags all pending.
+    assert_ne!(peek(&saved, L4_SR2) & L4_SR2_VOSF, 0);
+
+    let mut shape = MachineShape::new();
+    shape.add_device("pwr", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("pwr", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let restored = pwr(Variant::WB);
+    let boot = watch_c2boot(&restored);
+    assert!(!boot.is_high());
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("pwr", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+
+    let words = Variant::WB.register_bytes() / 4;
+    let before: Vec<u32> = (0..words).map(|i| peek_debug(&saved, i * 4)).collect();
+    let after: Vec<u32> = (0..words).map(|i| peek_debug(&restored, i * 4)).collect();
+    assert_eq!(before, after);
+    let held = *saved.regs.state.lock();
+    assert_eq!(held, *restored.regs.state.lock(), "deadlines and all");
+    assert!(restored.dbp());
+    assert!(boot.is_high(), "the load republished c2boot");
+    tick(&restored, DELAY);
+    let sr2 = peek(&restored, L4_SR2);
+    assert_eq!(sr2 & L4_SR2_VOSF, 0);
+    assert_ne!(sr2 & WB_SR2_REGLPF, 0);
+    assert_eq!(sr2 & 0b11, WB_SR2_SMPSF);
+    let props = Props::new().with("variant", Value::from("wb"));
+    assert_eq!(Pwr::new(&props).unwrap().variant(), Variant::WB);
+    let variant = schema();
+    let variant = variant
+        .props
+        .iter()
+        .find(|p| p.name == "variant")
+        .expect("variant");
+    assert!(variant.values.iter().any(|v| v == "wb"));
+}
+
+#[test]
+fn smpsen_follows_cr5_at_once_for_the_rcc() {
+    // RM0434 §6.4.9: the RCC's `SMPSSWS` is "no clock" whenever
+    // `PWR_CR5.SMPSEN` is clear, so the bit itself — not the SMPS flags that
+    // follow it a regulator transition later — is what the wire carries.
+    let pwr = pwr(Variant::WB);
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let sink = Arc::new(Probe::default());
+    let wire = Wire::builder()
+        .source(id)
+        .sink(Arc::clone(&sink) as Arc<dyn crate::core::wire::WireSink>, 0)
+        .build_shared();
+    Device::connect(&pwr, SMPSEN_PIN, WireSource::new(wire, id)).expect("smpsen");
+    assert!(!sink.is_high(), "SMPSEN resets clear (RM0434 §5.6.8)");
+    poke(&pwr, WB_CR5, peek(&pwr, WB_CR5) | WB_CR5_SMPSEN);
+    assert!(sink.is_high(), "at once");
+    assert_eq!(peek(&pwr, L4_SR2) & 0b11, WB_SR2_SMPSBF, "the flags lag");
+    Device::reset(&pwr, ResetKind::Warm);
+    assert!(!sink.is_high());
+
+    // A WB's pin only.
+    let other = Pwr::with_config(Variant::L4, DELAY);
+    let id = ids.alloc();
+    let wire = Wire::builder().source(id).build_shared();
+    assert!(Device::connect(&other, SMPSEN_PIN, WireSource::new(wire, id)).is_err());
+    assert_eq!(
+        schema().port_named(SMPSEN_PIN).map(|p| p.dir),
+        Some(PortDir::Out)
+    );
+}

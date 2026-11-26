@@ -83,6 +83,7 @@
 //! | `l4` | L4x5, L4x6 | `CR1`…`CR4`, `SR1`/`SR2`, `SCR`, the `PUCRx`/`PDCRx` pull registers |
 //! | `l4plus` | L4+ | as `l4`, plus `CR5` and its `R1MODE` |
 //! | `u5` | U575/U585 | RM0456's map: `VOSR`, `SVMSR`, `DBPR`, `CR3.REGSEL` — see below |
+//! | `wb` | WB55 | RM0434's map: the L4's, plus the SMPS, CPU2's `C2CR1`/`C2CR3`, `EXTSCR` and `CR4.C2BOOT` — see below |
 //!
 //! # The U5 variant
 //!
@@ -110,6 +111,52 @@
 //! pwr.enable` — and there is no `PWRRST`: `AHB3RSTR` has no bit for the PWR,
 //! so a U5 board draws no `reset` wire.
 //!
+//! # The WB variant
+//!
+//! An STM32WB55's PWR (RM0434 §5.6 and Table 33; ST CMSIS `stm32wb55xx.h`,
+//! `PWR_TypeDef`) is the L4's register file with a second CPU's controls
+//! added. What firmware waits on:
+//!
+//! | firmware writes | and waits for | model |
+//! | --- | --- | --- |
+//! | `CR1.VOS[10:9]` (`HAL_PWREx_ControlVoltageScaling`) | `SR2.VOSF` (10) to go **clear** | as on an L4: a change sets `VOSF`, `ready-delay` ticks later it clears (§5.6.6: "1: the regulator output voltage is changing") |
+//! | `CR1.LPR` (14) clear (`HAL_PWREx_DisableLowPowerRunMode`) | `SR2.REGLPF` (9) to go clear | `REGLPF` follows `LPR`, either way, after `ready-delay` ticks ("remains at 1 until the regulator is ready in main mode") |
+//! | `CR5.SMPSEN` (15) (`LL_PWR_SMPS_SetMode`) | `SR2.SMPSF` (1) / `SMPSBF` (0), read by `LL_PWR_SMPS_GetEffectiveMode` | `ready-delay` ticks after `SMPSEN` moves, `SMPSF` = `SMPSEN` and `SMPSBF` = its complement; `SMPSEN` itself is also the **`smpsen`** output, which the RCC's `SMPSSWS` needs (RM0434 §6.4.9) |
+//! | `CR1.DBP` (8) (`HAL_PWR_EnableBkUpAccess`, which the WB RCC HAL then polls) | `CR1.DBP` reading back | storage, and it drives the `dbp` output |
+//! | `CR4.C2BOOT` (15) (`HAL_PWREx_ReleaseCore`) | nothing here — CPU2 starts | drives the **`c2boot`** output |
+//!
+//! `SR1` is read-only and `SCR` clears it (write one; bits 0–4 and 7–14),
+//! reading as zero. `EXTSCR`'s CPU1/CPU2 stop and standby flags (8–11) and
+//! `CRPF` (13) are read-only and cleared by `C1CSSF` (0), `C2CSSF` (1) and
+//! `CCRPF` (2), which read as zero; `C1DS`/`C2DS` read zero, because nothing
+//! here sleeps. `CR2`, `CR3`, `CR4`'s other bits, `CR5`'s SMPS trims, the
+//! pull registers and CPU2's **`C2CR1`/`C2CR3`** (its low-power mode and
+//! wake-up enables) are storage. Out of reset (RM0434 §5.6, agreeing with
+//! ST's `STM32WB55_CM4.svd`): `CR1` = `0x200` (range 1), `CR3` = `C2CR3` =
+//! `0x8000` (`EIWUL`), `CR5` = `0x427X` with the factory `SMPSVOS` trim read
+//! as zero.
+//!
+//! ## `c2boot`
+//!
+//! The `c2boot` output is **high exactly while `CR4.C2BOOT` reads one**, and
+//! the CPU2 model's `boot` input is wired to it. RM0434 §5.3: "Following
+//! reset the CPU2 is prevented from booting by the C2BOOT bit. The CPU2 boots
+//! only once the CPU1 has set the C2BOOT bit", and after a Stop or Standby
+//! exit the bit decides whether CPU2 boots again. Nothing in the chapter
+//! stops a running CPU2 when the bit is cleared — the bit is consulted at a
+//! reset or a low-power exit, and CPU1 clears it as routine before it
+//! enters CSTOP mode (§5.3) — so the level is a permission, and the
+//! consumer treats its **rising edge** as the release and ignores a fall.
+//! Keeping that latch in CPU2 rather than here means the register reads back
+//! what was written, as the hardware's does, and one wire carries the whole
+//! fact. A system reset clears `C2BOOT`, and with it
+//! the level, which is right: CPU2 is held again until firmware sets it.
+//! (`C2BOOT` is retained in Standby, §2.4; Standby is not modelled.)
+//!
+//! A WB's PWR has no clock-enable bit (`APB1ENR1` has no `PWREN`), so a WB
+//! board draws neither `enable` nor `reset` and the controller is always
+//! clocked.
+//!
 //! # Sources
 //!
 //! * ST **RM0090** rev 21, §5 "Power control (PWR)" — §5.5 for the register
@@ -121,6 +168,15 @@
 //!   from ST's CMSIS `stm32u585xx.h` (`PWR_TypeDef`, `PWR_*_Pos`; Apache-2.0),
 //!   and the flags that must move from the polling loops of ST's U5 HAL
 //!   (`stm32u5xx_hal_pwr_ex.c`, BSD-3-Clause), whose code is not reproduced.
+//! * ST **RM0434** rev 16, §5 "Power control (PWR)", for the STM32WB55:
+//!   §5.1 for the SMPS step-down converter's modes, §5.3 (and §2.4) for CPU2
+//!   boot, §5.6.1–§5.6.23 and Table 33 for every register, bit and reset
+//!   value. The offsets and bits agree with ST's CMSIS `stm32wb55xx.h`
+//!   (`PWR_TypeDef`, `PWR_*_Pos`; Apache-2.0) and the reset values with
+//!   ST's `STM32WB55_CM4.svd` (Apache-2.0); the flags that must move were
+//!   read off the polling loops of ST's WB HAL and LL
+//!   (`stm32wbxx_hal_pwr_ex.c`, `stm32wbxx_ll_pwr.h`, BSD-3-Clause), whose
+//!   code is not reproduced.
 //!
 //! No emulator source of any licence was consulted (`ROADMAP.md` §1).
 //!
@@ -134,6 +190,22 @@
 //!   not model, exactly as in [`gpio`](super::gpio).
 //! * `PVD`/`PVM` never trip. There is no analogue supply to compare against,
 //!   so `PVDO` and `PVMOx` stay clear rather than reporting an invented level.
+//! * **WB `SR2` resets to `SMPSBF`** (`0x1`, bypass). RM0434 disagrees with
+//!   itself here: §5.1 says "After a POR reset the SMPS step-down converter
+//!   is in Bypass mode", and `SMPSEN` resets clear (§5.6.8), but §5.6.6
+//!   (and the SVD) give `SR2` a reset value of `0x2`, which is `SMPSF`, step
+//!   down. The prose and `CR5` win; no HAL loop waits on either. `REGLPS`
+//!   (the low-power regulator has started) reads zero, the reset value.
+//! * **`SMPSEN` is not cleared by a BORH**, which on silicon forces the SMPS
+//!   into bypass with `SMPSEN` reset (§5.6.8): there is no supply to brown
+//!   out.
+//! * **`EXTSCR.C2DS` reads zero.** RM0434 §5.6.23 has it read 1 while CPU2
+//!   is "in deepsleep or hold by C2BOOT"; whether CPU2 is held is the CPU2
+//!   model's state, and the register's reset value is `0`.
+//! * **WB radio and CPU2 events are never raised**: `SR1`'s BLE/802.15.4
+//!   activity and wake-up flags, `C2HF`, `CRPEF`, `BORHF` and `SMPSFBF`, and
+//!   `EXTSCR`'s `CRPF` and `C2STOPF`/`C2SBF`, have no source. They read zero
+//!   and their clear bits work.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -200,6 +272,9 @@ pub enum Variant {
     /// RM0456's U5 map: `VOSR`, `SVMSR`, `DBPR` and the rest of
     /// `PWR_TypeDef`.
     U5,
+    /// RM0434's STM32WB55 map: the L4's, plus `CR5`'s SMPS, `C2CR1`,
+    /// `C2CR3`, `EXTSCR` and `CR4.C2BOOT`.
+    WB,
 }
 
 impl Variant {
@@ -212,6 +287,7 @@ impl Variant {
             Variant::L4 => "l4",
             Variant::L4Plus => "l4plus",
             Variant::U5 => "u5",
+            Variant::WB => "wb",
         }
     }
 
@@ -232,6 +308,8 @@ impl Variant {
             Variant::L4Plus => 0x84,
             // Through `PDCRI` at `+0x94`.
             Variant::U5 => 0x98,
+            // Through `EXTSCR` at `+0x88` (ST CMSIS `stm32wb55xx.h`).
+            Variant::WB => 0x8c,
         }
     }
 
@@ -245,7 +323,8 @@ impl Variant {
             // F427/F429).
             Variant::F42x => 0x0000_c000,
             // `VOS` = 01, range 1 (RM0351 §5.4.1, "Reset value: 0x0000 0200").
-            Variant::L4 | Variant::L4Plus => 0x0000_0200,
+            // A WB's is the same (RM0434 §5.6.1, "Reset value: 0x0000 0200").
+            Variant::L4 | Variant::L4Plus | Variant::WB => 0x0000_0200,
             // Low-power mode bits all clear; `VOS` is not in `CR1` on a U5.
             Variant::U5 => 0,
         }
@@ -266,7 +345,7 @@ impl Variant {
         match self {
             Variant::F4 => (14, 1),
             Variant::F42x => (14, 2),
-            Variant::L4 | Variant::L4Plus => (9, 2),
+            Variant::L4 | Variant::L4Plus | Variant::WB => (9, 2),
             // `VOSR.VOS[17:16]`.
             Variant::U5 => (16, 2),
         }
@@ -291,6 +370,14 @@ const L4_SR2: u64 = 0x14;
 const L4_SCR: u64 = 0x18;
 /// L4+: `PWR_CR5`.
 const L4_CR5: u64 = 0x80;
+/// WB: `PWR_CR4`, with `C2BOOT` at 15.
+const WB_CR4: u64 = 0x0c;
+/// WB: `PWR_CR5`, the SMPS — at `+0x1c`, not the L4+'s `+0x80`.
+const WB_CR5: u64 = 0x1c;
+/// WB: `PWR_C2CR3`, CPU2's wake-up enables.
+const WB_C2CR3: u64 = 0x84;
+/// WB: `PWR_EXTSCR`, both CPUs' stop and standby flags and their clears.
+const WB_EXTSCR: u64 = 0x88;
 /// U5: `PWR_CR3`, with `REGSEL` at bit 1.
 const U5_CR3: u64 = 0x08;
 /// U5: `PWR_VOSR`.
@@ -329,6 +416,33 @@ const U5_SVMSR_ACTVOSRDY: u32 = 1 << 15;
 /// `SVMSR.VDDUSBRDY`…`VDDA2RDY`, bits 24–27, which sit at the same positions
 /// as their monitor enables `SVMCR.UVMEN`…`AVM2EN`.
 const U5_MONITORS: u32 = 0xf << 24;
+
+// -- WB bits (ST CMSIS `stm32wb55xx.h`, `PWR_*_Pos`) -------------------------
+
+/// `CR1.LPR` — low-power run.
+const WB_CR1_LPR: u32 = 1 << 14;
+/// `CR4.C2BOOT` — boot CPU2.
+const WB_CR4_C2BOOT: u32 = 1 << 15;
+/// `CR5.SMPSEN` — the step-down converter in SMPS mode.
+const WB_CR5_SMPSEN: u32 = 1 << 15;
+/// `SR2.SMPSBF` — the SMPS is in bypass.
+const WB_SR2_SMPSBF: u32 = 1 << 0;
+/// `SR2.SMPSF` — the SMPS is stepping down.
+const WB_SR2_SMPSF: u32 = 1 << 1;
+/// `SR2.REGLPF` — the main regulator is in low-power mode.
+const WB_SR2_REGLPF: u32 = 1 << 9;
+/// `SCR`'s clear bits: `CWUF1`…`CWUF5` (0–4) and `CSMPSFBF`…`CC2HF` (7–14).
+const WB_SCR_CLEARS: u32 = 0x7f9f;
+/// `EXTSCR`'s hardware-owned flags: `C1SBF`…`C2STOPF` (8–11), `CRPF` (13),
+/// `C1DS`/`C2DS` (14, 15).
+const WB_EXTSCR_FLAGS: u32 = 0xef00;
+
+/// The name of the WB's CPU2 boot output (`CR4.C2BOOT`).
+pub const C2BOOT_PIN: &str = "c2boot";
+
+/// The name of the WB's `CR5.SMPSEN` output, which the RCC's
+/// `SMPSCR.SMPSSWS` reports through (RM0434 §6.4.9).
+pub const SMPSEN_PIN: &str = "smpsen";
 
 // -- F4 `CR` and `CSR` bits (RM0090 §5.5.1, §5.5.2) --------------------------
 
@@ -371,7 +485,9 @@ struct State {
     vos_at: u64,
     /// When the over-drive comes up, and when it switches in (F42x). On a U5
     /// the same two deadlines are the EPOD booster's `BOOSTRDY` and the
-    /// regulator switch that `SVMSR.REGS` reports.
+    /// regulator switch that `SVMSR.REGS` reports; on a WB they are
+    /// `SR2.REGLPF` following `CR1.LPR` and `SR2.SMPSF`/`SMPSBF` following
+    /// `CR5.SMPSEN`.
     od_at: u64,
     odsw_at: u64,
     /// The tick this device has been advanced to.
@@ -385,6 +501,18 @@ impl State {
         if variant.is_f4() {
             // The regulator is already at the scale `CR` selects out of reset.
             words[(F4_CSR / 4) as usize] = F4_CSR_VOSRDY;
+        } else if variant == Variant::WB {
+            // RM0434 §5.6.3 and §5.6.22: `CR3.EIWUL` and `C2CR3.EIWUL` set;
+            // §5.6.8: `CR5` = `0x427X` — `SMPSEN` clear, `SMPSSC` = 7, bits 9
+            // and 14 (reserved) as the manual has them, and the
+            // factory-trimmed `SMPSVOS` (`X`) as zero.
+            words[(L4_CR3 / 4) as usize] = 0x0000_8000;
+            words[(WB_C2CR3 / 4) as usize] = 0x0000_8000;
+            words[(WB_CR5 / 4) as usize] = 0x0000_4270;
+            // The SMPS in bypass, as RM0434 §5.1 says it is after a POR —
+            // where §5.6.6's reset value says `SMPSF`; see the known
+            // deviations.
+            words[(L4_SR2 / 4) as usize] = WB_SR2_SMPSBF;
         } else if variant == Variant::U5 {
             // Range 4 (`VOS` = 00), reached: `VOSRDY` and `ACTVOSRDY` set,
             // the LDO supplying the core (RM0456 §10, `PWR_VOSR` and
@@ -431,6 +559,10 @@ struct Registers {
     ready_delay: u64,
     /// The `DBP` output, connected at realize time.
     dbp: Mutex<Option<WireSource>>,
+    /// A WB's `c2boot` output, likewise.
+    c2boot: Mutex<Option<WireSource>>,
+    /// A WB's `smpsen` output, likewise.
+    smpsen: Mutex<Option<WireSource>>,
     /// The lock-free half of the lazy contract.
     tick: AtomicU64,
     next_event: AtomicU64,
@@ -518,6 +650,31 @@ impl Registers {
         if let Some(source) = source {
             source.set(level);
         }
+        self.refresh_wb_outputs();
+    }
+
+    /// Drive a WB's `c2boot` to `CR4.C2BOOT` and `smpsen` to `CR5.SMPSEN`.
+    /// No lock held, as for `dbp`.
+    ///
+    /// Every path that republishes `dbp` comes through here too, so a reset,
+    /// a load and a register write each move all three outputs.
+    fn refresh_wb_outputs(&self) {
+        if self.variant != Variant::WB {
+            return;
+        }
+        let (boot, smps) = {
+            let state = self.state.lock();
+            (
+                Level::from_bool(state.word(WB_CR4) & WB_CR4_C2BOOT != 0),
+                Level::from_bool(state.word(WB_CR5) & WB_CR5_SMPSEN != 0),
+            )
+        };
+        for (pin, level) in [(&self.c2boot, boot), (&self.smpsen, smps)] {
+            let source = pin.lock().clone();
+            if let Some(source) = source {
+                source.set(level);
+            }
+        }
     }
 
     /// Simulate forward: the regulator and the over-drive finish transitioning.
@@ -548,6 +705,11 @@ impl Registers {
         state.tick = tick;
         if self.variant == Variant::U5 {
             Self::advance_u5(&mut state, tick);
+            self.republish(&state);
+            return;
+        }
+        if self.variant == Variant::WB {
+            Self::advance_wb(&mut state, tick);
             self.republish(&state);
             return;
         }
@@ -598,11 +760,41 @@ impl Registers {
         }
     }
 
+    /// The WB's three transitions finishing: `VOSF` clears, `REGLPF` and the
+    /// SMPS flags catch up with what `CR1.LPR` and `CR5.SMPSEN` now ask for.
+    fn advance_wb(state: &mut State, tick: u64) {
+        if state.vos_at <= tick {
+            state.vos_at = NO_DEADLINE;
+            *state.word_mut(L4_SR2) &= !L4_SR2_VOSF;
+        }
+        if state.od_at <= tick {
+            state.od_at = NO_DEADLINE;
+            let lpr = state.word(CR) & WB_CR1_LPR != 0;
+            let sr2 = state.word_mut(L4_SR2);
+            *sr2 = if lpr {
+                *sr2 | WB_SR2_REGLPF
+            } else {
+                *sr2 & !WB_SR2_REGLPF
+            };
+        }
+        if state.odsw_at <= tick {
+            state.odsw_at = NO_DEADLINE;
+            let smps = state.word(WB_CR5) & WB_CR5_SMPSEN != 0;
+            let sr2 = state.word_mut(L4_SR2);
+            *sr2 &= !(WB_SR2_SMPSF | WB_SR2_SMPSBF);
+            *sr2 |= if smps { WB_SR2_SMPSF } else { WB_SR2_SMPSBF };
+        }
+    }
+
     fn read_register(&self, offset: u64) -> u32 {
         let state = self.state.lock();
         if self.variant == Variant::U5 && offset == U5_WUSCR {
             // A clear register, which holds nothing of its own.
             return 0;
+        }
+        if self.variant == Variant::WB && offset == WB_EXTSCR {
+            // The three clear bits are write-only.
+            return state.word(WB_EXTSCR) & WB_EXTSCR_FLAGS;
         }
         if !self.variant.is_f4() && self.variant != Variant::U5 && offset == L4_SCR {
             // "This register is write-only": the clear register reads as zero.
@@ -620,6 +812,8 @@ impl Registers {
                 self.write_f4(&mut state, offset, value, before);
             } else if self.variant == Variant::U5 {
                 self.write_u5(&mut state, offset, value, before);
+            } else if self.variant == Variant::WB {
+                self.write_wb(&mut state, offset, value, before);
             } else {
                 self.write_l4(&mut state, offset, value, before);
             }
@@ -739,6 +933,55 @@ impl Registers {
         }
     }
 
+    fn write_wb(&self, state: &mut State, offset: u64, value: u32, before: u32) {
+        let deadline = state.tick.saturating_add(self.ready_delay);
+        match offset {
+            CR => {
+                // `VOS` and `VOSF` are the L4's.
+                self.write_l4(state, offset, value, before);
+                if (value ^ before) & WB_CR1_LPR != 0 {
+                    // The main regulator takes time to enter or leave low
+                    // power, and `REGLPF` is what reports it arriving.
+                    state.od_at = deadline;
+                }
+            }
+            WB_CR5 => {
+                *state.word_mut(WB_CR5) = value;
+                if (value ^ before) & WB_CR5_SMPSEN != 0 {
+                    state.odsw_at = deadline;
+                }
+            }
+            L4_SCR => {
+                // "Writing 1 clears the corresponding flag in `SR1`."
+                *state.word_mut(L4_SR1) &= !(value & WB_SCR_CLEARS);
+            }
+            WB_EXTSCR => {
+                // `C1CSSF` clears CPU1's stop and standby flags, `C2CSSF`
+                // CPU2's, `CCRPF` the critical radio phase; nothing else
+                // here is the guest's to write.
+                let mut clear = 0;
+                if value & 1 != 0 {
+                    clear |= 0b11 << 8;
+                }
+                if value & 2 != 0 {
+                    clear |= 0b11 << 10;
+                }
+                if value & 4 != 0 {
+                    clear |= 1 << 13;
+                }
+                *state.word_mut(WB_EXTSCR) &= !clear;
+            }
+            L4_SR1 | L4_SR2 => {
+                // Hardware-owned through and through.
+            }
+            _ => {
+                // `CR2`, `CR3`, `CR4` (whose `C2BOOT` the caller republishes
+                // on `c2boot`), the pulls, `C2CR1`, `C2CR3`: storage.
+                *state.word_mut(offset) = value;
+            }
+        }
+    }
+
     fn write_l4(&self, state: &mut State, offset: u64, value: u32, before: u32) {
         match offset {
             CR => {
@@ -843,13 +1086,15 @@ impl Pwr {
     /// one this class does not know was given.
     pub fn new(props: &Props) -> Result<Pwr> {
         let mut r = props.reader();
-        let variant = match r.or_enum("variant", "f4", &["f4", "f42x", "l4", "l4plus", "u5"])? {
-            "f42x" => Variant::F42x,
-            "u5" => Variant::U5,
-            "l4" => Variant::L4,
-            "l4plus" => Variant::L4Plus,
-            _ => Variant::F4,
-        };
+        let variant =
+            match r.or_enum("variant", "f4", &["f4", "f42x", "l4", "l4plus", "u5", "wb"])? {
+                "f42x" => Variant::F42x,
+                "u5" => Variant::U5,
+                "wb" => Variant::WB,
+                "l4" => Variant::L4,
+                "l4plus" => Variant::L4Plus,
+                _ => Variant::F4,
+            };
         let ready_delay = r.or("ready-delay", DEFAULT_READY_DELAY)?;
         r.finish()?;
         Ok(Pwr::with_config(variant, ready_delay))
@@ -863,6 +1108,8 @@ impl Pwr {
             variant,
             ready_delay,
             dbp: Mutex::with_rank(LockRank::WIRE, None),
+            c2boot: Mutex::with_rank(LockRank::WIRE, None),
+            smpsen: Mutex::with_rank(LockRank::WIRE, None),
             tick: AtomicU64::new(0),
             next_event: AtomicU64::new(u64::MAX),
             lazy: Mutex::with_rank(LockRank::LEAF, None),
@@ -903,6 +1150,13 @@ impl Pwr {
             word & !(1 << bit)
         };
         self.regs.write_register(reg, next);
+    }
+
+    /// Whether `CR4.C2BOOT` is set, which is what `c2boot` drives. Always
+    /// false on a part with one CPU.
+    #[must_use]
+    pub fn c2boot(&self) -> bool {
+        self.regs.variant == Variant::WB && self.regs.state.lock().word(WB_CR4) & WB_CR4_C2BOOT != 0
     }
 
     /// Connect the `DBP` output.
@@ -967,13 +1221,32 @@ impl Device for Pwr {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
-        if port != DBP_PIN {
-            return Err(Error::Config {
-                at: port.to_string(),
-                message: format!("a PWR drives one pin, `{DBP_PIN}`"),
-            });
+        match port {
+            DBP_PIN => self.connect_dbp(source),
+            C2BOOT_PIN if self.regs.variant == Variant::WB => {
+                *self.regs.c2boot.lock() = Some(source);
+                self.regs.refresh_wb_outputs();
+            }
+            SMPSEN_PIN if self.regs.variant == Variant::WB => {
+                *self.regs.smpsen.lock() = Some(source);
+                self.regs.refresh_wb_outputs();
+            }
+            _ => {
+                let message = if self.regs.variant == Variant::WB {
+                    format!("a WB PWR drives `{DBP_PIN}`, `{C2BOOT_PIN}` and `{SMPSEN_PIN}`")
+                } else {
+                    format!(
+                        "an `{}` PWR drives one pin, `{DBP_PIN}`; `{C2BOOT_PIN}` and \
+                         `{SMPSEN_PIN}` are a WB's",
+                        self.regs.variant.as_str()
+                    )
+                };
+                return Err(Error::Config {
+                    at: port.to_string(),
+                    message,
+                });
+            }
         }
-        self.connect_dbp(source);
         Ok(())
     }
 
@@ -984,7 +1257,7 @@ impl Device for Pwr {
     }
 
     fn announce(&self, port: &str) {
-        if port == DBP_PIN {
+        if port == DBP_PIN || port == C2BOOT_PIN || port == SMPSEN_PIN {
             self.regs.refresh_dbp();
         }
     }
@@ -1021,15 +1294,15 @@ impl Instance for Pwr {}
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "STM32 power control: DBP, the voltage-scaling ready flags, the F42x over-drive and \
-              the U5's EPOD booster and SMPS/LDO switch",
+    summary: "STM32 power control: DBP, the voltage-scaling ready flags, the F42x over-drive, \
+              the U5's EPOD booster and SMPS/LDO switch, and the WB's SMPS and CPU2 boot",
     properties: &[
         PropertySpec {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "which register layout: \"f4\", \"f42x\" (over-drive), \"l4\", \"l4plus\" or \
-                      \"u5\"",
+            summary: "which register layout: \"f4\", \"f42x\" (over-drive), \"l4\", \"l4plus\", \
+                      \"u5\" or \"wb\" (RM0434)",
         },
         PropertySpec {
             name: "ready-delay",
@@ -1066,7 +1339,7 @@ pub fn schema() -> ClassSchema {
     let schema = ClassSchema::new(CLASS_NAME)
         .prop(
             PropSchema::new("variant", ValueKind::Str)
-                .values(&["f4", "f42x", "l4", "l4plus", "u5"]),
+                .values(&["f4", "f42x", "l4", "l4plus", "u5", "wb"]),
         )
         .prop(PropSchema::new("ready-delay", ValueKind::Uint))
         .region("")
@@ -1074,7 +1347,14 @@ pub fn schema() -> ClassSchema {
         // `wire pwr.dbp -> rcc.dbp`: the backup domain opens when this goes
         // high, and it is a level on a net rather than a handle because that
         // is what it is on the die.
-        .port(DBP_PIN, PortDir::Out);
+        .port(DBP_PIN, PortDir::Out)
+        // `wire pwr.c2boot -> cpu2.boot` on a WB: `CR4.C2BOOT`, which CPU2
+        // takes the rising edge of. A WB-only pin; another variant refuses
+        // the `connect`.
+        .port(C2BOOT_PIN, PortDir::Out)
+        // `wire pwr.smpsen -> rcc.smpsen` on a WB: `CR5.SMPSEN`, without
+        // which the RCC's `SMPSSWS` reads "no clock".
+        .port(SMPSEN_PIN, PortDir::Out);
     // `RCC_APB1ENR.PWREN` and `RCC_APB1RSTR.PWRRST`.
     gate::ports(schema)
 }

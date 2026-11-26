@@ -312,6 +312,35 @@ full account; in short:
   Examples: HSEM `ahb3en19`/`c2ahb3en19` (on out of reset), IPCC
   `ahb3en20`/`c2ahb3en20`, FLASH `ahb3en25`, BLE `c2apb3en0`.
 
+### `st.pwr`
+
+Map: RM0434 §5.6 and Table 33, `0x8c` bytes (through `EXTSCR`) at
+`0x5800_0400`. The L4's logic at the L4's offsets, plus:
+
+| firmware writes | and waits for | model |
+| --- | --- | --- |
+| `CR1.VOS[10:9]` | `SR2.VOSF` (10) clear | set on a change, clear after `ready-delay` |
+| `CR1.LPR` (14) | `SR2.REGLPF` (9) | follows `LPR` after `ready-delay` |
+| `CR5.SMPSEN` (15) | `SR2.SMPSF` (1) / `SMPSBF` (0) | `SMPSF` = `SMPSEN`, `SMPSBF` = its complement, after `ready-delay`; the bit itself drives the new **`smpsen`** output to `rcc.smpsen` |
+| `CR1.DBP` (8) | read-back (the WB RCC HAL polls it) | drives `dbp` |
+| `CR4.C2BOOT` (15) | — | drives the new **`c2boot`** output |
+
+`c2boot` is high exactly while `CR4.C2BOOT` reads one. RM0434 §5.3: CPU2 "boots
+only once the CPU1 has set the C2BOOT bit", and the bit is consulted again at a
+Stop/Standby exit; nothing stops a running CPU2 when it is cleared (CPU1 clears
+it routinely before CSTOP). So the CPU2 model takes the **rising edge** as its
+release and ignores a fall; the register reads back what was written. A reset
+clears the bit and the level. `SCR` clears `SR1` (bits 0–4,
+7–14) and reads zero; `EXTSCR`'s `C1CSSF`/`C2CSSF`/`CCRPF` clear the CPU1/CPU2
+stop-standby flags and `CRPF`. `CR2`, `CR3`, `CR4`'s other bits, `CR5`'s
+trims, the pulls (A–E, H) and CPU2's `C2CR1`/`C2CR3` are storage. Reset
+values are RM0434's (`CR1` `0x200`, `CR3` = `C2CR3` = `0x8000`, `CR5`
+`0x427X` with the factory trim as 0) except `SR2`, which resets to `SMPSBF`
+(bypass): §5.1 says the SMPS is in Bypass mode after a POR and `SMPSEN`
+resets clear, where §5.6.6 gives `0x2` (`SMPSF`). `EXTSCR.C2DS` reads 0
+(it would read 1 while CPU2 is held, which is the CPU2 model's state). The radio and CPU2 event flags have
+no source. A WB's PWR has no `PWREN`: no `enable`/`reset` wire.
+
 ## Implementation notes
 
 - **Ready bits are time, and the scheduler owns time.** Both devices are
