@@ -1232,6 +1232,8 @@ pub fn registry() -> Result<Registry> {
     builtin::register(&mut reg)?;
     #[cfg(feature = "cpu-mos6502")]
     crate::cpu::mos6502::register(&mut reg)?;
+    #[cfg(feature = "cpu-w65c816")]
+    crate::cpu::w65c816::register(&mut reg)?;
     #[cfg(feature = "cpu-sm83")]
     crate::cpu::sm83::register(&mut reg)?;
     #[cfg(feature = "cpu-spc700")]
@@ -1420,6 +1422,8 @@ pub fn bindings() -> Result<Bindings> {
     builtin::bind(&mut b)?;
     #[cfg(feature = "cpu-mos6502")]
     crate::cpu::mos6502::bind(&mut b)?;
+    #[cfg(feature = "cpu-w65c816")]
+    crate::cpu::w65c816::bind(&mut b)?;
     #[cfg(feature = "cpu-sm83")]
     crate::cpu::sm83::bind(&mut b)?;
     #[cfg(feature = "cpu-spc700")]
@@ -1593,6 +1597,8 @@ pub fn classes() -> ClassTable {
     }
     #[cfg(feature = "cpu-mos6502")]
     table.insert(crate::cpu::mos6502::schema());
+    #[cfg(feature = "cpu-w65c816")]
+    table.insert(crate::cpu::w65c816::schema());
     #[cfg(feature = "cpu-sm83")]
     table.insert(crate::cpu::sm83::schema());
     #[cfg(feature = "cpu-spc700")]

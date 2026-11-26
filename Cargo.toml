@@ -203,6 +203,7 @@ full = [
     "machine-tft-spi",
     "ir",
     "cpu-mos6502",
+    "cpu-w65c816",
     "cpu-arm-aprofile",
     "cpu-arm-aprofile-vfp",
     "cpu-arm-a64",
@@ -1263,6 +1264,14 @@ accel-kvm = ["std"]
 # table, and the RP2A03 (NES) variant selected by a construction property. Adds
 # no dependencies and is `no_std + alloc`.
 cpu-mos6502 = []
+
+# The WDC W65C816S core (src/cpu/w65c816), the CPU of the SNES and the Apple
+# IIGS: a cycle-accurate interpreter of the full instruction set in emulation
+# and native modes, every cycle a read, a write or an internal operation
+# charged through a board-supplied timing hook (the SNES's 6/8/12 master-clock
+# access speeds), plus a disassembler generated from the same table. Adds no
+# dependencies and is `no_std + alloc`.
+cpu-w65c816 = []
 
 # The A-profile ARM core (src/cpu/arm/aprofile): today an ARM926EJ-S-class
 # ARMv5TE interpreter with the full ARM and Thumb instruction sets,

@@ -2137,8 +2137,10 @@ fn properties_name_the_part_and_default_its_adder() {
     );
 
     // A part nobody has implemented is a config error, not a silent 6502.
+    // The 65C816 is implemented, but as its own class; the error says where.
     let props = Props::new().with("variant", "65816");
-    assert!(Mos6502::from_props(&props).is_err());
+    let err = Mos6502::from_props(&props).expect_err("not a mos6502 variant");
+    assert!(alloc::format!("{err}").contains("cpu.w65c816"), "{err}");
 }
 
 #[test]

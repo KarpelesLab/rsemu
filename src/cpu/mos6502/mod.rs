@@ -608,6 +608,18 @@ impl Mos6502 {
     /// property nothing here accepts was given — a typo'd property that was
     /// silently ignored is an afternoon lost.
     pub fn from_props(props: &Props) -> Result<Mos6502> {
+        // The 65C816 is a different core, not a variant of this one; saying
+        // where it lives beats listing the three spellings this class takes.
+        if props
+            .get("variant")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case("65816") || v.eq_ignore_ascii_case("65c816"))
+        {
+            return Err(Error::Property(String::from(
+                "property `variant`: the 65C816 is its own class, `cpu.w65c816` \
+                 (feature `cpu-w65c816`), not a variant of `cpu.mos6502`",
+            )));
+        }
         let mut r = props.reader();
         let variant = r.or_enum("variant", "6502", &["6502", "2a03", "65c02"])?;
         let variant = Variant::from_name(variant).expect("the enum listed above");

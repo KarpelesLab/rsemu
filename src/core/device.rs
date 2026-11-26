@@ -319,6 +319,16 @@ impl ExportId {
     /// `cpu::sh4a::pack_request`), and zero means nothing is pending.
     pub const INTERRUPT_REQUEST: ExportId = ExportId(15);
 
+    /// How many clocks each bus cycle of a processor costs, decided by the
+    /// board's address decoder rather than by the processor. Transported as
+    /// [`Export::Opaque`]; the payload is the consuming core's own type
+    /// (for the 65C816, `cpu::w65c816::TimingPort`).
+    ///
+    /// The SNES is the case it exists for: its 65C816 runs each cycle in 6,
+    /// 8 or 12 master clocks depending on the address it drives, and only the
+    /// board knows the map.
+    pub const ACCESS_TIMING: ExportId = ExportId(16);
+
     /// The SNES S-PPU's beam: the H/V position and interlace field, the
     /// counter latch the S-CPU's `WRIO` bit 7 drives, the television region
     /// and the frame counter. Transported as [`Export::Opaque`].
@@ -352,6 +362,7 @@ impl ExportId {
             ExportId::RESET_ADDRESS => Some("reset address"),
             ExportId::EXCLUSIVE_MONITOR => Some("global exclusive monitor"),
             ExportId::INTERRUPT_REQUEST => Some("interrupt request"),
+            ExportId::ACCESS_TIMING => Some("bus access timing"),
             ExportId::SNES_PPU_BEAM => Some("S-PPU beam position and counter latch"),
             _ => None,
         }

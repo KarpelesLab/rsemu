@@ -9,6 +9,7 @@
 //! | Core | Feature | State |
 //! | --- | --- | --- |
 //! | `mos6502` | `cpu-mos6502` | cycle-accurate interpreter, illegal opcodes, disassembler |
+//! | `w65c816` | `cpu-w65c816` | WDC 65C816: cycle-accurate interpreter, emulation and native modes, board-supplied per-access timing, disassembler |
 //! | `z80` | `cpu-z80` | cycle-accurate interpreter, every prefix page, MEMPTR, separate I/O space |
 
 //! | `x86` | `cpu-x86` | Intel 8086/8088 real mode and 80386/80486 protected mode with paging, hardware-checked against `SingleStepTests/8088` |
@@ -41,6 +42,10 @@ pub mod mos6502;
 #[cfg(feature = "cpu-sh4a")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-sh4a")))]
 pub mod sh4a;
+
+#[cfg(feature = "cpu-w65c816")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-w65c816")))]
+pub mod w65c816;
 
 // The family module always compiles and links nothing; the cores underneath
 // it are individually gated.

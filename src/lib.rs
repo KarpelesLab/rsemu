@@ -190,6 +190,9 @@ pub fn build_info() -> alloc::string::String {
     if cfg!(feature = "cpu-mos6502") {
         features.push("cpu-mos6502");
     }
+    if cfg!(feature = "cpu-w65c816") {
+        features.push("cpu-w65c816");
+    }
     if cfg!(feature = "dev-nes-cart") {
         features.push("dev-nes-cart");
     }
