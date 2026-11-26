@@ -1379,6 +1379,10 @@ fn install_capture(
     if args.record_audio.is_some() {
         rsemu::host::audio::sms::capture::install(options)?;
     }
+    #[cfg(feature = "dev-snes-apu")]
+    if args.record_audio.is_some() {
+        rsemu::host::audio::snes::capture::install(options)?;
+    }
     #[cfg(feature = "dev-amiga-paula")]
     if args.record_audio.is_some() {
         rsemu::host::audio::amiga::capture::install(options)?;
@@ -1584,6 +1588,10 @@ fn take_audio(
     }
     #[cfg(feature = "dev-sms")]
     if let Some(s) = rsemu::host::audio::sms::capture::take(hosts, machine) {
+        return Some(Box::new(s));
+    }
+    #[cfg(feature = "dev-snes-apu")]
+    if let Some(s) = rsemu::host::audio::snes::capture::take(hosts, machine) {
         return Some(Box::new(s));
     }
     #[cfg(feature = "dev-amiga-paula")]
@@ -2683,7 +2691,12 @@ fn input_sinks(hosts: &HostObjects) -> Vec<Arc<dyn rsemu::host::input::InputSink
     // Boy's and a Master System's *names* and then failed the downcast in
     // silence, which is a screen with no buttons. `host::input::Pads` asks each
     // family for its own type.
-    #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+    #[cfg(any(
+        feature = "dev-nes-io",
+        feature = "dev-gb",
+        feature = "dev-sms",
+        feature = "dev-snes-scpu"
+    ))]
     if let Some(pad) = rsemu::host::input::PadSink::open(hosts, 0) {
         sinks.push(Arc::new(pad));
     }

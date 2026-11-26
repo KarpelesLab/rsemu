@@ -71,6 +71,27 @@ pub static NES_NTSC: CatalogEntry = CatalogEntry {
     source: include_str!("../../machines/nes-ntsc.machine"),
 };
 
+/// The NTSC Super Nintendo / Super Famicom: a 5A22, the S-PPU, the audio
+/// unit and a cartridge. The `cart` slot takes the ROM image.
+#[cfg(feature = "machine-snes")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-snes")))]
+pub static SNES_NTSC: CatalogEntry = CatalogEntry {
+    name: "snes-ntsc",
+    summary: "Super Nintendo / Super Famicom, NTSC (65C816 5A22, S-PPU at 60 Hz, SPC700 + S-DSP)",
+    media: &["cart"],
+    source: include_str!("../../machines/snes-ntsc.machine"),
+};
+
+/// The PAL Super Nintendo: the same board on the PAL master crystal.
+#[cfg(feature = "machine-snes")]
+#[cfg_attr(docsrs, doc(cfg(feature = "machine-snes")))]
+pub static SNES_PAL: CatalogEntry = CatalogEntry {
+    name: "snes-pal",
+    summary: "Super Nintendo, PAL (the same board on a 21.281 MHz master, S-PPU at 50 Hz)",
+    media: &["cart"],
+    source: include_str!("../../machines/snes-pal.machine"),
+};
+
 /// The PAL NES: the same board with a different crystal and different
 /// dividers.
 ///
@@ -1117,6 +1138,10 @@ pub fn machines() -> Vec<&'static CatalogEntry> {
     out.push(&STM32U575);
     #[cfg(feature = "machine-stm32u585")]
     out.push(&STM32U585);
+    #[cfg(feature = "machine-snes")]
+    out.push(&SNES_NTSC);
+    #[cfg(feature = "machine-snes")]
+    out.push(&SNES_PAL);
     #[cfg(feature = "machine-stm32wb55")]
     out.push(&STM32WB55);
     #[cfg(feature = "machine-stm32wb35")]
@@ -2617,10 +2642,16 @@ mod tests {
     /// realized without a corpus.
     fn fixture(machine: &str, slot: &str) -> &'static [u8] {
         match (machine, slot) {
-            // Two machines take a slot called `cart` and they are not the same
-            // kind of cartridge at all, which is why this is keyed by both.
+            // Three machines take a slot called `cart` and they are not the
+            // same kind of cartridge at all, which is why this is keyed by both.
             #[cfg(feature = "machine-gameboy")]
             ("gameboy", "cart") => minimal_gb(),
+            // Four bytes are a whole LoROM image: they mirror through every
+            // bank, so the reset vector at $00FFFC reads bytes 0-1 ($8002)
+            // and $8002 holds `BRA -2`. `tests/snes_board.rs` has the
+            // programs that do something.
+            #[cfg(feature = "machine-snes")]
+            ("snes-ntsc" | "snes-pal", "cart") => &[0x02, 0x80, 0x80, 0xFE],
             (_, "cart") => MINIMAL_NROM,
             // Each board's default monitor: rsemu's own, committed precisely so
             // that this needs no download and no licence question. The two are

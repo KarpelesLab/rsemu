@@ -1,0 +1,87 @@
+# snes-ntsc — a Super Nintendo / Super Famicom, NTSC (SHVC-001 / SNS-001).
+#
+#   rsemu run snes-ntsc --media cart=game.sfc
+#
+# The 5A22 (a 65C816 core plus its on-chip peripherals), the S-PPU pair, the
+# audio unit (S-SMP + S-DSP behind four ports), 128 KiB of WRAM, and a
+# cartridge decoded LoROM, HiROM or ExHiROM by its internal header.
+#
+# Sources: nocash fullsnes and the SNESdev wiki (the memory map, the B-bus,
+# the clocks); the WDC W65C816S datasheet. No emulator source of any licence
+# was consulted (ROADMAP.md §1). docs/platforms/snes.md has the account.
+#
+# ---------------------------------------------------------------------------
+# The two crystals
+# ---------------------------------------------------------------------------
+#
+# The console has two oscillators that are not locked to each other: the
+# 21.477 MHz master (six times the NTSC colour subcarrier — the NES's crystal
+# too) that clocks the CPU and the PPU, and the audio unit's own 24.576 MHz
+# ceramic resonator, divided by 24 for the SPC700. They drift on real
+# hardware; here each is exact and the scheduler keeps them in step
+# (ROADMAP.md, the two-oscillator discussion).
+
+machine "snes-ntsc" {
+  osc master = 236250000/11 Hz
+  osc apuosc = 24576000 Hz
+
+  # The A-bus: 24 bits, and a read nothing drives is the CPU's open bus.
+  space abus { width = 24, unassigned = open-bus }
+
+  # The 65C816 runs in master clocks; the S-CPU prices each cycle (6, 8 or
+  # 12 clocks by address, FastROM included) and holds it for DMA, HDMA and
+  # DRAM refresh.
+  object cpu "cpu.w65c816" {
+    clock  = master
+    space  = abus
+    rdy    = scpu
+    timing = scpu
+  }
+  object scpu "snes.scpu" { clock = master, space = abus, ppu = ppu, pads = "snes-pads" }
+  object ppu  "snes.ppu"  { clock = master, region = "ntsc" }
+  object apu  "snes.apu"  { clock = apuosc / 24 }
+  object wram "snes.wram" { }
+  object cart "snes.cart" { rom = "cart" }
+
+  # ---------------------------------------------------------------------
+  # The memory map (fullsnes "SNES Memory Map")
+  # ---------------------------------------------------------------------
+  #
+  # The system banks $00-$3F and $80-$BF share one layout below $8000:
+  # LowRAM (WRAM's first 8 KiB), the B-bus at $2100 (PPU, APU ports, WRAM
+  # port), the joypad ports, the S-CPU's registers and DMA, and the
+  # cartridge from $6000. Everything else is the cartridge's, except banks
+  # $7E-$7F, which are WRAM. The cartridge decodes its region by full
+  # A-bus address, so each window aliases it at its own address and an
+  # address the cartridge does not drive reads open bus.
+  for b in 0..0x40 {
+    map abus b * 0x10000          size 0x2000 = wram.ram
+    map abus b * 0x10000 + 0x2100 size 0x40   = ppu.regs
+    map abus b * 0x10000 + 0x2140 size 0x40   = apu.cpuio
+    map abus b * 0x10000 + 0x2180 size 4      = wram.port
+    map abus b * 0x10000 + 0x4016 size 2      = scpu.joy
+    map abus b * 0x10000 + 0x4200 size 0x20   = scpu.regs
+    map abus b * 0x10000 + 0x4300 size 0x80   = scpu.dma
+    map abus b * 0x10000 + 0x6000 size 0xA000 = alias(cart, b * 0x10000 + 0x6000)
+  }
+  for b in 0x80..0xC0 {
+    map abus b * 0x10000          size 0x2000 = wram.ram
+    map abus b * 0x10000 + 0x2100 size 0x40   = ppu.regs
+    map abus b * 0x10000 + 0x2140 size 0x40   = apu.cpuio
+    map abus b * 0x10000 + 0x2180 size 4      = wram.port
+    map abus b * 0x10000 + 0x4016 size 2      = scpu.joy
+    map abus b * 0x10000 + 0x4200 size 0x20   = scpu.regs
+    map abus b * 0x10000 + 0x4300 size 0x80   = scpu.dma
+    map abus b * 0x10000 + 0x6000 size 0xA000 = alias(cart, b * 0x10000 + 0x6000)
+  }
+  map abus 0x400000 size 0x3E0000 = alias(cart, 0x400000)   # $40-$7D
+  map abus 0x7E0000 size 128K     = wram.ram                 # $7E-$7F
+  map abus 0xC00000 size 0x400000 = alias(cart, 0xC00000)   # $C0-$FF
+
+  # ---------------------------------------------------------------------
+  # Wires
+  # ---------------------------------------------------------------------
+  wire ppu.vblank -> scpu.vblank
+  wire scpu.nmi   -> cpu.nmi
+  wire scpu.irq   -> cpu.irq
+}

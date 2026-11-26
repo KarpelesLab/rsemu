@@ -561,6 +561,15 @@ built by `scripts/fetch-testdata.sh stm32u5-hal`: clock configuration to
 SHA-256, each checked. `docs/platforms/stm32u5.md` lists what is not there yet,
 DMA and the RTC first.
 
+`snes-ntsc` and `snes-pal` are the **Super Nintendo**: a 65C816 core that
+passes every one of SingleStepTests' five million vectors, the 5A22's DMA,
+HDMA, timers and joypads, the S-PPU in all eight modes, and the audio unit —
+an SPC700 that passes its own 256 000 vectors and the S-DSP's eight voices
+and echo. Its 64-byte boot ROM is Nintendo's, so it is not here: the audio
+unit boots a clean-room one that speaks the same upload protocol.
+`rsemu run snes-ntsc --media cart=game.sfc`; `docs/platforms/snes.md` lists
+what is not there yet, the enhancement chips first.
+
 `stm32wb55` and `stm32wb35` are the dual-core wireless parts: an **STM32WB55RG**
 (the NUCLEO-WB55RG's) and an **STM32WB35CE**, a Cortex-M4F with a Cortex-M0+
 radio coprocessor. That second core runs ST's encrypted wireless stack on the
