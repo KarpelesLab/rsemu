@@ -3104,6 +3104,85 @@ Consumed by RSEMU_STM32U5_HAL_DIR in tests/stm32u5_hal.rs."
 	note "          cargo test --release --test stm32u5_hal -- --nocapture"
 }
 
+# ---------------------------------------------------------------------------
+# stm32wb-ble: ST's WB HAL plus our BLE mailbox client, for the WB boards
+# ---------------------------------------------------------------------------
+#
+# Built rather than downloaded, like stm32u5-hal: the app is ours
+# (tests/fixtures/stm32wb-ble, MIT) and what is fetched is the vendor code it
+# links against. All three are permissive (CLAUDE.md, Provenance). ST's
+# STM32_WPAN middleware is **not** fetched — it is under ST's SLA0044 — and
+# the app speaks the mailbox itself, from AN5289/AN5185/AN5270.
+#
+#   * ST CMSIS device files for the WB — Apache-2.0 — the register header,
+#     the startup file with the vector table, and system_stm32wbxx.c.
+#   * ST's STM32WB HAL driver — BSD-3-Clause.
+#   * Arm CMSIS 5 core headers (core_cm4.h and friends) — Apache-2.0.
+#
+# Needs arm-none-eabi-gcc. No C library is used.
+readonly WB_DEVICE_REPO="https://github.com/STMicroelectronics/cmsis-device-wb"
+readonly WB_DEVICE_REV="05abd6a79e6529765bd10a08cc74553dae7f5da6"   # v1.12.4
+readonly WB_HAL_REPO="https://github.com/STMicroelectronics/stm32wbxx-hal-driver"
+readonly WB_HAL_REV="6d4bac1990af2325c2158cb87d3a639d3b7c4c07"      # v1.14.8
+
+fetch_stm32wb_ble() {
+	need git
+	need arm-none-eabi-gcc
+	need arm-none-eabi-objcopy
+	local dest="${DEST_ROOT}/stm32wb-ble"
+	local fixture="${REPO_ROOT}/tests/fixtures/stm32wb-ble"
+	local src="${dest}/src"
+	git_at "$WB_DEVICE_REPO" "$WB_DEVICE_REV" "${src}/cmsis-device-wb"
+	git_at "$WB_HAL_REPO" "$WB_HAL_REV" "${src}/stm32wbxx-hal-driver"
+	git_at "$CMSIS5_REPO" "$CMSIS5_REV" "${src}/CMSIS_5"
+	ok "sources at ${src}"
+
+	local hal="${src}/stm32wbxx-hal-driver" dev="${src}/cmsis-device-wb"
+	local core="${src}/CMSIS_5/CMSIS/Core/Include"
+	local part p obj s
+	for part in WB55 WB35; do
+		p="$(printf '%s' "$part" | tr 'A-Z' 'a-z')"
+		obj="${dest}/obj-${p}"
+		rm -rf "$obj"
+		mkdir -p "$obj"
+		local cflags=(-mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
+			-O2 -g -ffreestanding -ffunction-sections -fdata-sections
+			"-DSTM32${part}xx" -DUSE_HAL_DRIVER
+			"-I${fixture}" "-I${fixture}/libc" "-I${hal}/Inc" "-I${dev}/Include" "-I${core}")
+		local srcs=("${fixture}/main.c" "${dev}/Source/Templates/system_stm32wbxx.c")
+		for s in "${hal}"/Src/stm32wbxx_hal*.c; do
+			case "$s" in *template*) continue ;; esac
+			srcs+=("$s")
+		done
+		for s in "${srcs[@]}"; do
+			arm-none-eabi-gcc "${cflags[@]}" -c "$s" -o "${obj}/$(basename "$s" .c).o"
+		done
+		arm-none-eabi-gcc "${cflags[@]}" -c "${dev}/Source/Templates/gcc/startup_stm32${p}xx_cm4.s" \
+			-o "${obj}/startup.o"
+		arm-none-eabi-gcc "${cflags[@]}" -T"${fixture}/wb.ld" -nostdlib \
+			-Wl,--gc-sections -Wl,--no-warn-rwx-segments \
+			-o "${dest}/${p}.elf" "${obj}"/*.o -lgcc
+		arm-none-eabi-objcopy -O binary "${dest}/${p}.elf" "${dest}/${p}.bin"
+		rm -rf "$obj"
+		ok "${p}.bin ($(wc -c <"${dest}/${p}.bin" | tr -d ' ') bytes)"
+	done
+	write_notice "$dest" "stm32wb-ble — ST's STM32WB HAL linked into a BLE smoke firmware
+The app, including its mailbox client: tests/fixtures/stm32wb-ble (rsemu, MIT).
+${WB_DEVICE_REPO} @ ${WB_DEVICE_REV} (Apache-2.0)
+${WB_HAL_REPO} @ ${WB_HAL_REV} (BSD-3-Clause)
+${CMSIS5_REPO} @ ${CMSIS5_REV} (Apache-2.0)
+
+All permissive. ST's STM32_WPAN (SLA0044) is not used. Fetched rather than
+committed because they are large and someone else's; the binaries carry ST's
+and Arm's code under those licences.
+
+Consumed by RSEMU_STM32WB_BLE_DIR in tests/stm32wb_ble.rs."
+	note ""
+	note "  Run it:"
+	note "      RSEMU_STM32WB_BLE_DIR=${dest} \\"
+	note "          cargo test --release --test stm32wb_ble -- --nocapture"
+}
+
 usage() {
 	cat <<'EOF'
 usage: scripts/fetch-testdata.sh [options] [suite ...]
@@ -3176,6 +3255,10 @@ Suites:
                  fetched at pinned commits and BUILT into a smoke firmware for
                  the stm32u575/stm32u585 boards from tests/fixtures/stm32u5-hal.
                  Needs arm-none-eabi-gcc (no C library required)
+  stm32wb-ble    ST's STM32WB HAL (BSD-3-Clause) and CMSIS files (Apache-2.0)
+                 BUILT with our BLE mailbox client into a smoke firmware for
+                 the stm32wb55/stm32wb35 boards, from tests/fixtures/stm32wb-ble.
+                 Needs arm-none-eabi-gcc (no C library required)
   linux          riscv64 Linux Image to boot on it (GPL-2.0, FETCH-ONLY)
   initramfs      a busybox root filesystem for that kernel, built here around
                  Debian's riscv64 busybox-static (GPL-2.0, FETCH-ONLY)
@@ -3229,7 +3312,7 @@ list_present() {
 	fi
 	local suite
 	for suite in sst-65x02 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
-		sms-zexall apple1 riscv riscv-arch-test a64-tests arm64 freedos x86 stm32u5-hal; do
+		sms-zexall apple1 riscv riscv-arch-test a64-tests arm64 freedos x86 stm32u5-hal stm32wb-ble; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
 				"$(du -sh "${DEST_ROOT}/${suite}" 2>/dev/null | cut -f1) present"
@@ -3298,6 +3381,7 @@ for suite in "${SUITES[@]}"; do
 		initramfs-virtio|virtio) fetch_initramfs_virtio ;;
 		initramfs-x86|x86) fetch_initramfs_x86 ;;
 		stm32u5-hal|u5) fetch_stm32u5_hal ;;
+		stm32wb-ble|wb) fetch_stm32wb_ble ;;
 		*) die "unknown suite $suite (try --help)" ;;
 	esac
 done
