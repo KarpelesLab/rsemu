@@ -10,28 +10,35 @@
 //!
 //! # The register map
 //!
-//! RM0434's IPCC chapter, offsets as ST CMSIS `stm32wb55xx.h` (`IPCC_TypeDef`,
-//! `IPCC_CommonTypeDef`) gives them. The first four registers are processor 1's
-//! and the next four the same four for processor 2:
+//! RM0434 Rev 16 §9.4 (Table 50 is the map), which agrees with ST CMSIS
+//! `stm32wb55xx.h` (`IPCC_TypeDef`, `IPCC_CommonTypeDef`) on every offset and
+//! bit. The first four registers are processor 1's and the next four the same
+//! four for processor 2:
 //!
 //! | Offset | Register | What it holds |
 //! | --- | --- | --- |
-//! | `0x00` / `0x10` | `C1CR` / `C2CR` | `RXOIE` (bit 0) and `TXFIE` (bit 16): the two interrupt enables |
-//! | `0x04` / `0x14` | `C1MR` / `C2MR` | `CHnOM` (bits 0–5) masks channel *n*'s RX-occupied interrupt, `CHnFM` (bits 16–21) its TX-free one |
-//! | `0x08` / `0x18` | `C1SCR` / `C2SCR` | write-only: `CHnC` (bit *n*) clears the *other* side's flag, `CHnS` (bit 16+*n*) sets this side's |
-//! | `0x0C` / `0x1C` | `C1TOC2SR` / `C2TOC1SR` | read-only: `CHnF` (bits 0–5), set while channel *n* holds a message for the other side |
-//! | `0x3F0` | `HWCFGR` | `0x0000_0006`: six channels |
-//! | `0x3F4` | `VERR` | `0x0000_0010`: revision 1.0 |
-//! | `0x3F8` | `IPIDR` | `0x0010_0071` |
-//! | `0x3FC` | `SIDR` | `0xA3C5_DD01` |
+//! | `0x00` / `0x10` | `C1CR` / `C2CR` | `RXOIE` (bit 0) and `TXFIE` (bit 16): the two interrupt enables; reset 0 (§9.4.1, §9.4.5) |
+//! | `0x04` / `0x14` | `C1MR` / `C2MR` | `CHnOM` (bits 0–5) masks channel *n*'s RX-occupied interrupt, `CHnFM` (bits 16–21) its TX-free one; reset `0xFFFF_FFFF` (§9.4.2, §9.4.6) |
+//! | `0x08` / `0x18` | `C1SCR` / `C2SCR` | `CHnC` (bit *n*) clears the *other* side's flag, `CHnS` (bit 16+*n*) sets this side's; "reading this register always returns 0x0000 0000" (§9.4.3, §9.4.7) |
+//! | `0x0C` / `0x1C` | `C1TOC2SR` / `C2TOC1SR` | read-only: `CHnF` (bits 0–5), set while channel *n* holds a message for the other side; reset 0 (§9.4.4, §9.4.8) |
+//! | `0x3F0` | `HWCFGR` | `0x0000_0006`: six channels (SVD) |
+//! | `0x3F4` | `VERR` | `0x0000_0010`: revision 1.0 (SVD) |
+//! | `0x3F8` | `IPIDR` | `0x0010_0071` (SVD) |
+//! | `0x3FC` | `SIDR` | `0xA3C5_DD01` (SVD) |
 //!
-//! The identification values and the `0xFFFF_FFFF` reset value of both mask
-//! registers are ST's `STM32WB55_CM4.svd` (Apache-2.0), which states them as
-//! reset values; the CMSIS header stops at `C2TOC1SR` and does not name the
-//! identification block at all. A mask register's reserved bits read back as
-//! that reset value — set — and writes do not move them.
+//! RM0434 gives each mask register's reset value as `0xFFFF_FFFF`, reserved
+//! bits included, and says reserved bits "must be kept at reset value"; so
+//! they read back set, and writes do not move them. Table 50 stops at
+//! `C2TOC1SR`: the identification block is ST's `STM32WB55_CM4.svd`
+//! (Apache-2.0) alone, and RM0434 does not say what the gaps do. Every other
+//! offset in the kilobyte reads as zero and ignores writes.
 //!
-//! Every other offset in the kilobyte reads as zero and ignores writes.
+//! The registers "must be accessed by words (32-bit). Byte (8-bit) and
+//! half-word (16-bit) accesses are not permitted and do not generate a bus
+//! error" (§9.4) — unlike the HSEM's, which do. What such an access does
+//! instead RM0434 does not say. Here an aligned byte or halfword access
+//! completes without a fault and does nothing: a write is dropped, so a byte
+//! of `CxSCR` rings no doorbell, and a read answers zero.
 //!
 //! # A channel, end to end
 //!
@@ -50,7 +57,11 @@
 //!
 //! # The four interrupts
 //!
-//! Levels, recomputed after every write:
+//! RM0434 §9.3.4: the RX-occupied line "indicates when an unmasked channel
+//! status indicates occupied (CHnF = 1)" and the TX-free line "when an
+//! unmasked channel status indicates free (CHnF = 0)", each behind its
+//! processor's enable — levels, not edges. Table 49 and §9.4 say which status
+//! register each enable and mask goes with. Recomputed after every write:
 //!
 //! | Output | High while |
 //! | --- | --- |
@@ -59,9 +70,10 @@
 //! | `c2-rx` | `C2CR.RXOIE` and some channel has `C1TOC2SR.CHnF` set with `C2MR.CHnOM` clear |
 //! | `c2-tx` | `C2CR.TXFIE` and some channel has `C2TOC1SR.CHnF` clear with `C2MR.CHnFM` clear |
 //!
-//! On an STM32WB55 `c1-rx` is NVIC line 44 (`IPCC_C1_RX_IRQn`) and `c1-tx`
-//! line 45 (`IPCC_C1_TX_IRQn`) — `stm32wb55xx.h` — and the two `c2` lines go
-//! to CPU2. The board file draws those wires; nothing here knows the numbers.
+//! On an STM32WB55 `c1-rx` is NVIC line 44 (`IPCC_C1_RX_IT`) and `c1-tx`
+//! line 45 (`IPCC_C1_TX_IT`), RM0434 §15.4 Table 72, and the two `c2` lines
+//! go to CPU2, which has them both on its line 19 (Table 73). The board file
+//! draws those wires; nothing here knows the numbers.
 //!
 //! # Which processor is asking
 //!
@@ -75,8 +87,8 @@
 //! # The clock
 //!
 //! `enable` is `RCC_AHB3ENR.IPCCEN`, bit 20, and `reset` is
-//! `RCC_AHB3RSTR.IPCCRST`, the same bit (`stm32wb55xx.h`). CPU2 has its own
-//! enable for the block in `RCC_C2AHB3ENR`, bit 20 again; the `enable` pin ORs
+//! `RCC_AHB3RSTR.IPCCRST`, the same bit (RM0434 §6.4.19, §6.4.12). CPU2 has
+//! its own enable for the block in `RCC_C2AHB3ENR`, bit 20 again (§6.4.37); the `enable` pin ORs
 //! every wire drawn to it, so a board that models both draws both. [`gate`]
 //! has what a gated block does. The interrupt outputs hold their level while
 //! the gate is shut, which is what most of the family's models do (see
@@ -84,11 +96,12 @@
 //!
 //! # Sources
 //!
-//! ST **RM0434**, the "Inter-processor communication controller (IPCC)"
-//! chapter, for the channel protocol and the interrupt equations; ST CMSIS
-//! `stm32wb55xx.h` (Apache-2.0) for the offsets, the bit positions and the
-//! interrupt numbers; ST `STM32WB55_CM4.svd` (Apache-2.0) for the reset and
-//! identification values. ST's BSD-3 WB HAL (`stm32wbxx_hal_ipcc.c`) was read
+//! ST **RM0434 Rev 16**, chapter 9 "Inter-processor communication controller
+//! (IPCC)", for the register map, the reset values, the channel protocol, the
+//! interrupt equations and the access width; §6.4 (RCC) for the clock bits;
+//! §15.4 for the interrupt lines. ST CMSIS `stm32wb55xx.h` (Apache-2.0) for
+//! the same offsets and bits as names; ST `STM32WB55_CM4.svd` (Apache-2.0)
+//! for the identification values, which RM0434 does not list. ST's BSD-3 WB HAL (`stm32wbxx_hal_ipcc.c`) was read
 //! for what firmware polls, not copied. No emulator source of any licence was
 //! consulted (`ROADMAP.md` §1).
 
@@ -148,7 +161,7 @@ const CR_MASK: u32 = CR_RXOIE | CR_TXFIE;
 const HIGH_SHIFT: u32 = 16;
 /// The bits `CxMR` implements: `CHnOM` and `CHnFM`.
 const MR_MASK: u32 = CH_MASK | (CH_MASK << HIGH_SHIFT);
-/// `CxMR`'s reset value, every interrupt masked (ST `STM32WB55_CM4.svd`).
+/// `CxMR`'s reset value, every interrupt masked (RM0434 §9.4.2, §9.4.6).
 const MR_RESET: u32 = 0xffff_ffff;
 
 /// `HWCFGR`: `CHANNELS = 6`.
@@ -316,6 +329,12 @@ impl MemOps for Registers {
             dst.fill(0);
             return Ok(());
         }
+        if dst.len() != 4 {
+            // A byte or halfword: "not permitted and do not generate a bus
+            // error" (RM0434 §9.4). No value is promised, so none is given.
+            dst.fill(0);
+            return Ok(());
+        }
         // No register here changes on a read, so a debug read is the same
         // read (`MemAttrs::debug`, `ROADMAP.md` §15 invariant 5).
         let bytes = self.read_register(offset).to_le_bytes();
@@ -338,6 +357,12 @@ impl MemOps for Registers {
             // Not effective: a doorbell rung at an unclocked block is lost.
             return Ok(());
         }
+        if src.len() != 4 {
+            // A byte or halfword: not permitted, but no bus error either
+            // (RM0434 §9.4). It does nothing — half a `CxSCR` word is not a
+            // doorbell anybody rang on purpose.
+            return Ok(());
+        }
         let mut word = [0u8; 4];
         for (slot, byte) in word.iter_mut().zip(src) {
             *slot = *byte;
@@ -349,9 +374,10 @@ impl MemOps for Registers {
     }
 
     fn constraints(&self) -> AccessConstraints {
-        // Word access: every register is a 32-bit AHB register, and ST's HAL
-        // and LL touch them no other way.
-        AccessConstraints::word(Width::U32, Endian::Little)
+        // Bytes and halfwords reach the block, which drops them: RM0434 §9.4
+        // forbids them but says they raise no bus error. Alignment is still
+        // required — a misaligned word is the core's to split or fault on.
+        AccessConstraints::word(Width::U32, Endian::Little).with_widths(Width::U8, Width::U32)
     }
 }
 
@@ -716,6 +742,34 @@ mod tests {
         assert_eq!(read(&d, C2TOC1SR), 0);
         write(&d, 0x3f0, 0);
         assert_eq!(read(&d, 0x3f0), HWCFGR);
+    }
+
+    #[test]
+    fn byte_and_halfword_accesses_do_nothing_and_raise_no_fault() {
+        // RM0434 §9.4: "not permitted and do not generate a bus error".
+        let d = Ipcc::build();
+        let c = d.regs.constraints();
+        for width in [Width::U8, Width::U16, Width::U32] {
+            assert!(
+                c.check(C1SCR, width, MemAttrs::DEFAULT).is_ok(),
+                "{width:?}"
+            );
+        }
+        // A byte of C1SCR's CHnS lane rings nothing.
+        d.regs
+            .write(C1SCR + 2, &[0x3f], MemAttrs::DEFAULT)
+            .expect("no bus error");
+        d.regs
+            .write(C1MR, &[0, 0], MemAttrs::DEFAULT)
+            .expect("no bus error");
+        assert_eq!(read(&d, C1TOC2SR), 0);
+        assert_eq!(read(&d, C1MR), MR_RESET);
+        // And a narrow read of a set register answers zero.
+        let mut half = [0xaa; 2];
+        d.regs
+            .read(C1MR, &mut half, MemAttrs::DEFAULT)
+            .expect("no bus error");
+        assert_eq!(half, [0, 0]);
     }
 
     #[test]
