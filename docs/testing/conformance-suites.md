@@ -33,6 +33,7 @@ anything**; this table records a point in time.
 | Suite | Covers | Licence | May we vendor? |
 | --- | --- | --- | --- |
 | [SingleStepTests/65x02](https://github.com/SingleStepTests/65x02) | 6502/65C02, 10 000 vectors per opcode with full bus-cycle traces | **MIT** ✅ | Yes, with attribution |
+| [SingleStepTests/65816](https://github.com/SingleStepTests/65816) | WDC 65C816, both modes, bus traces with VDA/VPA/VPB/RWB/E/MX/MLB per cycle | **MIT** ✅ (© Thomas Harte et al., verified against upstream `LICENCE`) | Yes, with attribution — fetched at a pinned commit by `scripts/fetch-testdata.sh sst-65816` |
 | [SingleStepTests/z80](https://github.com/SingleStepTests/z80) | Z80, same format | **MIT** ✅ | Yes, with attribution |
 | [SingleStepTests/8088](https://github.com/SingleStepTests/8088) | 8088/8086, same format | **MIT** ✅ | Yes, with attribution |
 | [Gekkio/mooneye-test-suite](https://github.com/Gekkio/mooneye-test-suite) | Game Boy acceptance tests — timing, PPU, interrupts | **MIT** ✅ | Yes, with attribution |

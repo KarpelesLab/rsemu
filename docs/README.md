@@ -45,7 +45,8 @@ the question never arises.
 ### CPU architectures
 | | |
 | --- | --- |
-| [`cpu/6502.md`](cpu/6502.md) | MOS 6502, RP2A03, 65C02, 65816 |
+| [`cpu/6502.md`](cpu/6502.md) | MOS 6502, RP2A03, 65C02 |
+| [`cpu/65816.md`](cpu/65816.md) | WDC 65C816 (SNES, Apple IIGS): the datasheet, emulation-mode wrapping, the board-supplied per-access timing hook, open bus, and the SingleStepTests/65816 result |
 | [`cpu/z80-sm83.md`](cpu/z80-sm83.md) | Zilog Z80, Sharp SM83 (Game Boy), Intel 8080 |
 | [`cpu/spc700.md`](cpu/spc700.md) | Sony SPC700 and the S-SMP (SNES audio): registers, timers, the clean-room IPL |
 | [`cpu/x86.md`](cpu/x86.md) | 8086 → i386 → x86-64, SSE/AVX, paging, segmentation |
