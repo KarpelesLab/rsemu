@@ -8,7 +8,7 @@
 //!   the channel multiplexer of §14.3.2, the synchronization mode and its
 //!   `NBREQ`/`SPOL`/`SYNC_ID` of §14.3.3, the event generation of §14.3.4 and
 //!   the request generator of §14.3.5.
-//! * ST **RM0440** (STM32G4) §13 and ST **RM0434** (STM32WB) §15 describe the
+//! * ST **RM0440** (STM32G4) §13 and ST **RM0434** (STM32WB) §14 describe the
 //!   same block. Where the three differ it is only in *how many* channels and
 //!   request lines the part bonds and in which source sits on which line —
 //!   both facts about the part, and both therefore in the board file rather
@@ -117,7 +117,7 @@
 //! # Synchronization (`SE`, `SPOL`, `SYNC_ID`, `NBREQ`)
 //!
 //! RM0432 §14.3.3. A synchronized channel does not forward anything until an
-//! edge arrives on one of the eight `sync` inputs — `SYNC_ID` picks it,
+//! edge arrives on one of the thirty-two `sync` inputs — `SYNC_ID` picks it,
 //! `SPOL` picks the edge (`00` none, `01` rising, `10` falling, `11` both). On
 //! that edge the channel is given credit for `NBREQ + 1` requests, forwards
 //! exactly that many, and then goes quiet again until the next sync event.
@@ -215,7 +215,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema, port_index};
 pub const CLASS_NAME: &str = "st.dmamux";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// The pin names this device answers to.
 pub mod pin {
@@ -246,8 +246,10 @@ pub const GENERATORS: usize = 4;
 /// How many request lines `DMAREQ_ID` can name: seven bits, so 128.
 const REQUEST_LINES: usize = 1 << 7;
 
-/// How many synchronization inputs `SYNC_ID` can name: three bits.
-const SYNC_LINES: usize = 1 << 3;
+/// How many synchronization inputs `SYNC_ID` can name: five bits
+/// (`SYNC_ID[4:0]` in RM0432's `DMAMUX_CxCR`, and RM0434 §14.6.1, where twenty are
+/// wired — EXTI0–15, `dmamux_evt0`/`1`, LPTIM1/2).
+const SYNC_LINES: usize = 1 << 5;
 
 /// How many trigger inputs `SIG_ID` can name: five bits.
 const TRIGGER_LINES: usize = 1 << 5;
@@ -277,9 +279,9 @@ const CCR_SPOL_SHIFT: u32 = 17;
 const CCR_NBREQ_SHIFT: u32 = 19;
 const CCR_NBREQ_MASK: u32 = 0x1f;
 const CCR_SYNC_ID_SHIFT: u32 = 24;
-const CCR_SYNC_ID_MASK: u32 = 0x7;
-/// Bits 7, 10–15, 27–31 are reserved and read as zero.
-const CCR_MASK: u32 = 0x07ff_037f;
+const CCR_SYNC_ID_MASK: u32 = 0x1f;
+/// Bits 7, 10–15 and 29–31 are reserved and read as zero.
+const CCR_MASK: u32 = 0x1fff_037f;
 
 // `DMAMUX_RGxCR` (RM0432 §14.5.5).
 const RGCR_SIG_ID: u32 = 0x1f;
@@ -1084,13 +1086,13 @@ impl Device for Dmamux {
             }
             w.write_u32(bits)?;
         }
-        let mut sync = 0u8;
+        let mut sync = 0u32;
         for (i, &level) in state.sync.iter().enumerate() {
             if level {
                 sync |= 1 << i;
             }
         }
-        w.write_u8(sync)?;
+        w.write_u32(sync)?;
         let mut trigger = 0u32;
         for (i, &level) in state.trigger.iter().enumerate() {
             if level {
@@ -1129,7 +1131,7 @@ impl Device for Dmamux {
         // Line 0 is the idle encoding and is never high, whatever a snapshot
         // claims: a channel parked on `DMAREQ_ID = 0` must stay parked.
         state.request[0] = false;
-        let sync = r.read_u8()?;
+        let sync = r.read_u32()?;
         for (i, level) in state.sync.iter_mut().enumerate() {
             *level = sync & (1 << i) != 0;
         }

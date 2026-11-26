@@ -336,6 +336,32 @@ fn synchronization_holds_requests_back_until_the_sync_edge() {
 }
 
 #[test]
+fn sync_id_reaches_all_five_bits_of_inputs() {
+    // RM0434 Table 65 puts LPTIM2_OUT on sync input 19, which a three-bit
+    // SYNC_ID could never name.
+    let rig = Rig::new(14);
+    let ch0 = rig.probe_channel(0);
+    rig.poke(
+        ccr(0),
+        Ccr {
+            id: 20,
+            se: true,
+            spol: 0b01,
+            nbreq: 0,
+            sync_id: 19,
+            ..Ccr::default()
+        }
+        .bits(),
+    );
+    assert_eq!((rig.peek(ccr(0)) >> CCR_SYNC_ID_SHIFT) & 0x1f, 19);
+    rig.mux.set_request(20, Level::High);
+    rig.mux.set_sync(3, Level::High);
+    assert_eq!(ch0.level(), Level::Low, "sync3 is not the input it named");
+    rig.mux.set_sync(19, Level::High);
+    assert_eq!(ch0.level(), Level::High, "sync19 is");
+}
+
+#[test]
 fn a_held_request_is_forwarded_on_the_sync_edge_itself() {
     let rig = Rig::new(7);
     let ch0 = rig.probe_channel(0);
@@ -602,7 +628,7 @@ fn the_control_registers_read_back_only_what_rm0432_makes_writable() {
     assert_eq!(
         rig.peek(ccr(0)),
         CCR_MASK,
-        "CxCR bits 7, 10-15 and 27-31 are reserved"
+        "CxCR bits 7, 10-15 and 29-31 are reserved"
     );
     rig.poke(rgcr(0), 0xffff_ffff);
     assert_eq!(
@@ -693,8 +719,9 @@ fn the_generators_request_lines_have_no_pins() {
         rig.mux.input_index("req128").is_none(),
         "DMAREQ_ID is 7 bits"
     );
-    assert_eq!(rig.mux.input_index("sync7"), Some((Bank::Sync, 7)));
-    assert!(rig.mux.input_index("sync8").is_none(), "SYNC_ID is 3 bits");
+    assert_eq!(rig.mux.input_index("sync19"), Some((Bank::Sync, 19)));
+    assert_eq!(rig.mux.input_index("sync31"), Some((Bank::Sync, 31)));
+    assert!(rig.mux.input_index("sync32").is_none(), "SYNC_ID is 5 bits");
     assert_eq!(rig.mux.input_index("trg31"), Some((Bank::Trigger, 31)));
     assert!(rig.mux.input_index("trg32").is_none(), "SIG_ID is 5 bits");
 }
@@ -788,7 +815,7 @@ fn dmamux_state_survives_save_and_load() {
             se: true,
             spol: 0b11,
             nbreq: 5,
-            sync_id: 2,
+            sync_id: 18,
         }
         .bits(),
     );
@@ -802,7 +829,8 @@ fn dmamux_state_survives_save_and_load() {
     );
     saved.poke(rgcr(1), 6 | RGCR_GE | RGCR_OIE | (0b01 << RGCR_GPOL_SHIFT));
     saved.mux.set_request(31, Level::High);
-    saved.mux.set_sync(2, Level::High);
+    // A sync input above the old three-bit range, so its level has to travel.
+    saved.mux.set_sync(18, Level::High);
     saved.mux.set_request(20, Level::High);
     saved.mux.set_trigger(6, Level::High);
     saved.mux.set_trigger(6, Level::Low);
@@ -848,9 +876,9 @@ fn dmamux_state_survives_save_and_load() {
         "line 31 was held high and channel 3 was passing it on"
     );
     // The edge detectors kept their inputs, so the *next* change is an edge
-    // rather than a repeat: dropping sync 2 and raising it again overruns.
-    restored.mux.set_sync(2, Level::Low);
-    restored.mux.set_sync(2, Level::High);
+    // rather than a repeat: dropping sync 18 and raising it again overruns.
+    restored.mux.set_sync(18, Level::Low);
+    restored.mux.set_sync(18, Level::High);
     assert_eq!(restored.csr(), 1 << 1, "credit was still outstanding");
 }
 
