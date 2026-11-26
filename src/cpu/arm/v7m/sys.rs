@@ -376,6 +376,17 @@ pub const CPUID_CORTEX_M4: u32 = 0x410f_c241;
 /// The default `CPUID` value for a Cortex-M7 r1p0: part number `0xC27`.
 pub const CPUID_CORTEX_M7: u32 = 0x411f_c271;
 
+/// The fields of an SC300's `CPUID` that can be stated: implementer `0x41`
+/// (ARM) and architecture `0xF` (ARMv7-M), the two DDI 0403E B4.1.2 fixes for
+/// an ARM-designed ARMv7-M part.
+///
+/// Variant, part number and revision read as zero because **they are not
+/// published** (the SC300 TRM is under NDA, and CMSIS `core_sc300.h` names
+/// the fields without giving values), not because they are zero. A board
+/// modelling real SC300 silicon sets the value it reads with
+/// [`Config::cpuid`](super::Config::cpuid) or the `cpuid` property.
+pub const CPUID_SC300: u32 = 0x410f_0000;
+
 /// Everything behind `0xE000E000`, plus the exception bookkeeping the NVIC
 /// and the SCB share.
 #[derive(Debug, Clone)]

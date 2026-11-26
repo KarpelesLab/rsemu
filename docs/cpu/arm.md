@@ -2,7 +2,7 @@
 
 Consumed by: `cpu/arm/aprofile` (ARMv5TE, and ARMv7-A's A32 and T32 (Thumb-2)
 instruction sets with VFPv3; NEON to follow),
-`cpu/arm/v7m` (ARMv6-M, ARMv7E-M and Armv8-M Mainline, Cortex-M0/M0+/SC000/M3/M4/M7/M33), `cpu/arm/a64` (ARMv8-A AArch64).
+`cpu/arm/v7m` (ARMv6-M, ARMv7E-M and Armv8-M Mainline, Cortex-M0/M0+/SC000/M3/SC300/M4/M7/M33), `cpu/arm/a64` (ARMv8-A AArch64).
 
 ## Primary
 
@@ -19,6 +19,8 @@ instruction sets with VFPv3; NEON to follow),
 | ARMv6-M ARM (DDI 0419E) | The **Cortex-M0 family's architecture**: the v6-M Thumb subset (A5's encoding tables), the one-fault exception model (B1.5), the v6-M SCB/NVIC subset, SysTick and PMSAv6 (B3), `MRS`/`MSR`/`CPS` (B4) | `developer.arm.com/documentation/ddi0419/latest/` (a free PDF) |
 | Cortex-M0 TRM (DDI 0432C), Cortex-M0+ TRM (DDI 0484C) | `CPUID`, the implementation options (VTOR, MPU, unprivileged support, SysTick, multiplier), the instruction cycle counts | developer.arm.com |
 | SecurCore SC000 TRM (DDI 0456) | **Not public** (SecurCore NDA). What `Config::SC000` rests on instead is stated in its documentation and in `tests/conformance/ledgers/cpu-arm-v6m.txt` | — |
+| SecurCore SC300 TRM | **Not public** (SecurCore NDA). `Config::SC300` is the Cortex-M3's options plus CMSIS `core_sc300.h`'s `VTOR` width; the gaps are in `tests/conformance/ledgers/cpu-arm-v7m.txt` | — |
+| CMSIS-Core `core_sc000.h`, `core_sc300.h`, `core_cm3.h` (Apache-2.0) | The SecurCore register layouts the TRMs would otherwise give: which SCB/SCnSCB registers exist, the `VTOR` field widths (`TBLBASE` at bit 29 and `TBLOFF` `[28:7]` on the SC300 and pre-r2p1 Cortex-M3), the IMPLEMENTATION DEFINED `SFCR` at `0xE000EF90` | `github.com/ARM-software/CMSIS_5`, `CMSIS/Core/Include/` |
 | Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489), Cortex-M33 TRM (100230) | The implementation-defined values a guest can see: `CPUID`, `MVFR0`/`MVFR1`/`MVFR2`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
 | PrimeCell UART (PL011), TRM DDI 0183 | The UART every ARM virtual board exposes | developer.arm.com **[browser]** |
 
@@ -144,6 +146,15 @@ secondary reference for the exception model.
   unverified and says so. `src/cpu/arm/v7m/v6m.rs`'s documentation is the
   precise statement, `tests/conformance/ledgers/cpu-arm-v6m.txt` the list of
   what is absent.
+- **The SecurCore SC300 is a Cortex-M3 preset, not an architecture.**
+  `Config::SC300` (`part = "sc300"`, no feature beyond `cpu-arm-v7m`) is
+  ARMv7-M with no DSP and no FPU, the optional PMSAv7 MPU modelled present
+  (`mpu = false` for silicon without it), and two differences from the
+  Cortex-M3 preset: a `CPUID` carrying only the implementer and architecture
+  fields, because the SC300's part number is not published, and `VTOR`
+  implementing bits `[29:7]`, the layout CMSIS `core_sc300.h` gives it. Its
+  anti-tampering features and `SFCR` are not modelled;
+  `tests/conformance/ledgers/cpu-arm-v7m.txt` says so.
 - **The boot vector table is the SoC's.** `cpu.arm.v7m`'s `vtor` property is
   `VTOR`'s reset value and where every reset, warm or cold, reads `SP` and
   `PC`. It is zero on a part that boots from zero; an STM32U5 boots from

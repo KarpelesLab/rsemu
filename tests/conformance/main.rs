@@ -743,6 +743,11 @@ const LEDGERS: &[(&str, bool)] = &[
     // `src/cpu/arm/v7m/v6mtests.rs`, the clang-built v6-M corpus and the
     // LLVM encoding cross-check deliberately leave out.
     ("cpu-arm-v6m", true),
+    // The ARMv7-M part presets whose manuals are not public -- the SC300
+    // today: what `Config::SC300` declines, measured by
+    // `src/cpu/arm/v7m/tests.rs` and the ARMv7-M suite it shares with the
+    // Cortex-M3.
+    ("cpu-arm-v7m", true),
     // No downloadable VFP corpus exists to key this one to a run: the ARMv7E-M
     // floating-point unit is measured by its in-tree ledger table, its
     // differential against the A64 core's wrapper and the `clang`-built corpus,

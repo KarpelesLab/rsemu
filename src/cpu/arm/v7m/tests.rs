@@ -738,6 +738,85 @@ fn a_cortex_m3_has_no_dsp_extension() {
 }
 
 #[test]
+fn the_sc300_is_a_cortex_m3_with_its_own_cpuid_and_vtor() {
+    let sc = Config::SC300;
+    assert_eq!(sc.cpuid, CPUID_SC300);
+    // Implementer ARM, architecture ARMv7-M: the two fields DDI 0403E
+    // B4.1.2 fixes. The rest is not published.
+    assert_eq!(sc.cpuid >> 24, 0x41);
+    assert_eq!((sc.cpuid >> 16) & 0xf, 0xf);
+    assert_eq!(sc.arch, Arch::V7m);
+    assert!(!sc.is_v6m() && !sc.is_v8m());
+    assert_eq!(sc.ext, Extensions::CORTEX_M3);
+    assert_eq!(sc.priority_bits, Config::CORTEX_M3.priority_bits);
+    assert!(sc.bit_band);
+    // CMSIS core_sc300.h: TBLBASE at bit 29, TBLOFF at [28:7].
+    assert_eq!(sc.vtor_mask, 0x3fff_ff80);
+
+    // `LDR.W r1, [r0]` against CPUID: the guest sees the same value.
+    let h = Harness::new(sc, &wide(0xf8d0_1000));
+    h.cpu.set_reg(0, 0xe000_ed00);
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(1), CPUID_SC300);
+    h.cpu.with_sys(|s| {
+        // VTOR: write ones, read back the implemented bits.
+        assert!(s.write_word(0xe000_ed08, 0xffff_ffff));
+        assert_eq!(s.read_word(0xe000_ed08, true), Some(0x3fff_ff80));
+        // MPU_TYPE.DREGION: the eight-region PMSAv7 MPU.
+        assert_eq!(s.read_word(0xe000_ed90, true), Some(8 << 8));
+        // The IMPLEMENTATION DEFINED SFCR CMSIS names reads as zero.
+        assert_eq!(s.read_word(0xe000_ef90, true), Some(0));
+    });
+
+    // No DSP extension, as on the Cortex-M3: `SADD16` is UNDEFINED.
+    let h = Harness::new(sc, &wide(0xfa91_f302));
+    h.cpu.with_sys(|s| s.shcsr |= shcsr::USGFAULTENA);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::USAGE_FAULT);
+    assert!(h.cpu.with_sys(|s| s.cfsr & fsr::UF_UNDEFINSTR != 0));
+}
+
+#[test]
+fn from_props_names_the_sc300_and_its_mpu_is_optional() {
+    let props = Props::new().with("part", Value::from("sc300"));
+    let cpu = ArmV7m::from_props(&props).unwrap();
+    assert_eq!(cpu.config(), Config::SC300);
+    assert_eq!(
+        cpu.with_sys(|s| s.read_word(0xe000_ed90, true)),
+        Some(8 << 8)
+    );
+
+    // Silicon built without the MPU: MPU_TYPE says so.
+    let props = Props::new()
+        .with("part", Value::from("sc300"))
+        .with("mpu", Value::from(false));
+    let cpu = ArmV7m::from_props(&props).unwrap();
+    assert!(!cpu.config().ext.mpu);
+    assert_eq!(cpu.with_sys(|s| s.read_word(0xe000_ed90, true)), Some(0));
+
+    // A board that knows its SC300's real CPUID says so.
+    let props = Props::new()
+        .with("part", Value::from("sc300"))
+        .with("cpuid", Value::from(0x410f_1234u64));
+    let cpu = ArmV7m::from_props(&props).unwrap();
+    assert_eq!(cpu.config().cpuid, 0x410f_1234);
+
+    // VTOR holds bits [29:7]: a table in the top gigabyte cannot be named,
+    // and is refused rather than silently moved.
+    let props = Props::new()
+        .with("part", Value::from("sc300"))
+        .with("vtor", Value::from(0x4000_0000u64));
+    assert!(ArmV7m::from_props(&props).is_err());
+    let props = Props::new()
+        .with("part", Value::from("sc300"))
+        .with("vtor", Value::from(0x2000_0000u64));
+    assert_eq!(
+        ArmV7m::from_props(&props).unwrap().config().reset_vtor,
+        0x2000_0000
+    );
+}
+
+#[test]
 fn a_coprocessor_access_is_nocp_rather_than_undefined() {
     // `VMOV.F32 s0, s0` on a part with no FPU — firmware distinguishes
     // "absent" from "not an instruction" by exactly this bit. `Harness::m4`

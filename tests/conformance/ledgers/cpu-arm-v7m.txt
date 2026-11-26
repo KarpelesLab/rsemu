@@ -1,0 +1,39 @@
+# Known gaps: cpu-arm-v7m, the ARMv7-M part presets in the ARMv7E-M core
+# (src/cpu/arm/v7m/mod.rs's `Config` constants) -- today only the SecurCore
+# SC300, whose Technical Reference Manual is not public.
+#
+# Like cpu-arm-v6m.txt and cpu-arm-v8m.txt beside it, this ledger is not keyed
+# by the name of a test in a downloaded suite. The SC300 preset is measured by
+# src/cpu/arm/v7m/tests.rs (the_sc300_is_a_cortex_m3_with_its_own_cpuid_and_vtor,
+# from_props_names_the_sc300_and_its_mpu_is_optional) and, because it is the
+# Cortex-M3's configuration bar CPUID and VTOR, by the whole ARMv7-M suite and
+# built corpus that run on the M3 and M4. This file does not list the base
+# ARMv7-M core's gaps; it is the SC300's.
+#
+# Everything below is a deliberate and stated non-implementation. **This file
+# only ever shrinks**, a defect never goes in it, and every line says what it
+# is declining and what a guest sees instead.
+#
+# ---------------------------------------------------------------------------
+# 2026-11-26: the initial landing.
+#
+#   * tests.rs: the two SC300 tests pass, and the ARMv7-M suite with them.
+# ---------------------------------------------------------------------------
+
+sc300.trm                   # The SC300 Technical Reference Manual is not
+                            # public (SecurCore NDA). Its CPUID variant, part
+                            # number and revision read as zero (implementer
+                            # 0x41 and architecture 0xF are real, DDI 0403E
+                            # B4.1.2); its anti-tampering features and the
+                            # IMPLEMENTATION DEFINED SFCR at 0xE000EF90 that
+                            # CMSIS core_sc300.h names read as zero, writes
+                            # ignored. The preset is the Cortex-M3's options
+                            # with VTOR [29:7] after core_sc300.h (TBLBASE at
+                            # bit 29, TBLOFF [28:7]). A board sets the real
+                            # CPUID with the `cpuid` property.
+
+sc300.actlr                 # ACTLR at 0xE000E008 (DISMCYCINT, DISDEFWBUF,
+                            # DISFOLD in core_sc300.h) reads as zero and
+                            # ignores writes, as on every v7-M part here;
+                            # none of the three changes anything this
+                            # interpreter models.

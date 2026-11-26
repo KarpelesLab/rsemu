@@ -45,6 +45,11 @@
 //! the part has an MPU, and no bit-band. `v6m`'s documentation has the whole
 //! list. It too keys off [`Config::arch`], and a v7-M part is unchanged by it.
 //!
+//! The **SecurCore SC300** is a Cortex-M3 by another name as far as this
+//! core can tell: [`Config::SC300`] (`part = "sc300"`) is the Cortex-M3's
+//! options with its own `CPUID` and CMSIS `core_sc300.h`'s `VTOR` width, and
+//! needs no feature beyond the core's own.
+//!
 //! The reset sequence reads `SP` and `PC` from [`Config::reset_vtor`] — the
 //! `vtor` property — which every reset restores. Zero, as DDI 0403 has it,
 //! unless the SoC boots elsewhere; an STM32U5 boots from `0x08000000` with
@@ -210,7 +215,7 @@ use crate::machine::validate::port_index;
 use exec::{Exec, State};
 use sys::{Exception, Sys};
 
-pub use sys::{CPUID_CORTEX_M4, CPUID_CORTEX_M7};
+pub use sys::{CPUID_CORTEX_M4, CPUID_CORTEX_M7, CPUID_SC300};
 
 #[cfg(feature = "cpu-arm-v8m")]
 pub use v8m::CPUID_CORTEX_M33;
@@ -297,6 +302,16 @@ pub struct Extensions {
 impl Extensions {
     /// A Cortex-M3: ARMv7-M, no DSP, an MPU if the SoC bought one.
     pub const CORTEX_M3: Extensions = Extensions {
+        dsp: false,
+        fp: FpUnit::None,
+        mpu: true,
+        unpriv: true,
+    };
+    /// An SC300: the Cortex-M3's options — ARMv7-M, no DSP, no FPU — with
+    /// its optional PMSAv7 MPU modelled present, as the Cortex-M3's is.
+    /// The same options as [`Extensions::CORTEX_M3`] today, kept apart so
+    /// that a change to one part cannot quietly move the other.
+    pub const SC300: Extensions = Extensions {
         dsp: false,
         fp: FpUnit::None,
         mpu: true,
@@ -698,6 +713,33 @@ impl Config {
         ..Config::CORTEX_M4
     };
 
+    /// An Arm SecurCore SC300: the SecurCore counterpart of the Cortex-M3 —
+    /// ARMv7-M without the DSP extension, no FPU, the optional eight-region
+    /// PMSAv7 MPU modelled present, three priority bits and the bit-band
+    /// windows, all as [`Config::CORTEX_M3`].
+    ///
+    /// The SC300 Technical Reference Manual is not publicly available, so
+    /// this preset rests on what is. CMSIS `core_sc300.h` (V5.1.0,
+    /// Apache-2.0) gives the SCB and SCnSCB the Cortex-M3's layout — `ACTLR`
+    /// with `DISMCYCINT`/`DISDEFWBUF`/`DISFOLD` only, `CPACR` for a part
+    /// with no FPU, the MPU behind `__MPU_PRESENT` — plus an
+    /// IMPLEMENTATION DEFINED `SFCR` at `0xE000EF90`, which reads as zero
+    /// here. It also gives `VTOR` a `TBLBASE` bit at 29 and a 22-bit
+    /// `TBLOFF` at `[28:7]` — the layout `core_cm3.h` gives a Cortex-M3
+    /// before r2p1, rather than DDI 0403E's `[31:7]` — so `VTOR` implements
+    /// bits `[29:7]` and no table above `0x3FFFFF80` can be selected (the
+    /// Cortex-M3 preset here is r2p1 and keeps `[31:7]`). A board whose
+    /// silicon left the MPU out says `mpu = false`. The `CPUID` part number
+    /// is not published; [`CPUID_SC300`] carries only the two fields
+    /// DDI 0403E fixes, and a board that knows its silicon's value sets
+    /// [`Config::cpuid`] (or the `cpuid` property).
+    pub const SC300: Config = Config {
+        ext: Extensions::SC300,
+        cpuid: CPUID_SC300,
+        vtor_mask: 0x3fff_ff80,
+        ..Config::CORTEX_M3
+    };
+
     /// Same configuration, with a different requester id.
     #[must_use]
     pub const fn with_requester(mut self, id: RequesterId) -> Config {
@@ -782,6 +824,7 @@ const PARTS: &[&str] = &[
     #[cfg(feature = "cpu-arm-v6m")]
     "sc000",
     "cortex-m3",
+    "sc300",
     "cortex-m4",
     #[cfg(feature = "cpu-arm-v7m-fp")]
     "cortex-m4f",
@@ -1156,6 +1199,7 @@ impl ArmV7m {
             #[cfg(feature = "cpu-arm-v6m")]
             "sc000" => Config::SC000,
             "cortex-m3" => Config::CORTEX_M3,
+            "sc300" => Config::SC300,
             "cortex-m4" => Config::CORTEX_M4,
             "cortex-m4f" => Config::CORTEX_M4F,
             "cortex-m7" => Config::CORTEX_M7,
@@ -1787,7 +1831,7 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "part",
             kind: ValueKind::Str,
             required: false,
-            summary: "which part to model: cortex-m0, cortex-m0plus (cortex-m0+), sc000, cortex-m3, cortex-m4[f], cortex-m7[f] or cortex-m33[f]",
+            summary: "which part to model: cortex-m0, cortex-m0plus (cortex-m0+), sc000, cortex-m3, sc300, cortex-m4[f], cortex-m7[f] or cortex-m33[f]",
         },
         PropertySpec {
             name: "cpuid",
