@@ -2120,8 +2120,13 @@ dev-stm32-dmamux = []
 # STM32U575/U585 block (RM0456 S22), which ST rebuilt: separate rising and
 # falling pending registers, and the EXTICR port mux moved *into* EXTI, so on a
 # U5 the GPIO pins wire straight to `exti.pa0`... with st.syscfg's names.
-# Written from ST RM0090 S9 and S12, ST RM0351 S9 and S13 and ST RM0456 S22
-# with the ST CMSIS stm32u585xx.h offsets (Apache-2.0); no emulator source was
+# `variant = "wb"` is the dual-core STM32WB55/WB35 block (RM0434 S16): 49
+# lines split into configurable ones (edge, pending bit, EXTI interrupt) and
+# direct ones (a peripheral's wakeup, no pending bit), one pending register
+# shared by both CPUs, a C1/C2 interrupt and event mask bank each, and an
+# `event`/`c2event` pin per core. Written from ST RM0090 S9 and S12, ST
+# RM0351 S9 and S13, ST RM0456 S22 and ST RM0434 S16 with the ST CMSIS
+# stm32u585xx.h and stm32wb55xx.h offsets (Apache-2.0); no emulator source was
 # consulted (ROADMAP.md S1). `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-exti = []
 
