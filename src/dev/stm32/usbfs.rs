@@ -715,6 +715,15 @@ impl MemOps for Regs {
             // The reserved high half of the word: a write is dropped.
             return Ok(());
         }
+        // A word write is the register in its low half and the reserved
+        // half above it, which drops — `constraints` admits words, and a
+        // stack that stores the whole `uint32_t` is not writing past the
+        // register.
+        let src = if lane == 0 && src.len() == 4 {
+            &src[..2]
+        } else {
+            src
+        };
         if lane + src.len() > 2 {
             return Err(BusError::BadAccess);
         }

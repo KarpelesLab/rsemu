@@ -201,6 +201,16 @@ fn a_word_read_sees_the_register_in_the_low_half_and_the_high_half_is_inert() {
 }
 
 #[test]
+fn a_word_write_lands_its_low_half_and_drops_the_reserved_one() {
+    let f = fixture();
+    f.regs
+        .write(OFF_DADDR, &0xdead_00a5u32.to_le_bytes(), MemAttrs::DEFAULT)
+        .expect("constraints admit a word, so the write does too");
+    assert_eq!(f.rd(OFF_DADDR), 0x00a5, "the register is the low half");
+    assert_eq!(f.rd(OFF_DADDR + 2), 0, "the reserved half took nothing");
+}
+
+#[test]
 fn a_reserved_offset_and_an_offset_past_the_block_fault() {
     let f = fixture();
     let mut b = [0u8; 2];
