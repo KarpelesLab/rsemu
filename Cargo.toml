@@ -269,6 +269,7 @@ full = [
     "dev-stm32-rng",
     "dev-stm32-ipcc",
     "dev-stm32-hsem",
+    "dev-stm32-wb-cpu2",
     "machine-stm32f407",
     "machine-stm32u575",
     "machine-stm32u585",
@@ -2373,6 +2374,27 @@ dev-stm32-ipcc = []
 # (both Apache-2.0); no emulator source was consulted (ROADMAP.md S1).
 # `no_std + alloc`, no `unsafe`, no dependencies.
 dev-stm32-hsem = []
+
+# The STM32WB's second core, CPU2, as the firmware on it behaves
+# (src/dev/stm32/wb_cpu2.rs): one class, `st.wb-cpu2`. The real CPU2 runs ST's
+# encrypted wireless stack, which nothing outside ST can run, so this is a bus
+# master that answers CPU1 the way that stack does: on `boot` (PWR_CR4.C2BOOT)
+# it reads the mailbox reference table in SRAM2a, writes the device
+# information table and posts the system READY event; it answers system
+# (SHCI) commands in place on IPCC channel 2, BLE HCI/ACI commands on channel 1
+# with the Command Complete or Command Status AN5270 lists for each, takes
+# event buffers back on channel 4 and swallows ACL data on channel 6. Behind
+# that is a BLE host/controller with real state -- configuration data, a GATT
+# database with ST's handle allocation, advertising data, LE_Rand from the
+# board seed, LE_Encrypt by AES-128 -- and **no radio**: nothing is ever
+# transmitted, heard or connected. Lazily advanced on CPU2's clock; drives
+# IPCC through the bus, so it needs `space = mem` and `dev-stm32-ipcc`.
+# Written from ST AN5289, AN5185, AN5270 and RM0434, the Bluetooth Core
+# Specification, and the Apache-2.0 NuttX STM32WB mailbox driver for the table
+# layouts; ST's SLA-licensed STM32_WPAN was not read and no emulator source was
+# consulted (ROADMAP.md S1). `no_std + alloc`, no `unsafe`; `purecrypto` for
+# the one AES block LE_Encrypt needs.
+dev-stm32-wb-cpu2 = ["dev-stm32-ipcc", "dep:purecrypto"]
 
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4F at 168 MHz, 1 MiB of flash aliased at zero, the three

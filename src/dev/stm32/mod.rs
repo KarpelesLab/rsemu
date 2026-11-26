@@ -34,6 +34,7 @@
 //! | [`pwr`] | `st.pwr` | the power controller: `DBP`, voltage scaling and the F42x over-drive |
 //! | [`rng`] | `st.rng` | the random number generator: `CR`/`SR`/`DR`, both error paths, and a stream the machine seeds |
 //! | [`hsem`] | `st.hsem` | the STM32WB hardware semaphore: thirty-two locks CPU1 and CPU2 share, clear-by-key, and a free interrupt per core |
+//! | [`wb_cpu2`] | `st.wb-cpu2` | the STM32WB's CPU2 as its firmware behaves: the SRAM2 mailbox, the system channel, and a BLE stack that answers every HCI/ACI command with no radio behind it |
 //! | [`ipcc`] | `st.ipcc` | the STM32WB inter-processor mailbox doorbells: six channels each way between CPU1 and CPU2, and their four interrupts |
 //! | [`rtc`] | `st.rtc` | the real-time clock: a BCD calendar, both alarms, the wakeup timer and the thirty-two backup registers |
 //!
@@ -179,6 +180,10 @@ pub mod ipcc;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-hsem")))]
 pub mod hsem;
 
+#[cfg(feature = "dev-stm32-wb-cpu2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-wb-cpu2")))]
+pub mod wb_cpu2;
+
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
 pub mod demo;
@@ -267,6 +272,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     ipcc::register(registry)?;
     #[cfg(feature = "dev-stm32-hsem")]
     hsem::register(registry)?;
+    #[cfg(feature = "dev-stm32-wb-cpu2")]
+    wb_cpu2::register(registry)?;
     Ok(())
 }
 
@@ -334,6 +341,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     ipcc::bind(bindings)?;
     #[cfg(feature = "dev-stm32-hsem")]
     hsem::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-wb-cpu2")]
+    wb_cpu2::bind(bindings)?;
     Ok(())
 }
 
@@ -398,5 +407,7 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(ipcc::schema());
     #[cfg(feature = "dev-stm32-hsem")]
     out.push(hsem::schema());
+    #[cfg(feature = "dev-stm32-wb-cpu2")]
+    out.push(wb_cpu2::schema());
     out
 }
