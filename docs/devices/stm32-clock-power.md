@@ -134,7 +134,7 @@ order the chunks load in — and adopting the gate moved no device's encoding.
 
 | Class | `enable` | `reset` | Notes |
 | --- | --- | --- | --- |
-| `st.gpio`, `st.usart`, `st.tim`, `st.dma`, `st.dmamux`, `st.crc`, `st.rng`, `st.syscfg`, `st.i2c`, `st.i2c-v2`, `stm32.spi`, `st.octospi`, `stm32.sdio`, `stm32.sdmmc`, `st.hash`, `st.pwr` | yes | yes | |
+| `st.gpio`, `st.usart`, `st.tim`, `st.dma`, `st.dmamux`, `st.crc`, `st.rng`, `st.syscfg`, `st.i2c`, `st.i2c-v2`, `stm32.spi`, `st.octospi`, `stm32.sdio`, `stm32.sdmmc`, `st.hash`, `st.pwr`, `st.ipcc`, `st.hsem` | yes | yes | |
 | `st.wwdg` | yes | — | its `reset` is the watchdog's **output**, and two opposite things cannot share a pin name; `APB1RSTR.WWDGRST` has no input here |
 | `st.firewall` | `clken` | — | predates this module: `FWEN` is write-once and its level is inside that device's snapshot |
 | `st.rtc` | `rtcen` | `bdrst` | the RTC's gate is `BDCR.RTCEN`, not an `xxENR` bit |

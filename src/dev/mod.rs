@@ -210,6 +210,7 @@ pub mod sms;
     feature = "dev-stm32-rtc",
     feature = "dev-stm32-rng",
     feature = "dev-stm32-ipcc",
+    feature = "dev-stm32-hsem",
     feature = "machine-spi-flash"
 ))]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]

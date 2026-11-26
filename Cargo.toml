@@ -268,6 +268,7 @@ full = [
     "dev-stm32-icache",
     "dev-stm32-rng",
     "dev-stm32-ipcc",
+    "dev-stm32-hsem",
     "machine-stm32f407",
     "machine-stm32u575",
     "machine-stm32u585",
@@ -2357,6 +2358,21 @@ dev-stm32-rng = []
 # no emulator source was consulted (ROADMAP.md S1). `no_std + alloc`, no
 # `unsafe`, no dependencies.
 dev-stm32-ipcc = []
+
+# The STM32WB hardware semaphore (src/dev/stm32/hsem.rs): one class,
+# `st.hsem`, thirty-two locks the WB's two cores share. ST's WB firmware takes
+# one around everything both cores touch -- the RCC clock switch, flash, the
+# RNG -- so a board without it is a HAL_Init spinning on its first
+# LL_HSEM_1StepLock. Both lock protocols (the two-step write-then-read of Rn
+# and the one-step read of RLRn), unlock by matching COREID and PROCID, CR's
+# clear-by-key, and the free event into C1ISR/C2ISR behind `c1-irq` and
+# `c2-irq`. A debugger's read of RLRn takes nothing. The COREID comes from
+# MemAttrs::requester: the `cpu2-requester` property names the bus master that
+# is CPU2 (COREID 8) and every other access is CPU1's (COREID 4). Written from
+# ST RM0434's HSEM chapter, ST CMSIS stm32wb55xx.h and ST STM32WB55_CM4.svd
+# (both Apache-2.0); no emulator source was consulted (ROADMAP.md S1).
+# `no_std + alloc`, no `unsafe`, no dependencies.
+dev-stm32-hsem = []
 
 # The STM32F407 as a machine (machines/stm32f407.machine plus the classes it
 # names): a Cortex-M4F at 168 MHz, 1 MiB of flash aliased at zero, the three
