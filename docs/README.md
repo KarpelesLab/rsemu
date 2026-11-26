@@ -208,6 +208,7 @@ would answer that the machine file does not.
 | [`devices/video-audio.md`](devices/video-audio.md) | VGA/VBE, framebuffers, sound hardware |
 | [`devices/pc-video.md`](devices/pc-video.md) | `pc.video`: the VGA's planar memory and its scanout, and the part that is **ours** — the extension registers a linear framebuffer is set up through, and the VBE services the in-house BIOS builds on them. Deliberately not Bochs' DISPI interface, whose only specification is a GPL program's source |
 | [`devices/network-input.md`](devices/network-input.md) | NIC models, PS/2, HID |
+| [`devices/snes-ppu.md`](devices/snes-ppu.md) | `snes.ppu`: the S-PPU's registers and latches, modes 0-7, sprites, windows and colour math, beam timing, and the beam handle the S-CPU builds NMI, H/V IRQ and the counter latch on |
 | [`devices/dma.md`](devices/dma.md) | DMA controllers as bus masters, and the peripheral-request seam |
 | [`devices/stm32-clock-power.md`](devices/stm32-clock-power.md) | STM32 RCC and PWR: the ready bits, the clock tree, the peripheral gates, `DBP` |
 | [`devices/stm32wb-cpu2.md`](devices/stm32wb-cpu2.md) | STM32WB CPU2 behaviourally: the SRAM2 mailbox, FUS and the system channel, a BLE stack answering every AN5270 command with no radio; which layouts are documented, which inferred |
