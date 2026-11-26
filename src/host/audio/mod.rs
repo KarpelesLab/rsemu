@@ -135,6 +135,10 @@ pub mod nes;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-sms")))]
 pub mod sms;
 
+#[cfg(feature = "dev-snes-apu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-apu")))]
+pub mod snes;
+
 #[cfg(test)]
 mod tests;
 
@@ -152,7 +156,8 @@ mod tests;
     feature = "dev-gb",
     feature = "dev-sms",
     feature = "dev-amiga-paula",
-    feature = "dev-mac"
+    feature = "dev-mac",
+    feature = "dev-snes-apu"
 ))]
 pub(crate) const fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {

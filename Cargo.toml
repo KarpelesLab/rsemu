@@ -278,6 +278,7 @@ full = [
     "dev-snes-cart",
     "dev-snes-dsp",
     "dev-snes-ppu",
+    "dev-snes-apu",
     "cpu-z80",
     "machine-z80-mini",
     "machine-usb-mini",
@@ -2678,6 +2679,16 @@ dev-snes-dsp = []
 # NMI, H/V IRQ and the counter latch on. Written from nocash fullsnes and the
 # SNESdev wiki. `no_std + alloc`, no dependencies.
 dev-snes-ppu = []
+
+# The SNES S-SMP (src/dev/snes/apu.rs, class `snes.apu`): the audio unit's
+# processor side. Contains the SPC700 (cpu-spc700) with 64 KiB of audio RAM,
+# the $F0-$FF registers, the three timers on their 8 kHz / 64 kHz prescalers,
+# the four CPU ports (region `cpuio`, mapped at $2140-$217F), and a clean-room
+# boot ROM written from the documented upload protocol -- Nintendo's is not
+# shipped; an optional `ipl` media property takes a real dump. Drives the S-DSP
+# through `dsp_seam::SDsp`, constructing dev-snes-dsp's chip, and publishes
+# 32 kHz stereo to `host::audio::snes`. `no_std + alloc`, no dependencies.
+dev-snes-apu = ["cpu-spc700", "dev-snes-dsp"]
 
 # The Game Boy as a machine (machines/gameboy.machine plus the classes it
 # names). `rsemu run gameboy --cart tetris.gb`. Phase 4's genericity proof:
