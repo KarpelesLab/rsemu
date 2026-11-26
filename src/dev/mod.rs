@@ -209,6 +209,7 @@ pub mod sms;
     feature = "dev-stm32-icache",
     feature = "dev-stm32-rtc",
     feature = "dev-stm32-rng",
+    feature = "dev-stm32-ipcc",
     feature = "machine-spi-flash"
 ))]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32")))]

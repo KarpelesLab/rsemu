@@ -33,6 +33,7 @@
 //! | [`icache`] | `st.icache` | the U5 ICACHE and DCACHE control blocks: invalidation and clean commands with their busy and end flags, no actual caching |
 //! | [`pwr`] | `st.pwr` | the power controller: `DBP`, voltage scaling and the F42x over-drive |
 //! | [`rng`] | `st.rng` | the random number generator: `CR`/`SR`/`DR`, both error paths, and a stream the machine seeds |
+//! | [`ipcc`] | `st.ipcc` | the STM32WB inter-processor mailbox doorbells: six channels each way between CPU1 and CPU2, and their four interrupts |
 //! | [`rtc`] | `st.rtc` | the real-time clock: a BCD calendar, both alarms, the wakeup timer and the thirty-two backup registers |
 //!
 //! # Which part
@@ -169,6 +170,10 @@ pub mod rng;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-rtc")))]
 pub mod rtc;
 
+#[cfg(feature = "dev-stm32-ipcc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-stm32-ipcc")))]
+pub mod ipcc;
+
 #[cfg(feature = "machine-spi-flash")]
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-spi-flash")))]
 pub mod demo;
@@ -253,6 +258,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     rng::register(registry)?;
     #[cfg(feature = "dev-stm32-rtc")]
     rtc::register(registry)?;
+    #[cfg(feature = "dev-stm32-ipcc")]
+    ipcc::register(registry)?;
     Ok(())
 }
 
@@ -316,6 +323,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     rng::bind(bindings)?;
     #[cfg(feature = "dev-stm32-rtc")]
     rtc::bind(bindings)?;
+    #[cfg(feature = "dev-stm32-ipcc")]
+    ipcc::bind(bindings)?;
     Ok(())
 }
 
@@ -376,5 +385,7 @@ pub fn schemas() -> Vec<ClassSchema> {
     out.push(rng::schema());
     #[cfg(feature = "dev-stm32-rtc")]
     out.push(rtc::schema());
+    #[cfg(feature = "dev-stm32-ipcc")]
+    out.push(ipcc::schema());
     out
 }
