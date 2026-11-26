@@ -65,6 +65,18 @@
 //!   USART, so a second byte arriving before the first is read sets `ORE` and
 //!   is lost, which is the overrun firmware is supposed to handle and usually
 //!   does not.
+//! * `IDLE` — the line has been quiet for a whole character time after
+//!   carrying one. It sets one tick after the last character arrived with
+//!   nothing behind it, raises the interrupt under `IDLEIE`, clears by the
+//!   usual sequence (`ICR.IDLECF`, or `SR` then `DR` on an F4), and is "not
+//!   set again until the RXNE bit has been set" (RM0434 §36.8.10), so a quiet
+//!   line raises it once, not every tick.
+//! * **Half-duplex** (`CR3.HDSEL`): "the TX and RX lines are internally
+//!   connected" (RM0434 §36.5.15), so with `RE` set the receiver hears every
+//!   frame the transmitter sends — the byte lands in `RDR` (or sets `ORE` if
+//!   firmware left the previous one), and `IDLE` follows the last one. A
+//!   driver that waits for `TXE` and `IDLE` before turning the line round
+//!   gets both.
 //!
 //! # The pins
 //!
@@ -150,7 +162,10 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 const CLASS_NAME: &str = "st.usart";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 added the idle-line detector's armed flag; a version-1 chunk is
+/// refused rather than guessed at.
+const STATE_VERSION: u32 = 2;
 
 /// The character port a machine file gets if it names none.
 const DEFAULT_PORT: &str = "console";
@@ -223,6 +238,9 @@ const CR1_UE_F4: u32 = 1 << 13;
 const CR1_UE_F7: u32 = 1 << 0;
 /// `CR3.EIE` — the error interrupt, which is what makes `ORE` raise one.
 const CR3_EIE: u32 = 1 << 0;
+/// `CR3.HDSEL`: single-wire half-duplex, TX and RX connected inside the
+/// part (bit 3 in the F4 and the F7/U5 layouts alike).
+const CR3_HDSEL: u32 = 1 << 3;
 /// `CR3.DMAR`: receive by DMA (bit 6 in every layout: RM0090 §30.6.6,
 /// RM0351 §40.8.3, `USART_CR3_DMAR_Pos` in `stm32u585xx.h`).
 const CR3_DMAR: u32 = 1 << 6;
@@ -389,6 +407,12 @@ struct State {
     txq: Fifo,
     /// The receive side (`u5`), one deep unless `FIFOEN`.
     rxq: Fifo,
+    /// The idle-line detector is armed: a character has been received since
+    /// `IDLE` last set ("not set again until the RXNE bit has been set").
+    idle_armed: bool,
+    /// A character reached the receiver during the current character time.
+    /// Transient — cleared every tick — so not in the snapshot.
+    heard: bool,
 }
 
 impl State {
@@ -608,15 +632,59 @@ impl Registers {
             return false;
         };
         let mut state = self.state.lock();
+        self.receive_frame(&mut state, byte);
+        true
+    }
+
+    /// A character has arrived at the receiver — from the line, or in
+    /// half-duplex from this USART's own transmitter. It lands in `RDR` (or
+    /// the FIFO), or sets `ORE` if there is no room, and it arms the
+    /// idle-line detector either way: the line was busy for a frame.
+    fn receive_frame(&self, state: &mut State, byte: u8) {
+        state.heard = true;
+        state.idle_armed = true;
         if self.variant == Variant::U5 {
-            state.rxq.push(byte);
-            Registers::sync_fifo_flags(&mut state);
-            return true;
+            if state.rxq.len() >= Registers::depth(state) {
+                state.sr |= SR_ORE;
+            } else {
+                state.rxq.push(byte);
+                Registers::sync_fifo_flags(state);
+            }
+            return;
+        }
+        if state.sr & SR_RXNE != 0 {
+            state.sr |= SR_ORE;
+            return;
         }
         state.rdr = byte;
         state.sr |= SR_RXNE;
         state.sr_read = false;
+    }
+
+    /// The end of one character time on the receive side: if the line was
+    /// quiet for it and a character came before, an idle line has been
+    /// detected (RM0434 §36.8.10, `IDLE`; RM0090 §30.6.1). Returns whether
+    /// `IDLE` set.
+    fn idle_tick(&self) -> bool {
+        let mut state = self.state.lock();
+        if core::mem::take(&mut state.heard) {
+            return false;
+        }
+        if !state.idle_armed || !self.enabled(&state) || state.cr1 & CR1_RE == 0 {
+            return false;
+        }
+        state.idle_armed = false;
+        state.sr |= SR_IDLE;
         true
+    }
+
+    /// In single-wire half-duplex the receiver hears the transmitter: "the TX
+    /// and RX lines are internally connected" (RM0434 §36.5.15).
+    fn echo(&self, byte: u8) {
+        let mut state = self.state.lock();
+        if state.cr3 & CR3_HDSEL != 0 && state.cr1 & CR1_RE != 0 && self.enabled(&state) {
+            self.receive_frame(&mut state, byte);
+        }
     }
 
     /// Hand the byte the transmitter is holding to the host.
@@ -638,8 +706,8 @@ impl Registers {
         if !self.port.write_byte(byte) {
             return false;
         }
-        let mut state = self.state.lock();
-        state.sr |= SR_TXE | SR_TC;
+        self.state.lock().sr |= SR_TXE | SR_TC;
+        self.echo(byte);
         true
     }
 
@@ -652,12 +720,15 @@ impl Registers {
         if !self.port.write_byte(byte) {
             return false;
         }
-        let mut state = self.state.lock();
-        state.txq.pop();
-        if state.txq.len() == 0 {
-            state.sr |= SR_TC;
+        {
+            let mut state = self.state.lock();
+            state.txq.pop();
+            if state.txq.len() == 0 {
+                state.sr |= SR_TC;
+            }
+            Registers::sync_fifo_flags(&mut state);
         }
-        Registers::sync_fifo_flags(&mut state);
+        self.echo(byte);
         true
     }
 
@@ -1056,6 +1127,7 @@ impl Device for Usart {
         w.write_u8(state.tdr)?;
         w.write_bool(state.sr_read)?;
         w.write_bool(state.irq)?;
+        w.write_bool(state.idle_armed)?;
         // The `u5` state follows, on a `u5` only: the variant is a construction
         // property, so the F4 and F7 encodings are what they always were.
         if self.regs.variant == Variant::U5 {
@@ -1087,6 +1159,7 @@ impl Device for Usart {
         state.tdr = r.read_u8()?;
         state.sr_read = r.read_bool()?;
         state.irq = r.read_bool()?;
+        state.idle_armed = r.read_bool()?;
         if self.regs.variant == Variant::U5 {
             state.presc = r.read_u32()? & PRESC_MASK;
             state.autocr = r.read_u32()? & AUTOCR_MASK;
@@ -1163,7 +1236,8 @@ impl Device for Usart {
         // At most one character per call, which is right however many ticks
         // the budget covers: a board sets the domain to the character rate.
         let moved = self.regs.transmit() | self.regs.poll_receiver();
-        if moved {
+        let idle = self.regs.idle_tick();
+        if moved || idle {
             self.regs.refresh_irq();
         }
         Consumed::new(budget.ticks)
@@ -1593,6 +1667,108 @@ mod tests {
             assert_ne!(peek_debug(&usart, map.sr) & SR_RXNE, 0);
             assert!(!rx.high(), "{variant:?}: DMAR clear");
         }
+    }
+
+    #[test]
+    fn idle_sets_one_quiet_character_time_after_a_reception_and_only_once() {
+        for variant in [Variant::F4, Variant::F7, Variant::U5] {
+            let (usart, port, map) = wired(variant);
+            enable(&usart, map);
+            tick(&usart);
+            assert_eq!(
+                peek_debug(&usart, map.sr) & SR_IDLE,
+                0,
+                "{variant:?}: a quiet line that never spoke"
+            );
+            port.feed(b"ab");
+            tick(&usart);
+            let _ = peek(&usart, map.rdr);
+            tick(&usart);
+            assert_eq!(
+                peek_debug(&usart, map.sr) & SR_IDLE,
+                0,
+                "{variant:?}: the second byte kept it busy"
+            );
+            tick(&usart);
+            assert_ne!(
+                peek_debug(&usart, map.sr) & SR_IDLE,
+                0,
+                "{variant:?}: quiet for a frame"
+            );
+            // Clear it, and a quiet line does not raise it again.
+            match map.icr {
+                Some(icr) => poke(&usart, icr, SR_IDLE),
+                None => {
+                    let _ = peek(&usart, map.sr);
+                    let _ = peek(&usart, map.rdr);
+                }
+            }
+            for _ in 0..3 {
+                tick(&usart);
+            }
+            assert_eq!(
+                peek_debug(&usart, map.sr) & SR_IDLE,
+                0,
+                "{variant:?}: armed only by a new character"
+            );
+        }
+    }
+
+    #[test]
+    fn idleie_raises_the_interrupt() {
+        let (usart, port, map) = wired(Variant::U5);
+        let irq = probe_pin(&usart, IRQ_PIN);
+        poke(&usart, map.cr1, map.ue | CR1_TE | CR1_RE | CR1_IDLEIE);
+        port.feed(b"x");
+        tick(&usart);
+        let _ = peek(&usart, map.rdr);
+        assert!(!irq.high());
+        tick(&usart);
+        assert!(irq.high(), "IDLE with IDLEIE");
+        poke(&usart, map.icr.expect("an ICR"), SR_IDLE);
+        assert!(!irq.high(), "IDLECF");
+    }
+
+    #[test]
+    fn half_duplex_hears_its_own_frames_and_then_the_idle_line() {
+        let (usart, port, map) = wired(Variant::U5);
+        enable(&usart, map);
+        poke(&usart, map.cr3, CR3_HDSEL);
+        for byte in b"hi" {
+            poke(&usart, map.tdr, u32::from(*byte));
+            tick(&usart);
+            assert_eq!(peek(&usart, map.rdr) & 0xff, u32::from(*byte), "the echo");
+        }
+        assert_eq!(port.drain(), b"hi", "and it still went out");
+        // The driver's turn-round wait: TXE and IDLE.
+        tick(&usart);
+        assert_eq!(peek(&usart, map.sr) & 0x90, 0x90);
+
+        // Full duplex, the transmitter alone never arms the detector.
+        let (usart, _port, map) = wired(Variant::U5);
+        enable(&usart, map);
+        poke(&usart, map.tdr, u32::from(b'z'));
+        for _ in 0..3 {
+            tick(&usart);
+        }
+        assert_eq!(peek_debug(&usart, map.sr) & (SR_IDLE | SR_RXNE), 0);
+    }
+
+    #[test]
+    fn an_unread_echo_overruns() {
+        let (usart, _port, map) = wired(Variant::F4);
+        enable(&usart, map);
+        poke(&usart, map.cr3, CR3_HDSEL);
+        for byte in b"12" {
+            poke(&usart, map.tdr, u32::from(*byte));
+            tick(&usart);
+        }
+        assert_ne!(
+            peek_debug(&usart, map.sr) & SR_ORE,
+            0,
+            "the second frame found RDR full"
+        );
+        assert_eq!(peek(&usart, map.rdr) & 0xff, u32::from(b'1'));
     }
 
     #[test]
