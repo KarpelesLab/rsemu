@@ -1146,3 +1146,30 @@ fn the_gate_pins_are_in_the_schema() {
         );
     }
 }
+
+#[test]
+fn a_wb_dmamux_has_fourteen_channels_and_a_six_bit_dmareq_id() {
+    let props = Props::new()
+        .with("channels", Value::from(14u64))
+        .with("requests", Value::from(64u64));
+    let mux = Dmamux::new(&props).expect("a WB DMAMUX1");
+    assert_eq!(
+        mux.input_index("req40"),
+        Some((Bank::Request, 40)),
+        "AES2_OUT"
+    );
+    assert_eq!(mux.input_index("req63"), Some((Bank::Request, 63)));
+    assert!(mux.input_index("req64").is_none(), "DMAREQ_ID is 6 bits");
+    let regs = Registers {
+        shared: Arc::clone(&mux.shared),
+    };
+    regs.write(ccr(13), &u32::MAX.to_le_bytes(), MemAttrs::DEFAULT)
+        .unwrap();
+    let mut word = [0u8; 4];
+    regs.read(ccr(13), &mut word, MemAttrs::DEFAULT).unwrap();
+    assert_eq!(u32::from_le_bytes(word), CCR_MASK & !0x40, "DMAREQ_ID[5:0]");
+    for bad in [0u64, 32, 100, 256] {
+        let props = Props::new().with("requests", Value::from(bad));
+        assert!(Dmamux::new(&props).is_err(), "{bad}");
+    }
+}

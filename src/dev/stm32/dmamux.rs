@@ -67,6 +67,15 @@
 //! what one would look like rather than a description of a machine file that
 //! exists. The device is tested against its own registers and pins.
 //!
+//! A WB55/WB35 is `channels = 14` (DMA1 and DMA2, seven each, fed by
+//! `ch0`–`ch6` and `ch7`–`ch13`) and `requests = 64`: RM0434 Table 63 gives
+//! fourteen output channels, four generators, twenty trigger and twenty sync
+//! inputs and 36 peripheral requests, and `DMAREQ_ID` is six bits there
+//! (`DMAMUX_CxCR_DMAREQ_ID_Msk` = `0x3F` in `stm32wb55xx.h`). Its table
+//! (RM0434 Table 64) follows RM0432's numbering — 1–4 the generators, 5 the
+//! ADC, 6/7 SPI1 RX/TX … 40 AES2_OUT — and a WB35 simply has nothing on 8/9,
+//! the SPI2 requests (Table 62).
+//!
 //! # The request lines, and the four that are not pins
 //!
 //! `DMAREQ_ID` is seven bits, so there are 128 request line numbers. Three
@@ -419,6 +428,9 @@ impl Update {
 struct Shared {
     /// How many channels this instance serves.
     channels: usize,
+    /// How many `DMAREQ_ID` values the part decodes: 128 on an L4+
+    /// (`DMAREQ_ID[6:0]`), 64 on a WB (`DMAMUX_CxCR_DMAREQ_ID_Msk` = `0x3F`).
+    requests: usize,
     /// Every register, at `DEVICE` rank. **Never held across a wire change**
     /// (`CLAUDE.md`, re-entrancy).
     state: Mutex<State>,
@@ -437,7 +449,8 @@ struct Shared {
 impl fmt::Debug for Shared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Shared");
-        s.field("channels", &self.channels);
+        s.field("channels", &self.channels)
+            .field("requests", &self.requests);
         match self.state.try_lock() {
             Some(state) => s.field("state", &*state).finish_non_exhaustive(),
             None => s.field("state", &"<in use>").finish_non_exhaustive(),
@@ -446,9 +459,10 @@ impl fmt::Debug for Shared {
 }
 
 impl Shared {
-    fn new(channels: usize) -> Shared {
+    fn new(channels: usize, requests: usize) -> Shared {
         Shared {
             channels,
+            requests,
             state: Mutex::with_rank(LockRank::DEVICE, State::reset()),
             ch: core::array::from_fn(|_| Mutex::with_rank(LockRank::WIRE, None)),
             evt: core::array::from_fn(|_| Mutex::with_rank(LockRank::WIRE, None)),
@@ -730,7 +744,9 @@ impl Shared {
         if offset < OFF_CSR {
             let c = (offset / 4) as usize;
             if c < self.channels {
-                state.ccr[c] = value & CCR_MASK;
+                // `DMAREQ_ID` is as wide as the part's request count.
+                let id = (self.requests - 1) as u32;
+                state.ccr[c] = value & ((CCR_MASK & !CCR_DMAREQ_ID) | id);
                 // Re-pointing a channel at another line, or turning
                 // synchronization on, changes what it forwards this instant.
                 state.credit[c] = 0;
@@ -770,7 +786,7 @@ impl Shared {
         let update = {
             let mut state = self.state.lock();
             let high = level == Level::High;
-            if line == 0 || line >= REQUEST_LINES || state.request[line] == high || !self.sampling()
+            if line == 0 || line >= self.requests || state.request[line] == high || !self.sampling()
             {
                 return;
             }
@@ -950,8 +966,15 @@ impl Dmamux {
     pub fn new(props: &Props) -> Result<Dmamux> {
         let mut r = props.reader();
         let channels = r.or_range("channels", 7u64, 1..=MAX_CHANNELS as u64)? as usize;
+        let requests = r.or("requests", REQUEST_LINES as u64)?;
         r.finish()?;
-        Ok(Dmamux::with_channels(channels))
+        if requests != 64 && requests != REQUEST_LINES as u64 {
+            return Err(Error::Property(format!(
+                "`requests` is 128 (a seven-bit DMAREQ_ID, RM0432) or 64 (six bits, RM0434), \
+                 not {requests}"
+            )));
+        }
+        Ok(Dmamux::build(channels, requests as usize))
     }
 
     /// Build one with `channels` channels — the route a test takes.
@@ -959,8 +982,16 @@ impl Dmamux {
     /// `channels` is clamped to `1..=`[`MAX_CHANNELS`].
     #[must_use]
     pub fn with_channels(channels: usize) -> Dmamux {
+        Dmamux::build(channels, REQUEST_LINES)
+    }
+
+    /// Build one with `channels` channels and `requests` request IDs (64 or
+    /// 128; anything else is taken as 128).
+    #[must_use]
+    pub fn build(channels: usize, requests: usize) -> Dmamux {
         let channels = channels.clamp(1, MAX_CHANNELS);
-        let shared = Arc::new(Shared::new(channels));
+        let requests = if requests == 64 { 64 } else { REQUEST_LINES };
+        let shared = Arc::new(Shared::new(channels, requests));
         let region = Arc::new(Region::io(
             "dmamux",
             WINDOW,
@@ -1031,7 +1062,7 @@ impl Dmamux {
 
     /// The index an input pin name selects, and which bank it is in.
     fn input_index(&self, port: &str) -> Option<(Bank, u32)> {
-        if let Some(n) = port_index(port, pin::REQUEST, REQUEST_LINES as u32) {
+        if let Some(n) = port_index(port, pin::REQUEST, self.shared.requests as u32) {
             // Lines 0 to 4 have no pin: the module documentation says why.
             return (n >= FIRST_EXTERNAL_LINE).then_some((Bank::Request, n));
         }
@@ -1211,12 +1242,22 @@ pub static CLASS: DeviceClass = DeviceClass {
     version: STATE_VERSION,
     summary: "STM32 DMA request multiplexer (RM0432 §14): CxCR routing, synchronization and \
               the four request generators",
-    properties: &[PropertySpec {
-        name: "channels",
-        kind: ValueKind::Uint,
-        required: false,
-        summary: "how many DMA channels this multiplexer feeds (7 by default, up to 16)",
-    }],
+    properties: &[
+        PropertySpec {
+            name: "channels",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "how many DMA channels this multiplexer feeds (7 by default, up to 16; 14 \
+                      on a WB)",
+        },
+        PropertySpec {
+            name: "requests",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "how many DMAREQ_ID values the part decodes: 128 (default, RM0432) or 64 \
+                      (a WB, RM0434)",
+        },
+    ],
     construct: |props| Ok(Box::new(Dmamux::new(props)?)),
 };
 
@@ -1250,6 +1291,7 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
 pub fn schema() -> ClassSchema {
     let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("channels", ValueKind::Uint).range(1, MAX_CHANNELS as u64))
+        .prop(PropSchema::new("requests", ValueKind::Uint).range(64, REQUEST_LINES as u64))
         .region("")
         .region("regs")
         .port_bank(pin::REQUEST, PortDir::In, REQUEST_LINES as u32)
