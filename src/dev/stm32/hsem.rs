@@ -10,81 +10,115 @@
 //!
 //! # The register map
 //!
-//! Offsets as ST CMSIS `stm32wb55xx.h` gives them (`HSEM_TypeDef`,
-//! `HSEM_Common_TypeDef`), the identification block from ST's
+//! RM0434 Rev 16 §8.4 (Table 47 is the map), which agrees with ST CMSIS
+//! `stm32wb55xx.h` (`HSEM_TypeDef`, `HSEM_Common_TypeDef`) on every offset and
+//! field. Every register resets to zero. The identification block is not in
+//! RM0434 — Table 47 stops at `KEYR` — and comes from ST's
 //! `STM32WB55_CM4.svd`:
 //!
 //! | Offset | Register | What it does |
 //! | --- | --- | --- |
-//! | `0x000 + 4n` | `Rn` | the semaphore, and its **two-step** lock: write `LOCK` with a `COREID` and `PROCID`, then read back to see who won |
-//! | `0x080 + 4n` | `RLRn` | the **one-step** lock: a read takes the semaphore if it is free, and answers who holds it |
-//! | `0x100` / `0x110` | `C1IER` / `C2IER` | which semaphores' freeing interrupts this core |
-//! | `0x104` / `0x114` | `C1ICR` / `C2ICR` | write one to clear the status bit; reads zero |
-//! | `0x108` / `0x118` | `C1ISR` / `C2ISR` | read-only: semaphores freed while enabled |
-//! | `0x10C` / `0x11C` | `C1MISR` / `C2MISR` | read-only: `ISR & IER` |
-//! | `0x140` | `CR` | write `KEY` and a `COREID`: frees every semaphore that core holds, if `KEY` matches `KEYR` |
-//! | `0x144` | `KEYR` | the clear key, bits 31:16 |
-//! | `0x3EC` | `HWCFGR2` | `0x0000_0084`: the valid bus-master ids, 4 and 8 |
-//! | `0x3F0` | `HWCFGR1` | `0x0000_0220`: two interrupt lines, thirty-two semaphores |
-//! | `0x3F4` | `VERR` | `0x0000_0020`: revision 2.0 |
-//! | `0x3F8` | `IPIDR` | `0x0010_0072` |
-//! | `0x3FC` | `SIDR` | `0xA3C5_DD01` |
+//! | `0x000 + 4n` | `Rn` | the semaphore, and its **two-step** lock: write `LOCK` with a `COREID` and `PROCID`, then read back to see who won (§8.4.1) |
+//! | `0x080 + 4n` | `RLRn` | the **one-step** lock: a read takes the semaphore if it is free, and answers who holds it (§8.4.2) |
+//! | `0x100` / `0x110` | `C1IER` / `C2IER` | which semaphores' freeing interrupts this core (§8.4.3) |
+//! | `0x104` / `0x114` | `C1ICR` / `C2ICR` | write one to clear the status bit; "always read 0" (§8.4.4) |
+//! | `0x108` / `0x118` | `C1ISR` / `C2ISR` | read-only: semaphores freed, **before** the enable (§8.4.5) |
+//! | `0x10C` / `0x11C` | `C1MISR` / `C2MISR` | read-only: `ISR & IER` (§8.4.6) |
+//! | `0x140` | `CR` | write `KEY` and a `COREID`: frees every semaphore that core holds, if `KEY` matches `KEYR`; both fields "always read 0" (§8.4.7) |
+//! | `0x144` | `KEYR` | the clear key, bits 31:16 (§8.4.8) |
+//! | `0x3EC` | `HWCFGR2` | `0x0000_0084`: the valid bus-master ids, 4 and 8 (SVD) |
+//! | `0x3F0` | `HWCFGR1` | `0x0000_0220`: two interrupt lines, thirty-two semaphores (SVD) |
+//! | `0x3F4` | `VERR` | `0x0000_0020`: revision 2.0 (SVD) |
+//! | `0x3F8` | `IPIDR` | `0x0010_0072` (SVD) |
+//! | `0x3FC` | `SIDR` | `0xA3C5_DD01` (SVD) |
 //!
-//! `Rn` holds `PROCID` in bits 7:0, `COREID` in 11:8 and `LOCK` at 31. A free
-//! semaphore reads as zero. Every other offset in the kilobyte reads as zero
-//! and ignores writes.
+//! `Rn` holds `PROCID` in bits 7:0, `COREID` in 11:8 and `LOCK` at 31; a free
+//! semaphore's `COREID` and `PROCID` "are also 0" (§8.3.3), so it reads as
+//! zero. Every other offset in the kilobyte reads as zero and ignores writes;
+//! RM0434 does not say what the gaps do.
+//!
+//! The registers "must be accessed using word format. Byte and half-word
+//! accesses are ignored and have no effect on the semaphores, they generate a
+//! bus error" (§8.4) — which is what a word-only region does here.
 //!
 //! # Who is asking
 //!
 //! The `COREID` the hardware records is the AHB bus master's: **4 for CPU1
-//! and 8 for CPU2** (`HSEM_CR_COREID_CPU1` / `_CPU2` in `stm32wb55xx.h`, and
-//! the `MASTERID1`/`MASTERID2` fields of `HWCFGR2`). Here that comes from
-//! [`MemAttrs::requester`]: an access whose requester is the `cpu2-requester`
-//! property is CPU2's, and **every other access is CPU1's** — the anonymous
-//! requester, a DMA, a debugger. With the property unset, which is the
-//! default, every access is CPU1's. That is the known deviation, and it costs
-//! nothing on today's WB board: its CPU2 model does not use the semaphores.
+//! and 8 for CPU2** (RM0434 §8.3.8, Table 46, "Authorized AHB bus master
+//! IDs"; `HSEM_CR_COREID_CPU1` / `_CPU2` in `stm32wb55xx.h` agree). Here that
+//! comes from [`MemAttrs::requester`]: an access whose requester is the
+//! `cpu2-requester` property is CPU2's, and **every other access is CPU1's** —
+//! the anonymous requester, a DMA, a debugger. With the property unset, which
+//! is the default, every access is CPU1's.
+//!
+//! That is the known deviation. Under §8.3.8 a master that is neither is
+//! *unauthorized*: its `Rn` and `CR` writes are discarded and its `RLRn` read
+//! "returns all 0" without locking; its accesses to the other registers are
+//! granted. A DMA that touched the block would get CPU1's answers here. It costs nothing on today's WB board, whose DMAs have no
+//! reason to, and a debugger's `RLRn` read is already kept from locking (see
+//! below).
 //!
 //! # The rules
 //!
+//! RM0434 §8.3.3–§8.3.7, and the field descriptions of §8.4.1 and §8.4.2:
+//!
 //! - **Two-step lock.** A write to `Rn` with `LOCK` set takes a free
 //!   semaphore for the written `COREID` and `PROCID` — but only when the
-//!   written `COREID` is the writer's own; a core cannot lock on another's
-//!   behalf. A write to a semaphore already held changes nothing, by its
-//!   holder or anybody else, which is why the protocol reads back.
+//!   written `COREID` is the writer's own: "the written COREID must match the
+//!   AHB bus master ID" (§8.3.3). A write to a semaphore already held changes
+//!   nothing, by its holder or anybody else ("consecutive write attempts with
+//!   LOCK = 1 to a locked semaphore are ignored"), which is why the protocol
+//!   reads back.
 //! - **One-step lock.** A read of `RLRn` takes a free semaphore for the
-//!   reader's `COREID` with `PROCID` zero and answers the new value; on a
-//!   held one it answers the holder and changes nothing. A **debug** read
+//!   reader's `COREID`, with `PROCID` "forced to 0 by hardware", and answers
+//!   the new value; on a held one it answers the holder's `COREID` and
+//!   `PROCID` and changes nothing (§8.3.3, §8.4.2). A **debug** read
 //!   (`MemAttrs::debug`) never takes it: a debugger's memory window over the
-//!   block would otherwise lock all thirty-two. Writes to `RLRn` do nothing.
+//!   block would otherwise lock all thirty-two. Writes to `RLRn` do nothing;
+//!   every field there is read-only.
 //! - **Unlock.** A write to `Rn` with `LOCK` clear frees the semaphore when
-//!   the written `COREID` and `PROCID` are the holder's and the `COREID` is
-//!   the writer's own. Anything else is ignored.
+//!   "the written data matches the semaphore PROCID and COREID and the AHB bus
+//!   master ID"; otherwise the "write is ignored, semaphore remains locked and
+//!   no interrupt is generated" (§8.3.5). So the wrong `PROCID` frees nothing,
+//!   and neither does the right one written in another core's name. Freeing a
+//!   semaphore that is already free changes nothing and raises nothing: the
+//!   event is drawn from the locked state only (Figure 23).
 //! - **Clear by key.** A write to `CR` whose `KEY` equals `KEYR.KEY` frees
 //!   every semaphore held by the written `COREID`, whoever writes it — that is
-//!   what one core does after resetting the other.
+//!   what one core does after the other has failed (§8.3.6). The semaphores
+//!   it frees "may generate an interrupt when enabled", exactly as an unlock
+//!   does. The reset `KEYR` is zero, so a zero `KEY` matches until firmware
+//!   sets one.
 //! - **The free event.** Freeing semaphore *n*, by either route, sets bit *n*
-//!   of `CxISR` for each core whose `CxIER` has bit *n* set at that moment.
-//!   `CxMISR` is `CxISR & CxIER`, and the core's interrupt is high while
-//!   `CxMISR` is nonzero. Clearing an `IER` bit masks a pending status rather
-//!   than discarding it.
+//!   of **both** cores' `CxISR`, enabled or not: `CxISR` "mirrors the
+//!   semaphore interrupt status ISF before the enable" (§8.3.7, Figure 23).
+//!   `CxMISR` is `CxISR & CxIER` — "read as 0 when semaphore x status is
+//!   masked" (§8.4.6) — and core *x*'s interrupt is high while `CxMISR` is
+//!   nonzero. So clearing an `IER` bit masks a pending status rather than
+//!   discarding it, and setting one over a stale status raises the line at
+//!   once — which is why §8.3.7's procedure writes `CxICR` before it enables.
+//!   A write of one to a `CxICR` bit clears that core's status bit only.
 //!
-//! On an STM32WB55 `c1-irq` is NVIC line 46 (`HSEM_IRQn`); `c2-irq` goes to
-//! CPU2. The board file draws those wires.
+//! On an STM32WB55 `c1-irq` is NVIC line 46 (`HSEM_IRQn`, "Semaphore
+//! interrupt 0 to CPU1", RM0434 §15.4 Table 72); `c2-irq` goes to CPU2,
+//! where it shares line 19 with the IPCC's and the PKA's (Table 73). The
+//! board file draws those wires.
 //!
 //! # The clock
 //!
 //! `enable` is `RCC_AHB3ENR.HSEMEN`, bit 19, and `reset` is
-//! `RCC_AHB3RSTR.HSEMRST`, the same bit (`stm32wb55xx.h`); CPU2's
-//! `RCC_C2AHB3ENR.HSEMEN` can be wired to `enable` too, which ORs its inputs.
+//! `RCC_AHB3RSTR.HSEMRST`, the same bit (RM0434 §6.4.19, §6.4.12); CPU2's
+//! `RCC_C2AHB3ENR.HSEMEN` (§6.4.37) can be wired to `enable` too, which ORs its inputs.
 //! [`gate`] has what a gated block does.
 //!
 //! # Sources
 //!
-//! ST **RM0434**, the "Hardware semaphore (HSEM)" chapter, for the lock,
-//! unlock, clear and interrupt rules; ST CMSIS `stm32wb55xx.h` (Apache-2.0)
-//! for the offsets, the field positions, the core ids and the interrupt
-//! number; ST `STM32WB55_CM4.svd` (Apache-2.0) for the identification values.
+//! ST **RM0434 Rev 16**, chapter 8 "Hardware semaphore (HSEM)", for the
+//! register map, the reset values, the lock, unlock, clear and interrupt
+//! rules, the core ids and the access width; §6.4 (RCC) for the clock bits;
+//! §15.4 for the interrupt lines. ST CMSIS `stm32wb55xx.h` (Apache-2.0) for
+//! the same offsets and field positions as names; ST `STM32WB55_CM4.svd`
+//! (Apache-2.0) for the identification values, which RM0434 does not list.
 //! ST's BSD-3 WB HAL (`stm32wbxx_hal_hsem.c`) and LL (`stm32wbxx_ll_hsem.h`)
 //! were read for what firmware writes and compares, not copied. No emulator
 //! source of any licence was consulted (`ROADMAP.md` §1).
@@ -173,14 +207,16 @@ impl State {
         self.isr[c] & self.ier[c]
     }
 
-    /// Free semaphore `n` and raise its event for whichever core wants it.
+    /// Free semaphore `n` and raise its event on both interrupt lines.
+    ///
+    /// The status is set whatever the enables say: `CxISR` is the status
+    /// "before the enable" (RM0434 §8.3.7, Figure 23), and `CxIER` only
+    /// decides whether it reaches `CxMISR` and the line.
     fn free(&mut self, n: usize) {
         self.sem[n] = 0;
         let bit = 1u32 << n;
-        for c in 0..2 {
-            if self.ier[c] & bit != 0 {
-                self.isr[c] |= bit;
-            }
+        for isr in &mut self.isr {
+            *isr |= bit;
         }
     }
 
@@ -336,9 +372,10 @@ impl Gated for Registers {
     }
 
     fn gate_reset(&self) {
-        // `RCC_AHB3RSTR.HSEMRST`: every semaphore free, every interrupt off —
-        // what `Device::reset` does. No free *event*: a reset is not an
-        // unlock, and the enables it would be checked against reset too.
+        // `RCC_AHB3RSTR.HSEMRST`: every register to its reset value, zero
+        // (RM0434 Table 47) — what `Device::reset` does. No free *event*: the
+        // status is set by an unlock or a clear (§8.3.7, Figure 23), and a
+        // reset is neither; it zeroes `CxISR` with everything else.
         *self.state.lock() = State::default();
         self.refresh_irq();
     }
@@ -388,9 +425,9 @@ impl MemOps for Registers {
     }
 
     fn constraints(&self) -> AccessConstraints {
-        // Word access: ST's HAL and LL touch these registers no other way, and
-        // a byte write of `Rn` that carried `LOCK` without `COREID` would be a
-        // lock nobody could release.
+        // Word access: "Byte and half-word accesses are ignored and have no
+        // effect on the semaphores, they generate a bus error" (RM0434 §8.4).
+        // A word-only region refuses them before they reach this block.
         AccessConstraints::word(Width::U32, Endian::Little)
     }
 }
@@ -763,6 +800,7 @@ mod tests {
             locked(COREID_CPU2, 7),
             "nor free it for CPU2"
         );
+        assert_eq!(read(&d, C2ISR), 0, "and raises nothing");
         write_as(&d, true, r(1), (COREID_CPU2 << COREID_SHIFT) | 7);
         assert_eq!(read(&d, r(1)), 0, "but CPU2 can");
     }
@@ -773,10 +811,13 @@ mod tests {
         write(&d, r(9), locked(COREID_CPU1, 3));
         write(&d, r(9), (COREID_CPU1 << COREID_SHIFT) | 4);
         assert_eq!(read(&d, r(9)), locked(COREID_CPU1, 3), "wrong PROCID");
+        assert_eq!(read(&d, C1ISR), 0, "and no free event");
         // `HAL_HSEM_Release`: PROCID | COREID_CURRENT, no LOCK.
         write(&d, r(9), (COREID_CPU1 << COREID_SHIFT) | 3);
         assert_eq!(read(&d, r(9)), 0);
+        assert_eq!(read(&d, C1ISR), 1 << 9, "the free event");
         // Releasing a free semaphore changes nothing and raises nothing.
+        write(&d, C1ICR, 1 << 9);
         write(&d, C1IER, 1 << 9);
         write(&d, r(9), COREID_CPU1 << COREID_SHIFT);
         assert_eq!(read(&d, C1ISR), 0);
@@ -798,6 +839,19 @@ mod tests {
         // And a one-step lock is freed like any other, PROCID zero.
         write(&d, r(3), COREID_CPU1 << COREID_SHIFT);
         assert_eq!(read(&d, r(3)), 0);
+    }
+
+    #[test]
+    fn byte_and_halfword_accesses_are_bus_errors() {
+        // RM0434 §8.4: "ignored and have no effect on the semaphores, they
+        // generate a bus error". The region refuses them before `write`.
+        let c = hsem().regs.constraints();
+        for width in [Width::U8, Width::U16] {
+            for offset in [r(0), rlr(0), C1IER, CR, KEYR] {
+                assert!(c.check(offset, width, MemAttrs::DEFAULT).is_err());
+            }
+        }
+        assert!(c.check(r(0), Width::U32, MemAttrs::DEFAULT).is_ok());
     }
 
     #[test]
@@ -838,6 +892,7 @@ mod tests {
         // The wrong key does nothing.
         write(&d, CR, 0xbeee_0000 | (COREID_CPU1 << COREID_SHIFT));
         assert_eq!(read(&d, r(0)), locked(COREID_CPU1, 1));
+        assert_eq!(read(&d, C1ISR), 0);
         // CPU1 clears CPU2's — the after-a-reset case.
         write(&d, CR, 0xbeef_0000 | (COREID_CPU2 << COREID_SHIFT));
         assert_eq!(read(&d, r(2)), 0);
@@ -861,7 +916,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn freeing_sets_status_for_the_cores_that_enabled_it() {
+    fn freeing_sets_both_statuses_and_the_enables_pick_the_line() {
         let d = hsem();
         let probes = watch(&d);
         write(&d, r(4), locked(COREID_CPU1, 0));
@@ -871,7 +926,11 @@ mod tests {
         write(&d, C1IER, 1 << 5);
         write(&d, r(4), COREID_CPU1 << COREID_SHIFT);
         assert_eq!(read(&d, C2ISR), 1 << 4);
-        assert_eq!(read(&d, C1ISR), 0, "CPU1 did not ask about 4");
+        assert_eq!(read(&d, C2MISR), 1 << 4);
+        // CPU1 did not ask about 4: its status is set — ISR is "before the
+        // enable" — but its masked status and its line are not.
+        assert_eq!(read(&d, C1ISR), 1 << 4);
+        assert_eq!(read(&d, C1MISR), 0);
         assert!(probes[1].high() && !probes[0].high());
         write(&d, r(5), COREID_CPU1 << COREID_SHIFT);
         assert_eq!(read(&d, C1MISR), 1 << 5);
@@ -882,21 +941,39 @@ mod tests {
         let misr = read(&d, C1MISR);
         write(&d, C1IER, read(&d, C1IER) & !misr);
         assert!(!probes[0].high(), "masked");
-        assert_eq!(read(&d, C1ISR), 1 << 5, "the status is kept, only masked");
+        assert_eq!(
+            read(&d, C1ISR),
+            0b11 << 4,
+            "the status is kept, only masked"
+        );
         write(&d, C1ICR, misr);
-        assert_eq!(read(&d, C1ISR), 0);
+        assert_eq!(read(&d, C1ISR), 1 << 4, "ICR clears only the bits written");
         assert_eq!(read(&d, C1ICR), 0);
+        assert_eq!(read(&d, C2ISR), 0b11 << 4, "and only this core's");
         write_as(&d, true, C2ICR, 1 << 4);
         assert!(!probes[1].high());
     }
 
     #[test]
-    fn the_status_only_sets_if_enabled_when_freed() {
+    fn a_status_set_while_disabled_raises_the_line_when_enabled() {
+        // Why RM0434 §8.3.7's procedure clears `CxICR` before it enables.
         let d = hsem();
+        let probes = watch(&d);
         write(&d, r(8), locked(COREID_CPU1, 0));
         write(&d, r(8), COREID_CPU1 << COREID_SHIFT);
+        assert_eq!(read(&d, C1ISR), 1 << 8, "set with no enable");
+        assert_eq!(read(&d, C1MISR), 0);
+        assert!(!probes[0].high());
         write(&d, C1IER, 1 << 8);
-        assert_eq!(read(&d, C1ISR), 0, "the free came before the enable");
+        assert_eq!(read(&d, C1MISR), 1 << 8);
+        assert!(probes[0].high(), "the stale status reaches the line");
+        // The procedure's order: clear, then enable — no interrupt.
+        write(&d, C1IER, 0);
+        write(&d, r(8), locked(COREID_CPU1, 0));
+        write(&d, r(8), COREID_CPU1 << COREID_SHIFT);
+        write(&d, C1ICR, 1 << 8);
+        write(&d, C1IER, 1 << 8);
+        assert!(!probes[0].high());
     }
 
     #[test]
