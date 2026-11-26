@@ -68,16 +68,35 @@
 //!
 //! # The pins
 //!
-//! **There are none.** A USART's transmit pin carries a bit stream, and this
+//! **No data pins.** A USART's transmit pin carries a bit stream, and this
 //! model's data path is [`host::chardev`](crate::host::chardev) — a byte at a
 //! time, to a terminal. So `TX` and `RX` are not wires and a board does not
-//! connect them to a GPIO's alternate-function inputs; the only pin here is
-//! `irq`. Firmware still configures `MODER` and `AFR` for its `TX` pin and
-//! that configuration is modelled faithfully by [`gpio`](super::gpio), because
-//! firmware does it and expects the registers to read back — it simply is not
-//! what carries the data. A peripheral whose pin genuinely *is* a level, an
-//! SPI clock or a timer compare output, is the case the GPIO's `af{n}` inputs
-//! exist for.
+//! connect them to a GPIO's alternate-function inputs. Firmware still
+//! configures `MODER` and `AFR` for its `TX` pin and that configuration is
+//! modelled faithfully by [`gpio`](super::gpio), because firmware does it and
+//! expects the registers to read back — it simply is not what carries the
+//! data. A peripheral whose pin genuinely *is* a level, an SPI clock or a timer
+//! compare output, is the case the GPIO's `af{n}` inputs exist for.
+//!
+//! What a USART does drive is three request levels:
+//!
+//! | Pin | High while | Dropped by |
+//! | --- | --- | --- |
+//! | `irq` | an enabled interrupt condition stands (RM0090 Table 149) | servicing it |
+//! | `dma-rx` | `CR3.DMAR` and `RXNE` (on a `u5` with the FIFO on, `RXFNE`) | the DMA's read of `DR`/`RDR` |
+//! | `dma-tx` | `CR3.DMAT` and `TXE` (`TXFNF`) | the DMA's write of `DR`/`TDR` |
+//!
+//! RM0090 §30.6.7 and RM0351 §40.5.15: "DMA mode can be enabled for
+//! transmission by setting DMAT bit in the USART_CR3 register. Data is loaded
+//! from a SRAM area … to the USART_DR register whenever the TXE bit is set";
+//! reception the same with `DMAR` and `RXNE`. The DMA request is a level
+//! ([`st.dma`](super::dma)'s contract), and the controller's ordinary bus
+//! access to the data register is what clears the flag, exactly as a CPU read
+//! would — so circular-buffer reception, the pattern every Cube UART driver
+//! uses, fills its ring with no firmware access to the USART at all, because
+//! the receiver is polled on the scheduler's quantum. Which DMA channel or
+//! DMAMUX input a request reaches is the part's request table, and that is
+//! the board file's to say.
 //!
 //! Two *inputs* arrive from the reset and clock controller — `enable`, which
 //! is `RCC_APB1ENR.USART2EN`, and `reset`, which is `RCC_APB1RSTR.USART2RST`.
@@ -138,6 +157,10 @@ const DEFAULT_PORT: &str = "console";
 
 /// The name of the interrupt output pin.
 pub const IRQ_PIN: &str = "irq";
+/// The receive DMA request: `CR3.DMAR` and `RXNE`.
+pub const DMA_RX_PIN: &str = "dma-rx";
+/// The transmit DMA request: `CR3.DMAT` and `TXE`.
+pub const DMA_TX_PIN: &str = "dma-tx";
 
 /// How many bytes the register block occupies.
 ///
@@ -200,6 +223,11 @@ const CR1_UE_F4: u32 = 1 << 13;
 const CR1_UE_F7: u32 = 1 << 0;
 /// `CR3.EIE` — the error interrupt, which is what makes `ORE` raise one.
 const CR3_EIE: u32 = 1 << 0;
+/// `CR3.DMAR`: receive by DMA (bit 6 in every layout: RM0090 §30.6.6,
+/// RM0351 §40.8.3, `USART_CR3_DMAR_Pos` in `stm32u585xx.h`).
+const CR3_DMAR: u32 = 1 << 6;
+/// `CR3.DMAT`: transmit by DMA (bit 7 in every layout).
+const CR3_DMAT: u32 = 1 << 7;
 
 // -- the u5 additions (ST CMSIS `stm32u585xx.h`, `USART_*_Pos`) --------------
 
@@ -387,6 +415,10 @@ struct Registers {
     lpuart: bool,
     /// The interrupt output, connected at realize time.
     irq: Mutex<Option<WireSource>>,
+    /// The receive DMA request output, if a board wired one.
+    dma_rx: Mutex<Option<WireSource>>,
+    /// The transmit DMA request output, if a board wired one.
+    dma_tx: Mutex<Option<WireSource>>,
     /// `RCC_APB1ENR.USART2EN` and `RCC_APB1RSTR.USART2RST`, as a board's wires
     /// deliver them.
     gate: ClockGate,
@@ -432,6 +464,30 @@ impl Registers {
             || (sr & ISR_RXFF != 0 && cr1 & CR1_RXFFIE != 0)
             || (sr & ISR_TXFT != 0 && state.cr3 & CR3_TXFTIE != 0)
             || (sr & ISR_RXFT != 0 && state.cr3 & CR3_RXFTIE != 0)
+    }
+
+    /// Whether an access of `len` bytes at `offset` is one this layout takes:
+    /// a word, or on the bridged layouts a naturally aligned byte or
+    /// half-word (see [`MemOps::constraints`]).
+    fn lane_access(&self, offset: u64, len: usize) -> bool {
+        match len {
+            4 => true,
+            1 | 2 => self.variant != Variant::F4 && offset.is_multiple_of(len as u64),
+            _ => false,
+        }
+    }
+
+    /// The two DMA request levels, `(rx, tx)`: the data flag ANDed with its
+    /// `CR3` enable, on a switched-on peripheral.
+    fn dma_requests(&self, state: &State) -> (bool, bool) {
+        if !self.enabled(state) {
+            return (false, false);
+        }
+        let sr = self.isr(state);
+        (
+            sr & SR_RXNE != 0 && state.cr3 & CR3_DMAR != 0,
+            sr & SR_TXE != 0 && state.cr3 & CR3_DMAT != 0,
+        )
     }
 
     /// The status word as the guest reads it. On a `u5` that is the stored
@@ -498,20 +554,28 @@ impl Registers {
         }
     }
 
-    /// Drive the interrupt pin to whatever the latch now says.
+    /// Drive the interrupt pin and both DMA requests to whatever the
+    /// registers now say.
     ///
     /// Called with **no lock held**: a sink is free to call back into this
     /// device, and the re-entrancy contract is that outward calls happen after
     /// the critical section rather than inside it.
     fn refresh_irq(&self) {
-        let level = {
+        let (level, rx, tx) = {
             let mut state = self.state.lock();
             state.irq = self.irq_pending(&state);
-            Level::from_bool(state.irq)
+            let (rx, tx) = self.dma_requests(&state);
+            (
+                Level::from_bool(state.irq),
+                Level::from_bool(rx),
+                Level::from_bool(tx),
+            )
         };
-        let source = self.irq.lock().clone();
-        if let Some(source) = source {
-            source.set(level);
+        for (pin, level) in [(&self.irq, level), (&self.dma_rx, rx), (&self.dma_tx, tx)] {
+            let source = pin.lock().clone();
+            if let Some(source) = source {
+                source.set(level);
+            }
         }
     }
 
@@ -778,15 +842,15 @@ impl Gated for Registers {
 
 impl MemOps for Registers {
     fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
-        let [a, b, c, d] = dst else {
+        if !self.lane_access(offset, dst.len()) {
             return Err(BusError::BadAccess);
-        };
+        }
         if !self.gate.live() {
             // No `RCC_APB1ENR.USART2EN`, or `USART2RST` standing: the block is
             // not readable and the value that comes back is zero
             // ([`gate`](super::gate)). A debug read sees the same nothing,
             // because that is what the bus itself returns.
-            (*a, *b, *c, *d) = (0, 0, 0, 0);
+            dst.fill(0);
             return Ok(());
         }
         if !attrs.debug {
@@ -794,9 +858,12 @@ impl MemOps for Registers {
             // firmware looks, not one scheduler tick later.
             self.poll_receiver();
         }
+        // A narrow read is a word read at the APB side, side effects and all
+        // (a byte read of `RDR` consumes the character); the access gets its
+        // own lanes of it.
         let value = self.read_register(offset & !3, attrs.debug);
-        let bytes = value.to_le_bytes();
-        (*a, *b, *c, *d) = (bytes[0], bytes[1], bytes[2], bytes[3]);
+        let lane = (offset & 3) as usize;
+        dst.copy_from_slice(&value.to_le_bytes()[lane..lane + dst.len()]);
         if !attrs.debug {
             self.refresh_irq();
         }
@@ -804,9 +871,9 @@ impl MemOps for Registers {
     }
 
     fn write(&self, offset: u64, src: &[u8], attrs: MemAttrs) -> MemResult {
-        let [a, b, c, d] = src else {
+        if !self.lane_access(offset, src.len()) {
             return Err(BusError::BadAccess);
-        };
+        }
         if attrs.debug {
             // A debug write to the data register would put a character on the
             // console and one to `CR1` would change when the guest is next
@@ -819,16 +886,33 @@ impl MemOps for Registers {
             // peripheral is lost, so this one reaches no chardev.
             return Ok(());
         }
-        self.write_register(offset & !3, u32::from_le_bytes([*a, *b, *c, *d]));
+        // The bridge duplicates a narrow write's data on every lane and makes
+        // it a word write (RM0434 §13.4.6): a byte `0xB0` is `0xB0B0B0B0`.
+        let value = match *src {
+            [b] => u32::from(b) * 0x0101_0101,
+            [l, h] => u32::from(u16::from_le_bytes([l, h])) * 0x0001_0001,
+            [a, b, c, d] => u32::from_le_bytes([a, b, c, d]),
+            _ => return Err(BusError::BadAccess),
+        };
+        self.write_register(offset & !3, value);
         self.refresh_irq();
         Ok(())
     }
 
     fn constraints(&self) -> AccessConstraints {
-        // "The peripheral registers have to be accessed by words (32 bits)"
-        // — RM0090 §30.6. Byte access to `DR` is a thing firmware does anyway
-        // on some parts, but this one says words, so words is the model.
-        AccessConstraints::word(Width::U32, Endian::Little)
+        if self.variant == Variant::F4 {
+            // "The peripheral registers have to be accessed by words (32
+            // bits)" — RM0090 §30.6, and that is the model for the F4 layout:
+            // its bridge's narrow-access rule was not checked against RM0090.
+            return AccessConstraints::word(Width::U32, Endian::Little);
+        }
+        // RM0434 §36.8 says words too, but the register is behind the AHB/APB
+        // bridge, which "changes any AHB byte or half-word transfer into a
+        // 32-bit APB transfer" (§13.4.6) rather than faulting it — and a DMA
+        // channel with `PSIZE` = byte, which is how every HAL UART DMA is
+        // set up, depends on it. So narrow accesses are taken, naturally
+        // aligned, and widened in `read`/`write`.
+        AccessConstraints::word(Width::U32, Endian::Little).with_widths(Width::U8, Width::U32)
     }
 }
 
@@ -904,6 +988,8 @@ impl Usart {
             variant,
             lpuart,
             irq: Mutex::with_rank(LockRank::WIRE, None),
+            dma_rx: Mutex::with_rank(LockRank::WIRE, None),
+            dma_tx: Mutex::with_rank(LockRank::WIRE, None),
             gate: ClockGate::new(),
         });
         let region = Arc::new(Region::io(
@@ -1028,18 +1114,26 @@ impl Device for Usart {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
-        if port != IRQ_PIN {
-            return Err(Error::Config {
-                at: port.to_string(),
-                message: format!("a USART drives one pin, `{IRQ_PIN}`"),
-            });
-        }
-        self.connect_irq(source);
+        let pin = match port {
+            IRQ_PIN => &self.regs.irq,
+            DMA_RX_PIN => &self.regs.dma_rx,
+            DMA_TX_PIN => &self.regs.dma_tx,
+            _ => {
+                return Err(Error::Config {
+                    at: port.to_string(),
+                    message: format!(
+                        "a USART drives `{IRQ_PIN}`, `{DMA_RX_PIN}` and `{DMA_TX_PIN}`"
+                    ),
+                });
+            }
+        };
+        *pin.lock() = Some(source);
+        self.regs.refresh_irq();
         Ok(())
     }
 
     fn announce(&self, port: &str) {
-        if port == IRQ_PIN {
+        if matches!(port, IRQ_PIN | DMA_RX_PIN | DMA_TX_PIN) {
             self.regs.refresh_irq();
         }
     }
@@ -1135,7 +1229,11 @@ pub fn schema() -> ClassSchema {
         .region("regs")
         // An M-profile board wires this straight to the core: `wire
         // usart2.irq -> cpu.irq38`. There is no controller in between.
-        .port(IRQ_PIN, PortDir::Out);
+        .port(IRQ_PIN, PortDir::Out)
+        // The request levels a DMA channel (or a DMAMUX input) takes; which
+        // one is the part's request table, so the board file says.
+        .port(DMA_RX_PIN, PortDir::Out)
+        .port(DMA_TX_PIN, PortDir::Out);
     // `RCC_APB1ENR.USART2EN` and `RCC_APB1RSTR.USART2RST`.
     gate::ports(schema)
 }
@@ -1428,6 +1526,155 @@ mod tests {
         // And a write cannot *set* a flag.
         poke(&usart, map.sr, 0xffff_ffff);
         assert_eq!(peek(&usart, map.sr) & SR_TC, 0);
+    }
+
+    /// A sink that records the last level it was driven to.
+    #[derive(Debug, Default)]
+    struct LevelProbe {
+        level: AtomicU32,
+    }
+
+    impl WireSink for LevelProbe {
+        fn set_level(&self, _src: WireId, _line: u32, level: Level) {
+            self.level
+                .store(u32::from(level.is_high()), Ordering::Relaxed);
+        }
+    }
+
+    impl LevelProbe {
+        fn high(&self) -> bool {
+            self.level.load(Ordering::Relaxed) != 0
+        }
+    }
+
+    /// Wire `pin` of `usart` to a fresh probe.
+    fn probe_pin(usart: &Usart, pin: &str) -> Arc<LevelProbe> {
+        let ids = WireIdAllocator::new();
+        let id = ids.alloc();
+        let probe = Arc::new(LevelProbe::default());
+        let wire = Wire::builder()
+            .source(id)
+            .sink(Arc::clone(&probe) as Arc<dyn WireSink>, 0)
+            .build_shared();
+        Device::connect(usart, pin, WireSource::new(wire, id)).expect("a USART drives it");
+        probe
+    }
+
+    #[test]
+    fn the_dma_requests_follow_the_data_flags_and_their_cr3_enables() {
+        for variant in [Variant::F4, Variant::F7, Variant::U5] {
+            let (usart, port, map) = wired(variant);
+            let rx = probe_pin(&usart, DMA_RX_PIN);
+            let tx = probe_pin(&usart, DMA_TX_PIN);
+
+            // Switched off, nothing is requested whatever CR3 says.
+            poke(&usart, map.cr3, CR3_DMAR | CR3_DMAT);
+            assert!(!rx.high() && !tx.high(), "{variant:?}: UE clear");
+
+            enable(&usart, map);
+            // TXE stands out of reset: DMAT alone asks for a byte to send.
+            assert!(tx.high(), "{variant:?}: TXE with DMAT");
+            assert!(!rx.high(), "{variant:?}: nothing received yet");
+            poke(&usart, map.cr3, CR3_DMAR);
+            assert!(!tx.high(), "{variant:?}: DMAT clear");
+
+            // A byte arrives: RXNE with DMAR raises the request, and the
+            // read of the data register — the DMA's beat — drops it.
+            port.feed(b"z");
+            tick(&usart);
+            assert!(rx.high(), "{variant:?}: RXNE with DMAR");
+            assert_eq!(peek(&usart, map.rdr) & 0xff, u32::from(b'z'));
+            assert!(!rx.high(), "{variant:?}: serviced by the read");
+
+            // DMAR clear: the same byte only raises RXNE.
+            poke(&usart, map.cr3, 0);
+            port.feed(b"y");
+            tick(&usart);
+            assert_ne!(peek_debug(&usart, map.sr) & SR_RXNE, 0);
+            assert!(!rx.high(), "{variant:?}: DMAR clear");
+        }
+    }
+
+    #[test]
+    fn a_bridged_layout_widens_byte_and_halfword_accesses() {
+        let (usart, port, map) = wired(Variant::U5);
+        enable(&usart, map);
+        // A byte read of RDR — a DMA channel with PSIZE = byte — consumes the
+        // character, as the word read the bridge makes of it does.
+        port.feed(b"k");
+        tick(&usart);
+        let mut byte = [0u8; 1];
+        usart
+            .regs
+            .read(map.rdr, &mut byte, MemAttrs::DEFAULT)
+            .expect("the bridge takes a byte");
+        assert_eq!(byte, *b"k");
+        assert_eq!(peek_debug(&usart, map.sr) & SR_RXNE, 0, "consumed");
+        // A byte write of TDR is the byte on every lane: one character out.
+        usart
+            .regs
+            .write(map.tdr, b"m", MemAttrs::DEFAULT)
+            .expect("the bridge takes a byte");
+        for _ in 0..4 {
+            tick(&usart);
+        }
+        assert_eq!(port.drain(), b"m");
+        // A half-word read of the second half of ISR is its upper lanes.
+        let isr = peek_debug(&usart, map.sr);
+        let mut half = [0u8; 2];
+        usart
+            .regs
+            .read(map.sr + 2, &mut half, MemAttrs::DEFAULT)
+            .expect("aligned half-word");
+        assert_eq!(u32::from(u16::from_le_bytes(half)), isr >> 16);
+        // Misaligned is still refused, and the F4 layout keeps words only.
+        assert!(
+            usart
+                .regs
+                .read(map.sr + 1, &mut half, MemAttrs::DEFAULT)
+                .is_err()
+        );
+        let (f4, _port, f4map) = wired(Variant::F4);
+        assert!(
+            f4.regs
+                .read(f4map.rdr, &mut byte, MemAttrs::DEFAULT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_dma_requests_survive_a_debug_read_and_a_snapshot() {
+        let (usart, port, map) = wired(Variant::U5);
+        let rx = probe_pin(&usart, DMA_RX_PIN);
+        enable(&usart, map);
+        poke(&usart, map.cr3, CR3_DMAR);
+        port.feed(b"q");
+        tick(&usart);
+        assert!(rx.high());
+        // A debugger's look at RDR is not the DMA's beat.
+        let _ = peek_debug(&usart, map.rdr);
+        assert!(rx.high(), "a debug read services nothing");
+
+        // The level is derived, not stored: a restored device drives it again.
+        let mut shape = MachineShape::new();
+        shape.add_device("usart", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("usart", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&usart, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+        let (restored, _port, _) = wired(Variant::U5);
+        let rx2 = probe_pin(&restored, DMA_RX_PIN);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("usart", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        assert!(
+            rx2.high(),
+            "RXNE and DMAR came back, and so did the request"
+        );
     }
 
     #[test]
