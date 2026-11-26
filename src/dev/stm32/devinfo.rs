@@ -10,6 +10,7 @@
 //! | **flash size** | the array's size in KiB, a 16-bit value | `FLASH_SIZE`, and through it every page/bank calculation in `HAL_FLASHEx_Erase` |
 //! | **unique ID** | 96 bits, different on every die | `HAL_GetUIDw0/1/2`, USB serial numbers, licence keys, MAC addresses |
 //! | **package** | which package the die is bonded in | `LL_GetPackageType` |
+//! | **UID64** (WB) | a 32-bit device number, then ST's company ID and a device byte | `LL_FLASH_GetUDN`, and the BLE stack's public address |
 //!
 //! Where they live is a fact about the *family*, so the offsets are
 //! properties and the board file says where to map the block:
@@ -18,6 +19,16 @@
 //! | --- | --- | --- | --- | --- | --- |
 //! | STM32U5 (RM0456 §75, the CMSIS `PACKAGE_BASE`/`UID_BASE`/`FLASHSIZE_BASE`) | `0x0BFA0500` | `0x200` | `0x2a0` | `0x0` | `0x2a4` |
 //! | STM32F4 (RM0090 §39) | `0x1FFF7A10` | `0x0` | `0x12` | — | `0x14` |
+//! | STM32WB55/WB35 (RM0434 §42, §3.5) | `0x1FFF7500` | `0x90` | `0xe0` | `0x0` | `0xe2` |
+//!
+//! A WB adds `uid64-offset = 0x80`: RM0434 §3.5's 64-bit unique ID at
+//! `UID64_BASE` (`0x1FFF7580`), a 32-bit "unique device number" (seeded, as
+//! the 96-bit ID is) followed by a word holding the 24-bit ST company ID
+//! `0x0080E1` in bits 31:8 and a device ID byte in 7:0 — `0x26` for a WB55
+//! rev Y / WB35 rev A, `0x27` for rev X, as `uid64-device` says (default
+//! `0x26`). ST's BLE stack builds the public device address from it. The
+//! WB package codes are `0x0A` (UFQFPN48: WB55Cx, WB35Cx), `0x13` (VFQFPN68:
+//! WB55Rx) and `0x11` (WLCSP100/UFBGA129: WB55Vx) (RM0434 §42.3).
 //!
 //! A U5 board that leaves this out takes a BusFault the first time the HAL
 //! erases a page, because `FLASH_SIZE` is a load from `0x0BFA07A0`.
@@ -40,7 +51,8 @@
 //!
 //! ST **RM0456** (STM32U5) chapter "Device electronic signature"; ST's CMSIS
 //! header `stm32u585xx.h` (Apache-2.0) for `PACKAGE_BASE`, `UID_BASE` and
-//! `FLASHSIZE_BASE`; ST **RM0090** §39 for the F4 offsets. No emulator source
+//! `FLASHSIZE_BASE`; ST **RM0090** §39 for the F4 offsets; ST **RM0434** rev 16
+//! §3.5 and §42 with `stm32wb55xx.h` v1.12.4 (`UID64_BASE`) for the WB. No emulator source
 //! of any licence was consulted (`ROADMAP.md` §1).
 
 use alloc::boxed::Box;
@@ -64,6 +76,10 @@ pub const CLASS_NAME: &str = "st.devinfo";
 
 /// Snapshot format version. The chunk is empty: nothing here changes.
 const STATE_VERSION: u32 = 1;
+
+/// ST's company ID, the top 24 bits of a WB UID64's second word (RM0434
+/// §3.5: "the 24-bit ST company ID returns 0x00 80 E1").
+const ST_COMPANY_ID: u32 = 0x0000_80e1;
 
 /// The bytes the block answers with, laid out at their offsets.
 ///
@@ -105,6 +121,8 @@ pub struct Devinfo {
     region: RegionRef,
     /// Where the unique ID sits, for a realize that has to draw it.
     uid_offset: Option<usize>,
+    /// Where a WB's UID64 sits; its device number is drawn at realize too.
+    uid64_offset: Option<usize>,
     /// The board's seed, mixed with the instance path at realize.
     seed: u64,
 }
@@ -129,6 +147,8 @@ impl Devinfo {
         let package_at: Option<u64> = r.optional("package-offset")?;
         let package = r.or_range("package", 0u64, 0..=0xffff)? as u16;
         let seed: u64 = r.or("seed", 0)?;
+        let uid64_at: Option<u64> = r.optional("uid64-offset")?;
+        let uid64_device = r.or_range("uid64-device", 0x26u64, 0..=0xff)? as u32;
         r.finish()?;
 
         let mut bytes = alloc::vec![0u8; size];
@@ -146,6 +166,10 @@ impl Devinfo {
         place("package-offset", package_at, &package.to_le_bytes())?;
         // Zero until realize draws it from the seed and the instance path.
         let uid_offset = place("uid-offset", uid_at, &[0u8; 12])?;
+        // The device number is drawn at realize; the second word is fixed.
+        let mut uid64 = [0u8; 8];
+        uid64[4..].copy_from_slice(&((ST_COMPANY_ID << 8) | uid64_device).to_le_bytes());
+        let uid64_offset = place("uid64-offset", uid64_at, &uid64)?;
 
         let contents = Arc::new(Contents {
             bytes: Mutex::with_rank(LockRank::DEVICE, bytes),
@@ -159,8 +183,18 @@ impl Devinfo {
             contents,
             region,
             uid_offset,
+            uid64_offset,
             seed,
         })
+    }
+
+    /// The eight UID64 bytes, as the guest reads them, if the block has one.
+    #[must_use]
+    pub fn uid64(&self) -> Option<[u8; 8]> {
+        let at = self.uid64_offset?;
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&self.contents.bytes.lock()[at..at + 8]);
+        Some(out)
     }
 
     /// The twelve unique-ID bytes, as the guest reads them, if the block has
@@ -195,6 +229,14 @@ impl Device for Devinfo {
             let mut uid = [0u8; 12];
             Stream::new(derive_seed(self.seed, ctx.path())).fill(&mut uid);
             self.contents.bytes.lock()[at..at + 12].copy_from_slice(&uid);
+        }
+        if let Some(at) = self.uid64_offset {
+            // A stream of its own, so adding a UID64 to a block does not move
+            // the 96-bit ID a board already had.
+            let mut number = [0u8; 4];
+            let path = alloc::format!("{}/uid64", ctx.path());
+            Stream::new(derive_seed(self.seed, &path)).fill(&mut number);
+            self.contents.bytes.lock()[at..at + 4].copy_from_slice(&number);
         }
         Ok(())
     }
@@ -266,6 +308,18 @@ pub static CLASS: DeviceClass = DeviceClass {
             required: false,
             summary: "the package word's value",
         },
+        PropertySpec {
+            name: "uid64-offset",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "WB: where the 64-bit UID64 is (0x80 in the block at 0x1FFF7500)",
+        },
+        PropertySpec {
+            name: "uid64-device",
+            kind: ValueKind::Uint,
+            required: false,
+            summary: "WB: UID64's device ID byte (0x26 by default; 0x27 for rev X)",
+        },
     ],
     construct: |props| Ok(Box::new(Devinfo::new(props)?)),
 };
@@ -299,6 +353,8 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("seed", ValueKind::Uint))
         .prop(PropSchema::new("package-offset", ValueKind::Uint))
         .prop(PropSchema::new("package", ValueKind::Uint).range(0, 0xffff))
+        .prop(PropSchema::new("uid64-offset", ValueKind::Uint))
+        .prop(PropSchema::new("uid64-device", ValueKind::Uint).range(0, 0xff))
         .region("")
         .region("regs")
 }
@@ -370,6 +426,40 @@ mod tests {
             "another seed, another ID"
         );
         assert_ne!(draw(7, "a"), draw(7, "b"), "two instances, two IDs");
+    }
+
+    #[test]
+    fn a_wb_block_has_uid64_with_st_s_company_id() {
+        let props = Props::new()
+            .with("size", Value::Size(0xe2))
+            .with("flash-kb", Value::Uint(1024))
+            .with("flash-size-offset", Value::Uint(0xe0))
+            .with("uid-offset", Value::Uint(0x90))
+            .with("uid64-offset", Value::Uint(0x80))
+            .with("package-offset", Value::Uint(0))
+            .with("package", Value::Uint(0x13));
+        let d = Devinfo::new(&props).expect("a WB55RG block");
+        assert_eq!(read(&d, 0xe0, 2), 1024);
+        assert_eq!(read(&d, 0, 2), 0x13, "VFQFPN68");
+        // `0x1FFF7584`: ST company ID 0x0080E1, device ID 0x26.
+        assert_eq!(read(&d, 0x84, 4), 0x0080_e126);
+        assert_eq!(
+            d.uid64().map(|u| u[4..].to_vec()),
+            Some(alloc::vec![0x26, 0xe1, 0x80, 0])
+        );
+        let props = Props::new()
+            .with("size", Value::Size(0x88))
+            .with("uid64-offset", Value::Uint(0x80))
+            .with("uid64-device", Value::Uint(0x27));
+        let d = Devinfo::new(&props).unwrap();
+        assert_eq!(read(&d, 0x84, 4), 0x0080_e127, "rev X");
+        let props = Props::new()
+            .with("size", Value::Size(0x84))
+            .with("uid64-offset", Value::Uint(0x80));
+        assert!(
+            Devinfo::new(&props).is_err(),
+            "a UID64 that runs off the end"
+        );
     }
 
     #[test]
