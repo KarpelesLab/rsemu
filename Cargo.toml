@@ -275,6 +275,7 @@ full = [
     "machine-stm32u585",
     "machine-stm32wb55",
     "machine-stm32wb35",
+    "dev-snes-cart",
     "cpu-z80",
     "machine-z80-mini",
     "machine-usb-mini",
@@ -2638,6 +2639,12 @@ cpu-sm83 = []
 # MBC5; the joypad matrix; and the serial port, which is how a headless test ROM
 # reports its result. `no_std + alloc` and dependency-free.
 dev-gb = []
+
+# The SNES cartridge (src/dev/snes/cart.rs): the ROM and battery SRAM behind
+# the A-bus, decoded LoROM, HiROM or ExHiROM by the internal header (scored,
+# since images carry no flag saying which header is real) or by `map`. Written
+# from nocash fullsnes and the SNESdev wiki. `no_std + alloc`, no dependencies.
+dev-snes-cart = []
 
 # The Game Boy as a machine (machines/gameboy.machine plus the classes it
 # names). `rsemu run gameboy --cart tetris.gb`. Phase 4's genericity proof:
