@@ -3620,6 +3620,7 @@ machine "exports" {
             ExportId::DMC_FETCH,
             ExportId::PORT_PASSTHROUGH,
             ExportId::CLOCK_TREE,
+            ExportId::SNES_PPU_BEAM,
         ] {
             assert!(id.name().is_some(), "{id:?} has no name");
         }

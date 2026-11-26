@@ -115,10 +115,18 @@ pub mod cart;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-gb")))]
 pub mod gb;
 
-#[cfg(any(feature = "dev-snes-cart", feature = "dev-snes-dsp"))]
+#[cfg(any(
+    feature = "dev-snes-cart",
+    feature = "dev-snes-dsp",
+    feature = "dev-snes-ppu"
+))]
 #[cfg_attr(
     docsrs,
-    doc(cfg(any(feature = "dev-snes-cart", feature = "dev-snes-dsp")))
+    doc(cfg(any(
+        feature = "dev-snes-cart",
+        feature = "dev-snes-dsp",
+        feature = "dev-snes-ppu"
+    )))
 )]
 pub mod snes;
 

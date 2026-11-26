@@ -1236,7 +1236,11 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::sm83::register(&mut reg)?;
     #[cfg(feature = "dev-gb")]
     crate::dev::gb::register(&mut reg)?;
-    #[cfg(any(feature = "dev-snes-cart", feature = "dev-snes-dsp"))]
+    #[cfg(any(
+        feature = "dev-snes-cart",
+        feature = "dev-snes-dsp",
+        feature = "dev-snes-ppu"
+    ))]
     crate::dev::snes::register(&mut reg)?;
     #[cfg(feature = "dev-sms")]
     crate::dev::sms::register(&mut reg)?;
@@ -1418,7 +1422,11 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::sm83::bind(&mut b)?;
     #[cfg(feature = "dev-gb")]
     crate::dev::gb::bind(&mut b)?;
-    #[cfg(any(feature = "dev-snes-cart", feature = "dev-snes-dsp"))]
+    #[cfg(any(
+        feature = "dev-snes-cart",
+        feature = "dev-snes-dsp",
+        feature = "dev-snes-ppu"
+    ))]
     crate::dev::snes::bind(&mut b)?;
     #[cfg(feature = "dev-sms")]
     crate::dev::sms::bind(&mut b)?;
@@ -1587,7 +1595,11 @@ pub fn classes() -> ClassTable {
     for schema in crate::dev::gb::schemas() {
         table.insert(schema);
     }
-    #[cfg(any(feature = "dev-snes-cart", feature = "dev-snes-dsp"))]
+    #[cfg(any(
+        feature = "dev-snes-cart",
+        feature = "dev-snes-dsp",
+        feature = "dev-snes-ppu"
+    ))]
     for schema in crate::dev::snes::schemas() {
         table.insert(schema);
     }

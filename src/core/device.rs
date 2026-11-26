@@ -319,6 +319,17 @@ impl ExportId {
     /// `cpu::sh4a::pack_request`), and zero means nothing is pending.
     pub const INTERRUPT_REQUEST: ExportId = ExportId(15);
 
+    /// The SNES S-PPU's beam: the H/V position and interlace field, the
+    /// counter latch the S-CPU's `WRIO` bit 7 drives, the television region
+    /// and the frame counter. Transported as [`Export::Opaque`].
+    ///
+    /// `snes.ppu` publishes it and the S-CPU's on-chip registers hold it:
+    /// `HVBJOY`, the H/V timer IRQ and the `$4201` latch are all questions
+    /// about where the beam is, and the beam belongs to the PPU. The handle's
+    /// type (`dev::snes::ppu::SnesPpuBeam`) is a contract between those
+    /// classes. Ids 16-18 are allocated to the other SNES chips.
+    pub const SNES_PPU_BEAM: ExportId = ExportId(19);
+
     /// The name this id is known by, for an error message.
     ///
     /// `None` for an id nothing in this crate defines, which an embedder's own
@@ -341,6 +352,7 @@ impl ExportId {
             ExportId::RESET_ADDRESS => Some("reset address"),
             ExportId::EXCLUSIVE_MONITOR => Some("global exclusive monitor"),
             ExportId::INTERRUPT_REQUEST => Some("interrupt request"),
+            ExportId::SNES_PPU_BEAM => Some("S-PPU beam position and counter latch"),
             _ => None,
         }
     }

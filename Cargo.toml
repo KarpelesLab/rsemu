@@ -277,6 +277,7 @@ full = [
     "machine-stm32wb35",
     "dev-snes-cart",
     "dev-snes-dsp",
+    "dev-snes-ppu",
     "cpu-z80",
     "machine-z80-mini",
     "machine-usb-mini",
@@ -2656,6 +2657,16 @@ dev-snes-cart = []
 # Scheduled on fullsnes's 32-slot per-sample timeline; integer arithmetic only.
 # Exposes the `SDsp` seam the S-SMP drives. `no_std + alloc`, no dependencies.
 dev-snes-dsp = []
+
+# The SNES S-PPU (src/dev/snes/ppu): the 5C77/5C78 pair behind $2100-$213F on
+# the B-bus -- 64 KiB VRAM, CGRAM and OAM with their access latches, BG modes
+# 0-7 (offset-per-tile, hires, mode 7 and EXTBG), sprites with the 32/34
+# per-line limits, mosaic, both windows, main/sub screens and colour math,
+# interlace up to 512x478, and the beam timing (long dots, the short and long
+# lines) as vblank/hblank levels plus a published beam handle the S-CPU builds
+# NMI, H/V IRQ and the counter latch on. Written from nocash fullsnes and the
+# SNESdev wiki. `no_std + alloc`, no dependencies.
+dev-snes-ppu = []
 
 # The Game Boy as a machine (machines/gameboy.machine plus the classes it
 # names). `rsemu run gameboy --cart tetris.gb`. Phase 4's genericity proof:

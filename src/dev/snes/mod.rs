@@ -6,6 +6,7 @@
 //! | [`wram`] | `snes.wram` | 128 KiB of work RAM and its `WMDATA`/`WMADD` port on the B-bus |
 //! | [`dsp`] | — | the S-DSP: eight BRR voices, envelopes, noise, echo and FIR (`dev-snes-dsp`) |
 //! | [`dsp_seam`] | — | what the S-SMP needs of the S-DSP, and the S-DSP of audio RAM |
+//! | [`ppu`] | `snes.ppu` | the S-PPU (5C77 + 5C78): registers, VRAM/CGRAM/OAM, modes 0-7, sprites, windows, colour math, beam timing |
 
 #[cfg(feature = "dev-snes-cart")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-cart")))]
@@ -23,6 +24,10 @@ pub mod dsp_seam;
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-dsp")))]
 pub mod dsp;
 
+#[cfg(feature = "dev-snes-ppu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-ppu")))]
+pub mod ppu;
+
 use alloc::vec::Vec;
 
 use crate::core::error::Result;
@@ -33,12 +38,17 @@ use crate::core::error::Result;
 ///
 /// If something already claimed one of the names.
 // The DSP has no class of its own; a DSP-only build has nothing to add.
-#[cfg_attr(not(feature = "dev-snes-cart"), allow(unused_variables))]
+#[cfg_attr(
+    not(any(feature = "dev-snes-cart", feature = "dev-snes-ppu")),
+    allow(unused_variables)
+)]
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     #[cfg(feature = "dev-snes-cart")]
     cart::register(registry)?;
     #[cfg(feature = "dev-snes-cart")]
     wram::register(registry)?;
+    #[cfg(feature = "dev-snes-ppu")]
+    ppu::register(registry)?;
     Ok(())
 }
 
@@ -48,12 +58,17 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
 ///
 /// If one of the classes is already bound.
 // The DSP has no class of its own; a DSP-only build has nothing to add.
-#[cfg_attr(not(feature = "dev-snes-cart"), allow(unused_variables))]
+#[cfg_attr(
+    not(any(feature = "dev-snes-cart", feature = "dev-snes-ppu")),
+    allow(unused_variables)
+)]
 pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     #[cfg(feature = "dev-snes-cart")]
     cart::bind(bindings)?;
     #[cfg(feature = "dev-snes-cart")]
     wram::bind(bindings)?;
+    #[cfg(feature = "dev-snes-ppu")]
+    ppu::bind(bindings)?;
     Ok(())
 }
 
@@ -64,5 +79,7 @@ pub fn schemas() -> Vec<crate::machine::validate::ClassSchema> {
     let mut out = Vec::new();
     #[cfg(feature = "dev-snes-cart")]
     out.extend([cart::schema(), wram::schema()]);
+    #[cfg(feature = "dev-snes-ppu")]
+    out.push(ppu::schema());
     out
 }
