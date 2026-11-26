@@ -821,7 +821,7 @@ impl UsbfsPeripheral {
     /// [`Error::Property`] for an unknown or missing property.
     pub fn new(props: &Props) -> Result<UsbfsPeripheral> {
         let mut r = props.reader();
-        let bus_name = r.require_str("bus")?.to_string();
+        let bus_name = String::from(r.require_str("bus")?);
         let port = r.or_range("port", 0u64, 0..=u64::from(u8::MAX))?;
         r.finish()?;
         let bus = buses::attach(props, &bus_name, (port as u8).saturating_add(1))?;
