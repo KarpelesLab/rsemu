@@ -43,6 +43,16 @@
 //! the U5's all-analogue reset (`MODER` `0xffff_ffff`, with `GPIOA` and
 //! `GPIOB` keeping the debug pins) is the board's `moder-reset` as ever.
 //!
+//! The **`wb`** variant (STM32WB55/WB35, ST **RM0434** §10.5; `GPIO_TypeDef`
+//! in ST CMSIS `stm32wb55xx.h` v1.12.4) is the ten plus `BRR` alone, for
+//! forty-four bytes: RM0434's map stops at `GPIOx_BRR` (§10.5.11–12), so
+//! `HSLVR`/`SECCFGR` read zero there and decode nothing. The ports' reset
+//! values are the board's `moder-reset`/`ospeedr-reset`/`pupdr-reset`, from
+//! RM0434 §10.5.1–4: `MODER` `0xABFF_FFFF` (A), `0xFFFF_FEBF` (B),
+//! `0xFFFF_FFFF` (C, D), `0x0000_03FF` (E), `0x0000_00CF` (H); `OSPEEDR`
+//! `0x0C00_0000` (A), `0x0000_00C0` (B); `PUPDR` `0x6400_0000` (A),
+//! `0x0000_0100` (B); zero elsewhere.
+//!
 //! `BSRR` is the interesting one and the reason the port is usable from an
 //! interrupt handler: a write of `1 << n` sets pin *n*, a write of
 //! `1 << (n + 16)` clears it, and neither is a read-modify-write, so two
@@ -174,6 +184,9 @@ pub const REGISTER_BYTES: u64 = 0x28;
 /// How many bytes the `u5` variant's thirteen registers occupy.
 pub const REGISTER_BYTES_U5: u64 = 0x34;
 
+/// How many bytes the `wb` variant's eleven registers occupy: through `BRR`.
+pub const REGISTER_BYTES_WB: u64 = 0x2c;
+
 /// `SECCFGR`'s reset value on the U5: every pin secure (RM0456, `GPIOx_SECCFGR`).
 const SECCFGR_RESET: u32 = 0xffff;
 
@@ -185,6 +198,8 @@ pub enum Variant {
     F4,
     /// The STM32U5 port: the same ten plus `BRR`, `HSLVR` and `SECCFGR`.
     U5,
+    /// The STM32WB port: the same ten plus `BRR` (RM0434 §10.5).
+    Wb,
 }
 
 impl Variant {
@@ -194,7 +209,13 @@ impl Variant {
         match self {
             Variant::F4 => REGISTER_BYTES,
             Variant::U5 => REGISTER_BYTES_U5,
+            Variant::Wb => REGISTER_BYTES_WB,
         }
+    }
+
+    /// Whether the port has `BRR` at `+0x28`.
+    fn has_brr(self) -> bool {
+        matches!(self, Variant::U5 | Variant::Wb)
     }
 }
 
@@ -597,7 +618,7 @@ impl Registers {
             0x20 => state.afr[0],
             0x24 => state.afr[1],
             // `BRR` is write-only and reads zero, like `BSRR`.
-            0x28 if self.variant == Variant::U5 => 0,
+            0x28 if self.variant.has_brr() => 0,
             0x2c if self.variant == Variant::U5 => state.hslvr,
             0x30 if self.variant == Variant::U5 => state.seccfgr,
             _ => 0,
@@ -628,8 +649,9 @@ impl Registers {
             0x1c => Registers::write_lckr(&mut state, value),
             0x20 => state.afr[0] = Registers::write_afr(&state, state.afr[0], value, 0),
             0x24 => state.afr[1] = Registers::write_afr(&state, state.afr[1], value, 1),
-            // `BRR`: `BSRR`'s reset half on its own (RM0456, `GPIOx_BRR`).
-            0x28 if self.variant == Variant::U5 => state.odr &= !(value & 0xffff),
+            // `BRR`: `BSRR`'s reset half on its own (RM0456, `GPIOx_BRR`;
+            // RM0434 §10.5.11).
+            0x28 if self.variant.has_brr() => state.odr &= !(value & 0xffff),
             0x2c if self.variant == Variant::U5 => {
                 state.hslvr = value & 0xffff;
                 return false;
@@ -744,8 +766,9 @@ impl Gpio {
         let moder = r.or_range("moder-reset", 0u64, 0..=u64::from(u32::MAX))? as u32;
         let ospeedr = r.or_range("ospeedr-reset", 0u64, 0..=u64::from(u32::MAX))? as u32;
         let pupdr = r.or_range("pupdr-reset", 0u64, 0..=u64::from(u32::MAX))? as u32;
-        let variant = match r.or_enum("variant", "f4", &["f4", "u5"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "u5", "wb"])? {
             "u5" => Variant::U5,
+            "wb" => Variant::Wb,
             _ => Variant::F4,
         };
         r.finish()?;
@@ -988,7 +1011,8 @@ pub static CLASS: DeviceClass = DeviceClass {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "register file: f4 (default, to AFRH) or u5 (adds BRR, HSLVR, SECCFGR)",
+            summary: "register file: f4 (default, to AFRH), u5 (adds BRR, HSLVR, SECCFGR) or wb \
+                      (adds BRR)",
         },
     ],
     construct: |props| Ok(Box::new(Gpio::new(props)?)),
@@ -1019,7 +1043,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("moder-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("ospeedr-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
         .prop(PropSchema::new("pupdr-reset", ValueKind::Uint).range(0, u64::from(u32::MAX)))
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "u5"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "u5", "wb"]))
         .region("")
         .region("regs")
         // `p{n}` is the pin; `in{n}` is what drives it from outside when the
@@ -1538,6 +1562,45 @@ mod tests {
         let props = Props::new().with("variant", Value::from("u5"));
         assert_eq!(Gpio::new(&props).unwrap().variant(), Variant::U5);
         assert!(Gpio::new(&Props::new().with("variant", Value::from("l4"))).is_err());
+    }
+
+    #[test]
+    fn a_wb_port_has_brr_and_nothing_after_it() {
+        // GPIOA of a WB55, with RM0434's reset values.
+        let gpio = Gpio::new(
+            &Props::new()
+                .with("variant", Value::from("wb"))
+                .with("moder-reset", Value::from(0xabff_ffffu64))
+                .with("ospeedr-reset", Value::from(0x0c00_0000u64))
+                .with("pupdr-reset", Value::from(0x6400_0000u64)),
+        )
+        .unwrap();
+        assert_eq!(gpio.variant(), Variant::Wb);
+        assert_eq!(gpio.region.len(), REGISTER_BYTES_WB);
+        assert_eq!(peek(&gpio, 0x00), 0xabff_ffff);
+        assert_eq!(peek(&gpio, 0x0c), 0x6400_0000);
+        poke(&gpio, 0x14, 0x00ff);
+        poke(&gpio, 0x28, 0x0003);
+        assert_eq!(peek(&gpio, 0x14), 0x00fc, "BRR clears");
+        assert_eq!(peek(&gpio, 0x28), 0, "write-only");
+        // The snapshot is the f4's shape: BRR has no state.
+        let mut shape = MachineShape::new();
+        shape.add_device("gpio", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("gpio", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(&gpio, &mut chunk).unwrap();
+        }
+        let bytes = w.to_vec().unwrap();
+        let restored = Gpio::with_variant(ResetValues::default(), Variant::Wb);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("gpio", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        for offset in (0..0x28).step_by(4) {
+            assert_eq!(peek(&gpio, offset), peek(&restored, offset), "{offset:#x}");
+        }
     }
 
     #[test]
