@@ -1,0 +1,9 @@
+# Known failures: SingleStepTests/spc700 (Sony SPC700, the SNES audio CPU).
+#
+# This file only ever shrinks; see sst-nes6502.txt for the format. The runner
+# fails the suite if an entry here starts passing.
+#
+#   9e                # whole opcode
+#   9e :: 9E 0042     # one vector, by its upstream name
+#
+# The `# why` note is mandatory.

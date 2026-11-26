@@ -16,6 +16,7 @@
 //! | `riscv` | `cpu-riscv` | RV64GC/RV32 interpreter, privileged modes, Sv39, software IEEE-754 |
 
 //! | `m68k` | `cpu-m68k` | MC68000 interpreter with a modelled prefetch queue, exceptions, disassembler; 68010, 68020 and 68EC020 as models of it |
+//! | `spc700` | `cpu-spc700` | Sony SPC700 (SNES audio CPU) interpreter, every opcode, bus-trace exact against `SingleStepTests/spc700`, disassembler |
 //! | `mips` | `cpu-mips` | MIPS I / R3000A interpreter: branch and load delay slots, CP0, the 64-entry TLB, disassembler |
 //! | `sh4a` | `cpu-sh4a` | Renesas SH-4A interpreter: banked registers, delay slots, exceptions and interrupts, software-IEEE FPU, UTLB/ITLB/PMB MMU, disassembler |
 
@@ -56,6 +57,10 @@ pub mod x86;
 #[cfg(feature = "cpu-sm83")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-sm83")))]
 pub mod sm83;
+
+#[cfg(feature = "cpu-spc700")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cpu-spc700")))]
+pub mod spc700;
 
 #[cfg(feature = "cpu-riscv")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cpu-riscv")))]

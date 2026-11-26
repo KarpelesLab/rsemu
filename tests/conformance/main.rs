@@ -79,6 +79,7 @@ mod machine;
 mod mock;
 mod nestest;
 mod riscv;
+mod spc700;
 mod sst;
 
 use std::fmt::Write as _;
@@ -278,6 +279,15 @@ fn summarise_sst(suite: &str, reports: &[sst::OpcodeReport], ran: &[u8]) {
         );
     }
     assert!(verdict.is_ok(), "\n{}", verdict.describe(&ledger));
+}
+
+// ---------------------------------------------------------------------------
+// SingleStepTests/spc700 — the SNES audio CPU
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sst_spc700() {
+    spc700::run_suite("sst-spc700", &ledger_path("sst-spc700"));
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +773,7 @@ const LEDGERS: &[(&str, bool)] = &[
     ("riscv-arch-test", true),
     ("sst-6502", false),
     ("sst-nes6502", false),
+    ("sst-spc700", false),
 ];
 
 /// The ledgers must parse even when nothing runs.

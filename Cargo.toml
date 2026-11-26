@@ -285,6 +285,7 @@ full = [
     "machine-xhci-pci-mini",
     "machine-hub-mini",
     "cpu-sm83",
+    "cpu-spc700",
     "dev-gb",
     "machine-gameboy",
     "dev-sms",
@@ -2631,6 +2632,16 @@ machine-hub-mini = ["cpu-riscv", "dev-riscv", "dev-usb-ehci", "dev-usb-hub", "de
 # blocking for free. A disassembler is generated from the same table. Adds no
 # dependencies and is `no_std + alloc`.
 cpu-sm83 = []
+
+# The Sony SPC700 core (src/cpu/spc700): the SNES audio processor's CPU, a
+# cycle-accurate interpreter over all 256 opcodes -- MUL/DIV with the documented
+# overflow result, DAA/DAS, TCALL/PCALL, the one-bit instructions, SLEEP/STOP --
+# with every dummy read and internal cycle SingleStepTests/spc700 records. The
+# interpreter is generic over a per-cycle `Bus`, so the S-SMP (dev-snes-apu)
+# embeds it directly; `cpu.spc700` is the standalone device over an address
+# space. A disassembler is generated from the same table. `no_std + alloc`, no
+# dependencies.
+cpu-spc700 = []
 
 # The Game Boy's chips (src/dev/gb): the LCD controller with its four modes,
 # variable mode-3 length, level-driven STAT and VBlank lines and OAM DMA; the

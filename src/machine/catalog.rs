@@ -1234,6 +1234,8 @@ pub fn registry() -> Result<Registry> {
     crate::cpu::mos6502::register(&mut reg)?;
     #[cfg(feature = "cpu-sm83")]
     crate::cpu::sm83::register(&mut reg)?;
+    #[cfg(feature = "cpu-spc700")]
+    crate::cpu::spc700::register(&mut reg)?;
     #[cfg(feature = "dev-gb")]
     crate::dev::gb::register(&mut reg)?;
     #[cfg(any(
@@ -1420,6 +1422,8 @@ pub fn bindings() -> Result<Bindings> {
     crate::cpu::mos6502::bind(&mut b)?;
     #[cfg(feature = "cpu-sm83")]
     crate::cpu::sm83::bind(&mut b)?;
+    #[cfg(feature = "cpu-spc700")]
+    crate::cpu::spc700::bind(&mut b)?;
     #[cfg(feature = "dev-gb")]
     crate::dev::gb::bind(&mut b)?;
     #[cfg(any(
@@ -1591,6 +1595,8 @@ pub fn classes() -> ClassTable {
     table.insert(crate::cpu::mos6502::schema());
     #[cfg(feature = "cpu-sm83")]
     table.insert(crate::cpu::sm83::schema());
+    #[cfg(feature = "cpu-spc700")]
+    table.insert(crate::cpu::spc700::schema());
     #[cfg(feature = "dev-gb")]
     for schema in crate::dev::gb::schemas() {
         table.insert(schema);

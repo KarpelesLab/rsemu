@@ -42,6 +42,15 @@ readonly SST_REPO="https://github.com/SingleStepTests/65x02"
 # it reports the numbers.
 readonly MIPS_R3000_REPO="https://github.com/SingleStepTests/r3000"
 
+# The SPC700 single-step vectors (the SNES audio CPU): 256 files, one per
+# opcode, 1000 vectors each, with the cycle-by-cycle bus trace including the
+# dummy reads and the internal ("wait") cycles. MIT (verified against the
+# upstream LICENSE), so redistributable with attribution -- downloaded anyway,
+# because corpora are never committed. Pinned: the vectors are regenerated now
+# and then, and a ledger keyed per vector means nothing against a moving target.
+readonly SPC700_REPO="https://github.com/SingleStepTests/spc700"
+readonly SPC700_REV="67d15f492b2740964abd4efd1229e0ec9c342228"
+
 readonly NESTEST_ROM_URL="https://www.qmtpro.com/~nes/misc/nestest.nes"
 readonly NESTEST_LOG_URL="https://www.qmtpro.com/~nes/misc/nestest.log"
 # Both artefacts have been frozen for over a decade, so a mismatch means the
@@ -562,6 +571,30 @@ necessary."
 	note "  run it with:"
 	note "      RSEMU_MIPS_TESTS=${dest}/v1 \\"
 	note "          cargo test --release --all-features mips --lib -- --nocapture"
+}
+
+fetch_sst_spc700() {
+	need git
+	local dest="${DEST_ROOT}/sst-spc700"
+	git_at "$SPC700_REPO" "$SPC700_REV" "$dest"
+	local count
+	count=$(find "${dest}/v1" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+	[ "$count" -eq 256 ] || die "expected 256 opcode files in ${dest}/v1, found ${count}"
+	ok "${count} opcode files in ${dest}/v1"
+	[ -f "${dest}/LICENSE" ] || warn "the upstream LICENSE was not checked out"
+
+	write_notice "$dest" "SingleStepTests/spc700
+${SPC700_REPO} @ ${SPC700_REV}
+
+Licence: MIT. Redistributable with attribution -- but this directory is
+git-ignored anyway, because corpora are downloaded and never committed.
+
+Consumed by tests/conformance/spc700.rs (ledger:
+tests/conformance/ledgers/sst-spc700.txt)."
+
+	note ""
+	note "  run it with:"
+	note "      RSEMU_CONFORMANCE=1 cargo test --release --test conformance sst_spc700 -- --nocapture"
 }
 
 fetch_nestest() {
@@ -3190,6 +3223,7 @@ usage: scripts/fetch-testdata.sh [options] [suite ...]
 Suites:
   sst-65x02      SingleStepTests 6502 vectors  (MIT, redistributable)
   mips-r3000     SingleStepTests R3000 vectors (MIT, redistributable)
+  sst-spc700     SingleStepTests SPC700 vectors (MIT, redistributable)
   nestest        nestest.nes + nestest.log     (licence unclear, FETCH-ONLY)
   accuracycoin   AccuracyCoin.nes + README     (MIT, (c) 2025 Chris Siebert)
   gameboy        blargg GB + mooneye acceptance (mixed; see the notices)
@@ -3311,7 +3345,7 @@ list_present() {
 		return 0
 	fi
 	local suite
-	for suite in sst-65x02 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
+	for suite in sst-65x02 sst-spc700 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
 		sms-zexall apple1 riscv riscv-arch-test a64-tests arm64 freedos x86 stm32u5-hal stm32wb-ble; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
@@ -3330,7 +3364,7 @@ SUITES=()
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--all) SUITES=(sst-65x02 mips-r3000 nestest accuracycoin gameboy sms opensbi freedos) ;;
+		--all) SUITES=(sst-65x02 sst-spc700 mips-r3000 nestest accuracycoin gameboy sms opensbi freedos) ;;
 		--force) FORCE=1 ;;
 		--variant) SST_VARIANT="${2:?--variant needs a value}"; shift ;;
 		--opcodes) SST_OPCODES="${2:?--opcodes needs a value}"; shift ;;
@@ -3343,7 +3377,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 mips-r3000 nestest accuracycoin gameboy sms opensbi freedos)
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(sst-65x02 sst-spc700 mips-r3000 nestest accuracycoin gameboy sms opensbi freedos)
 
 mkdir -p "$DEST_ROOT"
 # Belt and braces: even if the repository .gitignore is edited, nothing under
@@ -3358,6 +3392,7 @@ for suite in "${SUITES[@]}"; do
 	case "$suite" in
 		sst-65x02|sst) fetch_sst ;;
 		mips-r3000|mips) fetch_mips_r3000 ;;
+		sst-spc700|spc700) fetch_sst_spc700 ;;
 		nestest) fetch_nestest ;;
 		accuracycoin|coin) fetch_accuracycoin ;;
 		gameboy|gb) fetch_gameboy ;;
