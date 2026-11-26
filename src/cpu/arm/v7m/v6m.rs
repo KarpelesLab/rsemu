@@ -106,15 +106,13 @@ pub const CPUID_CORTEX_M0: u32 = 0x410c_c200;
 /// (Cortex-M0+ TRM, Table 4-2).
 pub const CPUID_CORTEX_M0PLUS: u32 = 0x410c_c601;
 
-/// The fields of an SC000's `CPUID` that can be stated: implementer `0x41`
-/// and architecture `0xC`, which DDI 0419E B3.2.3 fixes for every ARMv6-M
-/// part.
+/// `CPUID` for an SC000 r0p0: implementer `0x41`, variant 0, architecture
+/// `0xC` (ARMv6-M), part number `0xC30`, revision 0.
 ///
-/// **The part number, variant and revision are zero because they are not
-/// published** — the SC000 TRM is under NDA — not because they are zero. A
-/// board modelling real SC000 silicon sets the value it reads with the
-/// `cpuid` property.
-pub const CPUID_SC000: u32 = 0x410c_0000;
+/// The SC000 TRM is under NDA, so this is not from a document: it is the
+/// value the project owner read from `0xE000ED00` on SC000 silicon. Another
+/// revision sets its own with the `cpuid` property.
+pub const CPUID_SC000: u32 = 0x410c_c300;
 
 // The registers the v6-M map treats differently from the v7-M one, by the
 // names DDI 0419E gives them.

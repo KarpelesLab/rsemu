@@ -189,9 +189,8 @@ fn the_presets_carry_the_trm_values() {
     let sc = Config::SC000;
     assert!(sc.is_v6m());
     assert_eq!(sc.cpuid, CPUID_SC000);
-    // Implementer ARM, architecture ARMv6-M: the two fields DDI 0419E fixes.
-    assert_eq!(sc.cpuid >> 24, 0x41);
-    assert_eq!((sc.cpuid >> 16) & 0xf, 0xc);
+    // r0p0, part number 0xC30: read from SC000 silicon.
+    assert_eq!(sc.cpuid, 0x410c_c300);
     assert_eq!(sc.vtor_mask, 0xffff_ff80);
     // A PMSAv6 core: the MPU, and the extension PMSAv6 cannot be without.
     assert!(sc.ext.unpriv && sc.ext.mpu);
@@ -926,10 +925,14 @@ fn an_mpu_violation_is_a_hardfault() {
 #[test]
 fn the_sc000_is_a_pmsav6_core_with_a_vtor() {
     let h = Harness::sc000(&[PARK]);
+    // What SC000 silicon reads (the TRM is not public): CPUID r0p0 with
+    // part number 0xC30, and CCR with STKALIGN and UNALIGN_TRP.
+    assert_eq!(h.ppb_read(0xe000_ed00), 0x410c_c300);
+    assert_eq!(h.ppb_read(0xe000_ed14), 0x0000_0208);
     // VTOR at 0xE000ED08, bits [31:7].
     h.ppb_write(0xe000_ed08, 0xffff_ffff);
     assert_eq!(h.ppb_read(0xe000_ed08), 0xffff_ff80);
-    // MPU_TYPE: eight unified regions (DDI 0419E B3.5.5).
+    // MPU_TYPE: eight unified regions (DDI 0419E B3.5.5), 0x800 on silicon.
     assert_eq!(h.ppb_read(0xe000_ed90), 8 << 8);
 
     // An unprivileged load from a privileged-only region is refused by the

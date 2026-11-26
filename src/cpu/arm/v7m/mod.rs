@@ -649,10 +649,10 @@ impl Config {
     /// available. The PMSAv6 MPU and `VTOR` are the project owner's
     /// statement of the part; the `VTOR` width is CMSIS `core_sc000.h`'s
     /// (Apache-2.0). A board whose silicon left the MPU out says
-    /// `mpu = false`. The `CPUID` part number is not published at all;
-    /// [`CPUID_SC000`] carries only the two fields DDI 0419E fixes, and a
-    /// board that knows its silicon's value sets [`Config::cpuid`] (or the
-    /// `cpuid` property).
+    /// `mpu = false`. [`CPUID_SC000`] (r0p0, part number `0xC30`),
+    /// `MPU_TYPE` (eight regions) and `CCR` (`0x208`) are as the project
+    /// owner read them from SC000 silicon; another revision sets
+    /// [`Config::cpuid`] (or the `cpuid` property).
     #[cfg(feature = "cpu-arm-v6m")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v6m")))]
     pub const SC000: Config = Config {

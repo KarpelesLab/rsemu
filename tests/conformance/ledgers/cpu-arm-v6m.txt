@@ -51,18 +51,22 @@
 #     M-profile interpreter: a BKPT HardFault stacked the next instruction
 #     instead of the BKPT, and an interworking branch to an even address
 #     faulted on the branch instead of on the next instruction with T clear.
+#
+# 2026-11-26: SC000 silicon readings from the project owner.
+#
+#   * sc000.trm narrowed: CPUID is now the real 0x410CC300 (part number
+#     0xC30, r0p0) rather than zeroed fields; MPU_TYPE 0x800 and CCR 0x208
+#     already matched and are now asserted.
 # ---------------------------------------------------------------------------
 
 sc000.trm                   # The SC000 Technical Reference Manual (DDI 0456)
-                            # is not public. Its CPUID part number, variant
-                            # and revision read as zero (implementer and
-                            # architecture are real); its anti-tampering
-                            # features and the IMPLEMENTATION DEFINED SFCR at
-                            # 0xE000EF90 that CMSIS names read as zero. The
-                            # preset is a PMSAv6 core -- the MPU, unprivileged
-                            # Thread mode, VTOR [31:7] at 0xE000ED08 -- per
-                            # the project owner. A board sets the real CPUID
-                            # with the `cpuid` property.
+                            # is not public. Its anti-tampering features and
+                            # the IMPLEMENTATION DEFINED SFCR at 0xE000EF90
+                            # that CMSIS names read as zero. The preset is a
+                            # PMSAv6 core -- the MPU, unprivileged Thread
+                            # mode, VTOR [31:7] at 0xE000ED08 -- per the
+                            # project owner, and its CPUID (0x410CC300, r0p0),
+                            # MPU_TYPE and CCR are as read from silicon.
 
 systick.optional            # SysTick is an implementation option on every
                             # v6-M part (DDI 0419E B3.3.2; both TRMs' Table
