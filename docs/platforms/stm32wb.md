@@ -82,7 +82,7 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 | EXTI | `st.exti`, `variant = "wb"` | 49 lines, a mask bank per CPU; direct lines have no EXTI interrupt |
 | SYSCFG | `st.syscfg`, `variant = "wb"` | the boot alias, `EXTICR` with port H at 7, the keyed SRAM2 erase |
 | GPIO A–E, H (WB35: no D) | `st.gpio`, `variant = "wb"` | the F4 register file plus `BRR`; RM0434 §10.5's reset values |
-| USART1, LPUART1 | `st.usart`, `variant = "u5"` | FIFO and `PRESC` are present on a WB |
+| USART1, LPUART1 | `st.usart`, `variant = "u5"` | FIFO and `PRESC` are present on a WB; `dma-rx`/`dma-tx` reach DMAMUX1 as requests 14–17, and a byte or half-word access (a DMA channel with `PSIZE` = byte) is widened by the AHB/APB bridge rule rather than faulted |
 | TIM1, TIM2 (32-bit), TIM16, TIM17 | `st.tim` | TIM16/17 share TIM1's vectors 25/26 |
 | DMA1, DMA2, DMAMUX1 | `st.dma` `channel`, `st.dmamux` | fourteen DMAMUX channels, 64 request IDs |
 | RTC, IWDG, WWDG, CRC, RNG, DBGMCU | `st.rtc`, `st.iwdg`, `st.wwdg`, `st.crc`, `st.rng`, `st.dbgmcu` | `DEV_ID = 0x495` |
@@ -92,8 +92,9 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 
 - `tests/stm32wb_board.rs` — always runs: the host plays CPU1's half of the
   mailbox over the board's bus — `C2BOOT`, READY on channel 2,
-  `SHCI_C2_BLE_Init`, `HCI_Reset` — plus the IPCC clock gate, the secure flash,
-  and the WB35's smaller map.
+  `SHCI_C2_BLE_Init`, `HCI_Reset` — plus USART1 receiving into a circular
+  DMA ring through DMAMUX1, the IPCC clock gate, the secure flash, and the
+  WB35's smaller map.
 - `tests/stm32wb_ble.rs` — **ST's own HAL** plus a mailbox client of ours,
   built by `scripts/fetch-testdata.sh stm32wb-ble` from pinned commits with
   `arm-none-eabi-gcc` and the app in `tests/fixtures/stm32wb-ble/`. It runs
@@ -115,6 +116,9 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 - **ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD** have
   no class in the tree; **SPI1/2, I2C1/3 and the USB device** have classes
   but are not placed yet. An access to any of these addresses is a BusFault.
+- **DMA requests from anything but the U(S)ARTs.** DMAMUX1's request
+  inputs 14–17 are wired; the timers, SPI, I2C, SAI, ADC, QUADSPI and AES
+  requests are not, so a channel pointed at one of them never moves.
 - **CPU2's view of the shared peripherals**: its own interrupt vectors,
   `SYSCFG_C2IMRx` and `DBGMCU`'s CPU2 freeze bits are storage.
 - **The secure SRAM2 pages** (`SRRVR.SBRSA`/`SNBRSA`) are not enforced, and

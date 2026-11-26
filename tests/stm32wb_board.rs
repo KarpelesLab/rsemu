@@ -14,6 +14,8 @@
 //! * `SHCI_C2_BLE_Init` on channel 2 and `HCI_Reset` on channel 1 are answered
 //!   in the formats AN5185 §6.3 and the Core Specification give;
 //! * IPCC is gated by RCC: without `AHB3ENR.IPCCEN` it answers nothing;
+//! * USART1's receive request reaches DMA1 through DMAMUX1 (request 14), so
+//!   the circular-buffer reception every Cube UART driver uses fills its ring;
 //! * the CPU2-only top of flash is closed to CPU1, and the WB35 is the smaller
 //!   part.
 //!
@@ -22,9 +24,12 @@
 
 #![cfg(all(feature = "machine-stm32wb55", feature = "machine-stm32wb35"))]
 
+use std::sync::Arc;
+
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::space::MemAttrs;
 use rsemu::core::value::Width;
+use rsemu::host::chardev::{CharPort, ports};
 use rsemu::machine::{Machine, catalog};
 
 const RCC_AHB3ENR: u64 = 0x5800_0050;
@@ -58,12 +63,19 @@ const POOL_SIZE: u64 = 8 * 268;
 const IDLE: [u8; 10] = [0x00, 0x80, 0x00, 0x20, 0x09, 0x00, 0x00, 0x08, 0xfe, 0xe7];
 
 fn boot(board: &str) -> Machine {
+    boot_with_console(board).0
+}
+
+/// The board and the far end of USART1, the console.
+fn boot_with_console(board: &str) -> (Machine, Arc<CharPort>) {
     let entry = catalog::machine(board).expect("this build ships the board");
     let mut options = catalog::build_options().expect("the catalog agrees with itself");
     options.realize.media.insert("firmware", IDLE.to_vec());
     let registry = catalog::registry().expect("a registry");
-    rsemu::machine::build(entry.name, entry.source, &registry, &options)
-        .unwrap_or_else(|e| panic!("{board} does not realize: {e}"))
+    let m = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+        .unwrap_or_else(|e| panic!("{board} does not realize: {e}"));
+    let port = ports::open(&options.realize.hosts, "console").expect("USART1 opened it");
+    (m, port)
 }
 
 fn rd(m: &Machine, addr: u64) -> u64 {
@@ -248,4 +260,47 @@ fn the_secure_flash_is_cpu2s_and_the_parts_differ() {
         try_rd(&m, 0x2000_8000).is_none(),
         "the WB35's SRAM1 ends at 32 KiB"
     );
+}
+
+#[test]
+fn usart1_receives_into_a_circular_dma_ring_through_dmamux() {
+    const AHB1ENR: u64 = 0x5800_0048;
+    const APB2ENR: u64 = 0x5800_0060;
+    const DMAMUX_C0CR: u64 = 0x4002_0800;
+    const DMA1: u64 = 0x4002_0000;
+    const CCR1: u64 = DMA1 + 0x08;
+    const CNDTR1: u64 = DMA1 + 0x0C;
+    const CPAR1: u64 = DMA1 + 0x10;
+    const CMAR1: u64 = DMA1 + 0x14;
+    const USART1: u64 = 0x4001_3800;
+    const RING: u64 = 0x2000_1000;
+
+    for board in ["stm32wb55", "stm32wb35"] {
+        let (mut m, port) = boot_with_console(board);
+        // DMA1EN, DMAMUX1EN; USART1EN.
+        wr(&m, AHB1ENR, rd(&m, AHB1ENR) | 1 | 1 << 2);
+        wr(&m, APB2ENR, rd(&m, APB2ENR) | 1 << 14);
+        // DMAMUX channel 0 (DMA1 channel 1) takes DMAREQ_ID 14, USART1_RX.
+        wr(&m, DMAMUX_C0CR, 14);
+        // Peripheral-to-memory, bytes, MINC, CIRC, 8 entries, from RDR.
+        wr(&m, CPAR1, USART1 + 0x24);
+        wr(&m, CMAR1, RING);
+        wr(&m, CNDTR1, 8);
+        wr(&m, CCR1, 1 << 7 | 1 << 5 | 1);
+        // USART1: CR3.DMAR, then UE | RE | TE.
+        wr(&m, USART1 + 0x08, 1 << 6);
+        wr(&m, USART1, 1 | 1 << 2 | 1 << 3);
+
+        port.feed(b"hello");
+        run_ms(&mut m, 20);
+        assert_eq!(rd8(&m, RING, 5), b"hello", "{board}");
+        assert_eq!(rd(&m, CNDTR1), 3, "{board}: five of eight taken");
+
+        // Five more wrap the ring: CIRC reloads CNDTR at zero.
+        port.feed(b"abcde");
+        run_ms(&mut m, 20);
+        // h e l l o a b c, then d e over the first two.
+        assert_eq!(rd8(&m, RING, 8), b"delloabc", "{board}");
+        assert_eq!(rd(&m, CNDTR1), 6, "{board}: ten bytes into a ring of eight");
+    }
 }

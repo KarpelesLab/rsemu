@@ -304,6 +304,13 @@ machine "stm32wb35" {
   for n in 0..7 { wire dmamux.ch${n} -> dma1.req${n + 1} }
   for n in 0..7 { wire dmamux.ch${n + 7} -> dma2.req${n + 1} }
 
+  # Peripheral requests into DMAMUX1, numbered as DMAREQ_ID numbers them
+  # (RM0434 Table 64). Only the U(S)ARTs drive one so far.
+  wire usart1.dma-rx  -> dmamux.req14   # USART1_RX
+  wire usart1.dma-tx  -> dmamux.req15   # USART1_TX
+  wire lpuart1.dma-rx -> dmamux.req16   # LPUART1_RX
+  wire lpuart1.dma-tx -> dmamux.req17   # LPUART1_TX
+
   # ---------------------------------------------------------------------
   # Clock enables and resets, RCC -> peripheral. Bit numbers are the
   # header's RCC_xxxENR_yyyEN_Pos. CPU2's own enable (C2xxxENR) is ORed
