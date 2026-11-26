@@ -211,6 +211,7 @@ would answer that the machine file does not.
 | [`devices/dma.md`](devices/dma.md) | DMA controllers as bus masters, and the peripheral-request seam |
 | [`devices/stm32-clock-power.md`](devices/stm32-clock-power.md) | STM32 RCC and PWR: the ready bits, the clock tree, the peripheral gates, `DBP` |
 | [`devices/stm32wb-cpu2.md`](devices/stm32wb-cpu2.md) | STM32WB CPU2 behaviourally: the SRAM2 mailbox, FUS and the system channel, a BLE stack answering every AN5270 command with no radio; which layouts are documented, which inferred |
+| [`devices/snes-dsp.md`](devices/snes-dsp.md) | The SNES S-DSP: BRR, Gaussian interpolation, envelopes on the shared rate counter, noise, echo and FIR, on fullsnes's 32-slot timeline; the interpretations made where the documents leave a choice |
 | [`devices/sgx-usse-encoding.md`](devices/sgx-usse-encoding.md) | SGX543 USSE and PDS instruction encodings, measured black-box from the navi's own `useasm` encoder; the method, every field with its grade, and the open questions |
 
 ### System software interfaces

@@ -276,6 +276,7 @@ full = [
     "machine-stm32wb55",
     "machine-stm32wb35",
     "dev-snes-cart",
+    "dev-snes-dsp",
     "cpu-z80",
     "machine-z80-mini",
     "machine-usb-mini",
@@ -2645,6 +2646,16 @@ dev-gb = []
 # since images carry no flag saying which header is real) or by `map`. Written
 # from nocash fullsnes and the SNESdev wiki. `no_std + alloc`, no dependencies.
 dev-snes-cart = []
+
+# The SNES S-DSP (src/dev/snes/dsp.rs): the sound generator in the audio unit.
+# Eight voices of BRR sample decoding with the four filters and the hardware's
+# 15-bit wraparound, the 512-entry Gaussian interpolator with its overflow,
+# pitch modulation, the noise LFSR, ADSR and GAIN envelopes on the shared rate
+# counter, the KON/KOFF poll and its five-sample delay, and the echo unit: a
+# ring buffer in audio RAM, the 8-tap FIR, feedback and the write-disable flag.
+# Scheduled on fullsnes's 32-slot per-sample timeline; integer arithmetic only.
+# Exposes the `SDsp` seam the S-SMP drives. `no_std + alloc`, no dependencies.
+dev-snes-dsp = []
 
 # The Game Boy as a machine (machines/gameboy.machine plus the classes it
 # names). `rsemu run gameboy --cart tetris.gb`. Phase 4's genericity proof:
