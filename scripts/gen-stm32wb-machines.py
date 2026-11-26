@@ -108,9 +108,8 @@ def header(name, p):
 # What is not here
 # ---------------------------------------------------------------------------
 #
-# ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC, LCD and the
-# USB device. The first eleven have no class in the tree; the USB device has
-# one but is not placed yet. An access to any of their addresses is a
+# ADC1, AES1, AES2, PKA, QUADSPI, SAI1, LPTIM1/2, CRS, COMP, TSC and LCD:
+# none has a class in the tree, and an access to any of their addresses is a
 # BusFault. I2C1, I2C3 and the SPIs are placed with nothing on their buses;
 # the SPIs drive no DMA request.
 """
@@ -262,6 +261,12 @@ def body(name, p):
     if not p["wb35"]:
         w("  object spi2 \"stm32.spi\" { clock = pclk1, variant = \"f7\", link = \"wired\" }")
     w("")
+    w("  # The USB full-speed device (RM0434 §40): the F0x2-style block with a")
+    w("  # linear 1 KiB packet memory. It plugs into the named USB bus `usb`; a")
+    w("  # host — a test harness, or anything that opens that bus — enumerates")
+    w("  # the guest's device stack through it. Nothing else is on the bus.")
+    w("  object usb \"st.usbfs\" { bus = \"usb\" }")
+    w("")
     w("  # DMA1/DMA2, seven channels each, routed by DMAMUX1's fourteen channels")
     w("  # (RM0434 §13–14).")
     w("  object dma1   \"st.dma\"    { clock = hclk, space = mem, variant = \"channel\" }")
@@ -288,6 +293,8 @@ def body(name, p):
     w("  map mem apb1-base + 0x8000 size 0x34  = lpuart1")
     if not p["wb35"]:
         w("  map mem apb1-base + 0x3800 size 0x400 = spi2")
+    w("  map mem apb1-base + 0x6800 size 0x60  = usb.regs")
+    w("  map mem apb1-base + 0x6c00 size 0x400 = usb.pma")
     w("  map mem apb1-base + 0x5400 size 0x2c  = i2c1")
     w("  map mem apb1-base + 0x5c00 size 0x2c  = i2c3")
     w("  map mem apb2-base + 0x3000 size 0x400 = spi1")
@@ -338,6 +345,7 @@ def body(name, p):
         ("i2c3.ev", 32, "I2C3_EV"),
         ("i2c3.er", 33, "I2C3_ER"),
         ("spi1.irq", 34, "SPI1"),
+        ("usb.irq", 20, "USB_LP (the block has one request line)"),
         ("usart1.irq", 36, "USART1"),
         ("lpuart1.irq", 37, "LPUART1"),
     ]
@@ -415,6 +423,7 @@ def body(name, p):
         ("apb1", 11, "wwdg", False),
         ("apb1", 21, "i2c1", True),
         ("apb1", 23, "i2c3", True),
+        ("apb1", 26, "usb", True),
         ("apb2", 12, "spi1", True),
     ]
     if not p["wb35"]:

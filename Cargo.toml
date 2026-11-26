@@ -2558,6 +2558,11 @@ machine-stm32wb55 = [
     "dev-stm32-ipcc",
     "dev-stm32-hsem",
     "dev-stm32-wb-cpu2",
+    # I2C1/I2C3, SPI1/SPI2 and the USB device, placed with nothing on their
+    # buses.
+    "dev-stm32-i2c-v2",
+    "dev-stm32-spi",
+    "dev-stm32-usbfs",
 ]
 
 # The STM32WB35 board (machines/stm32wb35.machine): an STM32WB35CE -- the WB55

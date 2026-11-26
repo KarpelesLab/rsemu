@@ -351,3 +351,35 @@ fn i2c_and_spi_are_placed_gated_and_take_an_init() {
         );
     }
 }
+
+#[test]
+fn the_usb_device_comes_onto_the_named_bus_and_hears_a_reset() {
+    use rsemu::bus::usb::buses;
+    const APB1ENR1: u64 = 0x5800_0058;
+    const USB: u64 = 0x4000_6800;
+    const CNTR: u64 = USB + 0x40;
+    const ISTR: u64 = USB + 0x44;
+    const BCDR: u64 = USB + 0x58;
+    for board in ["stm32wb55", "stm32wb35"] {
+        let entry = catalog::machine(board).expect("this build ships the board");
+        let mut options = catalog::build_options().expect("the catalog agrees with itself");
+        options.realize.media.insert("firmware", IDLE.to_vec());
+        let registry = catalog::registry().expect("a registry");
+        let m = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+            .unwrap_or_else(|e| panic!("{board} does not realize: {e}"));
+        let bus = buses::get(&options.realize.hosts, "usb")
+            .expect("the host table")
+            .expect("the board opened the `usb` bus");
+        assert!(!bus.connected(0), "{board}: no pull-up out of reset");
+        // HAL_PCD_Init / USB_DevConnect: the clock, power up, leave reset,
+        // unmask RESET, then the D+ pull-up.
+        wr(&m, APB1ENR1, rd(&m, APB1ENR1) | 1 << 26);
+        wr(&m, CNTR, 1); // FRES only: powered
+        wr(&m, CNTR, 1 << 10); // RESETM, out of reset
+        wr(&m, BCDR, 1 << 15); // DPPU
+        assert!(bus.connected(0), "{board}: the device is on the bus");
+        // The host resets the port: the guest's driver sees RESET.
+        bus.reset_port(0);
+        assert_ne!(rd(&m, ISTR) & 1 << 10, 0, "{board}: ISTR.RESET");
+    }
+}
