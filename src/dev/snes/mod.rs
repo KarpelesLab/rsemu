@@ -7,6 +7,8 @@
 //! | [`dsp`] | — | the S-DSP: eight BRR voices, envelopes, noise, echo and FIR (`dev-snes-dsp`) |
 //! | [`apu`] | `snes.apu` | the S-SMP: SPC700, audio RAM, timers, the CPU ports, the boot ROM (`dev-snes-apu`) |
 //! | [`dsp_seam`] | — | what the S-SMP needs of the S-DSP, and the S-DSP of audio RAM |
+//! | [`scpu`] | `snes.scpu` | the 5A22's peripherals: NMI/IRQ timers, DMA/HDMA, multiply/divide, joypads, bus speed (`dev-snes-scpu`) |
+//! | [`input`] | — | the pad seam: what the host holds on the two controllers (`dev-snes-scpu`) |
 //! | [`ppu`] | `snes.ppu` | the S-PPU (5C77 + 5C78): registers, VRAM/CGRAM/OAM, modes 0-7, sprites, windows, colour math, beam timing |
 
 #[cfg(feature = "dev-snes-cart")]
@@ -28,9 +30,17 @@ pub mod dsp;
 #[cfg(feature = "dev-snes-apu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-apu")))]
 pub mod apu;
+
+#[cfg(feature = "dev-snes-scpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-scpu")))]
+pub mod input;
+
 #[cfg(feature = "dev-snes-ppu")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-ppu")))]
 pub mod ppu;
+#[cfg(feature = "dev-snes-scpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dev-snes-scpu")))]
+pub mod scpu;
 
 use alloc::vec::Vec;
 
@@ -59,6 +69,8 @@ pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     ppu::register(registry)?;
     #[cfg(feature = "dev-snes-apu")]
     apu::register(registry)?;
+    #[cfg(feature = "dev-snes-scpu")]
+    scpu::register(registry)?;
     Ok(())
 }
 
@@ -85,6 +97,8 @@ pub fn bind(bindings: &mut crate::machine::Bindings) -> Result<()> {
     ppu::bind(bindings)?;
     #[cfg(feature = "dev-snes-apu")]
     apu::bind(bindings)?;
+    #[cfg(feature = "dev-snes-scpu")]
+    scpu::bind(bindings)?;
     Ok(())
 }
 
@@ -99,5 +113,7 @@ pub fn schemas() -> Vec<crate::machine::validate::ClassSchema> {
     out.push(ppu::schema());
     #[cfg(feature = "dev-snes-apu")]
     out.push(apu::schema());
+    #[cfg(feature = "dev-snes-scpu")]
+    out.push(scpu::schema());
     out
 }

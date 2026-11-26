@@ -277,6 +277,8 @@ full = [
     "machine-stm32wb55",
     "machine-stm32wb35",
     "dev-snes-cart",
+    "dev-snes-scpu",
+    "machine-snes",
     "dev-snes-dsp",
     "dev-snes-ppu",
     "dev-snes-apu",
@@ -655,6 +657,13 @@ dev-nes-ppu = []
 # picture-less console. The feature sweep only `cargo check`s, so a build that
 # compiled and then failed the moment anyone ran it went unnoticed.
 machine-nes = ["cpu-mos6502", "dev-nes-cart", "dev-nes-io", "dev-nes-ppu"]
+
+# The Super Nintendo as a machine (machines/snes-ntsc.machine and
+# machines/snes-pal.machine plus the classes they name): the 5A22 -- a 65C816
+# with its on-chip peripherals -- the S-PPU, the audio unit (SPC700 + S-DSP),
+# WRAM and a LoROM/HiROM/ExHiROM cartridge. `rsemu run snes-ntsc --media
+# cart=game.sfc`. docs/platforms/snes.md has the account. Adds no dependencies.
+machine-snes = ["dev-snes-scpu", "dev-snes-cart", "dev-snes-apu"]
 
 # The Apple 1's chips (src/dev/apple1): the MC6821 PIA as that board wires it —
 # keyboard on port A, a 40x24 character terminal on port B — the 256-byte
@@ -2698,6 +2707,16 @@ dev-snes-ppu = []
 # through `dsp_seam::SDsp`, constructing dev-snes-dsp's chip, and publishes
 # 32 kHz stereo to `host::audio::snes`. `no_std + alloc`, no dependencies.
 dev-snes-apu = ["cpu-spc700", "dev-snes-dsp"]
+
+# The SNES S-CPU's on-chip peripherals (src/dev/snes/scpu.rs, class
+# `snes.scpu`): the 5A22's registers at $4200-$421F and $4016/$4017 -- NMI and
+# the H/V timer IRQ, the multiplier and divider, the automatic and manual
+# joypad reads -- the eight DMA/HDMA channels at $4300-$437F, DRAM refresh,
+# and the 6/8/12-clock bus speed with FastROM, published to the 65C816 as its
+# access-timing provider and `/RDY` gate. Times its events by the S-PPU's
+# beam. Plus the SNES pad seam (src/dev/snes/input.rs). Written from nocash
+# fullsnes and the SNESdev wiki. `no_std + alloc`, no dependencies.
+dev-snes-scpu = ["cpu-w65c816", "dev-snes-ppu"]
 
 # The Game Boy as a machine (machines/gameboy.machine plus the classes it
 # names). `rsemu run gameboy --cart tetris.gb`. Phase 4's genericity proof:
