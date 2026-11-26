@@ -395,3 +395,78 @@ fn a_u5_snapshot_round_trips_to_identical_state() {
     assert_eq!(before, after);
     assert_ne!(after[10], 0, "AHB3FZR came across");
 }
+
+// ---------------------------------------------------------------------------
+// The wb variant
+// ---------------------------------------------------------------------------
+
+fn wb() -> Dbgmcu {
+    Dbgmcu::new(&Props::new().with("variant", Value::from("wb"))).unwrap()
+}
+
+#[test]
+fn the_wb_identifies_itself_and_decodes_both_cpus_freeze_words() {
+    let d = wb();
+    assert_eq!(d.variant(), Variant::Wb);
+    assert_eq!(d.idcode(), 0x2001_0495, "a WB55 rev Y / WB35 rev A");
+    assert_eq!(d.region.len(), REGISTER_BYTES_WB);
+    for (offset, mask) in OFFSETS_WB.iter().zip(WRITE_MASK_WB) {
+        poke(&d, *offset, 0xffff_ffff);
+        assert_eq!(peek(&d, *offset), mask, "offset {offset:#x}");
+    }
+    // The F4's APB1_FZ/APB2_FZ offsets are a hole on a WB.
+    for hole in [0x08, 0x0c, 0x10, 0x38] {
+        poke(&d, hole, 0xffff_ffff);
+        assert_eq!(peek(&d, hole), 0, "offset {hole:#x}");
+    }
+}
+
+#[test]
+fn the_wb_freeze_pins_follow_cpu1_s_registers_only() {
+    let d = wb();
+    let iwdg = watch(&d, "iwdg");
+    let tim16 = watch(&d, "tim16");
+    d.set_halted(true);
+    // CPU2's IWDG bit freezes nothing: there is no CPU2 halt to AND it with.
+    poke(&d, 0x40, 1 << 12);
+    assert!(!iwdg.is_high());
+    poke(&d, 0x3c, 1 << 12);
+    poke(&d, 0x4c, 1 << 17);
+    assert!(iwdg.is_high());
+    assert!(tim16.is_high());
+    d.set_halted(false);
+    assert!(!iwdg.is_high(), "only while the core is halted");
+    // TIM3 does not exist on a WB; LPTIM1 does.
+    assert!(Device::connect(&d, "tim3", dummy_source()).is_err());
+    assert!(Device::connect(&d, "lptim1", dummy_source()).is_ok());
+}
+
+#[test]
+fn a_wb_snapshot_round_trips_to_identical_state() {
+    let saved = wb();
+    for (offset, mask) in OFFSETS_WB.iter().zip(WRITE_MASK_WB) {
+        poke(&saved, *offset, mask);
+    }
+    let mut shape = MachineShape::new();
+    shape.add_device("dbgmcu", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("dbgmcu", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let restored = wb();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("dbgmcu", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader()).unwrap();
+    for offset in OFFSETS_WB {
+        assert_eq!(peek(&saved, offset), peek(&restored, offset), "{offset:#x}");
+    }
+    // A warm reset keeps them; a cold one does not (RM0434 §41.8).
+    Device::reset(&restored, ResetKind::Warm);
+    assert_eq!(peek(&restored, 0x50), WRITE_MASK_WB[6]);
+    Device::reset(&restored, ResetKind::Cold);
+    assert_eq!(peek(&restored, 0x50), 0);
+}

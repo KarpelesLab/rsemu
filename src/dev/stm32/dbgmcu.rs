@@ -65,6 +65,32 @@
 //! `0xFD0` are not modelled: they serve a debugger's authentication protocol
 //! rather than firmware, and none of them is in the CMSIS struct.
 //!
+//! # The `wb` variant
+//!
+//! The STM32WB55/WB35's block (`variant = "wb"`) is at the F4's
+//! `0xE004_2000` with a freeze register per CPU per bus, per `DBGMCU_TypeDef`
+//! and the `DBGMCU_*_Pos` definitions in ST CMSIS `stm32wb55xx.h` v1.12.4
+//! (Apache-2.0) and RM0434 §41.8:
+//!
+//! | Offset | Register | Freeze pins |
+//! | --- | --- | --- |
+//! | `0x00` | `IDCODE` | — (`DEV_ID` `0x495` on a WB55 *and* a WB35, the `wb` default; `REV_ID` `0x2001` for WB55 rev Y / WB35 rev A, `0x2003` for rev X) |
+//! | `0x04` | `CR` | — (`DBG_SLEEP` 0, `DBG_STOP` 1, `DBG_STANDBY` 2, `TRACE_IOEN` 5, `TRGOEN` 28) |
+//! | `0x3C` | `APB1FZR1` | `tim2` 0, `rtc` 10, `wwdg` 11, `iwdg` 12, `i2c1` 21, `i2c3` 23, `lptim1` 31 |
+//! | `0x40` | `C2APB1FZR1` | CPU2's: the same bits but `wwdg` — stored only |
+//! | `0x44` | `APB1FZR2` | `lptim2` 5 |
+//! | `0x48` | `C2APB1FZR2` | CPU2's `lptim2` — stored only |
+//! | `0x4C` | `APB2FZR` | `tim1` 11, `tim16` 17, `tim17` 18 |
+//! | `0x50` | `C2APB2FZR` | CPU2's — stored only |
+//!
+//! Only CPU1's bits drive pins: the level is "the bit and *the core* is
+//! halted", and the one halt this machine reports ([`Device::debug_halt`]) is
+//! the debugger's on CPU1. CPU2's registers read back what was written and
+//! freeze nothing until there is a CPU2 halt to AND them with. (ST's SVD
+//! misplaces `C2APB2FZR` at `0x48`; the CMSIS header and RM0434 Table 279 put
+//! it at `0x50`.) As on the F4, "the DBGMCU registers are not reset by a
+//! system reset, only by a power on reset" (RM0434 §41.8).
+//!
 //! # The freeze pins
 //!
 //! A stored bit that nothing consults is the defect this block exists to fix,
@@ -140,6 +166,32 @@ pub const REGISTER_BYTES: u64 = 0x10;
 /// How many bytes the `u5` registers occupy: `IDCODE` through `AHB3FZR`.
 pub const REGISTER_BYTES_U5: u64 = 0x2c;
 
+/// How many bytes the `wb` registers occupy: `IDCODE` through `C2APB2FZR`.
+pub const REGISTER_BYTES_WB: u64 = 0x54;
+
+/// Where each of the WB's writable words is: `CR`, `APB1FZR1`, `C2APB1FZR1`,
+/// `APB1FZR2`, `C2APB1FZR2`, `APB2FZR`, `C2APB2FZR`.
+const OFFSETS_WB: [u64; MAX_WORDS] = [0x04, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50];
+
+/// The WB's writable bits, word by word — the `_Msk` lines of ST CMSIS
+/// `stm32wb55xx.h` for each register ORed together (identical in
+/// `stm32wb35xx.h`).
+const WRITE_MASK_WB: [u32; MAX_WORDS] = [
+    0x1000_0027,
+    0x80a0_1c01,
+    0x80a0_1401,
+    0x0000_0020,
+    0x0000_0020,
+    0x0006_0800,
+    0x0006_0800,
+];
+
+/// `DEV_ID` of a WB55 or WB35 (RM0434 §41.8.1).
+const WB_DEV_ID: u64 = 0x495;
+
+/// `REV_ID` of a WB55 rev Y or WB35 rev A (RM0434 §41.8.1).
+const WB_REV_ID: u64 = 0x2001;
+
 /// Where an STM32U5 puts the block (ST CMSIS `stm32u585xx.h`, `DBGMCU_BASE`).
 pub const BASE_U5: u64 = 0xe004_4000;
 
@@ -199,6 +251,8 @@ pub enum Variant {
     F4,
     /// RM0456's STM32U5 block at `0xE004_4000`.
     U5,
+    /// RM0434's STM32WB block at `0xE004_2000`, with CPU2's freeze registers.
+    Wb,
 }
 
 /// One variant's register file, as data.
@@ -230,19 +284,39 @@ static LAYOUT_U5: Layout = Layout {
     bytes: REGISTER_BYTES_U5,
 };
 
+/// The WB's register file.
+static LAYOUT_WB: Layout = Layout {
+    offsets: &OFFSETS_WB,
+    masks: &WRITE_MASK_WB,
+    freeze: FREEZE_WB,
+    bytes: REGISTER_BYTES_WB,
+};
+
 impl Variant {
     fn layout(self) -> &'static Layout {
         match self {
             Variant::F4 => &LAYOUT_F4,
             Variant::U5 => &LAYOUT_U5,
+            Variant::Wb => &LAYOUT_WB,
         }
     }
 
-    /// `DEV_ID` out of the box: `0x413` for an F407, `0x482` for a U575/U585.
+    /// `DEV_ID` out of the box: `0x413` for an F407, `0x482` for a U575/U585,
+    /// `0x495` for a WB55/WB35.
     fn default_dev_id(self) -> u64 {
         match self {
             Variant::F4 => DEFAULT_DEV_ID,
             Variant::U5 => 0x482,
+            Variant::Wb => WB_DEV_ID,
+        }
+    }
+
+    /// `REV_ID` out of the box: revision A (`0x1000`), or on a WB the
+    /// WB55 rev Y / WB35 rev A code, `0x2001`.
+    fn default_rev_id(self) -> u64 {
+        match self {
+            Variant::F4 | Variant::U5 => DEFAULT_REV_ID,
+            Variant::Wb => WB_REV_ID,
         }
     }
 }
@@ -381,6 +455,26 @@ static FREEZE: &[Freeze] = &[
         reg: APB2_FZ,
         bit: 18,
     },
+];
+
+/// Every CPU1 freeze bit ST CMSIS `stm32wb55xx.h` gives the WB. `reg`
+/// indexes [`OFFSETS_WB`]; CPU2's registers (indices 2, 4 and 6)
+/// have no pins — see the module header.
+static FREEZE_WB: &[Freeze] = &[
+    // APB1FZR1.
+    fz("tim2", 1, 0),
+    fz("rtc", 1, 10),
+    fz("wwdg", 1, 11),
+    fz("iwdg", 1, 12),
+    fz("i2c1", 1, 21),
+    fz("i2c3", 1, 23),
+    fz("lptim1", 1, 31),
+    // APB1FZR2.
+    fz("lptim2", 3, 5),
+    // APB2FZR.
+    fz("tim1", 5, 11),
+    fz("tim16", 5, 17),
+    fz("tim17", 5, 18),
 ];
 
 /// A U5 freeze bit, in one line.
@@ -624,14 +718,15 @@ impl Dbgmcu {
     /// one this class does not know was given.
     pub fn new(props: &Props) -> Result<Dbgmcu> {
         let mut r = props.reader();
-        let variant = match r.or_enum("variant", "f4", &["f4", "u5"])? {
+        let variant = match r.or_enum("variant", "f4", &["f4", "u5", "wb"])? {
             "u5" => Variant::U5,
+            "wb" => Variant::Wb,
             _ => Variant::F4,
         };
         // Twelve bits and sixteen: a value that does not fit is a machine file
         // that has confused `DEV_ID` with the part number.
         let dev_id = r.or_range("dev-id", variant.default_dev_id(), 0..=0xfff)? as u32;
-        let rev_id = r.or_range("rev-id", DEFAULT_REV_ID, 0..=0xffff)? as u32;
+        let rev_id = r.or_range("rev-id", variant.default_rev_id(), 0..=0xffff)? as u32;
         r.finish()?;
         Ok(Dbgmcu::with_variant(dev_id, rev_id, variant))
     }
@@ -803,20 +898,22 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "IDCODE.DEV_ID, twelve bits: 0x413 on an F405/407/415/417 (the f4 default), \
-                      0x482 on a U575/U585 (the u5 default)",
+                      0x482 on a U575/U585 (the u5 default), 0x495 on a WB55/WB35 (the wb \
+                      default)",
         },
         PropertySpec {
             name: "rev-id",
             kind: ValueKind::Uint,
             required: false,
-            summary: "IDCODE.REV_ID, sixteen bits: the silicon revision, 0x1000 for rev A",
+            summary: "IDCODE.REV_ID, sixteen bits: the silicon revision, 0x1000 for rev A (0x2001 \
+                      on a wb: WB55 rev Y, WB35 rev A)",
         },
         PropertySpec {
             name: "variant",
             kind: ValueKind::Str,
             required: false,
-            summary: "register file: f4 (default; RM0090, at 0xE0042000) or u5 (RM0456, at \
-                      0xE0044000)",
+            summary: "register file: f4 (default; RM0090, at 0xE0042000), u5 (RM0456, at \
+                      0xE0044000) or wb (RM0434, at 0xE0042000)",
         },
     ],
     construct: |props| Ok(Box::new(Dbgmcu::new(props)?)),
@@ -846,13 +943,13 @@ pub fn schema() -> ClassSchema {
     let mut schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("dev-id", ValueKind::Uint).range(0, 0xfff))
         .prop(PropSchema::new("rev-id", ValueKind::Uint).range(0, 0xffff))
-        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "u5"]))
+        .prop(PropSchema::new("variant", ValueKind::Str).values(&["f4", "u5", "wb"]))
         .region("")
         .region("regs");
     // Both variants' pins: the schema does not know which one a board names,
     // and `connect` refuses a pin the chosen variant does not have.
     let mut seen: Vec<&str> = Vec::new();
-    for bit in FREEZE.iter().chain(FREEZE_U5) {
+    for bit in FREEZE.iter().chain(FREEZE_U5).chain(FREEZE_WB) {
         if !seen.contains(&bit.pin) {
             seen.push(bit.pin);
             schema = schema.port(bit.pin, PortDir::Out);
