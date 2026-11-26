@@ -31,6 +31,15 @@ readonly DEST_ROOT="${RSEMU_TESTDATA:-${REPO_ROOT}/testdata}"
 
 readonly SST_REPO="https://github.com/SingleStepTests/65x02"
 
+# The WDC 65C816 single-step vectors: 512 files, one per opcode per mode
+# (`NN.e.json` emulation, `NN.n.json` native), 10 000 vectors each (200 for
+# MVN/MVP), with the full bus trace *and* the VDA/VPA/VPB/RWB/E/MX/MLB pin
+# states of every cycle. MIT (verified against the upstream LICENCE, (c)
+# Thomas Harte et al). Pinned, because a ledger keyed to one generation of a
+# corpus means nothing against another. About 2.7 GB.
+readonly SST65816_REPO="https://github.com/SingleStepTests/65816"
+readonly SST65816_REV="307c63f5673c8c6b861c52f71ddb89212a227480"
+
 # The MIPS R3000 single-step vectors: 56 files, one per instruction, 1000
 # vectors each. MIT (verified against the upstream LICENSE, (c) 2025
 # SingleStepTests), so redistributable with attribution -- but downloaded like
@@ -533,6 +542,68 @@ Licence: MIT. Redistributable with attribution — but this directory is
 git-ignored anyway, because the corpus is gigabytes.
 
 Consumed by tests/conformance/sst.rs."
+}
+
+fetch_sst_65816() {
+	need git
+	local dest="${DEST_ROOT}/sst-65816"
+
+	# Subset mode, as for sst-65x02: individual files over HTTP, both modes of
+	# each opcode named. Pairs with RSEMU_SST_OPCODES on the test side.
+	if [ -n "$SST_OPCODES" ]; then
+		need curl
+		local opcode mode target count=0
+		for opcode in $(printf '%s' "$SST_OPCODES" | tr ',' ' '); do
+			for mode in e n; do
+				target="${dest}/v1/${opcode}.${mode}.json"
+				if [ "$FORCE" = 0 ] && [ -s "$target" ]; then
+					continue
+				fi
+				download "${SST65816_REPO/github.com/raw.githubusercontent.com}/${SST65816_REV}/v1/${opcode}.${mode}.json" \
+					"$target"
+				count=$((count + 1))
+			done
+		done
+		download "${SST65816_REPO/github.com/raw.githubusercontent.com}/${SST65816_REV}/LICENCE" \
+			"${dest}/LICENCE"
+		ok "fetched $count opcode file(s) into ${dest}"
+		sst_65816_notice "$dest"
+		return 0
+	fi
+
+	if [ -d "${dest}/.git" ] && [ "$FORCE" = 0 ] && \
+		[ "$(git -C "$dest" rev-parse HEAD 2>/dev/null)" = "$SST65816_REV" ]; then
+		note "  already at ${SST65816_REV}"
+	else
+		if [ -e "$dest" ]; then
+			[ "$FORCE" = 1 ] || [ -d "${dest}/.git" ] || die "${dest} exists but is not a git checkout
+  It was probably created by --opcodes. Re-run with --force to replace it."
+			rm -rf "$dest"
+		fi
+		note "  fetching ${SST65816_REPO} @ ${SST65816_REV} (about 2.7 GB) ..."
+		mkdir -p "$dest"
+		git -C "$dest" init -q
+		git -C "$dest" remote add origin "$SST65816_REPO"
+		git -C "$dest" fetch -q --depth 1 origin "$SST65816_REV"
+		git -C "$dest" -c advice.detachedHead=false checkout -q FETCH_HEAD
+	fi
+
+	local count
+	count=$(find "${dest}/v1" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+	[ "$count" -gt 0 ] || die "no vector files were checked out"
+	ok "${count} opcode files in ${dest}/v1"
+	[ -f "${dest}/LICENCE" ] || warn "the upstream LICENCE was not checked out"
+	sst_65816_notice "$dest"
+}
+
+sst_65816_notice() {
+	write_notice "$1" "SingleStepTests/65816
+${SST65816_REPO} @ ${SST65816_REV}
+
+Licence: MIT, (c) Thomas Harte et al. Redistributable with attribution -- but
+this directory is git-ignored anyway, because the corpus is gigabytes.
+
+Consumed by tests/conformance/sst65816.rs."
 }
 
 fetch_mips_r3000() {
@@ -3222,6 +3293,8 @@ usage: scripts/fetch-testdata.sh [options] [suite ...]
 
 Suites:
   sst-65x02      SingleStepTests 6502 vectors  (MIT, redistributable)
+  sst-65816      SingleStepTests 65C816 vectors (MIT, redistributable; 2.7 GB,
+                 so --all leaves it out)
   mips-r3000     SingleStepTests R3000 vectors (MIT, redistributable)
   sst-spc700     SingleStepTests SPC700 vectors (MIT, redistributable)
   nestest        nestest.nes + nestest.log     (licence unclear, FETCH-ONLY)
@@ -3325,7 +3398,7 @@ Options:
                       from. There is no default and there will not be one;
                       see docs/platforms/apple1.md.
   --variant V         sst-65x02 only: nes6502 (default), 6502, or all
-  --opcodes LIST      sst-65x02 only: fetch just these opcode files,
+  --opcodes LIST      sst-65x02 and sst-65816: fetch just these opcode files,
                       e.g. --opcodes a9,ad,b1. Pairs with RSEMU_SST_OPCODES.
   --list              print what is present and exit
   -h, --help          this text
@@ -3345,7 +3418,7 @@ list_present() {
 		return 0
 	fi
 	local suite
-	for suite in sst-65x02 sst-spc700 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
+	for suite in sst-65x02 sst-65816 sst-spc700 mips-r3000 nestest accuracycoin gb-blargg gb-mooneye \
 		sms-zexall apple1 riscv riscv-arch-test a64-tests arm64 freedos x86 stm32u5-hal stm32wb-ble; do
 		if [ -d "${DEST_ROOT}/${suite}" ]; then
 			printf '  %-14s %s\n' "$suite" \
@@ -3391,6 +3464,7 @@ for suite in "${SUITES[@]}"; do
 	note "== ${suite}"
 	case "$suite" in
 		sst-65x02|sst) fetch_sst ;;
+		sst-65816|65816) fetch_sst_65816 ;;
 		mips-r3000|mips) fetch_mips_r3000 ;;
 		sst-spc700|spc700) fetch_sst_spc700 ;;
 		nestest) fetch_nestest ;;

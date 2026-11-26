@@ -81,6 +81,7 @@ mod nestest;
 mod riscv;
 mod spc700;
 mod sst;
+mod sst65816;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -288,6 +289,142 @@ fn summarise_sst(suite: &str, reports: &[sst::OpcodeReport], ran: &[u8]) {
 #[test]
 fn sst_spc700() {
     spc700::run_suite("sst-spc700", &ledger_path("sst-spc700"));
+}
+
+// ---------------------------------------------------------------------------
+// SingleStepTests/65816
+// ---------------------------------------------------------------------------
+
+/// The WDC 65C816, both modes, bus traces with pin states. Not on the NES
+/// gate; it is the SNES CPU's equivalent of gate one. `sst65816.rs` has the
+/// long form.
+#[test]
+fn sst_65816() {
+    let suite = "sst-65816";
+    let fetch = "scripts/fetch-testdata.sh sst-65816";
+    let dir = gated!(
+        suite,
+        harness::require(sst65816::corpus_dir(&harness::testdata_root()), fetch)
+    );
+    let mut files = match sst65816::files(&dir) {
+        Ok(f) => f,
+        Err(e) => panic!("{} exists but cannot be listed: {e}", dir.display()),
+    };
+    assert!(
+        !files.is_empty(),
+        "{} holds no NN.e.json / NN.n.json files — re-run: {fetch}",
+        dir.display()
+    );
+    if let Some(only) = sst::opcode_filter() {
+        files.retain(|(op, _, _)| only.contains(op));
+        println!(
+            "note: RSEMU_SST_OPCODES narrowed the run to {} file(s)",
+            files.len()
+        );
+        assert!(!files.is_empty(), "RSEMU_SST_OPCODES matched no file");
+    }
+    if !sst65816::cpu_is_built() {
+        let path = &files[0].2;
+        match harness::read(path).map(|b| sst65816::parse_vectors(&b)) {
+            Ok(Ok(v)) => println!(
+                "note: corpus is readable — {} parsed {} vectors",
+                path.display(),
+                v.len()
+            ),
+            Ok(Err(e)) => panic!("corpus at {} is malformed: {e}", path.display()),
+            Err(e) => panic!("cannot read the corpus: {e}"),
+        }
+        Skip::NotBuilt {
+            component: "a 65C816 core",
+            feature: "cpu-w65c816",
+        }
+        .report(suite);
+        return;
+    }
+    run_sst65816(suite, files);
+}
+
+#[cfg(not(feature = "cpu-w65c816"))]
+fn run_sst65816(_suite: &str, _files: Vec<(u8, char, PathBuf)>) {}
+
+#[cfg(feature = "cpu-w65c816")]
+fn run_sst65816(suite: &str, files: Vec<(u8, char, PathBuf)>) {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(files.len());
+    println!(
+        "{suite}: {} file(s) across {threads} thread(s)",
+        files.len()
+    );
+    let mut ran: Vec<u8> = files.iter().map(|f| f.0).collect();
+    ran.dedup();
+    let queue = Mutex::new(files);
+    let reports: Mutex<Vec<sst65816::FileReport>> = Mutex::new(Vec::new());
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut runner = sst65816::Runner::new();
+                loop {
+                    let Some((op, mode, path)) = queue.lock().unwrap().pop() else {
+                        break;
+                    };
+                    let vectors = match harness::read(&path).and_then(|b| {
+                        sst65816::parse_vectors(&b).map_err(|e| format!("{}: {e}", path.display()))
+                    }) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            errors.lock().unwrap().push(e);
+                            continue;
+                        }
+                    };
+                    let report = sst65816::run_file(&mut runner, op, mode, &vectors);
+                    reports.lock().unwrap().push(report);
+                }
+            });
+        }
+    });
+    let errors = errors.into_inner().unwrap();
+    assert!(
+        errors.is_empty(),
+        "corpus problems:\n  {}",
+        errors.join("\n  ")
+    );
+    let mut reports = reports.into_inner().unwrap();
+    reports.sort_by_key(|r| (r.opcode, r.mode));
+    let total: usize = reports.iter().map(|r| r.total).sum();
+    let failed: usize = reports.iter().map(|r| r.failed.len()).sum();
+    assert!(total > 0, "{suite}: the corpus is empty");
+    let clean = reports.iter().filter(|r| r.failed.is_empty()).count();
+    let headline = format!(
+        "{suite}: {}/{total} vectors passed; {clean}/{} files clean",
+        total - failed,
+        reports.len()
+    );
+    println!("{headline}");
+    harness::write_report(
+        &format!("{suite}.txt"),
+        &format!("{headline}\n\n{}", sst65816::summary(&reports)),
+    );
+    let failures: Vec<(u8, String)> = reports
+        .iter()
+        .flat_map(|r| r.failed.iter().map(move |n| (r.opcode, n.clone())))
+        .collect();
+    let path = ledger_path(suite);
+    let ledger = match ledger::Ledger::load(&path) {
+        Ok(l) => l,
+        Err(e) => panic!("{}: {e}", path.display()),
+    };
+    let verdict = ledger::judge(&ledger, &ran, &failures);
+    if verdict.excused > 0 {
+        println!(
+            "  {} failure(s) excused by {}",
+            verdict.excused,
+            path.display()
+        );
+    }
+    assert!(verdict.is_ok(), "\n{}", verdict.describe(&ledger));
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +909,7 @@ const LEDGERS: &[(&str, bool)] = &[
     ("cpu-arm-v8m", true),
     ("riscv-arch-test", true),
     ("sst-6502", false),
+    ("sst-65816", false),
     ("sst-nes6502", false),
     ("sst-spc700", false),
 ];

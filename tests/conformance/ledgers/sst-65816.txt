@@ -1,0 +1,8 @@
+# Known failures: SingleStepTests/65816 (WDC W65C816S), both modes.
+#
+# This file only ever shrinks; see sst-nes6502.txt for the format. Keys are
+# the opcode and the upstream vector name, which carries the mode: `54 n 1`.
+#
+# Empty on purpose: all 512 files (5 080 400 vectors) pass at the pinned
+# corpus commit, registers, memory and the full pin-level bus trace included.
+# docs/cpu/65816.md has the rules the corpus pinned down along the way.
