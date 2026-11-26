@@ -767,33 +767,44 @@ impl InputSink for KeyboardSink {
 /// only relationship between them that matters.
 pub mod buttons {
     /// The A button — the first bit out of a NES shift register.
-    pub const A: u8 = 0x80;
+    pub const A: u16 = 0x80;
     /// The B button.
-    pub const B: u8 = 0x40;
+    pub const B: u16 = 0x40;
     /// Select.
-    pub const SELECT: u8 = 0x20;
+    pub const SELECT: u16 = 0x20;
     /// Start.
-    pub const START: u8 = 0x10;
+    pub const START: u16 = 0x10;
     /// D-pad up.
-    pub const UP: u8 = 0x08;
+    pub const UP: u16 = 0x08;
     /// D-pad down.
-    pub const DOWN: u8 = 0x04;
+    pub const DOWN: u16 = 0x04;
     /// D-pad left.
-    pub const LEFT: u8 = 0x02;
+    pub const LEFT: u16 = 0x02;
     /// D-pad right — the last bit out.
-    pub const RIGHT: u8 = 0x01;
+    pub const RIGHT: u16 = 0x01;
+    /// X — the SNES's upper face button. The low byte above is the NES's
+    /// eight; these four exist only on a SNES pad and every other console
+    /// drops them.
+    pub const X: u16 = 0x0100;
+    /// Y — the SNES's left face button.
+    pub const Y: u16 = 0x0200;
+    /// The left shoulder.
+    pub const L: u16 = 0x0400;
+    /// The right shoulder.
+    pub const R: u16 = 0x0800;
     /// Nothing held.
-    pub const NONE: u8 = 0x00;
+    pub const NONE: u16 = 0x00;
 }
 
 /// Which host button a keysym is, for [`PadSink`].
 ///
 /// The arrow keys, `Z` and `X` for B and A, Return for Start and either Shift
-/// for Select — the layout every console emulator has used since the 1990s,
+/// for Select, and for a SNES pad `A`/`S` for Y/X and `Q`/`W` for the
+/// shoulders — the layout every console emulator has used since the 1990s,
 /// which makes it the one a person will try first. It is a *host* convention
 /// rather than a hardware fact, which is why it lives here and not in `dev/`.
 #[must_use]
-pub const fn button(keysym: Keysym) -> Option<u8> {
+pub const fn button(keysym: Keysym) -> Option<u16> {
     match keysym.0 {
         0xff52 => Some(buttons::UP),
         0xff54 => Some(buttons::DOWN),
@@ -803,6 +814,10 @@ pub const fn button(keysym: Keysym) -> Option<u8> {
         0x78 | 0x58 => Some(buttons::A),          // x, X
         0xff0d => Some(buttons::START),           // Return
         0xffe1 | 0xffe2 => Some(buttons::SELECT), // either Shift
+        0x73 | 0x53 => Some(buttons::X),          // s, S
+        0x61 | 0x41 => Some(buttons::Y),          // a, A
+        0x71 | 0x51 => Some(buttons::L),          // q, Q
+        0x77 | 0x57 => Some(buttons::R),          // w, W
         _ => None,
     }
 }
@@ -817,10 +832,20 @@ pub const fn button(keysym: Keysym) -> Option<u8> {
 ///
 /// A build with no controller device at all has no variants here, which is why
 /// every use of it carries the same `any(...)` gate.
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg(any(
+    feature = "dev-nes-io",
+    feature = "dev-gb",
+    feature = "dev-sms",
+    feature = "dev-snes-scpu"
+))]
 #[cfg_attr(
     docsrs,
-    doc(cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms")))
+    doc(cfg(any(
+        feature = "dev-nes-io",
+        feature = "dev-gb",
+        feature = "dev-sms",
+        feature = "dev-snes-scpu"
+    )))
 )]
 #[derive(Debug, Clone)]
 pub enum Pads {
@@ -833,15 +858,26 @@ pub enum Pads {
     /// Two Master System ports, plus the console's own Pause button.
     #[cfg(feature = "dev-sms")]
     Sms(Arc<crate::dev::sms::io::SmsPads>),
+    /// Two SNES ports: all twelve buttons, translated to the pad's own
+    /// B-first order.
+    #[cfg(feature = "dev-snes-scpu")]
+    Snes(Arc<crate::dev::snes::input::Pad>),
 }
 
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg(any(
+    feature = "dev-nes-io",
+    feature = "dev-gb",
+    feature = "dev-sms",
+    feature = "dev-snes-scpu"
+))]
 impl Pads {
     /// Apply the host mask for controller `port`.
-    pub fn set(&self, port: usize, mask: u8) {
+    pub fn set(&self, port: usize, mask: u16) {
         match self {
+            // The low byte is the NES's own order; the SNES's four extra
+            // buttons are not on its pad.
             #[cfg(feature = "dev-nes-io")]
-            Pads::Nes(pad) => pad.set(port, mask),
+            Pads::Nes(pad) => pad.set(port, mask as u8),
             // One pad, so port 1 is nobody: a Game Boy has a single matrix and
             // pressing a second controller on it would be inventing hardware.
             //
@@ -899,6 +935,31 @@ impl Pads {
                     pads.set_pause(mask & buttons::START != 0);
                 }
             }
+            // The SNES pad's own order (`dev::snes::input::buttons`), B first.
+            #[cfg(feature = "dev-snes-scpu")]
+            Pads::Snes(pad) => {
+                use crate::dev::snes::input::buttons as snes;
+                let mut out = 0u16;
+                for (from, to) in [
+                    (buttons::B, snes::B),
+                    (buttons::Y, snes::Y),
+                    (buttons::SELECT, snes::SELECT),
+                    (buttons::START, snes::START),
+                    (buttons::UP, snes::UP),
+                    (buttons::DOWN, snes::DOWN),
+                    (buttons::LEFT, snes::LEFT),
+                    (buttons::RIGHT, snes::RIGHT),
+                    (buttons::A, snes::A),
+                    (buttons::X, snes::X),
+                    (buttons::L, snes::L),
+                    (buttons::R, snes::R),
+                ] {
+                    if mask & from != 0 {
+                        out |= to;
+                    }
+                }
+                pad.set(port, out);
+            }
         }
     }
 
@@ -947,6 +1008,16 @@ impl Pads {
                 return Some(Pads::Sms(pads));
             }
         }
+        #[cfg(feature = "dev-snes-scpu")]
+        {
+            use crate::dev::snes::input::pads;
+            if let Some(pad) = pads::names(hosts)
+                .iter()
+                .find_map(|n| pads::get(hosts, n).ok().flatten())
+            {
+                return Some(Pads::Snes(pad));
+            }
+        }
         None
     }
 }
@@ -956,19 +1027,34 @@ impl Pads {
 /// Level rather than edge: a pad is a latch the console samples, so what the
 /// sink keeps is the held mask, and the guest reads whatever is set when it
 /// strobes.
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg(any(
+    feature = "dev-nes-io",
+    feature = "dev-gb",
+    feature = "dev-sms",
+    feature = "dev-snes-scpu"
+))]
 #[cfg_attr(
     docsrs,
-    doc(cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms")))
+    doc(cfg(any(
+        feature = "dev-nes-io",
+        feature = "dev-gb",
+        feature = "dev-sms",
+        feature = "dev-snes-scpu"
+    )))
 )]
 #[derive(Debug)]
 pub struct PadSink {
     pads: Pads,
     port: usize,
-    held: core::sync::atomic::AtomicU8,
+    held: core::sync::atomic::AtomicU16,
 }
 
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg(any(
+    feature = "dev-nes-io",
+    feature = "dev-gb",
+    feature = "dev-sms",
+    feature = "dev-snes-scpu"
+))]
 impl PadSink {
     /// Drive controller `port` of `pads`.
     #[must_use]
@@ -976,7 +1062,7 @@ impl PadSink {
         PadSink {
             pads,
             port,
-            held: core::sync::atomic::AtomicU8::new(buttons::NONE),
+            held: core::sync::atomic::AtomicU16::new(buttons::NONE),
         }
     }
 
@@ -991,12 +1077,17 @@ impl PadSink {
 
     /// Which buttons this sink is holding.
     #[must_use]
-    pub fn held(&self) -> u8 {
+    pub fn held(&self) -> u16 {
         self.held.load(core::sync::atomic::Ordering::Relaxed)
     }
 }
 
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg(any(
+    feature = "dev-nes-io",
+    feature = "dev-gb",
+    feature = "dev-sms",
+    feature = "dev-snes-scpu"
+))]
 impl InputSink for PadSink {
     fn deliver(&self, event: InputEvent) {
         use core::sync::atomic::Ordering;
@@ -1467,7 +1558,8 @@ mod tests {
                 buttons::LEFT,
                 buttons::RIGHT,
                 buttons::NONE
-            ],
+            ]
+            .map(|b| b as u8),
             [
                 nes::A,
                 nes::B,
@@ -1503,6 +1595,30 @@ mod tests {
         });
         assert_eq!(pad.get(0), buttons::A);
         assert_eq!(pad.get(1), buttons::NONE, "the other port is untouched");
+    }
+
+    /// A SNES pad gets all twelve, in its own B-first order: the host's A is
+    /// the pad's A (bit 7), not its first bit out, and the four buttons only a
+    /// SNES has come from the high byte.
+    #[cfg(feature = "dev-snes-scpu")]
+    #[test]
+    fn a_snes_pad_gets_twelve_buttons_in_its_own_order() {
+        use crate::dev::snes::input::{Pad, buttons as snes};
+        let pad = Arc::new(Pad::new());
+        let sink = PadSink::new(Pads::Snes(pad.clone()), 1);
+        for key in *b"xsqwaz" {
+            sink.deliver(InputEvent::Key {
+                keysym: Keysym::from_ascii(key),
+                down: true,
+            });
+        }
+        assert_eq!(
+            pad.get(1),
+            snes::A | snes::X | snes::L | snes::R | snes::Y | snes::B
+        );
+        assert_eq!(pad.get(0), snes::NONE, "the other port is untouched");
+        Pads::Snes(pad.clone()).set(0, buttons::START | buttons::UP);
+        assert_eq!(pad.get(0), snes::START | snes::UP);
     }
 
     /// The Game Boy's matrix reads its columns out in the opposite direction to
@@ -1587,7 +1703,12 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<KeyboardSink>();
         assert_send_sync::<Feed>();
-        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+        #[cfg(any(
+            feature = "dev-nes-io",
+            feature = "dev-gb",
+            feature = "dev-sms",
+            feature = "dev-snes-scpu"
+        ))]
         assert_send_sync::<PadSink>();
     }
 }

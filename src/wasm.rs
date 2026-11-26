@@ -119,7 +119,12 @@ use crate::core::sync::{Global, LockRank};
 /// is one job with one answer. It lived here first, which is why the doc
 /// comment about the Game Boy's reversed matrix and the Master System's Pause
 /// switch is over there now — with the code that does it.
-#[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+#[cfg(any(
+    feature = "dev-nes-io",
+    feature = "dev-gb",
+    feature = "dev-sms",
+    feature = "dev-snes-scpu"
+))]
 use crate::host::input::Pads;
 
 /// Length in bytes of the string [`rsemu_version_ptr`] points at.
@@ -221,7 +226,12 @@ struct State {
     /// ports rather than the last machine's.
     hosts: Option<alloc::sync::Arc<crate::core::hosts::HostObjects>>,
     /// The pad port the machine's controllers read, if it has any.
-    #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+    #[cfg(any(
+        feature = "dev-nes-io",
+        feature = "dev-gb",
+        feature = "dev-sms",
+        feature = "dev-snes-scpu"
+    ))]
     pad: Option<Pads>,
     /// The sound, resampled to whatever the page's `AudioContext` runs at, if
     /// this machine makes any.
@@ -260,7 +270,12 @@ impl State {
             console: None,
             keyboard: None,
             hosts: None,
-            #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+            #[cfg(any(
+                feature = "dev-nes-io",
+                feature = "dev-gb",
+                feature = "dev-sms",
+                feature = "dev-snes-scpu"
+            ))]
             pad: None,
             audio: None,
             audio_rate: DEFAULT_AUDIO_RATE,
@@ -1016,7 +1031,12 @@ fn boot_with(index: u32, media: Media) -> u32 {
         // same name-based seam as the console, for the same reason: a machine
         // file can hand a device a name and nothing else. Which console's pad
         // it is decides how a host mask reaches its pins — see [`Pads`].
-        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+        #[cfg(any(
+            feature = "dev-nes-io",
+            feature = "dev-gb",
+            feature = "dev-sms",
+            feature = "dev-snes-scpu"
+        ))]
         {
             state.pad = Pads::take(&hosts);
         }
@@ -1039,7 +1059,12 @@ pub extern "C" fn rsemu_shutdown() {
         state.keyboard = None;
         state.audio = None;
         state.hosts = None;
-        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+        #[cfg(any(
+            feature = "dev-nes-io",
+            feature = "dev-gb",
+            feature = "dev-sms",
+            feature = "dev-snes-scpu"
+        ))]
         {
             state.pad = None;
         }
@@ -1340,7 +1365,8 @@ pub extern "C" fn rsemu_audio_dropped() -> u64 {
 /// Set the buttons held on controller `port` (0 or 1).
 ///
 /// The mask is `0x80` A, `0x40` B, `0x20` Select, `0x10` Start, `0x08` Up,
-/// `0x04` Down, `0x02` Left, `0x01` Right. That is the NES shift register's own
+/// `0x04` Down, `0x02` Left, `0x01` Right, and for a SNES pad `0x100` X,
+/// `0x200` Y, `0x400` L, `0x800` R. The low byte is the NES shift register's own
 /// output order
 /// ([NESdev, "Standard controller"](https://www.nesdev.org/wiki/Standard_controller),
 /// and [`dev::nes::input::buttons`](crate::dev::nes::input::buttons), which is
@@ -1358,11 +1384,16 @@ pub extern "C" fn rsemu_audio_dropped() -> u64 {
 pub extern "C" fn rsemu_set_buttons(port: u32, mask: u32) {
     with_state(|state| {
         if let Some(slot) = state.buttons.get_mut(port as usize) {
-            *slot = mask & 0xff;
+            *slot = mask & 0xfff;
         }
-        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+        #[cfg(any(
+            feature = "dev-nes-io",
+            feature = "dev-gb",
+            feature = "dev-sms",
+            feature = "dev-snes-scpu"
+        ))]
         if let Some(pad) = state.pad.as_ref() {
-            pad.set(port as usize, (mask & 0xff) as u8);
+            pad.set(port as usize, (mask & 0xfff) as u16);
         }
     });
 }
@@ -1382,13 +1413,23 @@ pub extern "C" fn rsemu_buttons(port: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn rsemu_has_pad() -> u32 {
     with_state(|state| {
-        #[cfg(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms"))]
+        #[cfg(any(
+            feature = "dev-nes-io",
+            feature = "dev-gb",
+            feature = "dev-sms",
+            feature = "dev-snes-scpu"
+        ))]
         {
             u32::from(state.pad.is_some())
         }
         // A build with no controller device has no pad on any machine, and the
         // export still exists so a page never has to feature-detect.
-        #[cfg(not(any(feature = "dev-nes-io", feature = "dev-gb", feature = "dev-sms")))]
+        #[cfg(not(any(
+            feature = "dev-nes-io",
+            feature = "dev-gb",
+            feature = "dev-sms",
+            feature = "dev-snes-scpu"
+        )))]
         {
             let _ = state;
             0
