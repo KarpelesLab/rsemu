@@ -547,6 +547,8 @@ pub fn all() -> &'static [&'static Arch] {
 static ALL: &[&Arch] = &[
     #[cfg(feature = "cpu-mos6502")]
     &MOS6502,
+    #[cfg(feature = "cpu-w65c816")]
+    &W65C816,
     #[cfg(feature = "cpu-z80")]
     &Z80,
     #[cfg(feature = "cpu-arm-aprofile")]
@@ -617,6 +619,89 @@ pub static MOS6502: Arch = Arch {
         bytes: 8,
     }),
     computed: None,
+};
+
+// -- WDC 65C816 -------------------------------------------------------------
+
+/// `src/cpu/w65c816/mod.rs`'s `save`: `a x y s d pc` as `u16`s, then `pbr`,
+/// `dbr` and `p` as bytes and `e` as a bool, then the cycle counter.
+///
+/// `pc` is presented as the 24-bit `PBR:PC` — the address a breakpoint is set
+/// at — rather than as two registers a client would have to join. It is
+/// assembled by [`W65C816_COMPUTED`] into a 32-bit register, because a wire
+/// register is a power-of-two width and the chunk byte after `pbr` is `dbr`.
+/// Verified at chunk version 1.
+#[cfg(feature = "cpu-w65c816")]
+static W65C816_REGS: &[RegDesc] = &[
+    RegDesc::int("a", 2, 0),
+    RegDesc::int("x", 2, 2),
+    RegDesc::int("y", 2, 4),
+    RegDesc {
+        name: "sp",
+        bytes: 2,
+        offset: 6,
+        ty: RegType::DataPtr,
+    },
+    RegDesc::int("d", 2, 8),
+    RegDesc {
+        name: "pc",
+        bytes: 4,
+        offset: RegDesc::COMPUTED,
+        ty: RegType::CodePtr,
+    },
+    RegDesc::int("pbr", 1, 12),
+    RegDesc::int("dbr", 1, 13),
+    RegDesc::int("p", 1, 14),
+    RegDesc::int("e", 1, 15),
+];
+
+/// The WDC 65C816.
+///
+/// No `<architecture>`: upstream GDB has no 65816 gdbarch, so stock GDB
+/// refuses the description, as it does the 6502's.
+#[cfg(feature = "cpu-w65c816")]
+pub static W65C816: Arch = Arch {
+    class: &crate::cpu::w65c816::CLASS,
+    verified_version: 1,
+    features: &[Feature::whole("org.rsemu.w65c816")],
+    architecture: None,
+    regs: W65C816_REGS,
+    pc: 5,
+    retire: Some(RetireCounter {
+        offset: 16,
+        bytes: 8,
+    }),
+    computed: Some(&W65C816_COMPUTED),
+};
+
+/// `pc` as `PBR:PC`: chunk bytes 10-11 are PC and byte 12 is PBR.
+#[cfg(feature = "cpu-w65c816")]
+static W65C816_COMPUTED: Computed = Computed {
+    read: |chunk, index, out| {
+        if index != 5 {
+            return Access::Slice;
+        }
+        match chunk.get(10..13) {
+            Some(b) => {
+                out.extend_from_slice(&[b[0], b[1], b[2], 0]);
+                Access::Done
+            }
+            None => Access::Refused,
+        }
+    },
+    write: |chunk, index, data| {
+        if index != 5 {
+            return Access::Slice;
+        }
+        // A 65C816 address is 24 bits; a top byte is not one it can hold.
+        if data.len() != 4 || data[3] != 0 || chunk.len() < 13 {
+            return Access::Refused;
+        }
+        chunk[10..13].copy_from_slice(&data[..3]);
+        Access::Done
+    },
+    reach: 24,
+    selects: &[],
 };
 
 // -- Zilog Z80 --------------------------------------------------------------
@@ -2305,6 +2390,72 @@ mod tests {
         // monitor even when the monitor is disarmed and they are at their
         // lowest offsets.
         assert_eq!(A64.chunk_reach(), a64_layout::MIN_REACH);
+    }
+
+    #[cfg(feature = "cpu-w65c816")]
+    #[test]
+    fn the_65816_map_reads_its_own_snapshot() {
+        use crate::core::device::Device;
+        use crate::core::state::{MachineShape, Migrations, Source, StateReader, StateWriter};
+        use crate::cpu::w65c816::{CLASS, Regs, W65c816};
+
+        assert_eq!(W65C816.packet_len(), 18);
+        assert!(W65C816.check());
+        let cpu = W65c816::new();
+        cpu.set_regs(Regs {
+            a: 0x1122,
+            x: 0x3344,
+            y: 0x5566,
+            s: 0x7788,
+            d: 0x99aa,
+            pc: 0xbbcc,
+            pbr: 0xdd,
+            dbr: 0xee,
+            p: 0x0f,
+            e: false,
+        });
+        let mut shape = MachineShape::new();
+        shape.add_device("cpu", CLASS.name).unwrap();
+        let mut w = StateWriter::new(shape);
+        cpu.save(&mut w.chunk("cpu", CLASS.name, CLASS.version).unwrap())
+            .unwrap();
+        let bytes = w.to_vec().unwrap();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("cpu", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        let mut rd = chunk.reader();
+        let n = rd.remaining();
+        let raw = rd.take(n).unwrap();
+        let reg = |i: usize| {
+            let r = &W65C816.regs[i];
+            let bytes = match W65C816.read_computed(raw, i) {
+                Some(v) => v.expect("readable"),
+                None => raw[r.offset..r.offset + r.bytes].to_vec(),
+            };
+            let mut v = 0u64;
+            for (k, b) in bytes.iter().enumerate() {
+                v |= u64::from(*b) << (8 * k);
+            }
+            v
+        };
+        assert_eq!(
+            (0..10).map(reg).collect::<Vec<_>>(),
+            [
+                0x1122, 0x3344, 0x5566, 0x7788, 0x99aa, 0xddbbcc, 0xdd, 0xee, 0x0f, 0
+            ]
+        );
+        let mut patched = raw.to_vec();
+        assert_eq!(
+            W65C816.write_computed(&mut patched, 5, &[0x34, 0x12, 0x7e, 0]),
+            Some(true)
+        );
+        assert_eq!(&patched[10..13], &[0x34, 0x12, 0x7e]);
+        assert_eq!(
+            W65C816.write_computed(&mut patched, 5, &[0, 0, 0, 1]),
+            Some(false),
+            "no 65C816 address has a fourth byte"
+        );
     }
 
     #[cfg(feature = "cpu-mos6502")]
