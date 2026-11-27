@@ -262,6 +262,19 @@ fn a_drive_binds_the_slot_it_names() {
     assert!(!stderr.contains("never picked up"), "{stderr}");
 }
 
+/// `pc-at-smp` starts on rsemu's own firmware, as its machine file says.
+///
+/// `machines/pc-at-smp.machine` opens with `rsemu run pc-at-smp --hd0
+/// disk.img` and says it "boots with nothing supplied". The built-in BIOS was
+/// offered by machine stem and this stem was not in the list.
+#[cfg(all(feature = "machine-pc-at-smp", feature = "fw-pcbios"))]
+#[test]
+fn the_two_processor_at_starts_on_the_built_in_firmware() {
+    let (code, stdout, stderr) = run(&["run", "pc-at-smp", "--headless", "--for", "1ms"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("ran to"), "{stdout}");
+}
+
 /// A class this build lacks is reported at the line that names it.
 ///
 /// It was the one front-end mistake with no location: `registry: unknown

@@ -3091,7 +3091,8 @@ fn builtin_firmware(machine: &str) -> Option<Vec<u8>> {
 
 /// The system firmware for a machine whose `bios` slot the user left unbound.
 ///
-/// Only `pc-at` has one, and only because `ROADMAP.md` phase 6a said it must:
+/// Only `pc-at` and its two-processor twin have one, and only because
+/// `ROADMAP.md` phase 6a said they must:
 /// every legacy PC BIOS anyone could otherwise reach for is GPL, and running
 /// one is fine while shipping one is not. `--bios` overrides this, so pointing
 /// the board at a real image is still one flag.
@@ -3109,8 +3110,14 @@ fn builtin_bios(machine: &str, file: &str, text: &str) -> Option<Vec<u8>> {
         .strip_suffix(".machine")
         .unwrap_or_else(|| machine.rsplit('/').next().unwrap_or(machine));
     match stem {
+        // `pc-at-smp` is `pc-at` with a second processor, which is the board
+        // this firmware's generated MP and ACPI tables exist to describe
+        // (`tests/pc_at_smp.rs` boots it on exactly this image), and its
+        // machine file has said all along that `rsemu run pc-at-smp --hd0
+        // disk.img` "boots with nothing supplied". It did not: the stem was
+        // missing here, so the run was refused over an unbound `bios` slot.
         #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
-        "pc-at" => Some(
+        "pc-at" | "pc-at-smp" => Some(
             rsemu::fw::pcbios::image_for_machine(file, text)
                 .unwrap_or_else(|_| rsemu::fw::pcbios::image()),
         ),
