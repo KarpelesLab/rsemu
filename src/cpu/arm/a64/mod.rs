@@ -2376,7 +2376,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
     use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
     let names: Vec<&'static str> = Config::PARTS.iter().map(|(n, _)| *n).collect();
     ClassSchema::new(CLASS.name)
-        .prop(PropSchema::new("cpu", ValueKind::Str).values(names.leak()))
+        .prop(PropSchema::new("cpu", ValueKind::Str).values(&names))
         .prop(PropSchema::new("reset", ValueKind::Uint))
         .prop(PropSchema::new("mpidr", ValueKind::Uint))
         .prop(PropSchema::new("cntfrq", ValueKind::Uint))
