@@ -57,6 +57,25 @@ impl WireSink for Probe {
     }
 }
 
+/// Wait for `ready`, spinning first and yielding after.
+///
+/// Spinning is what makes the two writers start within a few instructions of
+/// each other, which is the whole experiment. Yielding is what keeps the test
+/// finite on a host with fewer cores than the three threads it runs: there a
+/// pure spin burns a scheduler timeslice per hand-off, and the rounds take
+/// minutes instead of milliseconds.
+fn wait_until(ready: impl Fn() -> bool) {
+    let mut spins = 0u32;
+    while !ready() {
+        if spins < 256 {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
 #[test]
 fn the_external_line_agrees_with_the_registers_after_two_harts_write_them_at_once() {
     let plic = Arc::new(Plic::build(31, 1, true));
@@ -98,9 +117,7 @@ fn the_external_line_agrees_with_the_registers_after_two_harts_write_them_at_onc
             let done = Arc::clone(&done);
             s.spawn(move || {
                 for round in 1..=ROUNDS {
-                    while go.load(Ordering::Acquire) < round {
-                        std::hint::spin_loop();
-                    }
+                    wait_until(|| go.load(Ordering::Acquire) >= round);
                     space
                         .write(ENABLE0, Width::U32, value, MemAttrs::DEFAULT)
                         .expect("the enable word takes a word write");
@@ -110,9 +127,7 @@ fn the_external_line_agrees_with_the_registers_after_two_harts_write_them_at_onc
         }
         for round in 1..=ROUNDS {
             go.store(round, Ordering::Release);
-            while done.load(Ordering::Acquire) < 2 * round {
-                std::hint::spin_loop();
-            }
+            wait_until(|| done.load(Ordering::Acquire) >= 2 * round);
             // Both writes have returned, so both drives have been delivered.
             let line = probe.level.load(Ordering::SeqCst) != 0;
             let enabled = space
