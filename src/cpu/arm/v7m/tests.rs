@@ -1053,6 +1053,43 @@ fn a_return_to_thread_mode_with_a_stacked_ipsr_is_an_invpc_usage_fault() {
 }
 
 #[test]
+fn a_block_transfer_that_faults_leaves_its_base_register_alone() {
+    // DDI 0403E.b B1.5.10, the fault condition: "The base register is
+    // restored to the original value." Both ways a load multiple changes its
+    // base are here, each faulting on its second word, which is one past the
+    // end of RAM.
+    let top = (RAM as u32) - 4;
+
+    // `POP {r0, r1}`: writeback. The fault's own frame goes below the
+    // *original* stack pointer — four bytes of alignment padding and the
+    // eight words — rather than over the word the `POP` had not reached.
+    let h = Harness::m4(&[0xbc03]);
+    h.set_word(3 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
+    h.cpu.set_reg(13, top);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    let sp = h.cpu.msp();
+    assert_eq!(sp, top - 4 - 0x20);
+    assert_eq!(h.word(sp + 24), ENTRY);
+    // The handler returns and the `POP` starts again from where it started.
+    h.cpu.step();
+    assert_eq!(h.cpu.msp(), top);
+    assert_eq!(h.cpu.pc(), ENTRY);
+
+    // `LDM r1, {r1, r2}`: the base is in the list and was loaded over before
+    // the second word faulted.
+    let h = Harness::m4(&wide(0xe891_0006));
+    h.set_word(3 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
+    h.set_word(top, 0x1234_5678);
+    h.cpu.set_reg(1, top);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_eq!(h.cpu.reg(1), top);
+}
+
+#[test]
 fn thread_mode_can_run_on_the_process_stack() {
     // `MSR psp, r0` ; `MSR control, r1` ; `ISB` ; `MOV r2, sp`
     let mut code = Vec::new();

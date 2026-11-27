@@ -2427,16 +2427,31 @@ impl<'a> Exec<'a> {
             if list & (1 << index) == 0 {
                 continue;
             }
-            if load {
-                let value = self.read_mem(addr, 4, privileged)?;
-                if index == 15 {
-                    pc_value = Some(value);
-                } else {
-                    self.set_reg(index, value);
-                }
+            let access = if load {
+                self.read_mem(addr, 4, privileged).map(|value| {
+                    if index == 15 {
+                        pc_value = Some(value);
+                    } else {
+                        self.set_reg(index, value);
+                    }
+                })
             } else {
                 let value = self.reg(index);
-                self.write_mem(addr, 4, value, privileged)?;
+                self.write_mem(addr, 4, value, privileged)
+            };
+            if let Err(trap) = access {
+                // DDI 0403E.b B1.5.10, "Load Multiple and Store Multiple base
+                // register updates and the ICI bits", fault condition: "The
+                // base register is restored to the original value. [...] In
+                // all cases, the return from the fault handler restarts the
+                // instruction from the beginning." That covers the early
+                // writeback above and a base the list has already loaded
+                // over; a `POP` that left `SP` moved would also have its
+                // fault frame pushed over the words it had not popped yet.
+                // Written directly: the original value was the register's
+                // own, so there is no limit to re-check.
+                self.state.r[usize::from(rn & 0xf)] = base;
+                return Err(trap);
             }
             addr = addr.wrapping_add(4);
         }
