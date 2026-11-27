@@ -2163,10 +2163,28 @@ impl Engine {
 
     /// Restore what [`Engine::save`] wrote.
     pub fn load(&mut self, r: &mut ChunkReader<'_>) -> Result<()> {
-        self.dots = r.read_u64()?;
-        self.frame = r.read_u64()?;
-        self.scanline = r.read_u16()?;
-        self.dot = r.read_u16()?;
+        let dots = r.read_u64()?;
+        let frame = r.read_u64()?;
+        let scanline = r.read_u16()?;
+        let dot = r.read_u16()?;
+        // The beam is somewhere on the raster. A snapshot is a file somebody
+        // can be handed, and one that puts the beam past the last dot of a
+        // line or the last line of a frame is refused *before* anything is
+        // stored: `next_event_dot` measures the distance from here to the
+        // next vertical-blank edge and to the end of the line with unguarded
+        // subtractions, and the device's `load` publishes that distance
+        // whether this function succeeded or not.
+        if dot >= DOTS_PER_SCANLINE || scanline >= self.geom.scanlines_per_frame {
+            return Err(crate::core::Error::State(alloc::format!(
+                "snapshot has the PPU's beam at scanline {scanline}, dot {dot}; a frame is {} \
+                 lines of {DOTS_PER_SCANLINE} dots",
+                self.geom.scanlines_per_frame
+            )));
+        }
+        self.dots = dots;
+        self.frame = frame;
+        self.scanline = scanline;
+        self.dot = dot;
 
         self.ctrl = r.read_u8()?;
         self.mask = r.read_u8()?;

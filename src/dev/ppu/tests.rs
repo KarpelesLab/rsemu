@@ -2124,3 +2124,62 @@ fn a_snapshot_restores_the_lock_free_position_too() {
     assert_eq!(device.current_tick(), 12_345);
     assert_eq!(device.next_event_tick(), Some(restored.next_event_dot()));
 }
+
+#[test]
+fn a_snapshot_with_the_beam_off_the_raster_is_refused() {
+    // The chunk opens with the dot counter and the frame number, eight bytes
+    // each, then the scanline and the dot, two bytes each. A frame is 262
+    // lines of 341 dots on this chip, and `next_event_dot` — which the
+    // device's `load` publishes — measures from the beam to the next
+    // vertical-blank edge and to the end of the line with plain subtractions.
+    const SCANLINE: usize = 16;
+    const DOT: usize = 18;
+    let (ppu, _chr, _nt) = new_ppu();
+    ppu.advance_by(DOTS_PER_FRAME + 100 * u64::from(DOTS_PER_SCANLINE) + 123);
+    let mut w = StateWriter::new(MachineShape::new());
+    {
+        let mut chunk = w
+            .chunk("/ppu", NES_PPU_CLASS.name, NES_PPU_CLASS.version)
+            .unwrap();
+        ppu.save(&mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let reader = StateReader::new(&bytes).unwrap();
+    let (_, _, payload) = reader.load_raw("/ppu").unwrap();
+    assert_eq!(payload[SCANLINE..SCANLINE + 2], 100u16.to_le_bytes());
+    assert_eq!(payload[DOT..DOT + 2], 123u16.to_le_bytes());
+
+    let try_load = |at: usize, value: u16| {
+        let mut payload = payload.to_vec();
+        payload[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        let mut w = StateWriter::new(MachineShape::new());
+        w.raw_chunk("/ppu", NES_PPU_CLASS.name, NES_PPU_CLASS.version, &payload)
+            .unwrap();
+        let bytes = w.to_vec().unwrap();
+        let (restored, _chr, _nt) = new_ppu();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load(
+                "/ppu",
+                NES_PPU_CLASS.name,
+                NES_PPU_CLASS.version,
+                &Migrations::new(),
+            )
+            .unwrap();
+        let result = restored.load(&mut chunk.reader());
+        // Loaded or refused, the device has to go on answering the scheduler.
+        let _ = Device::next_event_tick(&restored);
+        if result.is_ok() {
+            restored.advance_by(u64::from(DOTS_PER_SCANLINE) * 3);
+        }
+        result
+    };
+    // The last line and the last dot of a line are on the raster.
+    try_load(SCANLINE, SCANLINES_PER_FRAME - 1).expect("the pre-render line");
+    try_load(DOT, DOTS_PER_SCANLINE - 1).expect("the last dot of a line");
+    // One past either is not.
+    assert!(try_load(SCANLINE, SCANLINES_PER_FRAME).is_err());
+    assert!(try_load(DOT, DOTS_PER_SCANLINE).is_err());
+    assert!(try_load(SCANLINE, 0x5500).is_err());
+    assert!(try_load(DOT, 0xffff).is_err());
+}
