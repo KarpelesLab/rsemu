@@ -382,6 +382,10 @@ pub(super) struct Exec<'a> {
     /// Set when the instruction wrote the PC, so the fall-through advance is
     /// skipped.
     branched: bool,
+    /// Set when the instruction replaced `EPSR` wholesale — an exception
+    /// entry or an exception return — so the end-of-instruction `ITAdvance()`
+    /// must not touch the `ITSTATE` that is now there.
+    it_settled: bool,
     /// Cycles this step has charged.
     used: u64,
     /// An instruction tried to move `SP` below its limit; the step turns
@@ -414,6 +418,7 @@ impl<'a> Exec<'a> {
             attrs,
             insn_addr: 0,
             branched: false,
+            it_settled: false,
             used: 0,
             #[cfg(feature = "cpu-arm-v8m")]
             stkof: false,
@@ -1163,6 +1168,7 @@ impl<'a> Exec<'a> {
         // Taking an exception ends a `WFI` or `WFE` whether or not the
         // instruction stream ever gets back to it.
         self.state.asleep = false;
+        self.it_settled = true;
         // `ExceptionTaken` sets the event register (DDI 0403D B1.5.6,
         // DDI 0419E B1.5.6): the exception is itself a `WFE` wake-up event.
         self.state.event = true;
@@ -1364,6 +1370,7 @@ impl<'a> Exec<'a> {
         }
 
         self.state.sys.set_active(returning, false);
+        self.it_settled = true;
         // Exception return, like entry, sets the event register, so a `WFE`
         // that follows an interrupt it was waiting on does not sleep
         // through it (DDI 0403D B1.5.8, DDI 0419E B1.5.8).
@@ -1526,6 +1533,7 @@ impl<'a> Exec<'a> {
         let pc = self.state.r[15];
         self.insn_addr = pc;
         self.branched = false;
+        self.it_settled = false;
         self.cycle(1);
 
         if !self.flag(xpsr::T) {
@@ -1595,13 +1603,23 @@ impl<'a> Exec<'a> {
             other => other,
         };
 
-        // `IT` sets ITSTATE; everything else advances it.
-        if !matches!(insn, Insn::It { .. }) && it != 0 {
-            self.state.it_advance();
-        }
-
         match outcome {
             Ok(()) => {
+                // `IT` sets ITSTATE; everything else advances it, executed or
+                // skipped — "when an instruction in an IT block completes its
+                // execution normally, ITSTATE is advanced" (DDI 0403E.b
+                // A7.3.3). Two things are not that. An instruction that
+                // faulted did not complete, and its frame returns to it, so
+                // the frame must hold the state it started with (B1.5.6,
+                // `ReturnAddress()`: "xPSR.IT bits saved to the stack are
+                // consistent with ReturnAddress()"). And one that entered or
+                // returned from an exception left a different `EPSR` behind:
+                // a handler's cleared one, or the interrupted context's own,
+                // which a conditional `BX LR` in the handler has no business
+                // advancing.
+                if !matches!(insn, Insn::It { .. }) && it != 0 && !self.it_settled {
+                    self.state.it_advance();
+                }
                 if passed && self.cfg.is_v6m() {
                     self.cycle(v6m_extra_cycles(insn));
                 }
@@ -2142,6 +2160,14 @@ impl<'a> Exec<'a> {
             Insn::Svc { imm } => {
                 self.state.last_svc = imm;
                 let ret = self.insn_addr.wrapping_add(2);
+                // The frame returns to the next instruction, so it carries
+                // the next instruction's `ITSTATE` (DDI 0403E.b B1.5.6,
+                // `ReturnAddress()`: `SVCall` is `NextInstrAddr()`, and "xPSR.IT
+                // bits saved to the stack are consistent with
+                // ReturnAddress()"). An escalated one keeps both: "a fault
+                // that is escalated to the priority of a HardFault retains the
+                // ReturnAddress() value of the original fault".
+                self.state.it_advance();
                 let prio = self.state.execution_priority();
                 if self.state.sys.priority_of(Exception::SVCALL) >= prio {
                     // An `SVC` that cannot preempt the current priority is a

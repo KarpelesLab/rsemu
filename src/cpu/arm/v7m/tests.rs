@@ -928,6 +928,72 @@ fn a_bkpt_hardfault_stacks_the_bkpt_itself() {
     assert_eq!(h.cpu.last_bkpt(), 0xab);
 }
 
+/// `ITSTATE` as an exception frame's `xPSR` word holds it.
+fn stacked_itstate(xpsr_word: u32) -> u32 {
+    (((xpsr_word >> 10) & 0x3f) << 2) | ((xpsr_word >> 25) & 3)
+}
+
+#[test]
+fn a_fault_inside_an_it_block_stacks_the_itstate_of_the_faulting_instruction() {
+    // `ITT EQ` ; `LDREQ r0, [r1]` ; `MOVEQ r2, #1`, with `r1` unmapped. The
+    // frame returns to the load, so it must carry the load's own `ITSTATE`
+    // (DDI 0403E.b B1.5.6, `ReturnAddress()`: "xPSR.IT bits saved to the
+    // stack are consistent with ReturnAddress()") — a handler that repairs
+    // the access and returns re-executes the load as the *first* slot of the
+    // block, not as the second.
+    let h = Harness::m4(&[0xbf04, 0x6808, 0x2201]);
+    h.set_word(3 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
+    h.cpu.set_reg(1, 0x6000_0000);
+    h.cpu.set_xpsr(xpsr::Z | xpsr::T);
+    h.cpu.step();
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    let sp = h.cpu.msp();
+    assert_eq!(h.word(sp + 24), ENTRY + 2);
+    // `firstcond:mask` of `ITT EQ` is `0000:0100`, untouched.
+    assert_eq!(stacked_itstate(h.word(sp + 28)), 0x04);
+}
+
+#[test]
+fn an_svc_inside_an_it_block_stacks_the_itstate_of_the_next_instruction() {
+    // `ITE EQ` ; `SVCEQ #0` ; `MOVNE r2, #1`, with `Z` set. `SVC` returns to
+    // the instruction after it (`ReturnAddress()`: `SVCall` is
+    // `NextInstrAddr()`), and the stacked `ITSTATE` has to be that
+    // instruction's — the `NE` slot. Stacking the `SVC`'s own made the `MOVNE`
+    // run under `EQ` on return.
+    for handler in [&[0x4770u16][..], &[0xbf08, 0x4770][..]] {
+        let h = Harness::m4(&[0xbf0c, 0xdf00, 0x2201, 0xe7fe]);
+        h.set_word(11 * 4, 0x301);
+        for (i, half) in handler.iter().enumerate() {
+            h.ram
+                .write_at(0x300 + 2 * i as u64, &half.to_le_bytes())
+                .unwrap();
+        }
+        h.cpu.set_xpsr(xpsr::Z | xpsr::T);
+        h.cpu.step();
+        h.cpu.step();
+        assert_eq!(h.cpu.current_exception(), Exception::SVCALL);
+        let sp = h.cpu.msp();
+        assert_eq!(h.word(sp + 24), ENTRY + 4);
+        // `0000:1100` advanced once: condition `NE`, last in the block.
+        assert_eq!(stacked_itstate(h.word(sp + 28)), 0x18);
+        assert_eq!(h.cpu.xpsr() & xpsr::IT_MASK, 0, "a handler starts clear");
+        // The second handler is `IT EQ` ; `BXEQ lr`: a conditional return is
+        // an instruction of the *handler's* block, and finishing it must not
+        // advance the `ITSTATE` the return just restored.
+        for _ in 0..handler.len() {
+            h.cpu.step();
+        }
+        assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+        assert_eq!(h.cpu.pc(), ENTRY + 4);
+        assert_eq!(stacked_itstate(h.cpu.xpsr()), 0x18);
+        h.cpu.step();
+        assert_eq!(h.cpu.reg(2), 0, "MOVNE ran with Z set");
+        assert_eq!(h.cpu.xpsr() & xpsr::IT_MASK, 0);
+    }
+}
+
 #[test]
 fn thread_mode_can_run_on_the_process_stack() {
     // `MSR psp, r0` ; `MSR control, r1` ; `ISB` ; `MOV r2, sp`
