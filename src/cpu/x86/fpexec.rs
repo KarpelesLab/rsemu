@@ -2165,7 +2165,7 @@ impl Exec<'_> {
         // The eight registers, in stack order, each padded from ten bytes to
         // sixteen.
         for i in 0..8u8 {
-            let at = off.wrapping_add(32) + u64::from(i) * 16;
+            let at = off.wrapping_add(32 + u64::from(i) * 16);
             let value = x.raw(i);
             self.write_f80(sr, at, value)?;
             self.write_mem(sr, at.wrapping_add(10), 2, 0)?;
@@ -2184,7 +2184,7 @@ impl Exec<'_> {
     /// Write `XMM0` through `XMM(count - 1)` from byte 160.
     pub(super) fn store_xmm_image(&mut self, sr: u8, off: u64, count: u8) -> Ex<()> {
         for i in 0..count {
-            let at = off.wrapping_add(160) + u64::from(i) * 16;
+            let at = off.wrapping_add(160 + u64::from(i) * 16);
             let v = self.state.sse.get(i);
             self.write_xmm_mem(sr, at, v)?;
         }
@@ -2211,7 +2211,7 @@ impl Exec<'_> {
         };
         let mut regs = [F80::ZERO; 8];
         for (i, slot) in regs.iter_mut().enumerate() {
-            *slot = self.read_f80(sr, off.wrapping_add(32) + (i as u64) * 16)?;
+            *slot = self.read_f80(sr, off.wrapping_add(32 + (i as u64) * 16))?;
         }
         // Every field is overwritten below; the starting value is only a
         // well-formed unit to write into.
@@ -2255,7 +2255,7 @@ impl Exec<'_> {
     pub(super) fn load_xmm_image(&mut self, sr: u8, off: u64, count: u8) -> Ex<[[u64; 2]; 16]> {
         let mut xmm = self.state.sse.xmm;
         for (i, slot) in xmm.iter_mut().enumerate().take(usize::from(count)) {
-            *slot = self.read_xmm_mem(sr, off.wrapping_add(160) + (i as u64) * 16)?;
+            *slot = self.read_xmm_mem(sr, off.wrapping_add(160 + (i as u64) * 16))?;
         }
         Ok(xmm)
     }

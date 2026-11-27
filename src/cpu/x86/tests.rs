@@ -6000,6 +6000,44 @@ mod long_mode {
         assert_eq!(regs.cs & 3, 3, "at privilege level three");
     }
 
+    /// An `FXSAVE` area that runs off the top of the address space wraps to
+    /// the bottom of it, as every other operand's address arithmetic does.
+    ///
+    /// The register slots were addressed as `off.wrapping_add(32) + i * 16`,
+    /// and the second half of that is an unchecked sum on a guest's pointer:
+    /// with the area in the last 128 bytes of the address space it was an
+    /// overflow panic in a debug build. A guest has to map the top page to
+    /// get there, which a guest may.
+    #[test]
+    fn an_fxsave_area_that_wraps_the_address_space_is_addressed_by_wrapping() {
+        const PDPT_TOP: u64 = 0x1_5000;
+        const PD_TOP: u64 = 0x1_6000;
+        let pc = pc64();
+        // The top 2 MiB of the address space, onto the second 2 MiB of RAM.
+        pc.write64(la::PML4 + 511 * 8, PDPT_TOP | MAP);
+        pc.write64(PDPT_TOP + 511 * 8, PD_TOP | MAP);
+        pc.write64(PD_TOP + 511 * 8, 0x20_0000 | MAP | PS);
+        let pc = run64_on(
+            pc,
+            cr4::OSFXSR,
+            &[
+                0x48, 0xc7, 0xc0, 0x80, 0xff, 0xff, 0xff, // mov rax, -128
+                0x48, 0x0f, 0xae, 0x00, // fxsave64 [rax]
+                0x48, 0x0f, 0xae, 0x08, // fxrstor64 [rax]
+                0xbb, 0x2a, 0x00, 0x00, 0x00, // mov ebx, 42
+                0xf4,
+            ],
+        );
+        assert_eq!(pc.regs().rbx, 42, "both ran to completion");
+        // The control word is the first thing in the area, and the area's
+        // first byte is 128 below the top: the last 128 bytes of RAM's 4 MiB.
+        assert_eq!(
+            pc.read32(0x40_0000 - 128) & 0xffff,
+            0x037f,
+            "the image starts where RAX pointed"
+        );
+    }
+
     /// `STAR`'s selector fields are whatever ring 0 wrote, and the selectors
     /// derived from them are sixteen-bit sums that wrap.
     ///
