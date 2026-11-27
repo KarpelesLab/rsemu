@@ -91,10 +91,16 @@ fn rig() -> Rig {
 /// The same rig over a medium the caller chose, so that a test can put a
 /// *failing* one behind the namespace and watch what the guest is told.
 fn rig_on(media: Arc<dyn Medium>, store: Arc<RamStore>) -> Rig {
+    rig_in(media, store, 32)
+}
+
+/// And in an address space `width` bits wide, for a test that needs a queue
+/// base only a 64-bit space can name.
+fn rig_in(media: Arc<dyn Medium>, store: Arc<RamStore>, width: u32) -> Rig {
     let ns = Namespace::new(media, 9, false).expect("512-byte");
     let ctrl = Arc::new(Controller::new(ns, Params::default()));
 
-    let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let space = Arc::new(AddressSpace::new("mem", width).with_unassigned(UnassignedPolicy::ONES));
     {
         let mut topo = space.topology();
         topo.map(
@@ -390,6 +396,29 @@ fn a_prp_list_that_points_at_itself_terminates() {
 
     // Still alive.
     assert_eq!(r.io(0x02, 1, DATA, 0, 3, 0), 0);
+}
+
+#[test]
+fn a_queue_based_at_the_top_of_the_address_space_wraps_rather_than_overflowing() {
+    // `ASQ` and `ACQ` are 64 bits the driver wrote, and all `enable` asks of
+    // them is page alignment. On a bus whose unassigned policy answers rather
+    // than faults, a queue up there reads as all-ones, which is sixty-four
+    // commands with an opcode nobody implements; the sixty-fifth entry is
+    // then at `base + 0x1000`, which carries out of 64 bits.
+    let store = Arc::new(RamStore::new(BLOCKS * LBA));
+    let r = rig_in(Arc::clone(&store) as Arc<dyn Medium>, store, 64);
+    const TOP: u64 = 0xffff_ffff_ffff_f000;
+    r.set_reg(REG_AQA, 0x0fff_0fff);
+    r.set_reg64(REG_ASQ, TOP);
+    r.set_reg64(REG_ACQ, TOP);
+    r.set_reg(REG_CC, CC_ENABLE);
+    assert_eq!(r.reg(REG_CSTS) & 0x3, 1, "ready, and not fatal");
+    // The admin submission queue tail doorbell: 300 entries, so the head and
+    // the completion tail both pass the page that ends the address space.
+    r.set_reg(0x1000, 300);
+    // What the controller made of them is its own business — every one is an
+    // invalid opcode — but it got to the end of them.
+    assert_eq!(r.reg(REG_CSTS) & 0x1, 1, "still ready");
 }
 
 #[test]

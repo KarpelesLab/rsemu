@@ -1398,7 +1398,10 @@ impl Controller {
     fn next_job(&self) -> Option<Job> {
         let mut state = self.state.lock();
         let (qid, sq) = Controller::pick(&state)?;
-        let addr = sq.base + u64::from(sq.head) * SQE_LEN;
+        // Wrapping, and meant: the base is a 64-bit value the driver wrote
+        // and the queue may sit at the very top of the address space, where
+        // the entry's address is the guest's arithmetic and not the host's.
+        let addr = sq.base.wrapping_add(u64::from(sq.head) * SQE_LEN);
         let head = (sq.head + 1) % sq.entries;
         if let Some(slot) = state.sq[qid].as_mut() {
             slot.head = head;
@@ -1487,7 +1490,8 @@ impl Controller {
                 .and_then(Option::as_mut)
             {
                 Some(cq) if cq.has_room() => {
-                    let addr = cq.base + u64::from(cq.tail) * CQE_LEN;
+                    // Wrapping for the reason `next_job` gives.
+                    let addr = cq.base.wrapping_add(u64::from(cq.tail) * CQE_LEN);
                     let phase = cq.phase;
                     cq.tail += 1;
                     if cq.tail == cq.entries {
