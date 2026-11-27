@@ -2163,7 +2163,11 @@ impl Device for Paula {
             c.dsr = r.read_bool()?;
             c.alt_period = r.read_bool()?;
             c.next_at = r.read_u64()?;
-            c.left = r.read_u32()?.min(0x1_0000);
+            // A block is 1 to 65536 words (`length_words`), and a channel
+            // whose DMA is running is always inside one: the word boundary
+            // counts it down before it looks. Clamped at both ends, like
+            // the upper one always was, so a snapshot cannot hand it zero.
+            c.left = r.read_u32()?.clamp(u32::from(c.on), 0x1_0000);
         }
         {
             let mut state = self.shared.state.lock();

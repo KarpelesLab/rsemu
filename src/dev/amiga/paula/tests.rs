@@ -1178,6 +1178,32 @@ fn a_snapshot_round_trips_to_identical_state() {
 }
 
 #[test]
+fn a_snapshot_of_a_running_channel_with_no_words_left_is_given_one() {
+    // No guest can leave a DMA channel running with a block of zero words:
+    // turning it on loads the count from `AUDxLEN`, where zero is 65536. A
+    // snapshot can say so anyway, and the word boundary counts the block down
+    // before it looks — which from zero is a subtraction below nothing.
+    let rig = Rig::new();
+    rig.poke(INTENA, 0xc000 | int::AUD0);
+    rig.poke(AUD0LEN, 2);
+    rig.poke(AUD0PER, 130);
+    rig.poke(DMACON, DMAF_SETCLR | DMAF_MASTER | DMAF_AUD0);
+    rig.paula.shared.state.lock().aud[0].left = 0;
+    let bytes = snapshot(&rig.paula);
+
+    let other = Rig::new();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("paula", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&other.paula, &mut chunk.reader()).unwrap();
+    // One word and the block is over: the length reloads and the channel
+    // asks for its interrupt, as at the end of any block.
+    other.paula.advance_to(130 * 8);
+    assert_eq!(other.peek(INTREQR) & int::AUD0, int::AUD0);
+}
+
+#[test]
 fn the_class_needs_its_register_space_and_says_what_it_has() {
     use crate::core::props::{Link, Value};
     let props = Props::new().with("custom", Value::Link(Link::new("custom").unwrap()));
