@@ -718,6 +718,78 @@ fn an_object_draws_over_the_background_and_colour_zero_is_transparent() {
     assert_eq!(ppu.pixel(4, 0), Some(0), "its colour 0 is transparent");
 }
 
+/// A controller with objects on, tile 1 solid colour 1 and tile 2 solid
+/// colour 2, and `OBP0` mapping colour 1 to shade 1 and colour 2 to shade 2.
+fn lcd_with_two_solid_object_tiles() -> GbPpu {
+    let ppu = lcd(0);
+    for row in 0..8u64 {
+        ppu.poke_vram(16 + row * 2, 0xff);
+        ppu.poke_vram(16 + row * 2 + 1, 0x00);
+        ppu.poke_vram(32 + row * 2, 0x00);
+        ppu.poke_vram(32 + row * 2 + 1, 0xff);
+    }
+    ppu.write_register(
+        0x00,
+        lcdc::LCD_ENABLE | lcdc::BG_ENABLE | lcdc::TILE_DATA | lcdc::OBJ_ENABLE,
+    );
+    ppu.write_register(0x08, 0b00_10_01_00);
+    ppu
+}
+
+fn object(ppu: &GbPpu, slot: u64, x: u8, tile: u8, attrs: u8) {
+    ppu.poke_oam(slot * 4, 16);
+    ppu.poke_oam(slot * 4 + 1, x);
+    ppu.poke_oam(slot * 4 + 2, tile);
+    ppu.poke_oam(slot * 4 + 3, attrs);
+}
+
+#[test]
+fn objects_at_the_same_x_are_ordered_by_their_place_in_oam() {
+    // Pan Docs, *OAM*, "Drawing priority": "In Non-CGB mode, the smaller the X
+    // coordinate, the higher the priority. When X coordinates are identical,
+    // the object located first in OAM has higher priority."
+    let ppu = lcd_with_two_solid_object_tiles();
+    object(&ppu, 0, 28, 1, 0);
+    object(&ppu, 1, 28, 2, 0);
+    // And the X rule itself, with OAM order the other way about: the object
+    // further left wins where the two overlap.
+    object(&ppu, 2, 68, 1, 0);
+    object(&ppu, 3, 64, 2, 0);
+    ppu.advance_by(ppu::DOTS_PER_LINE);
+    assert_eq!(
+        ppu.pixel(20, 0),
+        Some(1),
+        "OAM entry 0 is on top of entry 1"
+    );
+    assert_eq!(ppu.pixel(60, 0), Some(2), "x=64 is on top of x=68");
+    assert_eq!(ppu.pixel(66, 0), Some(1), "which shows where it is alone");
+}
+
+#[test]
+fn an_object_behind_the_background_still_hides_the_objects_under_it() {
+    // Pan Docs, *OAM*, "Interaction with 'BG over OBJ' flag": "the PPU first
+    // resolves priority between objects to pick an 'object pixel' [...] The
+    // 'BG over OBJ' attribute is **never** considered in this process. [...]
+    // an object with a higher priority but with 'BG over OBJ' enabled will
+    // sort of 'mask' lower-priority objects, even if those have 'BG over OBJ'
+    // disabled."
+    let ppu = lcd_with_two_solid_object_tiles();
+    // Background tile 0, every pixel colour 3, shown as shade 3.
+    for i in 0..16u64 {
+        ppu.poke_vram(i, 0xff);
+    }
+    ppu.write_register(0x07, 0b11_00_00_00);
+    object(&ppu, 0, 28, 1, 0x80); // higher priority, behind the background
+    object(&ppu, 1, 30, 2, 0x00); // lower priority, in front of it
+    ppu.advance_by(ppu::DOTS_PER_LINE);
+    assert_eq!(
+        ppu.pixel(24, 0),
+        Some(3),
+        "the background shows through both, not the lower object"
+    );
+    assert_eq!(ppu.pixel(28, 0), Some(2), "past the mask it draws normally");
+}
+
 #[test]
 fn an_oam_transfer_copies_a_page_over_160_machine_cycles() {
     use crate::core::space::{AddressSpace, RamStore, Region};

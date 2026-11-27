@@ -748,10 +748,17 @@ impl Engine {
             8
         };
         let mut objects = self.objects_on_line();
-        // DMG priority: the smaller `x` wins, and OAM order breaks the tie. The
-        // scan already produced OAM order, so a *stable* sort by `x` is exactly
-        // the rule. Drawn back to front so the winner overwrites.
-        objects.sort_by_key(|o| core::cmp::Reverse(o.x));
+        // DMG priority: "the smaller the X coordinate, the higher the priority.
+        // When X coordinates are identical, the object located first in OAM
+        // has higher priority" (Pan Docs, *OAM*, "Drawing priority"). The scan
+        // already produced OAM order, so a *stable* ascending sort by `x` is
+        // exactly that order, highest priority first.
+        objects.sort_by_key(|o| o.x);
+        // Which columns already have their object pixel. Walking front to back
+        // and letting the first opaque pixel claim the column — rather than
+        // painting back to front — is what makes the rule below expressible:
+        // the claim happens whether or not the pixel ends up on screen.
+        let mut claimed = [false; SCREEN_WIDTH];
         for obj in objects {
             let mut line = ly.wrapping_add(16).wrapping_sub(obj.y);
             if obj.attrs & 0x40 != 0 {
@@ -780,11 +787,16 @@ impl Engine {
                 let index = self.tile_pixel(addr, tx, line % 8);
                 // Colour 0 is transparent for objects — always, whatever the
                 // palette maps it to.
-                if index == 0 {
+                if index == 0 || claimed[sx] {
                     continue;
                 }
+                claimed[sx] = true;
                 // Attribute bit 7: the background wins wherever it is not
-                // colour 0.
+                // colour 0 — checked only now, on the pixel that won. "The
+                // 'BG over OBJ' attribute is **never** considered" in picking
+                // it, so an object behind the background still "mask[s]
+                // lower-priority objects, even if those have 'BG over OBJ'
+                // disabled" (Pan Docs, *OAM*).
                 if obj.attrs & 0x80 != 0 && bg_index[sx] != 0 {
                     continue;
                 }
