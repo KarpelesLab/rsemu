@@ -2352,7 +2352,7 @@ impl<'a> Exec<'a> {
         let base = masked & (FetchWindow::PAGE - 1);
         let mut taken = 0u64;
         let mut last = 0u8;
-        let fields = isa::decode_stream_as(map, bits, &mut || {
+        let fields = isa::decode_stream_with(map, bits, &mut || {
             if taken >= run {
                 return None;
             }

@@ -6525,8 +6525,22 @@ pub fn decode_stream(next: &mut dyn FnMut() -> Option<u8>) -> Fields {
 /// ignored — there is one size and no prefix to change it.
 ///
 /// See [`decode_stream`] for what `next` and [`Fields::truncated`] mean.
-#[allow(clippy::too_many_lines)]
 pub fn decode_stream_as(map: Gen, bits: Bits, next: &mut dyn FnMut() -> Option<u8>) -> Fields {
+    decode_stream_with(map, bits, next)
+}
+
+/// [`decode_stream_as`], generic over where the bytes come from.
+///
+/// The same decoder — this is its body — for the one caller that asks for an
+/// instruction per guest instruction and can afford a copy of it specialised
+/// to its own byte source: the interpreter's in-page fetch, whose `next` is a
+/// bounds check and a load and was costing a call through a vtable per byte to
+/// reach. Everything else keeps the `dyn` form above and shares one copy.
+#[allow(clippy::too_many_lines)]
+pub fn decode_stream_with<F>(map: Gen, bits: Bits, next: &mut F) -> Fields
+where
+    F: FnMut() -> Option<u8> + ?Sized,
+{
     // An 8086 has one width whatever it is asked for: no `D` bit, no `66`, no
     // `67`, and certainly no `REX`.
     let bits = match map {
