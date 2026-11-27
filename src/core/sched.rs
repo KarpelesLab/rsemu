@@ -468,20 +468,33 @@ impl EventQueue {
 
     /// The earliest instant at which anything could fire, if anything is queued.
     ///
-    /// Exact, not a hint: the levels of the wheel are ordered, so the first
-    /// non-empty slot at the lowest non-empty level holds the earliest entries.
+    /// Exact, not a hint. Within a level the slots are ordered, so its first
+    /// non-empty slot holds its earliest entries — but the levels are *not*
+    /// ordered against each other. An entry stays where it was placed until
+    /// the position crosses a block boundary of its level, and meanwhile the
+    /// window of the level below slides forward into that level's next block:
+    /// an entry posted later can land lower and fire later. So a candidate
+    /// found on one level is still checked against the next block of every
+    /// level above. Only that one block can precede it — the block after
+    /// starts a whole span of the lower level further on, past its window.
     pub fn next_deadline(&mut self) -> Option<GlobalTime> {
         self.purge_cancelled_due();
         if let Some(Reverse(e)) = self.due.peek() {
             return Some(e.time);
         }
+        let mut best: Option<GlobalTime> = None;
         for level in 0..WHEEL_LEVELS {
             if self.level_len[level] == 0 {
                 continue;
             }
             let shift = WHEEL_SLOT_BITS * level as u32;
             let base = self.now_granule >> shift;
-            for step in 1..WHEEL_SLOTS as u128 {
+            let reach = if best.is_some() {
+                1
+            } else {
+                WHEEL_SLOTS as u128 - 1
+            };
+            for step in 1..=reach {
                 let slot = ((base + step) & (WHEEL_SLOTS as u128 - 1)) as usize;
                 let bucket = &self.near[level * WHEEL_SLOTS + slot];
                 let earliest = bucket
@@ -489,12 +502,15 @@ impl EventQueue {
                     .filter(|e| !self.cancelled.contains(&e.id.0))
                     .map(|e| e.time)
                     .min();
-                if earliest.is_some() {
-                    return earliest;
+                if let Some(at) = earliest {
+                    best = Some(best.map_or(at, |b| b.min(at)));
+                    break;
                 }
             }
         }
-        self.far.peek().map(|Reverse(e)| e.time)
+        // The far heap is re-examined on every advance, so unlike a wheel
+        // level it is never stale: everything in it is beyond the wheel.
+        best.or_else(|| self.far.peek().map(|Reverse(e)| e.time))
     }
 
     /// Moves the queue's position forward, cascading the wheel.
@@ -696,9 +712,9 @@ impl EventQueue {
     ///
     /// A level holds entries whose *block index at that level* is 1..=255 ahead
     /// of the current one. Choosing by block index rather than by raw distance
-    /// is what guarantees no two blocks ever share a slot, and it makes the
-    /// levels strictly ordered in time — which is what lets
-    /// [`EventQueue::next_deadline`] stop at the first non-empty level.
+    /// is what guarantees no two blocks ever share a slot. It orders the
+    /// levels only at the moment of placement, not afterwards — see
+    /// [`EventQueue::next_deadline`].
     fn placement(&self, time: GlobalTime) -> Placement {
         if time <= self.now {
             return Placement::Due;
@@ -5192,6 +5208,71 @@ mod tests {
             assert!(drain(&mut q, just_before).is_empty(), "at {ns} ns");
             assert_eq!(q.next_deadline(), Some(t(ns)), "at {ns} ns");
             assert_eq!(drain(&mut q, t(ns)).len(), 1, "at {ns} ns");
+        }
+    }
+
+    /// An instant `granules` wheel granules from the origin, at the default
+    /// granule.
+    fn g(granules: u64) -> GlobalTime {
+        GlobalTime::from_raw(u128::from(granules) << DEFAULT_GRANULE_SHIFT)
+    }
+
+    #[test]
+    fn next_deadline_sees_an_upper_level_entry_ahead_of_a_lower_level_one() {
+        // An entry stays on the level it was placed on until the position
+        // crosses that level's block boundary, so a level's window slides
+        // into the first block of the level above. `a` is placed on level 1
+        // from the origin; by granule 10, `b` — later than `a` — fits level 0.
+        let mut q = EventQueue::default();
+        q.schedule(g(256), EventTarget(0), 1);
+        q.advance_to(g(10));
+        q.schedule(g(260), EventTarget(0), 2);
+        assert_eq!(q.next_deadline(), Some(g(256)));
+
+        // The same across two levels at once: placed on level 2 from the
+        // origin, overtaken by a level-0 entry posted just short of the
+        // boundary.
+        let mut q = EventQueue::default();
+        q.schedule(g(0x1_0000), EventTarget(0), 1);
+        q.advance_to(g(0xfff0));
+        q.schedule(g(0x1_0005), EventTarget(0), 2);
+        assert_eq!(q.next_deadline(), Some(g(0x1_0000)));
+    }
+
+    #[test]
+    fn next_deadline_agrees_with_a_sorted_model_through_a_random_walk() {
+        // The property the two cases above are instances of: whatever the
+        // history of posts and advances, the deadline is the earliest live
+        // event, and running to each deadline in turn fires every event at
+        // its own instant.
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut q = EventQueue::default();
+        let mut model: Vec<(GlobalTime, u64)> = Vec::new();
+        let mut now = 0u64;
+        for round in 0..4_000u64 {
+            let spread = [40, 300, 70_000, 20_000_000][(next() % 4) as usize];
+            let at = now + 1 + next() % spread;
+            let id = q.schedule(g(at), EventTarget(0), round);
+            model.push((g(at), id.seq()));
+            // Two pops to a post on average, so the queue stays short and its
+            // earliest entry is as often on an upper level as on the lowest.
+            while next() % 3 != 0 {
+                let earliest = model.iter().min().copied();
+                assert_eq!(q.next_deadline(), earliest.map(|(time, _)| time));
+                let Some((time, seq)) = earliest else {
+                    break;
+                };
+                let fired = q.pop_due(time).expect("the deadline is an event");
+                assert_eq!((fired.time, fired.id.seq()), (time, seq));
+                model.retain(|e| *e != (time, seq));
+                now = (time.raw() >> DEFAULT_GRANULE_SHIFT) as u64;
+            }
         }
     }
 
