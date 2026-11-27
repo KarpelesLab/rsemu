@@ -731,11 +731,32 @@ impl RamStore {
     }
 
     /// Set `len` bytes at `offset` to `value`, marking them dirty.
+    ///
+    /// A stretch that already holds `value` is **read and left alone**. The
+    /// result is the same bytes and the same dirty bits; what differs is what
+    /// the host pays. The commonest fill in the tree is a board's power-on
+    /// reset zeroing RAM that was allocated zeroed a moment earlier, and
+    /// storing those zeroes made the kernel back every page of it: a gigabyte
+    /// of guest RAM was a gigabyte resident before the first instruction. A
+    /// load of a page nobody has written costs no memory at all.
+    ///
+    /// Compared a host page at a time, and without an early exit inside the
+    /// page, so the comparison is a straight loop the compiler can widen. A
+    /// concurrent writer changes nothing about the contract: a store that
+    /// lands between the compare and the (skipped) fill is a store that landed
+    /// after the fill.
     pub fn fill(&self, offset: u64, len: u64, value: u8) -> MemResult {
         let base = self.range(offset, len)?;
         let n = usize::try_from(len).map_err(|_| BusError::BadAccess)?;
-        for cell in &self.cells[base..base + n] {
-            cell.store(value, Ordering::Relaxed);
+        for chunk in self.cells[base..base + n].chunks(HOST_PAGE as usize) {
+            let same = chunk.iter().fold(true, |same, cell| {
+                same & (cell.load(Ordering::Relaxed) == value)
+            });
+            if !same {
+                for cell in chunk {
+                    cell.store(value, Ordering::Relaxed);
+                }
+            }
         }
         self.mark_dirty(offset, len);
         Ok(())

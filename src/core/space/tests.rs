@@ -2980,3 +2980,45 @@ fn a_store_the_host_cannot_back_is_an_error_not_an_abort() {
     assert!(buf.iter().all(|&b| b == 0));
     assert_eq!(ram.dirty_page_count(), 0);
 }
+
+/// A fill leaves the same bytes and the same dirty bits whether or not the
+/// store already held the value — the skip is a cost, never a result.
+#[test]
+fn a_fill_that_changes_nothing_still_fills_and_still_dirties() {
+    let ram = RamStore::new(0x5000);
+    // Fresh, so every byte is already zero: nothing is stored, and the pages
+    // are dirty all the same, as a snapshot taken after a reset expects.
+    ram.fill(0, 0x5000, 0).expect("in range");
+    assert_eq!(ram.dirty_page_count(), 5);
+    ram.clear_dirty();
+
+    // One byte in the middle of a page, and a fill that straddles pages at
+    // both ends without being aligned to either.
+    ram.write_u8(0x2345, 0x99).expect("in range");
+    ram.write_u8(0x0fff, 0x11).expect("in range");
+    ram.write_u8(0x4001, 0x22).expect("in range");
+    ram.clear_dirty();
+    ram.fill(0x1001, 0x2fff, 0).expect("in range");
+    assert_eq!(
+        ram.read_u8(0x2345),
+        Ok(0),
+        "the odd byte out is overwritten"
+    );
+    assert_eq!(ram.read_u8(0x0fff), Ok(0x11), "below the fill");
+    assert_eq!(ram.read_u8(0x4001), Ok(0x22), "above the fill");
+    let mut pages = Vec::new();
+    ram.for_each_dirty_page(|p| pages.push(p));
+    assert_eq!(
+        pages,
+        [1, 2, 3],
+        "every page the fill covers, changed or not"
+    );
+
+    // And a value that is not there is written everywhere.
+    ram.fill(0x1001, 0x2fff, 0xa5).expect("in range");
+    let mut buf = vec![0u8; 0x2fff];
+    ram.read_at(0x1001, &mut buf).expect("in range");
+    assert!(buf.iter().all(|&b| b == 0xa5));
+    assert_eq!(ram.read_u8(0x1000), Ok(0));
+    assert_eq!(ram.read_u8(0x4000), Ok(0));
+}
