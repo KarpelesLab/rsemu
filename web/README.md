@@ -366,7 +366,8 @@ and `No bootable device.` comes back. No font table at either end.
   board it is about to run in**, because its MP and ACPI tables describe that
   machine's processors, so `machine::catalog::BuiltinImage` cannot hold it:
   `src/wasm.rs` has a two-armed `Builtin` — static bytes, or this one — exactly
-  as `builtin_bios` in the CLI and `builtin_media` in the C ABI each do.
+  as the CLI and `builtin_media` in the C ABI each do. Which boards get the
+  generated one is `machine::catalog::has_generated_bios` for all three.
 * **Empty bays** — `machine::realize` refuses an *unbound* media slot, so a
   PC's diskette drive, its video option-ROM socket and its second IDE bay have
   to be bound as empty. `src/wasm.rs` binds the same **nine** slot names the CLI

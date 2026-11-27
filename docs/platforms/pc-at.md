@@ -1007,13 +1007,14 @@ POST, and nothing in the tree models one.
 
 Worth writing down, because it is easy to assume more than is true:
 
-- **`pc-at` and `pc-at-smp`** — the boards `rsemu run` offers it to.
-  `builtin_bios` in `src/bin/rsemu.rs` matches the machine's stem, and those
-  two are the stems in the match; the image is assembled from *that*
+- **`pc-at` and `pc-at-smp`** — the boards every front end offers it to.
+  `has_generated_bios` in `src/machine/catalog.rs` matches the machine's stem,
+  and those two are the stems in the match; the image is assembled from *that*
   description, so `pc-at-smp` gets tables with two processors in them and a
-  user who edits their copy gets tables that describe their copy. (The browser
-  and C-ABI front ends, `src/wasm.rs` and `src/ffi/abi.rs`, still offer it to
-  `pc-at` alone.)
+  user who edits their copy gets tables that describe their copy. `rsemu run`,
+  the browser module (`src/wasm.rs`) and the C ABI (`src/ffi/abi.rs`) all ask
+  that one function; they used to keep a list each, and the last two had only
+  `pc-at` on theirs.
 - **`q35`** — only from `tests/q35_board.rs`, which puts the image in the
   socket explicitly. `machines/q35.machine`'s firmware comment says the slot
   "defaults to rsemu's own 64 KiB image", and on the command line it does not:

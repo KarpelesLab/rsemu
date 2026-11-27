@@ -691,10 +691,14 @@ fn run(args: &[String]) -> ExitCode {
     // `rsemu` ships exactly one piece of firmware and this is where it is
     // offered (`fw::pcbios`); `--bios` still wins, because the slot is the
     // user's and always will be (`docs/platforms/pc-at.md`).
-    if !images.iter().any(|(slot, _)| slot == "bios")
-        && let Some(image) = builtin_bios(&parsed.machine, &name, &source)
+    // Which boards it is offered to is `catalog::has_generated_bios`'s to say,
+    // for this front end, the C ABI and the browser alike.
+    if !images
+        .iter()
+        .any(|(slot, _)| slot == catalog::GENERATED_BIOS_SLOT)
+        && let Some(image) = catalog::generated_bios(&parsed.machine, &name, &source)
     {
-        images.push((String::from("bios"), image));
+        images.push((String::from(catalog::GENERATED_BIOS_SLOT), image));
     }
 
     let mut options = match catalog::build_options() {
@@ -3110,45 +3114,6 @@ fn builtin_firmware(machine: &str) -> Option<Vec<u8>> {
         "spi-panel" => Some(rsemu::dev::lcd::demo::PANEL_DEMO.to_vec()),
         _ => {
             let _ = stem;
-            None
-        }
-    }
-}
-
-/// The system firmware for a machine whose `bios` slot the user left unbound.
-///
-/// Only `pc-at` and its two-processor twin have one, and only because
-/// `ROADMAP.md` phase 6a said they must:
-/// every legacy PC BIOS anyone could otherwise reach for is GPL, and running
-/// one is fine while shipping one is not. `--bios` overrides this, so pointing
-/// the board at a real image is still one flag.
-///
-/// `file` and `text` are the description that is about to be built, because the
-/// firmware's MP and ACPI tables describe *that* board — a copy of `pc-at` with
-/// a second processor added gets a table with two processors in it. A
-/// description this firmware cannot read falls back to the shipped board's, so
-/// a table generator is never the reason a machine will not start.
-fn builtin_bios(machine: &str, file: &str, text: &str) -> Option<Vec<u8>> {
-    let stem = machine
-        .rsplit('/')
-        .next()
-        .unwrap_or(machine)
-        .strip_suffix(".machine")
-        .unwrap_or_else(|| machine.rsplit('/').next().unwrap_or(machine));
-    match stem {
-        // `pc-at-smp` is `pc-at` with a second processor, which is the board
-        // this firmware's generated MP and ACPI tables exist to describe
-        // (`tests/pc_at_smp.rs` boots it on exactly this image), and its
-        // machine file has said all along that `rsemu run pc-at-smp --hd0
-        // disk.img` "boots with nothing supplied". It did not: the stem was
-        // missing here, so the run was refused over an unbound `bios` slot.
-        #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
-        "pc-at" | "pc-at-smp" => Some(
-            rsemu::fw::pcbios::image_for_machine(file, text)
-                .unwrap_or_else(|_| rsemu::fw::pcbios::image()),
-        ),
-        _ => {
-            let _ = (stem, file, text);
             None
         }
     }

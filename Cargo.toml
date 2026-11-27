@@ -534,8 +534,8 @@ display-png = ["std", "dep:oxideav-png"]
 # binds one, for 6 142 bytes of module — and after this round's re-measurement
 # size is not either; the wall clock still is. `q35` (+232 065 on top of pc-at)
 # would be a second POST screen, and its `bios` slot does not in fact default to
-# rsemu's image the way this file used to claim — neither `builtin_bios` in
-# src/bin/rsemu.rs nor `builtin_media` in src/ffi/abi.rs has a q35 arm.
+# rsemu's image the way this file used to claim — `has_generated_bios` in
+# src/machine/catalog.rs, which every front end asks, does not list q35.
 #
 # The two largest candidates both moved further away. `arm64-virt` went *up*
 # again, to +452 016: it mounts an ext4 root off a virtio disk, which makes the

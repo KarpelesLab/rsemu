@@ -967,3 +967,49 @@ fn a_freed_handle_leaves_the_table() {
     assert!(occupied >= 1);
     assert!(crate::ffi::common::lookup(machine).is_none());
 }
+
+/// The two-processor AT builds from its name alone, on rsemu's own BIOS.
+///
+/// The CLI had learned that `pc-at-smp` boots on the firmware `pc-at` does;
+/// this ABI kept its own list, which still said `pc-at` only, so a C host
+/// asking for the same board was refused over an unbound `bios` slot. The
+/// list is now `machine::catalog::has_generated_bios`, for every front end.
+///
+/// The board's other sockets are bound as empty, which is what they are on a
+/// machine with no disks in it; the firmware is the one slot left for the
+/// library to fill.
+#[cfg(all(feature = "machine-pc-at-smp", feature = "fw-pcbios"))]
+#[test]
+fn the_two_processor_at_builds_on_the_built_in_firmware() {
+    let entry = crate::machine::catalog::machine("pc-at-smp").expect("in this build");
+    // SAFETY: pointers into live locals; every NUL-terminated string really is
+    // one, `NULL, 0` is the documented "look it up in the catalog" for the
+    // machine and "no bytes" for a slot, and `machine` is a live `Handle`.
+    unsafe {
+        let cfg = rsemu_config_new();
+        let name = cstring("pc-at-smp");
+        assert_eq!(
+            rsemu_config_machine(cfg, name.as_ptr().cast::<c_char>(), core::ptr::null(), 0),
+            RsemuStatus::Ok as Status
+        );
+        for slot in entry.media {
+            if *slot == crate::machine::catalog::GENERATED_BIOS_SLOT {
+                continue;
+            }
+            let slot = cstring(slot);
+            assert_eq!(
+                rsemu_config_media(cfg, slot.as_ptr().cast::<c_char>(), core::ptr::null(), 0),
+                RsemuStatus::Ok as Status
+            );
+        }
+        let mut machine: Handle = 0;
+        assert_eq!(
+            rsemu_machine_new(cfg, &raw mut machine),
+            RsemuStatus::Ok as Status,
+            "an unbound `bios` slot must fall back to rsemu's own firmware: {}",
+            error_of(cfg)
+        );
+        assert_eq!(rsemu_free(cfg), RsemuStatus::Ok as Status);
+        assert_eq!(rsemu_free(machine), RsemuStatus::Ok as Status);
+    }
+}

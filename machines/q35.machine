@@ -426,8 +426,8 @@ machine "q35" {
   # -- firmware ---------------------------------------------------------------
   #
   # The `bios` slot is **empty unless bound** — `--bios` is how an image gets
-  # here. `builtin_bios` in `src/bin/rsemu.rs` matches the stem `pc-at` and
-  # nothing else, so this board does not get rsemu's own image by default, and
+  # here. `has_generated_bios` in `src/machine/catalog.rs` lists the two AT
+  # boards and nothing else, so this board does not get rsemu's own image, and
   # it should not: that ROM's MP table describes a PC/AT, while `q35.acpi`
   # publishes an ACPI set describing *this* machine as realized. A guest that
   # found both would take the board's (ACPI 6.5 §5.2.5.1 searches the EBDA and

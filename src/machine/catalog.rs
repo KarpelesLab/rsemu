@@ -1213,6 +1213,65 @@ pub fn builtins(machine: &str) -> &'static [BuiltinImage] {
     }
 }
 
+/// The media slot rsemu's own legacy PC BIOS goes in, on the boards that take
+/// it.
+pub const GENERATED_BIOS_SLOT: &str = "bios";
+
+/// Whether rsemu ships firmware for `machine`'s `bios` slot.
+///
+/// **The one list of which boards do**, for the three front ends that each
+/// used to keep their own: the CLI's, the C ABI's and the browser's. They had
+/// parted — the CLI learned that `pc-at-smp` boots on this firmware, and a
+/// page or a C host building the same board was still refused over an unbound
+/// `bios` slot.
+///
+/// `pc-at` and its two-processor twin, and only because `ROADMAP.md` phase 6a
+/// said they must: every legacy PC BIOS anyone could otherwise reach for is
+/// GPL, and running one is fine while shipping one is not. `machine` is a
+/// catalog name or a path to a `.machine` file of that name; a build without
+/// the `fw-pcbios` feature answers `false` for everything.
+#[must_use]
+pub fn has_generated_bios(machine: &str) -> bool {
+    let file = machine.rsplit('/').next().unwrap_or(machine);
+    let stem = file.strip_suffix(".machine").unwrap_or(file);
+    match stem {
+        // `pc-at-smp` is `pc-at` with a second processor, which is the board
+        // this firmware's generated MP and ACPI tables exist to describe
+        // (`tests/pc_at_smp.rs` boots it on exactly this image).
+        #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
+        "pc-at" | "pc-at-smp" => true,
+        _ => false,
+    }
+}
+
+/// The firmware for `machine`'s `bios` slot, when the user left it unbound.
+///
+/// `None` unless [`has_generated_bios`]. Unlike a [`BuiltinImage`] these bytes
+/// do not exist until somebody asks: the firmware's MP, ACPI and SMBIOS tables
+/// describe the board it is about to run in, so it is assembled from `file`
+/// and `text`, the description being built — a copy of `pc-at` with a second
+/// processor added gets a table with two processors in it. A description the
+/// firmware cannot read falls back to the shipped board's, so a table
+/// generator is never the reason a machine will not start.
+#[must_use]
+pub fn generated_bios(machine: &str, file: &str, text: &str) -> Option<Vec<u8>> {
+    if !has_generated_bios(machine) {
+        return None;
+    }
+    #[cfg(feature = "fw-pcbios")]
+    {
+        Some(
+            crate::fw::pcbios::image_for_machine(file, text)
+                .unwrap_or_else(|_| crate::fw::pcbios::image()),
+        )
+    }
+    #[cfg(not(feature = "fw-pcbios"))]
+    {
+        let _ = (file, text);
+        None
+    }
+}
+
 /// The Apple 1's socket: rsemu's own monitor, and nothing of unclear
 /// provenance.
 #[cfg(feature = "machine-apple1")]
@@ -1926,6 +1985,33 @@ fn unknown(name: &str) -> crate::core::Error {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+
+    /// One list of the boards rsemu ships firmware for, and it has both ATs.
+    ///
+    /// The CLI, the C ABI and the browser each kept their own, and the CLI's
+    /// was the only one that had `pc-at-smp` in it.
+    #[cfg(all(feature = "machine-pc-at-smp", feature = "fw-pcbios"))]
+    #[test]
+    fn both_ats_take_the_generated_bios_and_nothing_else_does() {
+        for name in ["pc-at", "pc-at-smp", "boards/pc-at-smp.machine"] {
+            assert!(has_generated_bios(name), "{name}");
+        }
+        for name in ["q35", "apple1", "pc-at-smp-copy", "", "pc-at.machine.bak"] {
+            assert!(!has_generated_bios(name), "{name}");
+            assert!(generated_bios(name, name, "").is_none(), "{name}");
+        }
+        let entry = machine("pc-at-smp").expect("in this build");
+        assert!(entry.media.contains(&GENERATED_BIOS_SLOT));
+        let image = generated_bios(entry.name, entry.name, entry.source).expect("an image");
+        // Assembled for *this* board: the uniprocessor image is a different
+        // ROM, because the tables in it say how many processors there are.
+        assert_ne!(image, crate::fw::pcbios::image());
+        // And a description the firmware cannot read still gets one.
+        assert_eq!(
+            generated_bios("pc-at", "pc-at", "not a machine"),
+            Some(crate::fw::pcbios::image())
+        );
+    }
 
     #[test]
     fn the_registry_and_the_bindings_agree() {

@@ -574,11 +574,12 @@ fn catalog_entry(index: u32) -> Option<&'static crate::machine::catalog::Catalog
 /// ([`crate::fw::pcbios`]) — so it does not exist until someone asks for it and
 /// cannot be a static slice.
 ///
-/// The CLI (`builtin_bios` in `src/bin/rsemu.rs`) and the C ABI
-/// (`builtin_media` in `crate::ffi`) each have the same fork for the same
-/// reason. This is the browser's, and it is here rather than in
-/// `machine::catalog` because a generated image has no `'static` bytes for
-/// [`crate::machine::catalog::BuiltinImage`] to hold.
+/// The CLI and the C ABI (`builtin_media` in `crate::ffi`) each have the same
+/// fork for the same reason. *Which* boards get the generated one, and the
+/// bytes, are [`crate::machine::catalog::has_generated_bios`] and
+/// [`crate::machine::catalog::generated_bios`] for all three; what is here is
+/// only the browser's picker entry, because a generated image has no
+/// `'static` bytes for [`crate::machine::catalog::BuiltinImage`] to hold.
 #[derive(Debug, Clone, Copy)]
 enum Builtin {
     /// An image the catalog carries as bytes.
@@ -614,7 +615,7 @@ impl Builtin {
         match self {
             Builtin::Static(image) => image.slot,
             #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
-            Builtin::PcBios => "bios",
+            Builtin::PcBios => crate::machine::catalog::GENERATED_BIOS_SLOT,
         }
     }
 
@@ -634,8 +635,8 @@ impl Builtin {
             Builtin::Static(image) => alloc::borrow::Cow::Borrowed(image.bytes),
             #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
             Builtin::PcBios => alloc::borrow::Cow::Owned(
-                crate::fw::pcbios::image_for_machine(entry.name, entry.source)
-                    .unwrap_or_else(|_| crate::fw::pcbios::image()),
+                crate::machine::catalog::generated_bios(entry.name, entry.name, entry.source)
+                    .unwrap_or_default(),
             ),
         }
     }
@@ -657,8 +658,10 @@ fn builtins(entry: &'static crate::machine::catalog::CatalogEntry) -> Vec<Builti
     // The one board whose firmware rsemu ships. `ROADMAP.md` phase 6a: every
     // other legacy PC BIOS anyone could reach for is GPL, and running one is
     // fine while shipping one is not.
+    // Which boards those are is `catalog::has_generated_bios`'s to say: this
+    // list said `pc-at` alone after the CLI had learned about `pc-at-smp`.
     #[cfg(all(feature = "fw-pcbios", feature = "machine-pc-at"))]
-    if entry.name == "pc-at" {
+    if crate::machine::catalog::has_generated_bios(entry.name) {
         out.push(Builtin::PcBios);
     }
     out
@@ -2601,6 +2604,26 @@ mod tests {
         assert_eq!(cell(1, 2), cell(1, 1), "the o of No is not that o");
         assert_ne!(cell(0, 2), cell(0, 1), "N and B are the same glyph");
         rsemu_shutdown();
+    }
+
+    /// The page is offered rsemu's own BIOS for both ATs, not only the first.
+    ///
+    /// This module kept its own `entry.name == "pc-at"`, which the CLI's list
+    /// had outgrown: `rsemu run pc-at-smp` booted with nothing supplied and a
+    /// page showing the same board had no built-in image to offer.
+    #[cfg(all(feature = "machine-pc-at-smp", feature = "fw-pcbios"))]
+    #[test]
+    fn both_ats_offer_the_built_in_bios() {
+        for name in ["pc-at", "pc-at-smp"] {
+            let entry = crate::machine::catalog::machine(name).expect("in this build");
+            let offered = builtins(entry);
+            let bios = offered
+                .iter()
+                .find(|b| b.name() == "rsemu-bios")
+                .unwrap_or_else(|| panic!("`{name}` is offered no BIOS"));
+            assert_eq!(bios.slot(), "bios");
+            assert!(!bios.bytes(entry).is_empty(), "{name}");
+        }
     }
 
     /// The index of `machine`'s media slot called `name`.
