@@ -1388,3 +1388,49 @@ fn an_open_transaction_survives_onto_a_fresh_fabric_without_readdressing_anyone(
     assert_eq!(small.state(), BusState::Unaddressed);
     assert_eq!(small.read(Ack::Nack), 0xff);
 }
+
+#[test]
+fn an_engine_whose_pins_are_on_a_net_is_freed_when_it_is_dropped() {
+    // An engine keeps the strong half of every sink it hands out, because a
+    // net holds its sinks weakly. When the sink owned the engine in return,
+    // an engine that had ever been wired was a cycle of its own: it and the
+    // slave behind it outlived the device, and the machine.
+    let slave = Recorder::new(Address::Seven(0x50), &[]);
+    let part = Arc::new(SlaveWires::new(Arc::clone(&slave) as Arc<dyn I2cSlave>));
+    let master = Arc::new(MasterWires::new());
+    let both = Arc::new(ControllerWires::new());
+    both.attach_slave(Arc::clone(&slave) as Arc<dyn I2cSlave>);
+
+    let src = WireId::new(1);
+    let scl = Wire::builder()
+        .source(src)
+        .sink(part.sink(pin::SCL, &[src]), pin::SCL)
+        .sink(master.sink(pin::SCL, &[src]), pin::SCL)
+        .sink(both.sink(pin::SCL, &[src]), pin::SCL)
+        .build();
+    let _ = part.sink(pin::SDA, &[]);
+    let _ = master.sink(pin::SDA, &[]);
+    let _ = both.sink(pin::SDA, &[]);
+
+    // While the engines live the net reaches them: a sink is still owned.
+    for level in [Level::High, Level::Low] {
+        scl.set(src, level);
+        assert_eq!(part.scl().net(), level);
+        assert_eq!(master.scl().net(), level);
+        assert_eq!(both.scl().net(), level);
+    }
+
+    let (weak_part, weak_master, weak_both) = (
+        Arc::downgrade(&part),
+        Arc::downgrade(&master),
+        Arc::downgrade(&both),
+    );
+    let weak_slave = Arc::downgrade(&slave);
+    drop((part, master, both, slave));
+    assert_eq!(weak_part.strong_count(), 0, "a wired `SlaveWires`");
+    assert_eq!(weak_master.strong_count(), 0, "a wired `MasterWires`");
+    assert_eq!(weak_both.strong_count(), 0, "a wired `ControllerWires`");
+    assert_eq!(weak_slave.strong_count(), 0, "and the slave behind them");
+    // A net that outlives them delivers to nobody, and says nothing.
+    scl.set(src, Level::High);
+}

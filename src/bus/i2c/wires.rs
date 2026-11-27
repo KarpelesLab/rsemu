@@ -83,7 +83,7 @@
 //! was the objection that kept this unbuilt, and sharing the face is the answer
 //! to it.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -303,8 +303,13 @@ trait LineObserver: Send + Sync + fmt::Debug {
 }
 
 /// One line of an engine, as the wire graph sees it.
+///
+/// It holds its engine **weakly**. The engine keeps every pin it hands out
+/// ([`Lines::pins`]), so a strong reference back would make a wired engine a
+/// cycle of its own that no drop of the device could reach. A pin whose
+/// engine is gone is a pad with nothing behind it: the edge is not observed.
 struct PinSink {
-    owner: Arc<dyn LineObserver>,
+    owner: Weak<dyn LineObserver>,
     line: u32,
 }
 
@@ -316,7 +321,9 @@ impl fmt::Debug for PinSink {
 
 impl WireSink for PinSink {
     fn set_level(&self, src: WireId, _line: u32, level: Level) {
-        self.owner.observe_line(self.line, src, level);
+        if let Some(owner) = self.owner.upgrade() {
+            owner.observe_line(self.line, src, level);
+        }
     }
 }
 
@@ -405,7 +412,7 @@ impl Lines {
     /// records.
     fn sink(
         &self,
-        owner: Arc<dyn LineObserver>,
+        owner: Weak<dyn LineObserver>,
         line: u32,
         sources: &[WireId],
     ) -> Arc<dyn WireSink> {
@@ -757,8 +764,11 @@ impl SlaveWires {
     /// so the strong half has to live somewhere.
     #[must_use]
     pub fn sink(self: &Arc<Self>, line: u32, sources: &[WireId]) -> Arc<dyn WireSink> {
-        self.lines
-            .sink(Arc::clone(self) as Arc<dyn LineObserver>, line, sources)
+        self.lines.sink(
+            Arc::downgrade(self) as Weak<dyn LineObserver>,
+            line,
+            sources,
+        )
     }
 
     /// Attach our driver for one line.
@@ -1361,8 +1371,11 @@ impl MasterWires {
     /// A sink for one line, for [`crate::core::device::Device::sink`].
     #[must_use]
     pub fn sink(self: &Arc<Self>, line: u32, sources: &[WireId]) -> Arc<dyn WireSink> {
-        self.lines
-            .sink(Arc::clone(self) as Arc<dyn LineObserver>, line, sources)
+        self.lines.sink(
+            Arc::downgrade(self) as Weak<dyn LineObserver>,
+            line,
+            sources,
+        )
     }
 
     /// Attach our driver for one line.
@@ -1971,8 +1984,11 @@ impl ControllerWires {
     /// A sink for one line, for [`crate::core::device::Device::sink`].
     #[must_use]
     pub fn sink(self: &Arc<Self>, line: u32, sources: &[WireId]) -> Arc<dyn WireSink> {
-        self.lines
-            .sink(Arc::clone(self) as Arc<dyn LineObserver>, line, sources)
+        self.lines.sink(
+            Arc::downgrade(self) as Weak<dyn LineObserver>,
+            line,
+            sources,
+        )
     }
 
     /// Attach our driver for one line.
