@@ -1277,3 +1277,329 @@ fn a_medium_error_becomes_the_error_register_bit_that_describes_it() {
     assert_eq!(error_bit(BusError::Retry), ERR_UNC);
     assert_eq!(error_bit(BusError::Protected), ERR_ABRT);
 }
+
+// ---------------------------------------------------------------------------
+// a DMA block is many sectors, and a medium error inside one is still exact
+// ---------------------------------------------------------------------------
+
+/// A medium with sectors that will not read and sectors that will not write,
+/// which records how it is called.
+///
+/// An access fails if it *covers* a bad sector, whatever its length — which is
+/// how a host file behaves, and is what makes a many-sector call lose the
+/// address a one-sector call would have had.
+#[derive(Debug)]
+struct Flawed {
+    ram: RamStore,
+    unreadable: Vec<u64>,
+    unwritable: Vec<u64>,
+    /// Every read, as (first sector, sectors).
+    reads: Mutex<Vec<(u64, u64)>>,
+    /// Every write, likewise.
+    writes: Mutex<Vec<(u64, u64)>>,
+}
+
+impl Flawed {
+    fn new(sectors: u64, unreadable: &[u64], unwritable: &[u64]) -> Arc<Flawed> {
+        let ram = RamStore::new(sectors * SECTOR);
+        for lba in 0..sectors {
+            RamStore::write_at(&ram, lba * SECTOR, &stamp(lba)).expect("in range");
+        }
+        Arc::new(Flawed {
+            ram,
+            unreadable: unreadable.to_vec(),
+            unwritable: unwritable.to_vec(),
+            reads: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+            writes: Mutex::with_rank(LockRank::LEAF, Vec::new()),
+        })
+    }
+
+    fn covers(bad: &[u64], offset: u64, len: u64) -> bool {
+        bad.iter()
+            .any(|lba| lba * SECTOR < offset + len && offset < (lba + 1) * SECTOR)
+    }
+
+    /// The sector on the medium itself, past the flaws.
+    fn holds(&self, lba: u64) -> Vec<u8> {
+        let mut out = alloc::vec![0u8; SECTOR as usize];
+        RamStore::read_at(&self.ram, lba * SECTOR, &mut out).expect("in range");
+        out
+    }
+}
+
+impl Medium for Flawed {
+    fn capacity(&self) -> u64 {
+        Medium::capacity(&self.ram)
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> crate::core::space::MemResult {
+        self.reads
+            .lock()
+            .push((offset / SECTOR, dst.len() as u64 / SECTOR));
+        if Flawed::covers(&self.unreadable, offset, dst.len() as u64) {
+            return Err(BusError::Unassigned);
+        }
+        RamStore::read_at(&self.ram, offset, dst)
+    }
+
+    fn write_at(&self, offset: u64, src: &[u8]) -> crate::core::space::MemResult {
+        self.writes
+            .lock()
+            .push((offset / SECTOR, src.len() as u64 / SECTOR));
+        if Flawed::covers(&self.unwritable, offset, src.len() as u64) {
+            return Err(BusError::Unassigned);
+        }
+        RamStore::write_at(&self.ram, offset, src)
+    }
+}
+
+/// A DMA-capable drive on a [`Flawed`] medium.
+fn flawed(sectors: u64, unreadable: &[u64], unwritable: &[u64]) -> (AtaDisk, Arc<Flawed>) {
+    let medium = Flawed::new(sectors, unreadable, unwritable);
+    let mut id =
+        Identity::new(sectors, default_geometry(sectors), true, 16).expect("a valid drive");
+    id.dma = true;
+    let disk = AtaDisk::with_medium(
+        id,
+        Position::Device0,
+        Arc::clone(&medium) as Arc<dyn Medium>,
+    )
+    .expect("the medium matches the identity");
+    (disk, medium)
+}
+
+fn dma_tf(command: u8, count: u16, lba: u64) -> taskfile::Taskfile {
+    taskfile::Taskfile {
+        command,
+        count,
+        lba,
+        device: DEV_LBA,
+        ..taskfile::Taskfile::default()
+    }
+}
+
+/// Drain a data-in phase the way a host adapter with a scatter list does, in
+/// pieces that divide neither a sector nor a block.
+fn dma_in(disk: &AtaDisk) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut piece = [0u8; 1000];
+    while disk.taskfile_phase().is_data() {
+        let n = disk.taskfile_read(&mut piece);
+        assert!(n > 0, "a data phase that moved nothing");
+        out.extend_from_slice(&piece[..n as usize]);
+    }
+    out
+}
+
+/// Feed a data-out phase from `bytes`, in the same awkward pieces. Returns how
+/// many bytes the drive took before it stopped asking.
+fn dma_out(disk: &AtaDisk, bytes: &[u8]) -> usize {
+    let mut at = 0;
+    while disk.taskfile_phase().is_data() && at < bytes.len() {
+        let end = (at + 1000).min(bytes.len());
+        let n = disk.taskfile_write(&bytes[at..end]) as usize;
+        assert!(n > 0, "a data phase that moved nothing");
+        at += n;
+    }
+    at
+}
+
+#[test]
+fn a_dma_read_costs_one_medium_call_per_block_and_not_one_per_sector() {
+    // The measurement this path was changed for, as an assertion: 300 sectors
+    // is two whole blocks and a short third, so three calls reach the medium
+    // where 300 did — on a host file, three reads rather than 300.
+    let (disk, medium) = flawed(1024, &[], &[]);
+    disk.taskfile_start(&dma_tf(cmd::READ_DMA_EXT, 300, 5));
+    let got = dma_in(&disk);
+
+    assert_eq!(got.len() as u64, 300 * SECTOR);
+    for (i, sector) in got.chunks(SECTOR as usize).enumerate() {
+        assert_eq!(sector, &stamp(5 + i as u64)[..], "sector {}", 5 + i);
+    }
+    assert_eq!(
+        *medium.reads.lock(),
+        [(5, 128), (133, 128), (261, 44)],
+        "one call per block, the last one short"
+    );
+    let regs = disk.taskfile_registers();
+    assert_eq!(regs.status & (ST_ERR | ST_DRQ), 0);
+    assert_eq!(regs.lba, 304, "the last sector transferred");
+    assert!(disk.taskfile_acknowledge(), "one interrupt, at completion");
+}
+
+#[test]
+fn a_dma_write_costs_one_medium_call_per_block_and_lands_where_it_was_aimed() {
+    let (disk, medium) = flawed(1024, &[], &[]);
+    let payload: Vec<u8> = (0..300 * SECTOR).map(|i| (i % 251) as u8).collect();
+    disk.taskfile_start(&dma_tf(cmd::WRITE_DMA_EXT, 300, 700));
+    assert_eq!(dma_out(&disk, &payload), payload.len());
+
+    assert_eq!(
+        *medium.writes.lock(),
+        [(700, 128), (828, 128), (956, 44)],
+        "one call per block, the last one short"
+    );
+    for i in 0..300u64 {
+        let at = (i * SECTOR) as usize;
+        assert_eq!(
+            medium.holds(700 + i),
+            &payload[at..at + SECTOR as usize],
+            "sector {}",
+            700 + i
+        );
+    }
+    // The neighbours on both sides are what they were.
+    assert_eq!(medium.holds(699), stamp(699));
+    assert_eq!(medium.holds(1000), stamp(1000));
+    let regs = disk.taskfile_registers();
+    assert_eq!(regs.status & (ST_ERR | ST_DRQ), 0);
+    assert_eq!(regs.lba, 999);
+}
+
+#[test]
+fn a_dma_read_error_in_the_middle_of_a_block_reports_that_sector() {
+    // ACS-2 §7.27.5: "the LBA field set to the LBA of the logical sector where
+    // the first unrecoverable error occurred". Sector 200 is in the second
+    // block of a read from 10 (138..=265), 62 sectors into it. A drive that
+    // reported the block's first sector would send a guest's bad-block
+    // handling to 138.
+    let (disk, medium) = flawed(1024, &[200], &[]);
+    disk.taskfile_start(&dma_tf(cmd::READ_DMA_EXT, 300, 10));
+    let got = dma_in(&disk);
+
+    // Everything ahead of the bad sector arrived, and nothing after it.
+    assert_eq!(got.len() as u64, 190 * SECTOR);
+    for (i, sector) in got.chunks(SECTOR as usize).enumerate() {
+        assert_eq!(sector, &stamp(10 + i as u64)[..], "sector {}", 10 + i);
+    }
+    let regs = disk.taskfile_registers();
+    assert_eq!(regs.status & (ST_ERR | ST_DRQ), ST_ERR);
+    assert_eq!(regs.error, ERR_UNC);
+    assert_eq!(regs.lba, 200, "the sector that would not read");
+    assert!(disk.taskfile_acknowledge(), "a failed command interrupts");
+    // And the narrowing only ran for the block that failed.
+    let reads = medium.reads.lock();
+    assert_eq!(reads[0], (10, 128));
+    assert_eq!(reads[1], (138, 128));
+    assert_eq!(reads[2], (138, 1), "then a sector at a time");
+}
+
+#[test]
+fn a_dma_read_error_on_the_first_sector_of_a_block_delivers_nothing_from_it() {
+    let (disk, _medium) = flawed(1024, &[138], &[]);
+    disk.taskfile_start(&dma_tf(cmd::READ_DMA_EXT, 300, 10));
+    let got = dma_in(&disk);
+    assert_eq!(
+        got.len() as u64,
+        128 * SECTOR,
+        "the first block and no more"
+    );
+    let regs = disk.taskfile_registers();
+    assert_eq!(regs.status & ST_ERR, ST_ERR);
+    assert_eq!(regs.lba, 138);
+
+    // The very first sector of the command: no data phase at all.
+    let (disk, _medium) = flawed(1024, &[10], &[]);
+    assert_eq!(
+        disk.taskfile_start(&dma_tf(cmd::READ_DMA_EXT, 300, 10)),
+        taskfile::Phase::Done
+    );
+    assert_eq!(disk.taskfile_registers().lba, 10);
+}
+
+#[test]
+fn a_dma_write_error_in_the_middle_of_a_block_reports_that_sector() {
+    let (disk, medium) = flawed(1024, &[], &[200]);
+    let payload: Vec<u8> = (0..300 * SECTOR).map(|i| (i % 249) as u8).collect();
+    disk.taskfile_start(&dma_tf(cmd::WRITE_DMA_EXT, 300, 10));
+    let fed = dma_out(&disk, &payload);
+
+    // The drive stopped asking once the block holding the bad sector failed.
+    assert_eq!(fed as u64, 256 * SECTOR, "two blocks were handed over");
+    let regs = disk.taskfile_registers();
+    assert_eq!(regs.status & (ST_ERR | ST_DRQ), ST_ERR);
+    assert_eq!(regs.error, ERR_UNC);
+    assert_eq!(regs.lba, 200, "the sector that would not write");
+
+    // The medium holds exactly what a sector-at-a-time transfer would have
+    // left: every sector ahead of the bad one, and nothing from it on.
+    for lba in 10..200u64 {
+        let at = ((lba - 10) * SECTOR) as usize;
+        assert_eq!(
+            medium.holds(lba),
+            &payload[at..at + SECTOR as usize],
+            "sector {lba}"
+        );
+    }
+    for lba in 200..320u64 {
+        assert_eq!(medium.holds(lba), stamp(lba), "sector {lba} is untouched");
+    }
+}
+
+#[test]
+fn a_read_multiple_error_inside_a_drq_block_reports_that_sector() {
+    // A PIO block is all or nothing, so the sectors ahead of the bad one are
+    // not handed over — but the address is the bad sector's, not the block's.
+    let (disk, _medium) = flawed(1024, &[35], &[]);
+    disk.write_reg(Reg::SectorCount, 8);
+    disk.write_reg(Reg::Command, u16::from(cmd::SET_MULTIPLE));
+    assert_eq!(status(&disk) & ST_ERR, 0);
+
+    select_lba(&disk, 0);
+    disk.write_reg(Reg::SectorCount, 16);
+    disk.write_reg(Reg::LbaLow, 24);
+    disk.write_reg(Reg::LbaMid, 0);
+    disk.write_reg(Reg::LbaHigh, 0);
+    disk.write_reg(Reg::Command, u16::from(cmd::READ_MULTIPLE));
+    let first = drain(&disk, 8 * 256);
+    assert_eq!(&first[..SECTOR as usize], &stamp(24)[..]);
+
+    // The second block (32..=39) holds the bad sector.
+    let st = disk.read_alt_status();
+    assert_eq!(st & (ST_ERR | ST_DRQ), ST_ERR);
+    assert_eq!(disk.read_reg(Reg::Feature, false) as u8, ERR_UNC);
+    assert_eq!(disk.read_reg(Reg::LbaLow, false) as u8, 35);
+}
+
+#[test]
+fn a_snapshot_taken_inside_a_dma_block_resumes_inside_it() {
+    // The buffer is a 64 KiB block now rather than a sector, and it is still
+    // state: a restore part way through one carries on at the same byte.
+    let dma_drive = || {
+        let mut id = Identity::new(1024, default_geometry(1024), true, 16).expect("a valid drive");
+        id.dma = true;
+        let disk = AtaDisk::with_identity(id, Position::Device0).expect("it fits");
+        for lba in 0..1024 {
+            disk.write_media(lba * SECTOR, &stamp(lba))
+                .expect("in range");
+        }
+        disk
+    };
+    let saved = dma_drive();
+    saved.taskfile_start(&dma_tf(cmd::READ_DMA_EXT, 300, 5));
+    let mut head = alloc::vec![0u8; 70_000];
+    assert_eq!(saved.taskfile_read(&mut head[..65_536]), 65_536);
+    assert_eq!(saved.taskfile_read(&mut head[65_536..]), 70_000 - 65_536);
+    let first = save_of(&saved);
+
+    let restored = dma_drive();
+    let reader = StateReader::new(&first).expect("a snapshot we just wrote");
+    let chunk = reader
+        .load("hd", CLASS.name, CLASS.version, &Migrations::new())
+        .expect("the chunk we just wrote");
+    restored.load(&mut chunk.reader()).expect("it loads");
+    assert_eq!(
+        first,
+        save_of(&restored),
+        "the same state must save the same bytes"
+    );
+
+    let mut all = head;
+    all.extend_from_slice(&dma_in(&restored));
+    assert_eq!(all.len() as u64, 300 * SECTOR);
+    for (i, sector) in all.chunks(SECTOR as usize).enumerate() {
+        assert_eq!(sector, &stamp(5 + i as u64)[..], "sector {}", 5 + i);
+    }
+    assert_eq!(restored.taskfile_registers().lba, 304);
+}

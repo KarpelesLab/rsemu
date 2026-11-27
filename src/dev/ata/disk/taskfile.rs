@@ -863,14 +863,17 @@ mod tests {
 
         // §11.9 DMA data-in: Data FISes with nothing around them, and one
         // Register FIS with the interrupt at the end (DDMAI2). ATA/ATAPI-6 §9.7
-        // likewise interrupts a DMA command once, at completion.
+        // likewise interrupts a DMA command once, at completion. A few sectors
+        // are one block of the drive's buffer, and how many blocks there are
+        // is the model's business rather than the protocol's — what the
+        // protocol fixes is that none of them is announced.
         assert_eq!(
             i_bits(&disk, &tf(cmd::READ_DMA_EXT, 3, 4), 0),
-            (vec![false, false, false], true)
+            (vec![false], true)
         );
         assert_eq!(
             i_bits(&disk, &tf(cmd::WRITE_DMA_EXT, 2, 50), 0x44),
-            (vec![false, false], true)
+            (vec![false], true)
         );
 
         // §11.6 non-data (DND1), and an error before any data (DPIOI3).

@@ -172,6 +172,22 @@ pub const LBA28_LIMIT: u64 = 1 << 28;
 /// The largest LBA the 48-bit addressing scheme can name, plus one.
 pub const LBA48_LIMIT: u64 = 1 << 48;
 
+/// How many sectors a DMA command moves through the drive's buffer at a time.
+///
+/// One medium call per block, so this is what a sequential transfer costs the
+/// host: at one sector a block a file-backed image paid its seeks and a `read`
+/// for every 512 bytes, and at this size it pays them once per 64 KiB — which
+/// is also a qcow2 cluster at the default cluster size, so an aligned block is
+/// one run of the image rather than several.
+///
+/// It is not a DRQ block and no guest can observe it: see
+/// `AtaDisk::dma_transfer`. A medium error inside a block is narrowed to its
+/// sector before it is reported, so the address the guest reads back is what
+/// it was at one sector a block. The buffer is drive state and travels in a
+/// snapshot taken mid-transfer, which is the reason not to make it larger than
+/// it earns.
+const DMA_BATCH: u32 = 128;
+
 /// The largest cylinder count words 1 and 54 of `IDENTIFY DEVICE` can express.
 pub const MAX_IDENTIFY_CYLINDERS: u64 = 16383;
 
@@ -1320,13 +1336,19 @@ impl AtaDisk {
             return;
         };
         let count = (state.buf.len() as u64) / SECTOR;
-        let wrote = self.media.write_at(xfer.next * SECTOR, &state.buf[..]);
+        let refused = match self.media.write_at(xfer.next * SECTOR, &state.buf[..]) {
+            Ok(()) => None,
+            // One call carried the whole block, so its failure names no
+            // sector. Go back over it a sector at a time: the first one the
+            // medium refuses is the address the command reports.
+            Err(_) => self.first_unwritable(xfer.next, &state.buf[..]),
+        };
         state.status &= !ST_DRQ;
-        if let Err(e) = wrote {
+        if let Some((at, e)) = refused {
             // A host I/O error — a torn write, a full filesystem, a device that
             // went away — is *not* IDNF: the sector exists. `error_bit`
             // is the one place that mapping is written down.
-            self.fail(state, error_bit(e), xfer.next, xfer.mode);
+            self.fail(state, error_bit(e), at, xfer.mode);
             return;
         }
         xfer.last = xfer.next + count - 1;
@@ -1356,13 +1378,38 @@ impl AtaDisk {
         let Some(mut xfer) = state.xfer.clone() else {
             return;
         };
-        let count = u64::from(xfer.block).min(xfer.left);
-        let mut buf = alloc::vec![0u8; (count * SECTOR) as usize];
-        if let Err(e) = self.media.read_at(xfer.next * SECTOR, &mut buf) {
-            // A short read or a host I/O error is an uncorrectable data error,
-            // not a missing address. See `error_bit`.
-            self.fail(state, error_bit(e), xfer.next, xfer.mode);
-            return;
+        let mut count = u64::from(xfer.block).min(xfer.left);
+        // The buffer the last block used, emptied: a transfer of many blocks
+        // allocates once rather than once a block.
+        let mut buf = core::mem::take(&mut state.buf);
+        buf.clear();
+        buf.resize((count * SECTOR) as usize, 0);
+        if self.media.read_at(xfer.next * SECTOR, &mut buf).is_err() {
+            // One call asked for the whole block, so its failure names no
+            // sector. Read it again a sector at a time to find the one that
+            // will not read.
+            if let Some((bad, e)) = self.first_unreadable(xfer.next, &mut buf) {
+                let good = bad - xfer.next;
+                if good == 0 || !xfer.dma {
+                    // A short read or a host I/O error is an uncorrectable
+                    // data error, not a missing address. See `error_bit`.
+                    //
+                    // A PIO block is all or nothing — its size is the DRQ
+                    // block the host was promised, and ACS-2 §7.32.2 has the
+                    // error "posted at the beginning of the block or partial
+                    // block transfer" — so the sectors ahead of the bad one
+                    // are not handed over. The address is still the bad
+                    // sector's own.
+                    self.fail(state, error_bit(e), bad, xfer.mode);
+                    return;
+                }
+                // A DMA command has no DRQ block, so the sectors that did
+                // read are delivered exactly as they would have been one at a
+                // time, and the next call here starts on the bad one and
+                // reports it.
+                buf.truncate((good * SECTOR) as usize);
+                count = good;
+            }
         }
         xfer.last = xfer.next + count - 1;
         xfer.next += count;
@@ -1388,9 +1435,55 @@ impl AtaDisk {
         let count = u64::from(xfer.block).min(xfer.left);
         xfer.left -= count;
         state.xfer = Some(xfer);
-        state.buf = alloc::vec![0u8; (count * SECTOR) as usize];
+        // Emptied and refilled rather than replaced, so the allocation is the
+        // transfer's and not the block's.
+        state.buf.clear();
+        state.buf.resize((count * SECTOR) as usize, 0);
         state.pos = 0;
         state.status = ST_IDLE | ST_DRQ;
+    }
+
+    /// The first sector of a block at `lba` that will not read, and why.
+    ///
+    /// Run only after one medium call for the whole of `buf` has failed, which
+    /// says that *something* in the block is bad and not what. The command has
+    /// to say what: ACS-2 (T13/2015-D revision 2) §7.27.5, for `READ DMA` and
+    /// in the same words for every other read, "the device shall return
+    /// command completion with the Error bit set to one and the LBA field set
+    /// to the LBA of the logical sector where the first unrecoverable error
+    /// occurred."
+    ///
+    /// Every sector ahead of the bad one is left in `buf`, re-read. `None` if
+    /// the second pass read all of it: the failure was one a retry cures, and
+    /// it has now been retried.
+    fn first_unreadable(&self, lba: u64, buf: &mut [u8]) -> Option<(u64, BusError)> {
+        (lba..)
+            .zip(buf.chunks_mut(SECTOR as usize))
+            .find_map(|(at, sector)| {
+                self.media
+                    .read_at(at * SECTOR, sector)
+                    .err()
+                    .map(|e| (at, e))
+            })
+    }
+
+    /// The first sector of a block at `lba` that will not write, and why.
+    ///
+    /// The other direction of [`first_unreadable`](Self::first_unreadable),
+    /// under the same rule. Writing the sectors ahead of the bad one a second
+    /// time is harmless — they are the bytes the failed call was already asked
+    /// to put there — and it is what leaves the medium holding exactly what a
+    /// sector-at-a-time transfer would have left: everything before the
+    /// address the command reports.
+    fn first_unwritable(&self, lba: u64, buf: &[u8]) -> Option<(u64, BusError)> {
+        (lba..)
+            .zip(buf.chunks(SECTOR as usize))
+            .find_map(|(at, sector)| {
+                self.media
+                    .write_at(at * SECTOR, sector)
+                    .err()
+                    .map(|e| (at, e))
+            })
     }
 
     /// One block of data with no transfer behind it: `IDENTIFY DEVICE`.
@@ -1652,18 +1745,18 @@ impl AtaDisk {
 
     /// `READ DMA`, `WRITE DMA` and their EXT forms.
     ///
-    /// One sector per block, which is invisible above the seam: the DMA
-    /// protocol has no DRQ block at all, so the size this model moves at a time
-    /// is a property of the buffer rather than anything the guest can observe.
-    /// It is deliberately not the whole transfer, because the whole transfer of
-    /// a 48-bit command is 32 MiB and a host allocation of that size is not what
-    /// a data path should cost.
+    /// [`DMA_BATCH`] sectors per block, which is invisible above the seam: the
+    /// DMA protocol has no DRQ block at all, so the size this model moves at a
+    /// time is a property of the buffer rather than anything the guest can
+    /// observe. It is deliberately not the whole transfer, because the whole
+    /// transfer of a 48-bit command is 32 MiB and a host allocation of that
+    /// size is not what a data path should cost.
     fn dma_transfer(&self, state: &mut Volatile, out: bool, ext: bool) {
         if !self.id.dma {
             self.abort(state);
             return;
         }
-        self.transfer(state, out, ext, 1, true);
+        self.transfer(state, out, ext, DMA_BATCH, true);
     }
 
     /// `READ SECTOR(S)`, `WRITE SECTOR(S)` and their EXT forms.

@@ -856,13 +856,15 @@ fn a_write_overflow_stops_the_port_and_puts_nothing_on_the_medium() {
         "PxTFD.STS.DRQ, which is what tells software to COMRESET"
     );
 
-    // The first sector went, because the drive had a whole block for it. The
-    // two behind it are untouched — not zeroed, which is the failure this test
-    // exists to catch.
+    // Nothing reached the medium. The sector the adapter did hand over is in
+    // the drive's buffer, waiting for the rest of a block that never arrives —
+    // a DMA command's three sectors are one block — and the COMRESET below
+    // discards it. The two behind it are untouched too: not zeroed, which is
+    // the failure this test exists to catch. A command that ends this way has
+    // no defined effect on the medium, and the one outcome that is always
+    // safe is none.
     let mut got = alloc::vec![0u8; SECTOR as usize];
-    Medium::read_at(&*rig.store, 60 * SECTOR, &mut got).expect("the medium reads");
-    assert_eq!(got, payload);
-    for lba in [61u64, 62] {
+    for lba in [60u64, 61, 62] {
         Medium::read_at(&*rig.store, lba * SECTOR, &mut got).expect("the medium reads");
         assert_eq!(got, stamp(lba), "sector {lba} was written by nobody");
     }

@@ -294,10 +294,15 @@ const MAX_COMMANDS_PER_RUN: u32 = MAX_PORTS as u32 * COMMAND_SLOTS * 2;
 
 /// Bytes moved between the drive and guest memory at a time.
 ///
-/// One sector. The drive hands out at most one `DRQ` block per call and a PRD
-/// may be any length, so this is only the size of the staging buffer that sits
-/// between them — small, because it is a host allocation on a data path.
-const CHUNK: usize = 512;
+/// The drive hands out at most the rest of one block per call and a PRD may be
+/// any length, so this is only the ceiling on the staging buffer that sits
+/// between them. 64 KiB is the block a DMA command moves at a time
+/// (`dev::ata::disk`), so such a block crosses in one piece when its PRD has
+/// room for it: one copy out of the drive and one write into guest memory,
+/// where a sector-sized buffer made 128 of each. The buffer itself is only as
+/// large as the pieces a command actually moves — an `IDENTIFY DEVICE` stages
+/// 512 bytes, not this.
+const CHUNK: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // the registers (§3.1, §3.3)
@@ -1701,7 +1706,8 @@ impl Hba {
             }
         }
         let mut prdt = Prdt::new(header.ctba.wrapping_add(PRDT_OFFSET), header.prdtl);
-        let mut scratch = [0u8; CHUNK];
+        // Grown to the largest piece this command moves and no further.
+        let mut scratch: Vec<u8> = Vec::new();
         let mut moved: u64 = 0;
         let mut blocks: u64 = 0;
         let mut pio = false;
@@ -1751,6 +1757,9 @@ impl Hba {
                     trouble |= IS_OFS;
                     break;
                 };
+                if scratch.len() < n {
+                    scratch.resize(n, 0);
+                }
                 let did = if out {
                     if space
                         .read_bytes(addr, &mut scratch[..n], self.attrs())
@@ -1923,7 +1932,7 @@ impl Hba {
     /// `I` bit set, which `PxIS.PSS` reports whatever became of the data
     /// (AHCI 1.3.1 §3.3.5).
     fn discard(&self, drive: &Arc<dyn TaskfileDevice>) -> bool {
-        let mut scratch = [0u8; CHUNK];
+        let mut scratch = alloc::vec![0u8; CHUNK];
         let mut interrupt = false;
         for _ in 0..MAX_BLOCKS {
             match drive.taskfile_phase() {

@@ -1238,3 +1238,128 @@ fn a_stopped_port_runs_nothing_and_an_unmastered_function_fetches_nothing() {
     assert_eq!(reg32(&m, port(P_CI)), 0);
     assert_eq!(peek_bytes(&m, DATA, SECTOR), stamp(7));
 }
+
+#[test]
+fn a_transfer_of_several_blocks_crosses_the_adapter_in_both_directions() {
+    // A DMA command moves through the drive 64 KiB at a time and through the
+    // adapter's staging buffer in pieces no larger than that. 300 sectors is
+    // two whole blocks and a short third, and the descriptors are cut so that
+    // one ends inside a block, one ends on a block boundary and one starts
+    // inside a sector — every place a piece can be cut short.
+    let (m, store) = ready();
+    const LBA: u64 = 1000;
+    const BLOCKS: u64 = 300;
+    let total = BLOCKS * SECTOR;
+
+    let parts: [(u64, u64); 4] = [
+        (DATA, 40_000),
+        (DATA + 0x1_0000, 25_536),
+        (DATA + 0x2_0000, 65_536 + 1000),
+        (DATA + 0x4_0000, total - 40_000 - 25_536 - 65_536 - 1000),
+    ];
+    let prds: Vec<[u8; 16]> = parts
+        .iter()
+        .map(|(addr, len)| prd(*addr, *len, false))
+        .collect();
+
+    // Read first: every sector says which one it is.
+    let moved = issue(
+        &m,
+        Cmd {
+            command: 0x25,
+            count: BLOCKS as u16,
+            lba: LBA,
+            device: 0x40,
+            ..Cmd::default()
+        },
+        false,
+        &prds,
+    );
+    assert_eq!(u64::from(moved), total, "PRDBC for the whole read");
+    assert_eq!(reg32(&m, port(P_TFD)) & STS_ERR, 0);
+    let mut got = Vec::new();
+    for (addr, len) in parts {
+        got.extend_from_slice(&peek_bytes(&m, addr, len));
+    }
+    for (i, sector) in got.chunks(SECTOR as usize).enumerate() {
+        assert_eq!(
+            sector,
+            &stamp(LBA + i as u64)[..],
+            "sector {}",
+            LBA + i as u64
+        );
+    }
+    acknowledge(&m);
+
+    // Then write something else over the same range, from the same scattered
+    // memory, and look at the medium.
+    let payload: Vec<u8> = (0..total).map(|i| (i % 253) as u8 ^ 0xa5).collect();
+    let mut at = 0usize;
+    for (addr, len) in parts {
+        poke_bytes(&m, addr, &payload[at..at + len as usize]);
+        at += len as usize;
+    }
+    let moved = issue(
+        &m,
+        Cmd {
+            command: 0x35,
+            count: BLOCKS as u16,
+            lba: LBA,
+            device: 0x40,
+            ..Cmd::default()
+        },
+        true,
+        &prds,
+    );
+    assert_eq!(u64::from(moved), total, "PRDBC for the whole write");
+    assert_eq!(reg32(&m, port(P_TFD)) & STS_ERR, 0);
+    for i in 0..BLOCKS {
+        let from = (i * SECTOR) as usize;
+        assert_eq!(
+            on_medium(&store, LBA + i),
+            &payload[from..from + SECTOR as usize],
+            "sector {} on the medium",
+            LBA + i
+        );
+    }
+    // The sectors on either side are still stamped.
+    assert_eq!(on_medium(&store, LBA - 1), stamp(LBA - 1));
+    assert_eq!(on_medium(&store, LBA + BLOCKS), stamp(LBA + BLOCKS));
+}
+
+#[test]
+fn a_read_cut_short_inside_a_block_keeps_what_fitted_and_reports_the_overflow() {
+    // The descriptor table has room for 70,000 bytes of a 300-sector read: the
+    // first block and part of the second. §6.1.5 has the adapter carry on and
+    // discard, and `PRDBC` says how much actually landed.
+    let (m, store) = ready();
+    const LBA: u64 = 2000;
+    poke_bytes(&m, DATA + 70_000, &[0x5a; 16]);
+    let moved = issue(
+        &m,
+        Cmd {
+            command: 0x25,
+            count: 300,
+            lba: LBA,
+            device: 0x40,
+            ..Cmd::default()
+        },
+        false,
+        &[prd(DATA, 70_000, false)],
+    );
+    assert_eq!(moved, 70_000, "PRDBC is what the table had room for");
+    assert_eq!(reg32(&m, port(P_IS)) & IS_OFS, IS_OFS, "an overflow");
+    let got = peek_bytes(&m, DATA, 70_000);
+    let mut want = Vec::new();
+    for lba in LBA..LBA + 137 {
+        want.extend_from_slice(&on_medium(&store, lba));
+    }
+    assert_eq!(got, &want[..70_000]);
+    assert_eq!(
+        peek_bytes(&m, DATA + 70_000, 16),
+        [0x5a; 16],
+        "nothing was written past the descriptor"
+    );
+    // The port is still running and takes the next command.
+    assert_eq!(reg32(&m, port(P_CMD)) & CMD_CR, CMD_CR);
+}

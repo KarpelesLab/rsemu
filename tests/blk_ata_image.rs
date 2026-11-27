@@ -24,6 +24,7 @@ use rsemu::core::device::Device;
 use rsemu::core::hosts::HostObjects;
 use rsemu::core::props::{Media, Props, Value};
 use rsemu::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+use rsemu::dev::ata::disk::taskfile::Taskfile;
 use rsemu::dev::ata::disk::{
     self, AtaDisk, DEV_LBA, DiskDevice, Geometry, Identity, Position, Reg, SECTOR, cmd,
 };
@@ -632,4 +633,186 @@ fn an_empty_bay_has_nothing_to_flush() {
     let device = DiskDevice::new(&props).expect("a bay");
     assert!(device.drive().is_none());
     Device::flush(&device).expect("nothing to do, and no complaint about it");
+}
+
+// ---------------------------------------------------------------------------
+// the DMA path, which moves many sectors per image call
+// ---------------------------------------------------------------------------
+
+/// A DMA-capable drive of `image`'s capacity.
+fn dma_drive_on(image: Arc<Image>) -> AtaDisk {
+    let sectors = image.capacity() / SECTOR;
+    let mut id = Identity::new(sectors, geometry_for(sectors), true, 16).expect("a valid drive");
+    id.dma = true;
+    AtaDisk::with_medium(id, Position::Device0, image).expect("the medium matches the identity")
+}
+
+fn dma_tf(command: u8, count: u16, lba: u64) -> Taskfile {
+    Taskfile {
+        command,
+        count,
+        lba,
+        device: DEV_LBA,
+        ..Taskfile::default()
+    }
+}
+
+/// `READ DMA EXT`, drained the way a host adapter drains it.
+fn dma_read(disk: &AtaDisk, lba: u64, count: u16) -> Vec<u8> {
+    disk.taskfile_start(&dma_tf(cmd::READ_DMA_EXT, count, lba));
+    let mut out = Vec::new();
+    let mut piece = [0u8; 3000];
+    while disk.taskfile_phase().is_data() {
+        let n = disk.taskfile_read(&mut piece) as usize;
+        assert!(n > 0, "a data phase that moved nothing");
+        out.extend_from_slice(&piece[..n]);
+    }
+    let regs = disk.taskfile_registers();
+    assert_eq!(regs.status & 0x01, 0, "READ DMA EXT at {lba} failed");
+    out
+}
+
+/// `WRITE DMA EXT` of `bytes`.
+fn dma_write(disk: &AtaDisk, lba: u64, bytes: &[u8]) {
+    let count = (bytes.len() as u64 / SECTOR) as u16;
+    disk.taskfile_start(&dma_tf(cmd::WRITE_DMA_EXT, count, lba));
+    let mut at = 0;
+    while disk.taskfile_phase().is_data() {
+        let end = (at + 3000).min(bytes.len());
+        let n = disk.taskfile_write(&bytes[at..end]) as usize;
+        assert!(n > 0, "a data phase that moved nothing");
+        at += n;
+    }
+    assert_eq!(at, bytes.len(), "the drive took the whole transfer");
+    let regs = disk.taskfile_registers();
+    assert_eq!(regs.status & 0x01, 0, "WRITE DMA EXT at {lba} failed");
+}
+
+/// A transfer that is neither aligned to a qcow2 cluster nor a whole number of
+/// them, across clusters that exist and clusters that do not.
+///
+/// The drive hands the image 64 KiB at a time, which with 64 KiB clusters and
+/// an unaligned start means **every** call straddles a cluster boundary. On
+/// the write that is an allocation part way through a call; on the read it is
+/// one call that begins in an allocated cluster and ends in a hole, or the
+/// other way about. A qcow2 hole reads as zeroes, and it has to read as zeroes
+/// for exactly the sectors nobody wrote — not for a cluster's worth around
+/// them.
+#[test]
+fn a_dma_transfer_crosses_qcow2_clusters_and_holes_exactly() {
+    const CLUSTER: u64 = 128; // sectors, at the 64 KiB default
+    let path = scratch("clusters.qcow2");
+    let image =
+        Arc::new(Image::open(&path, &ImageOptions::new().create(8 << 20)).expect("an 8 MiB qcow2"));
+    let disk = dma_drive_on(Arc::clone(&image));
+
+    // 300 sectors from 100: clusters 0, 1, 2 and 3 are each partly written,
+    // and the drive's own blocks (100.., 228.., 356..) each cross a boundary.
+    const FIRST: u64 = 100;
+    const COUNT: u64 = 300;
+    let payload: Vec<u8> = (0..COUNT * SECTOR)
+        .map(|i| (i % 241) as u8 ^ ((i / SECTOR) as u8))
+        .collect();
+    dma_write(&disk, FIRST, &payload);
+    // And one more, a long way off, so the read below crosses whole clusters
+    // that were never allocated on its way there.
+    const FAR: u64 = 10 * CLUSTER + 7;
+    dma_write(&disk, FAR, &stamp(FAR));
+
+    let want = |lba: u64| -> Vec<u8> {
+        if (FIRST..FIRST + COUNT).contains(&lba) {
+            let at = ((lba - FIRST) * SECTOR) as usize;
+            payload[at..at + SECTOR as usize].to_vec()
+        } else if lba == FAR {
+            stamp(FAR)
+        } else {
+            vec![0u8; SECTOR as usize]
+        }
+    };
+    let check = |disk: &AtaDisk, what: &str| {
+        // From the first sector to past the far one, in one command: holes,
+        // partly written clusters, full ones and holes again.
+        let span = 12 * CLUSTER;
+        let got = dma_read(disk, 0, span as u16);
+        assert_eq!(got.len() as u64, span * SECTOR);
+        for (lba, sector) in got.chunks(SECTOR as usize).enumerate() {
+            assert_eq!(sector, &want(lba as u64)[..], "{what}: sector {lba}");
+        }
+        // And a read that starts inside a hole and ends inside the data.
+        let got = dma_read(disk, 50, 200);
+        for (i, sector) in got.chunks(SECTOR as usize).enumerate() {
+            let lba = 50 + i as u64;
+            assert_eq!(sector, &want(lba)[..], "{what}: sector {lba}, short read");
+        }
+    };
+    check(&disk, "before reopening");
+
+    // Overwrite across the boundary between a written cluster and a hole, so
+    // an allocation happens in the middle of one of the drive's blocks.
+    let patch = vec![0xc7u8; (200 * SECTOR) as usize];
+    dma_write(&disk, 350, &patch);
+    let got = dma_read(&disk, 340, 220);
+    for (i, sector) in got.chunks(SECTOR as usize).enumerate() {
+        let lba = 340 + i as u64;
+        if (350..550).contains(&lba) {
+            assert!(sector.iter().all(|b| *b == 0xc7), "sector {lba} is patched");
+        } else {
+            assert_eq!(sector, &want(lba)[..], "sector {lba} around the patch");
+        }
+    }
+
+    // The bytes left the process: drop everything and open the file again.
+    flush(&disk);
+    drop(disk);
+    drop(image);
+    let image = Arc::new(Image::open(&path, &ImageOptions::new()).expect("it reopens"));
+    let disk = dma_drive_on(Arc::clone(&image));
+    let got = dma_read(&disk, 0, (12 * CLUSTER) as u16);
+    for (lba, sector) in got.chunks(SECTOR as usize).enumerate() {
+        let lba = lba as u64;
+        if (350..550).contains(&lba) {
+            assert!(
+                sector.iter().all(|b| *b == 0xc7),
+                "sector {lba} after reopening"
+            );
+        } else {
+            assert_eq!(sector, &want(lba)[..], "sector {lba} after reopening");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same transfer on a flat file, where a hole is the filesystem's.
+#[test]
+fn a_dma_transfer_on_a_sparse_raw_image_reads_back_what_was_written() {
+    let path = scratch("dma.img");
+    let image =
+        Arc::new(Image::open(&path, &ImageOptions::new().create(8 << 20)).expect("an 8 MiB file"));
+    let disk = dma_drive_on(Arc::clone(&image));
+    let payload: Vec<u8> = (0..300 * SECTOR).map(|i| (i % 239) as u8).collect();
+    dma_write(&disk, 1000, &payload);
+    let got = dma_read(&disk, 990, 320);
+    assert!(got[..(10 * SECTOR) as usize].iter().all(|b| *b == 0));
+    assert_eq!(
+        &got[(10 * SECTOR) as usize..(310 * SECTOR) as usize],
+        &payload[..]
+    );
+    assert!(got[(310 * SECTOR) as usize..].iter().all(|b| *b == 0));
+
+    // The last sectors of the drive, as a short final block that ends exactly
+    // at the capacity — one past it would be the image's bounds check.
+    let sectors = image.capacity() / SECTOR;
+    let tail: Vec<u8> = (0..130 * SECTOR).map(|i| (i % 233) as u8).collect();
+    dma_write(&disk, sectors - 130, &tail);
+    assert_eq!(dma_read(&disk, sectors - 130, 130), tail);
+    flush(&disk);
+    drop(disk);
+    drop(image);
+    let bytes = std::fs::read(&path).expect("the file");
+    assert_eq!(
+        &bytes[(1000 * SECTOR) as usize..(1300 * SECTOR) as usize],
+        &payload[..]
+    );
+    assert_eq!(&bytes[bytes.len() - tail.len()..], &tail[..]);
+    let _ = std::fs::remove_file(&path);
 }
