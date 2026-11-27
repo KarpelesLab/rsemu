@@ -1744,36 +1744,81 @@ impl Device for GbPpu {
                 "the LCD controller's snapshot has the wrong memory sizes",
             )));
         }
+        // Everything is read and checked before the engine is touched: a
+        // snapshot is a file somebody can be handed, and a refused one must
+        // leave the device as it was rather than half restored.
+        let lcdc = r.read_u8()?;
+        let stat = r.read_u8()?;
+        let scy = r.read_u8()?;
+        let scx = r.read_u8()?;
+        let ly = r.read_u8()?;
+        let lyc = r.read_u8()?;
+        let bgp = r.read_u8()?;
+        let obp0 = r.read_u8()?;
+        let obp1 = r.read_u8()?;
+        let wy = r.read_u8()?;
+        let wx = r.read_u8()?;
+        let dma_source = r.read_u8()?;
+        let window_line = r.read_u8()?;
+        let dma_page = r.read_u8()?;
+        let window_active = r.read_bool()?;
+        let lyc_match = r.read_bool()?;
+        let dot = r.read_u64()?;
+        let dots = r.read_u64()?;
+        let frame = r.read_u64()?;
+        let mode3_len = r.read_u64()?;
+        let dma_remaining = r.read_u64()?;
+        let dma_next_dot = r.read_u64()?;
+        let dma_block_from = r.read_u64()?;
+        let dma_block_until = r.read_u64()?;
+        let first_scan_after_on = r.read_bool()?;
+        // The beam is on the raster: `LY` counts lines up to the frame's 154
+        // and the line advances it with a plain increment, so a line past the
+        // last is one step from an overflow.
+        if u64::from(ly) >= LINES_PER_FRAME || dot > DOTS_PER_LINE {
+            return Err(Error::State(alloc::format!(
+                "the LCD controller's snapshot has the beam at line {ly}, dot {dot}; a frame is \
+                 {LINES_PER_FRAME} lines of {DOTS_PER_LINE} dots"
+            )));
+        }
+        // An OAM transfer is 160 bytes, and how far through it the controller
+        // is comes from subtracting what is left from that.
+        if dma_remaining > DMA_BYTES {
+            return Err(Error::State(alloc::format!(
+                "the LCD controller's snapshot has {dma_remaining} byte(s) of a {DMA_BYTES}-byte \
+                 OAM transfer still to move"
+            )));
+        }
         let (vblank, stat) = {
             let mut engine = self.shared.engine.lock();
             engine.vram.copy_from_slice(vram);
             engine.oam.copy_from_slice(oam);
             engine.fb.copy_from_slice(fb);
-            engine.lcdc = r.read_u8()?;
-            engine.stat = r.read_u8()?;
-            engine.scy = r.read_u8()?;
-            engine.scx = r.read_u8()?;
-            engine.ly = r.read_u8()?;
-            engine.lyc = r.read_u8()?;
-            engine.bgp = r.read_u8()?;
-            engine.obp0 = r.read_u8()?;
-            engine.obp1 = r.read_u8()?;
-            engine.wy = r.read_u8()?;
-            engine.wx = r.read_u8()?;
-            engine.dma_source = r.read_u8()?;
-            engine.window_line = r.read_u8()?;
-            engine.dma_page = r.read_u8()?;
-            engine.window_active = r.read_bool()?;
-            engine.lyc_match = r.read_bool()?;
-            engine.dot = r.read_u64()?;
-            engine.dots = r.read_u64()?;
-            engine.frame = r.read_u64()?;
-            engine.mode3_len = r.read_u64()?;
-            engine.dma_remaining = r.read_u64()?;
-            engine.dma_next_dot = r.read_u64()?;
-            engine.dma_block_from = r.read_u64()?;
-            engine.dma_block_until = r.read_u64()?;
-            engine.first_scan_after_on = r.read_bool()?;
+            engine.lcdc = lcdc;
+            engine.stat = stat;
+            engine.scy = scy;
+            engine.scx = scx;
+            engine.ly = ly;
+            engine.lyc = lyc;
+            engine.bgp = bgp;
+            engine.obp0 = obp0;
+            engine.obp1 = obp1;
+            engine.wy = wy;
+            engine.wx = wx;
+            engine.dma_source = dma_source;
+            engine.window_line = window_line;
+            engine.dma_page = dma_page;
+            engine.window_active = window_active;
+            engine.lyc_match = lyc_match;
+            engine.dot = dot;
+            engine.dots = dots;
+            engine.frame = frame;
+            engine.mode3_len = mode3_len;
+            engine.dma_remaining = dma_remaining;
+            engine.dma_next_dot = dma_next_dot;
+            engine.dma_block_from = dma_block_from;
+            engine.dma_block_until = dma_block_until;
+            engine.first_scan_after_on = first_scan_after_on;
             // The dot counter and the next event both came from the snapshot;
             // the lock-free copies of them are derived state and must follow.
             self.shared.publish(&engine);

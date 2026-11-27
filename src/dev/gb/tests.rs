@@ -1644,3 +1644,62 @@ fn the_ppu_does_not_keep_the_bus_it_masters_alive() {
     ppu.advance_by(4 + 160 * 4);
     assert_eq!(ppu.peek_oam(0), 0xff, "an undriven bus is all ones");
 }
+
+#[test]
+fn an_lcd_snapshot_with_the_beam_off_the_raster_or_too_much_dma_is_refused() {
+    // Past the three memories — each a length and its bytes — the chunk holds
+    // fourteen register bytes and two flags, then the dot within the line,
+    // the dot counter, the frame number and the mode-3 length, then how many
+    // bytes of an OAM transfer are still to move.
+    let memories = 3 * 8 + ppu::VRAM_LEN as usize + ppu::OAM_LEN as usize + ppu::FRAMEBUFFER_LEN;
+    let ly_at = memories + 4;
+    let dma_remaining_at = memories + 16 + 4 * 8;
+
+    let saved = lcd(stat::LYC_INT | stat::HBLANK_INT);
+    saved.advance_by(ppu::DOTS_PER_LINE * 5 + 123);
+    let class = saved.class();
+    let mut writer = StateWriter::new(MachineShape::new());
+    {
+        let mut chunk = writer
+            .chunk("ppu", class.name, class.version)
+            .expect("a chunk");
+        saved.save(&mut chunk).expect("saves");
+    }
+    let bytes = writer.to_vec().expect("serialises");
+    let reader = StateReader::new(&bytes).expect("well formed");
+    let (_, _, payload) = reader.load_raw("ppu").expect("the chunk");
+    assert_eq!(payload[ly_at], 5, "five lines in");
+    assert_eq!(
+        payload[dma_remaining_at..dma_remaining_at + 8],
+        0u64.to_le_bytes(),
+        "no OAM transfer running"
+    );
+
+    let try_load = |patch: &dyn Fn(&mut Vec<u8>)| {
+        let mut payload = payload.to_vec();
+        patch(&mut payload);
+        let mut writer = StateWriter::new(MachineShape::new());
+        writer
+            .raw_chunk("ppu", class.name, class.version, &payload)
+            .expect("a chunk");
+        let bytes = writer.to_vec().expect("serialises");
+        let restored = GbPpu::new();
+        let reader = StateReader::new(&bytes).expect("well formed");
+        let chunk = reader
+            .load("ppu", class.name, class.version, &Migrations::new())
+            .expect("the chunk is there");
+        let result = restored.load(&mut chunk.reader());
+        // Loaded or refused, the controller has to go on running.
+        restored.advance_by(ppu::DOTS_PER_LINE * 200);
+        result
+    };
+    try_load(&|_| {}).expect("the honest snapshot");
+    try_load(&|p| p[ly_at] = 153).expect("the last line of a frame");
+    // `LY` is a byte and the line advances it with a plain increment.
+    assert!(try_load(&|p| p[ly_at] = 154).is_err());
+    assert!(try_load(&|p| p[ly_at] = 0xff).is_err());
+    // An OAM transfer is 160 bytes; "161 left" makes the next one byte -1.
+    try_load(&|p| p[dma_remaining_at] = 160).expect("a transfer about to start");
+    assert!(try_load(&|p| p[dma_remaining_at] = 161).is_err());
+    assert!(try_load(&|p| p[dma_remaining_at + 7] = 0xff).is_err());
+}
