@@ -257,5 +257,22 @@ pub fn build(
     let resolved = resolve(&mut map, root, &mut sources::NoIncludes, &options.resolve)
         .map_err(|d| map.to_error(&d))?;
     validate(&resolved, &options.classes, &options.validate).map_err(|d| map.to_error(&d))?;
+    // A class the registry lacks is the one mistake `realize` would report
+    // with no location at all — `registry: unknown device class …` — and it is
+    // also the commonest one, since a machine is a feature set and a typo in a
+    // class name looks exactly like a missing feature. The validator cannot
+    // say it: its class table is deliberately partial (see the module docs).
+    // But this function holds both the registry and the spans, so it can put
+    // the caret under the name §5 promises one for. The wording is still the
+    // registry's, near-miss suggestion included.
+    for object in &resolved.objects {
+        if registry.get(&object.class).is_none() {
+            let message = match registry.create(&object.class, &object.props) {
+                Err(crate::core::Error::Config { message, .. }) => message,
+                _ => alloc::format!("unknown device class `{}`", object.class),
+            };
+            return Err(map.to_error(&Diagnostic::new(object.class_span, message)));
+        }
+    }
     realize_with(&resolved, registry, &options.bindings, &options.realize)
 }
