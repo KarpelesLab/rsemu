@@ -581,3 +581,65 @@ fn an_unshifted_function_key_is_reported_by_its_scan_code() {
     type_codes(&mut m, &hosts, &[0x12, 0x05, 0xf0, 0x05, 0xf0, 0x12]);
     assert_eq!(typed(&m), [0x3b00, 0x4400]);
 }
+
+/// `AX=4F00h` fills 256 bytes unless the caller said its block is 512.
+///
+/// *VBE Core Functions Standard* 3.0, Function 00h: "The VbeInfoBlock
+/// information block size is 256 bytes for VBE 1.x, and 512 bytes for VBE
+/// 2.0+", and "VBE 2.0+ applications should preset this field with the ASCII
+/// characters 'VBE2' to indicate to the VBE implementation that the VBE 2.0
+/// extended information is desired, and the VbeInfoBlock is 512 bytes in
+/// size." The firmware copied 512 bytes whatever the signature field held, so
+/// a VBE 1.x caller had the 256 bytes after its buffer overwritten.
+#[test]
+fn the_vbe_controller_block_is_256_bytes_unless_vbe2_is_preset() {
+    use rsemu::fw::asm16::{CX, DI};
+
+    /// A VBE 1.x caller's block, and what follows it in memory.
+    const OLD: u16 = 0x0e00;
+    /// A VBE 2.0 caller's block.
+    const NEW: u16 = 0x1200;
+
+    let (m, _hosts) = run("vbe controller information", |a| {
+        for block in [OLD, NEW] {
+            a.movi(DI, block);
+            a.movi(CX, 256);
+            a.movi(AX, 0xcccc);
+            a.rep();
+            a.stosw();
+        }
+        a.movi(AX, 0x4f00);
+        a.movi(DI, OLD);
+        a.int(0x10);
+        a.movto(Mem::abs(R), AX);
+
+        a.movmi(Mem::abs(NEW), u16::from_le_bytes(*b"VB"));
+        a.movmi(Mem::abs(NEW + 2), u16::from_le_bytes(*b"E2"));
+        a.movi(AX, 0x4f00);
+        a.movi(DI, NEW);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 2), AX);
+    });
+
+    let bytes = |from: u16, count: u16| -> Vec<u8> {
+        (from..from + count)
+            .map(|at| peek(&m, u64::from(at)))
+            .collect()
+    };
+
+    assert_eq!(peek16(&m, R), 0x004f, "the VBE 1.x call's status");
+    assert_eq!(bytes(OLD, 4), b"VESA");
+    assert_eq!(
+        bytes(OLD + 256, 256),
+        vec![0xcc; 256],
+        "the 256 bytes past a VBE 1.x block were written"
+    );
+
+    assert_eq!(peek16(&m, R + 2), 0x004f, "the VBE 2.0 call's status");
+    assert_eq!(bytes(NEW, 4), b"VESA");
+    assert_eq!(
+        bytes(NEW + 256, 256),
+        vec![0x00; 256],
+        "a VBE 2.0 block is filled to its 512th byte"
+    );
+}

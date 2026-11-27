@@ -110,8 +110,12 @@ const REGISTERS: usize = 1 + 5 + 25 + 9 + 21;
 
 /// A `ModeInfoBlock` is 256 bytes (VBE 2.0 §13.2).
 const MODE_INFO_LEN: usize = 256;
-/// A `VbeInfoBlock` is 512 (§13.1).
+/// A `VbeInfoBlock` is 512 (§13.1) for a caller that asked for VBE 2.0's.
 const VBE_INFO_LEN: usize = 512;
+/// And 256 for one that did not: "The VbeInfoBlock information block size is
+/// 256 bytes for VBE 1.x, and 512 bytes for VBE 2.0+" (*VBE Core Functions
+/// Standard* 3.0, Function 00h).
+const VBE1_INFO_LEN: usize = 256;
 
 // -- offsets inside a ModeInfoBlock (§13.2) ----------------------------------
 
@@ -984,15 +988,32 @@ pub(super) fn emit(a: &mut Asm, l: &Labels, v: &Vbe) {
 
     // AX=4F00h — the controller information block, and the total memory the
     // card reports through SR EFh, in 64 KiB units.
+    //
+    // How much of it is the caller's to say, in the block's own first four
+    // bytes: "VBE 2.0+ applications should preset this field with the ASCII
+    // characters 'VBE2' to indicate to the VBE implementation that the VBE
+    // 2.0 extended information is desired, and the VbeInfoBlock is 512 bytes
+    // in size" (*VBE Core Functions Standard* 3.0, Function 00h). Without it
+    // the block is a VBE 1.x one of 256 bytes, and all 512 used to be copied
+    // regardless — over whatever the caller kept after its buffer. The first
+    // 256 bytes are the same either way, and everything they point at is in
+    // this ROM rather than in the block's second half.
     a.bind(f_info);
     a.movsr(ES, Mem::bp(F_ES));
     a.mov(DI, Mem::bp(F_DI));
     a.mov(BX, DI);
+    let sized = a.label();
+    a.movi(CX, (VBE1_INFO_LEN / 2) as u16);
+    a.alui(Alu::CMP, Mem::di(0).seg(ES), u16::from_le_bytes(*b"VB"));
+    a.jcc(Cc::NE, sized);
+    a.alui(Alu::CMP, Mem::di(2).seg(ES), u16::from_le_bytes(*b"E2"));
+    a.jcc(Cc::NE, sized);
+    a.movi(CX, (VBE_INFO_LEN / 2) as u16);
+    a.bind(sized);
     a.pushs(DS);
     a.movrs(AX, CS);
     a.movsr(DS, AX);
     a.movi_label(SI, v.vbe_info);
-    a.movi(CX, (VBE_INFO_LEN / 2) as u16);
     a.cld();
     a.rep();
     a.movsw();
