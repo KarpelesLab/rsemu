@@ -557,6 +557,55 @@ fn an_allowance_that_ends_on_an_mmio_read_still_completes_it() {
     assert_eq!(regs.rip, CODE + 3, "RIP still names the load");
 }
 
+/// A vCPU descriptor keeps the kernel's VM alive after the VM descriptor is
+/// closed — the guest below still runs — so the memory behind that VM's slots
+/// has to stay alive for exactly as long. Dropping the [`Vm`] first must not
+/// free a store a guest can still execute out of and write into.
+#[test]
+fn a_vcpu_keeps_the_memory_its_vm_was_given() {
+    let Some(kvm) = kvm() else { return };
+    let vm = kvm.create_vm().expect("KVM_CREATE_VM");
+    let ram = Arc::new(RamStore::new(2 * PAGE_SIZE));
+    vm.set_memory_region(0, 0, &ram).expect("memory slot 0");
+    // Deliberately *not* mapped into the address space: the only owners of
+    // the store are this test and whatever is answerable for the slot.
+    let mem = Arc::new(AddressSpace::new("mem", 20));
+    let vcpu = vm.create_vcpu(0, mem, None).expect("KVM_CREATE_VCPU");
+    assert_eq!(Arc::strong_count(&ram), 2);
+
+    drop(vm);
+    assert_eq!(
+        Arc::strong_count(&ram),
+        2,
+        "the slot's store was released while a vCPU could still run on it"
+    );
+
+    //   mov byte [0x0800], 0x5a    c6 06 00 08 5a
+    //   hlt                        f4
+    ram.write_at(CODE, &[0xc6, 0x06, 0x00, 0x08, 0x5a, 0xf4])
+        .expect("load code");
+    let mut sregs = vcpu.sregs().expect("KVM_GET_SREGS");
+    for seg in [&mut sregs.cs, &mut sregs.ds, &mut sregs.ss] {
+        seg.base = 0;
+        seg.selector = 0;
+    }
+    vcpu.set_sregs(&sregs).expect("KVM_SET_SREGS");
+    let mut regs = vcpu.regs().expect("KVM_GET_REGS");
+    regs.rip = CODE;
+    regs.rflags = 0x2;
+    vcpu.set_regs(&regs).expect("KVM_SET_REGS");
+    let run = vcpu
+        .run_until_exit(8)
+        .expect("the guest runs with its VM closed");
+    assert_eq!(run.exit.expect("the guest halted").reason, ExitReason::HALT);
+    let mut byte = [0u8; 1];
+    ram.read_at(0x800, &mut byte).expect("RAM answers");
+    assert_eq!(byte, [0x5a], "and it wrote into that same store");
+
+    drop(vcpu);
+    assert_eq!(Arc::strong_count(&ram), 1, "the last descriptor lets go");
+}
+
 #[test]
 fn a_raised_exit_flag_declines_to_enter_the_guest() {
     let Some(kvm) = kvm() else { return };

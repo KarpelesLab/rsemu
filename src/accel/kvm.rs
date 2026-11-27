@@ -1087,7 +1087,7 @@ impl Kvm {
             immediate_exit: self.check_extension(KVM_CAP_IMMEDIATE_EXIT) != 0,
             readonly_mem: self.check_extension(KVM_CAP_READONLY_MEM) != 0,
             xsave: false,
-            slots: Mutex::with_rank(LockRank::MACHINE, Vec::new()),
+            slots: Arc::new(Mutex::with_rank(LockRank::MACHINE, Vec::new())),
         };
         let vm = Vm {
             xsave: self.check_extension(KVM_CAP_XSAVE) != 0 && vm.xsave_fits(),
@@ -1192,7 +1192,14 @@ pub struct Vm {
     /// holds their addresses. Dropping a store whose slot is still installed
     /// would free memory the guest is executing out of, so the VM owns a
     /// reference to it.
-    slots: Mutex<Vec<Slot>>,
+    ///
+    /// **And so does every vCPU**, which is why this is behind an [`Arc`]. The
+    /// kernel's VM is not destroyed when this descriptor closes: each vCPU
+    /// descriptor holds it open, slots and all, and a [`Vcpu`] outliving its
+    /// [`Vm`] is something safe code can arrange. If the table died with the
+    /// `Vm`, the guest would go on reading and writing host memory the
+    /// allocator had already handed to somebody else.
+    slots: Arc<Mutex<Vec<Slot>>>,
 }
 
 /// Which of `core::space`'s stores a slot is backed by.
@@ -1613,6 +1620,7 @@ impl Vm {
             // exactly as it did; only `Accel` turns it on, because only `Accel`
             // has anywhere to put the time a preemption hands back.
             preempt: Kicker::new(0),
+            _slots: Arc::clone(&self.slots),
         })
     }
 }
@@ -1666,6 +1674,13 @@ pub struct Vcpu {
     mask: Mutex<ExitMask>,
     stats: Mutex<VcpuStats>,
     preempt: Kicker,
+    /// The VM's slot table, held only so that it outlives this descriptor.
+    ///
+    /// Declared last on purpose: fields drop in declaration order, so the
+    /// descriptor in [`inner`](Vcpu::inner) — the thing keeping the kernel's
+    /// VM and its view of these stores alive — is closed before the stores
+    /// can be.
+    _slots: Arc<Mutex<Vec<Slot>>>,
 }
 
 impl Vcpu {
