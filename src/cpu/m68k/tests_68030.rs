@@ -565,6 +565,47 @@ fn an_mmu_snapshot_carries_the_registers_and_not_the_cache() -> Result<()> {
     Ok(())
 }
 
+/// A restored 68030 holds only what `PMOVE` could have put there.
+///
+/// `PMOVE` masks each register to its implemented bits and refuses to leave
+/// `TC` enabled with field widths that do not add up: "When written with the
+/// E bit set ... a consistency check is performed on the values of PS, IS,
+/// and TIx ... If an MMU configuration exception occurs, the TC register is
+/// updated with the data, and the E bit is cleared" (MC68030UM §9.7.2).
+/// `load` stored the snapshot's words as they came, so a snapshot could
+/// enable translation with a page size and index widths the table search was
+/// never written to see.
+#[test]
+fn a_68030_snapshot_cannot_load_what_pmove_would_refuse() -> Result<()> {
+    let make = |tc: u32| -> Result<alloc::vec::Vec<u8>> {
+        let cpu = M68k::new(Config::MC68030);
+        {
+            let mut session = cpu.session.lock();
+            session.state.mmu.tc = tc;
+            session.state.mmu.tt = [u32::MAX, u32::MAX];
+            session.state.mmu.mmusr = u16::MAX;
+            session.state.mmu.crp = u64::MAX;
+            session.state.mmu.srp = u64::MAX;
+        }
+        snapshot(&cpu)
+    };
+    // Disabled, every bit set: the reserved ones do not survive.
+    let other = M68k::new(Config::MC68030);
+    restore(&other, &make(0x7fff_ffff)?)?;
+    let regs = other.regs();
+    assert_eq!(regs.tc, 0x03ff_ffff, "SRE, FCL and the six fields");
+    assert_eq!(regs.tt, [0xffff_8777, 0xffff_8777]);
+    assert_eq!(regs.mmusr, 0xee47);
+    assert_eq!(regs.crp, 0xffff_0003_ffff_fff0);
+    assert_eq!(regs.srp, 0xffff_0003_ffff_fff0);
+    // Enabled and consistent — the tree the other tests walk — is fine.
+    restore(&M68k::new(Config::MC68030), &make(TC)?)?;
+    // Enabled with a page size of 2^3 and nothing adding up to 32 is not.
+    let bad = make(0x8030_0000)?;
+    assert!(restore(&M68k::new(Config::MC68030), &bad).is_err());
+    Ok(())
+}
+
 #[test]
 fn the_disassembler_speaks_the_memory_management_instructions() {
     use super::disasm::disassemble_for;

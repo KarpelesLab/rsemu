@@ -2528,13 +2528,31 @@ impl Device for M68k {
             }
         }
         if self.model.has_030() {
-            state.mmu.tt[0] = r.read_u32()?;
-            state.mmu.tt[1] = r.read_u32()?;
-            state.mmu.mmusr = r.read_u16()?;
+            // What `PMOVE` would have stored, and nothing else: each register
+            // masked to the bits the part implements, as `op_pmove` masks
+            // them, so that the table search only ever sees a configuration
+            // the instruction could have produced.
+            state.mmu.tt[0] = r.read_u32()? & mmu::tt::IMPLEMENTED;
+            state.mmu.tt[1] = r.read_u32()? & mmu::tt::IMPLEMENTED;
+            state.mmu.mmusr = r.read_u16()? & mmu::mmusr::IMPLEMENTED;
             if self.model.has_mmu() {
-                state.mmu.tc = r.read_u32()?;
-                state.mmu.crp = r.read_u64()?;
-                state.mmu.srp = r.read_u64()?;
+                let tc = r.read_u32()? & mmu::tc::IMPLEMENTED;
+                // "When written with the E bit set ... a consistency check
+                // is performed on the values of PS, IS, and TIx ... If an MMU
+                // configuration exception occurs, the TC register is updated
+                // with the data, and the E bit is cleared" (MC68030UM
+                // §9.7.2) — so an enabled, inconsistent `TC` is a state the
+                // processor cannot be in, and a snapshot claiming it is
+                // refused rather than repaired.
+                if tc & mmu::tc::E != 0 && !mmu::Mmu::tc_is_consistent(tc) {
+                    return Err(Error::State(alloc::format!(
+                        "translation control 0x{tc:08x} is enabled with a page size and \
+                         index widths that do not describe a 32-bit address"
+                    )));
+                }
+                state.mmu.tc = tc;
+                state.mmu.crp = r.read_u64()? & exec::ROOT_POINTER_BITS;
+                state.mmu.srp = r.read_u64()? & exec::ROOT_POINTER_BITS;
             }
         }
         if self.fpu.present() {

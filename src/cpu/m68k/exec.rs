@@ -6841,7 +6841,7 @@ pub(super) const FP_STATE_VERSION: u8 = 0x40;
 /// fifteen-bit **LIMIT** (62–48), **DT** (33–32) and the table address
 /// (31–4). "All other unused bits must always be zeros ... In the root
 /// pointers, these bits are not alterable" (MC68030UM §9.5.1.1).
-const ROOT_POINTER_BITS: u64 = 0xffff_0003_ffff_fff0;
+pub(super) const ROOT_POINTER_BITS: u64 = 0xffff_0003_ffff_fff0;
 
 /// The size of a `CALLM` module frame, arguments not included (MC68020UM
 /// Figure 9-12).
