@@ -117,6 +117,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::core::state::{Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -619,6 +620,61 @@ impl BusState {
     }
 }
 
+/// An open transaction, as a master's snapshot carries it.
+///
+/// What [`I2cBus::transaction`] reports and [`I2cBus::restore_transaction`]
+/// takes back: the routing the fabric holds between a START and its STOP,
+/// which no device's own chunk contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Transaction {
+    /// Which way the bytes are moving.
+    pub dir: Direction,
+    /// The devices that took the transfer, one bit per attachment index —
+    /// attachment order is machine-file order, so it is the same on the
+    /// machine that restores. Zero is a START nothing answered.
+    pub addressed: u128,
+}
+
+impl Transaction {
+    /// Write `open` — a bus's [`I2cBus::transaction`] — into a master's chunk.
+    ///
+    /// Every field is always written, so every field is always read.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sink reports.
+    pub fn save<S: Sink + ?Sized>(open: Option<Transaction>, w: &mut S) -> crate::Result<()> {
+        let t = open.unwrap_or(Transaction {
+            dir: Direction::Write,
+            addressed: 0,
+        });
+        w.write_bool(open.is_some())?;
+        w.write_bool(t.dir == Direction::Read)?;
+        w.write_u64(t.addressed as u64)?;
+        w.write_u64((t.addressed >> 64) as u64)
+    }
+
+    /// Read back what [`Transaction::save`] wrote.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source reports.
+    pub fn load<'a, S: Source<'a> + ?Sized>(r: &mut S) -> crate::Result<Option<Transaction>> {
+        let open = r.read_bool()?;
+        let dir = if r.read_bool()? {
+            Direction::Read
+        } else {
+            Direction::Write
+        };
+        let low = r.read_u64()?;
+        let high = r.read_u64()?;
+        Ok(open.then_some(Transaction {
+            dir,
+            addressed: u128::from(low) | (u128::from(high) << 64),
+        }))
+    }
+}
+
 /// One I²C bus: a set of devices sharing two lines.
 ///
 /// The fabric proper. It holds no timing and no clock — a bus is wires, and
@@ -724,6 +780,60 @@ impl I2cBus {
             dir: inner.dir,
             responders: inner.addressed.len(),
         }
+    }
+
+    /// The open transaction, for a master's snapshot. `None` while the bus is
+    /// free.
+    ///
+    /// Paired with [`restore_transaction`](I2cBus::restore_transaction), which
+    /// has the argument for why a master carries this rather than the bus.
+    #[must_use]
+    pub fn transaction(&self) -> Option<Transaction> {
+        let inner = self.inner.lock();
+        inner.started.then(|| Transaction {
+            dir: inner.dir,
+            // `attach` stops at `MAX_SLAVES`, so every index has a bit.
+            addressed: inner
+                .addressed
+                .iter()
+                .fold(0u128, |mask, i| mask | (1u128 << (*i % MAX_SLAVES))),
+        })
+    }
+
+    /// Put an open transaction back where a snapshot found it, telling nobody.
+    ///
+    /// For [`Device::load`](crate::core::device::Device::load) and nothing
+    /// else. Which devices took the current transfer is routing the fabric
+    /// holds, and the fabric is not a device: it has no chunk, and a restored
+    /// machine starts with a fresh one that has seen no START. The slaves
+    /// restore their own half — an EEPROM comes back mid-page-write, its word
+    /// address latched — and without this the master's next byte is routed to
+    /// nobody, comes back [`Ack::Nack`], and the transfer the snapshot carefully
+    /// preserved at both ends dies in the middle. So each master on a
+    /// transactional link saves [`transaction`](I2cBus::transaction) with its
+    /// own state and hands it back here while restoring itself; this is
+    /// `bus::spi`'s `SpiBus::restore_select` for a bus whose selection is in
+    /// band.
+    ///
+    /// **No slave is called.** [`start`](I2cBus::start) is how a device learns
+    /// it was addressed, and re-offering the address would begin a transaction
+    /// over the one the device has just restored.
+    ///
+    /// Only an open transaction is ever asserted, never a free bus: free is
+    /// what a fresh fabric already is, and clearing would undo a sibling master
+    /// that restored first. Two masters on one bus saved the same view of it,
+    /// so the second restore changes nothing.
+    ///
+    /// A bit naming a device this bus does not have is dropped: the snapshot
+    /// came from a different board, and the shape check has already said so
+    /// more usefully than a routing table could.
+    pub fn restore_transaction(&self, transaction: Transaction) {
+        let mut inner = self.inner.lock();
+        inner.addressed = (0..inner.slaves.len().min(MAX_SLAVES))
+            .filter(|i| transaction.addressed & (1u128 << i) != 0)
+            .collect();
+        inner.started = true;
+        inner.dir = transaction.dir;
     }
 
     /// A START or repeated START, followed by an address.

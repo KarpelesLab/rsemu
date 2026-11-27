@@ -62,7 +62,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 
-use crate::bus::i2c::{Ack, Address, Direction, I2cBus, buses};
+use crate::bus::i2c::{Ack, Address, Direction, I2cBus, Transaction, buses};
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
@@ -77,7 +77,10 @@ use crate::machine::realize::Instance;
 pub const CLASS_NAME: &str = "rcar.i2c";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 added the bus's open transaction
+/// ([`I2cBus::restore_transaction`]).
+const STATE_VERSION: u32 = 2;
 
 /// How much address space one controller answers.
 pub const REGISTER_WINDOW_LEN: u64 = 0x38;
@@ -512,7 +515,10 @@ impl Device for I2c {
         w.write_bool(s.read)?;
         w.write_bool(s.tx_pending)?;
         w.write_bool(s.nack_last)?;
-        w.write_u8(s.rx)
+        w.write_u8(s.rx)?;
+        // The fabric's routing, which is nobody else's to save: without it a
+        // restored machine's next byte goes to no device at all.
+        Transaction::save(self.regs.bus.as_ref().and_then(|b| b.transaction()), w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -530,7 +536,11 @@ impl Device for I2c {
             nack_last: r.read_bool()?,
             rx: r.read_u8()?,
         };
+        let open = Transaction::load(r)?;
         *self.regs.state.lock() = s;
+        if let (Some(open), Some(bus)) = (open, self.regs.bus.as_ref()) {
+            bus.restore_transaction(open);
+        }
         self.regs.refresh();
         Ok(())
     }
@@ -820,5 +830,12 @@ mod tests {
         let want = c.regs.state.lock().clone();
         assert_eq!(*back.regs.state.lock(), want);
         assert_eq!(save(&back), bytes);
+        // The message is part-way through, so the fabric has a transfer open
+        // — and the fabric is not a device. The controller carries its
+        // routing, or the restored machine's next byte reaches nobody.
+        let open = c.regs.bus.as_ref().unwrap().transaction();
+        assert!(open.is_some(), "the START went out and 0x50 answered");
+        assert_eq!(back.regs.bus.as_ref().unwrap().transaction(), open);
+        assert_eq!(back.regs.bus.as_ref().unwrap().write(0x99), Ack::Ack);
     }
 }

@@ -605,6 +605,78 @@ fn a_transfer_part_way_through_its_address_phase_round_trips() {
     }
 }
 
+/// Carry one device's chunk from `from` to `to`.
+fn carry(from: &dyn Device, to: &dyn Device) {
+    let class = from.class();
+    let mut shape = MachineShape::new();
+    shape.add_device("d", class.name).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("d", class.name, class.version).unwrap();
+        from.save(&mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("d", class.name, class.version, &Migrations::new())
+        .unwrap();
+    to.load(&mut chunk.reader()).unwrap();
+}
+
+#[test]
+fn a_page_write_snapshotted_between_two_data_bytes_finishes_on_the_restored_board() {
+    // A transactional link, stopped where a driver spends most of a transfer:
+    // addressed, the word address and one data byte gone, the next one not yet
+    // written. Both ends save that — the EEPROM is mid-page, the controller is
+    // a transmitting master — and the only thing in between is the fabric's
+    // routing, which is no device's chunk and which a restored machine builds
+    // fresh. Losing it sent the rest of the page to nobody.
+    let mut board = Board::new(Link::Transactional);
+    board.init();
+    poke(&board.region, CR1, CR1_PE | CR1_ACK | CR1_START);
+    board.wait(SR1_SB);
+    peek(&board.region, SR1);
+    poke(&board.region, DR, 0x50 << 1);
+    board.wait(SR1_ADDR);
+    peek(&board.region, SR1);
+    peek(&board.region, SR2);
+    board.wait(SR1_TXE);
+    poke(&board.region, DR, 0x10);
+    board.wait(SR1_TXE);
+    poke(&board.region, DR, 0xa1);
+    board.wait(SR1_TXE | SR1_BTF);
+    assert_ne!(peek_with(&board.region, SR2, MemAttrs::DEBUG) & SR2_BUSY, 0);
+
+    let mut restored = Board::new(Link::Transactional);
+    carry(&board.ctrl, &restored.ctrl);
+    carry(&board.eeprom, &restored.eeprom);
+    restored.now = board.now;
+    assert_ne!(
+        peek_with(&restored.region, SR2, MemAttrs::DEBUG) & SR2_BUSY,
+        0,
+        "the bus is still busy: the transaction is open"
+    );
+
+    // The driver carries on as if nothing had happened, which is the contract.
+    poke(&restored.region, DR, 0xb2);
+    restored.wait(SR1_TXE | SR1_BTF);
+    poke(&restored.region, CR1, CR1_PE | CR1_ACK | CR1_STOP);
+    for _ in 0..200 {
+        if peek_with(&restored.region, SR2, MemAttrs::DEBUG) & SR2_MSL == 0 {
+            break;
+        }
+        restored.step(1);
+    }
+    restored.step(crate::dev::atmel::at24c::DEFAULT_WRITE_TICKS);
+    assert_eq!(restored.eeprom.byte(0x10), Some(0xa1));
+    assert_eq!(restored.eeprom.byte(0x11), Some(0xb2));
+    assert_eq!(
+        peek_with(&restored.region, SR2, MemAttrs::DEBUG) & SR2_BUSY,
+        0,
+        "and the STOP freed the bus"
+    );
+}
+
 #[test]
 fn a_reset_keeps_the_tick_and_drops_everything_else() {
     let mut board = Board::new(Link::Wired);

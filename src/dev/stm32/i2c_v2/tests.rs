@@ -1355,6 +1355,63 @@ fn a_transfer_part_way_through_a_reload_round_trips() {
     }
 }
 
+/// Carry one device's chunk from `from` to `to`.
+fn carry(from: &dyn Device, to: &dyn Device) {
+    let class = from.class();
+    let mut shape = MachineShape::new();
+    shape.add_device("d", class.name).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("d", class.name, class.version).unwrap();
+        from.save(&mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("d", class.name, class.version, &Migrations::new())
+        .unwrap();
+    to.load(&mut chunk.reader()).unwrap();
+}
+
+#[test]
+fn a_page_write_snapshotted_between_two_data_bytes_finishes_on_the_restored_board() {
+    // A transactional link, stopped between two `TXIS`: both ends save where
+    // they are, and the fabric's routing between them is no device's chunk.
+    // Losing it sent the rest of the page to nobody.
+    let mut board = Board::new(Link::Transactional);
+    board.init();
+    poke(
+        &board.region,
+        CR2,
+        sadd(0x50) | nb(3) | CR2_AUTOEND | CR2_START,
+    );
+    board.wait(ISR_TXIS);
+    poke(&board.region, TXDR, 0x10);
+    board.wait(ISR_TXIS);
+    poke(&board.region, TXDR, 0xa1);
+    board.wait(ISR_TXIS);
+    assert_ne!(board.isr() & ISR_BUSY, 0);
+
+    let mut restored = Board::new(Link::Transactional);
+    carry(&board.ctrl, &restored.ctrl);
+    carry(&board.eeprom, &restored.eeprom);
+    restored.now = board.now;
+    assert_ne!(
+        restored.isr() & ISR_BUSY,
+        0,
+        "the bus is still busy: the transaction is open"
+    );
+
+    // The driver carries on as if nothing had happened, which is the contract.
+    poke(&restored.region, TXDR, 0xb2);
+    restored.wait(ISR_STOPF);
+    poke(&restored.region, ICR, ISR_STOPF);
+    restored.step(crate::dev::atmel::at24c::DEFAULT_WRITE_TICKS);
+    assert_eq!(restored.eeprom.byte(0x10), Some(0xa1));
+    assert_eq!(restored.eeprom.byte(0x11), Some(0xb2));
+    assert_eq!(restored.isr() & ISR_BUSY, 0, "and the STOP freed the bus");
+}
+
 #[test]
 fn a_reset_keeps_the_tick_and_drops_everything_else() {
     let mut board = Board::new(Link::Wired);

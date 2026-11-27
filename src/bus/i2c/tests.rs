@@ -1305,3 +1305,86 @@ fn a_repeated_start_is_not_mistaken_for_taking_somebody_elses_bus() {
         "a repeated START costs what a START costs, with nothing spent waiting"
     );
 }
+
+#[test]
+fn an_open_transaction_survives_onto_a_fresh_fabric_without_readdressing_anyone() {
+    // What a snapshot taken between an address byte and its STOP has to carry:
+    // the routing is the fabric's, the fabric has no chunk, and a restored
+    // machine's fabric has seen no START at all.
+    let far = Recorder::new(Address::Seven(0x51), &[]);
+    let near = Recorder::new(Address::Seven(0x50), &[0x42]);
+    let bus = I2cBus::new();
+    bus.attach(Arc::clone(&far) as Arc<dyn I2cSlave>).unwrap();
+    bus.attach(Arc::clone(&near) as Arc<dyn I2cSlave>).unwrap();
+    assert_eq!(bus.transaction(), None, "a free bus has nothing to carry");
+    assert_eq!(bus.start(Address::Seven(0x50), Direction::Write), Ack::Ack);
+    assert_eq!(bus.write(0x10), Ack::Ack);
+    let open = bus.transaction().expect("a transaction is open");
+    assert_eq!(
+        open,
+        Transaction {
+            dir: Direction::Write,
+            addressed: 0b10
+        },
+        "the second device attached took it"
+    );
+
+    // Through the codec a master's chunk uses, and back.
+    let mut bytes: Vec<u8> = Vec::new();
+    Transaction::save(Some(open), &mut bytes).unwrap();
+    let carried = Transaction::load(&mut SliceSource::new(&bytes))
+        .unwrap()
+        .expect("still open");
+    assert_eq!(carried, open);
+    let mut free: Vec<u8> = Vec::new();
+    Transaction::save(None, &mut free).unwrap();
+    assert_eq!(free.len(), bytes.len(), "every field is always written");
+    assert_eq!(
+        Transaction::load(&mut SliceSource::new(&free)).unwrap(),
+        None
+    );
+
+    // The restored machine: the same devices, a fabric that knows nothing.
+    let restored = I2cBus::new();
+    restored
+        .attach(Arc::clone(&far) as Arc<dyn I2cSlave>)
+        .unwrap();
+    restored
+        .attach(Arc::clone(&near) as Arc<dyn I2cSlave>)
+        .unwrap();
+    assert_eq!(
+        restored.write(0xa1),
+        Ack::Nack,
+        "which is the defect: the byte is routed to nobody"
+    );
+    far.take_log();
+    near.take_log();
+
+    restored.restore_transaction(carried);
+    assert_eq!(
+        restored.state(),
+        BusState::Addressed {
+            dir: Direction::Write,
+            responders: 1
+        }
+    );
+    assert!(
+        near.take_log().is_empty() && far.take_log().is_empty(),
+        "nobody is told: re-offering the address would start a transaction over the restored one"
+    );
+    assert_eq!(restored.write(0xa1), Ack::Ack);
+    assert_eq!(near.take_log(), vec![Call::Write(0xa1)]);
+    assert!(far.take_log().is_empty(), "and only the addressed device");
+    restored.stop();
+    assert_eq!(near.take_log(), vec![Call::Stop]);
+    assert_eq!(restored.transaction(), None);
+
+    // A bit for a device this bus does not have is dropped, not indexed.
+    let small = I2cBus::new();
+    small.restore_transaction(Transaction {
+        dir: Direction::Read,
+        addressed: u128::MAX,
+    });
+    assert_eq!(small.state(), BusState::Unaddressed);
+    assert_eq!(small.read(Ack::Nack), 0xff);
+}

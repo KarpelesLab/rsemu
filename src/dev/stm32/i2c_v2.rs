@@ -141,7 +141,7 @@ use crate::bus::i2c::wires::{
 };
 use crate::bus::i2c::{
     Ack, Address, BYTE_HALF_PERIODS, Direction, GENERAL_CALL, I2cBus, I2cSlave, Link,
-    START_HALF_PERIODS, STOP_HALF_PERIODS, buses,
+    START_HALF_PERIODS, STOP_HALF_PERIODS, Transaction, buses,
 };
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
@@ -162,7 +162,10 @@ mod tests;
 const CLASS_NAME: &str = "st.i2c-v2";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 2;
+///
+/// Version 3 added the transactional bus's open transaction
+/// ([`I2cBus::restore_transaction`]).
+const STATE_VERSION: u32 = 3;
 
 /// How many bytes of address space the register block occupies.
 ///
@@ -1060,6 +1063,21 @@ impl Shared {
             Link::Wired => self.wires.busy(),
             Link::Transactional => self.bus.as_ref().is_some_and(|b| b.state().is_busy()),
         }
+    }
+
+    /// The fabric a transactional link routes through, or `None` on a wired
+    /// one — where the open transaction is in the bit engines' own snapshots.
+    fn transactional_bus(&self) -> Option<&Arc<I2cBus>> {
+        match self.link {
+            Link::Wired => None,
+            Link::Transactional => self.bus.as_ref(),
+        }
+    }
+
+    /// The transaction open on the fabric, for the snapshot. Takes no state
+    /// lock, for [`Shared::bus_busy`]'s reason.
+    fn bus_transaction(&self) -> Option<Transaction> {
+        self.transactional_bus().and_then(|bus| bus.transaction())
     }
 
     /// Bring the controller up to date before an access.
@@ -2101,7 +2119,11 @@ impl Device for Stm32I2cV2 {
         w.write_u32(state.halves_left)?;
         w.write_u64(state.next_edge)?;
         w.write_bool(state.high_half)?;
-        self.shared.wires.snapshot().write(w)
+        self.shared.wires.snapshot().write(w)?;
+        // The fabric's routing, which is nobody else's to save: without it a
+        // restored machine's next byte goes to no device at all. Asked for
+        // with no lock of ours held — the fabric ranks above the state.
+        Transaction::save(self.shared.bus_transaction(), w)
         // The interrupt and DMA outputs are not saved: they are a pure function
         // of the flags, and `load` re-derives and re-announces them.
     }
@@ -2139,12 +2161,16 @@ impl Device for Stm32I2cV2 {
             high_half: r.read_bool()?,
         };
         let wires = ControllerWiresState::read(r)?;
+        let open = Transaction::load(r)?;
         {
             let mut slot = self.shared.state.lock();
             *slot = state;
             self.shared.publish(&slot);
         }
         self.shared.wires.restore(wires);
+        if let (Some(open), Some(bus)) = (open, self.shared.transactional_bus()) {
+            bus.restore_transaction(open);
+        }
         self.shared.update_outputs();
         Ok(())
     }
