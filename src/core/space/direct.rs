@@ -54,8 +54,11 @@
 //! [`AddressSpace::read`]: super::AddressSpace::read
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
-use super::{EntryKind, FlatTarget, Perms, RamStore, RomStore, SpaceView};
+use super::{
+    AddressSpace, EntryKind, FlatTarget, MemAttrs, MemResult, Perms, RamStore, RomStore, SpaceView,
+};
 use crate::core::value::{Endian, Width};
 
 /// The memory behind a [`DirectSpan`].
@@ -151,6 +154,158 @@ impl DirectSpan {
             Backing::Ram(s) => s.read_value(off, width, self.endian).ok(),
             Backing::Rom(s) => s.read_value(off, width, self.endian).ok(),
         }
+    }
+}
+
+/// One remembered page of a [`ReadCache`].
+#[derive(Debug)]
+struct Slot {
+    /// The page's address, or [`Slot::EMPTY`].
+    page: u64,
+    /// The topology generation the answer was taken under.
+    generation: u64,
+    /// The permission the answer was taken for.
+    need: Perms,
+    /// The store behind the page, or `None` for a page that has to keep
+    /// taking [`AddressSpace::read`](super::AddressSpace::read) — which is
+    /// worth remembering too, or every access to a device page would probe
+    /// the flat view twice.
+    span: Option<DirectSpan>,
+}
+
+impl Slot {
+    /// No page address equals this: its low twelve bits are set.
+    const EMPTY: u64 = u64::MAX;
+}
+
+/// A master's own cache of [`DirectSpan`]s, one per page it has read lately.
+///
+/// The software TLB `ROADMAP.md` §4.1 puts *above* the address space, in its
+/// plainest form: direct-mapped on the page number, read-only, and exact.
+/// [`ReadCache::read`] is [`AddressSpace::read`] — the same value and the same
+/// errors, because a page is served from here only under the conditions in the
+/// [module docs](self) and everything else is handed to the space unchanged.
+/// What a hit skips is the topology read guard, the dispatch table, the flat
+/// entry and the checks, which is most of what a load from RAM costs.
+///
+/// Per master and not shared: the holder passes the same space every time.
+/// A cache that has been used with one space and is handed another would
+/// answer from the first for as long as the two generations happened to
+/// agree, so a core that is attached to a new space starts a new cache.
+///
+/// Derived state (`CLAUDE.md`, *Devices*): never serialized, and
+/// [`Clone`] yields an **empty** cache rather than a copy — the one reason a
+/// core's state is cloned is to snapshot it, and a snapshot carries no
+/// derived state.
+///
+/// [`AddressSpace::read`]: super::AddressSpace::read
+#[derive(Debug, Default)]
+pub struct ReadCache {
+    /// Empty until the first read, so constructing a core allocates nothing.
+    slots: Vec<Slot>,
+}
+
+impl Clone for ReadCache {
+    fn clone(&self) -> ReadCache {
+        ReadCache::new()
+    }
+}
+
+impl ReadCache {
+    /// The granule: 4 KiB, the smallest page any guest in the tree maps.
+    pub const PAGE: u64 = 0x1000;
+
+    /// How many pages are remembered. A power of two, because the index is a
+    /// mask.
+    pub const SLOTS: usize = 64;
+
+    /// An empty cache.
+    #[must_use]
+    pub const fn new() -> ReadCache {
+        ReadCache { slots: Vec::new() }
+    }
+
+    /// Forget everything. Never needed for correctness within one space — a
+    /// stale slot fails its own generation test — and required when the
+    /// holder is moved to another.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    /// [`AddressSpace::read`](super::AddressSpace::read), served from a
+    /// remembered store where the page allows it.
+    ///
+    /// # Errors
+    ///
+    /// Exactly those of the read it replaces.
+    #[inline]
+    pub fn read(
+        &mut self,
+        space: &AddressSpace,
+        addr: u64,
+        width: Width,
+        attrs: MemAttrs,
+    ) -> MemResult<u64> {
+        if let Some(span) = self.span_at(space, addr, attrs.read_perm())
+            && let Some(value) = span.read_value(addr & (Self::PAGE - 1), width)
+        {
+            return Ok(value);
+        }
+        // A page that is not plain memory, or an access that runs off the end
+        // of the one that is.
+        space.read(addr, width, attrs)
+    }
+
+    /// The store behind the page holding `addr`, for reads checked against
+    /// `need`, if that page is one a [`DirectSpan`] can describe. The span
+    /// starts at the page, not at `addr`.
+    ///
+    /// For a holder that reads many bytes of one page in a row and would
+    /// rather index the span itself than come back through
+    /// [`read`](ReadCache::read) for each.
+    #[inline]
+    pub fn span_at(&mut self, space: &AddressSpace, addr: u64, need: Perms) -> Option<&DirectSpan> {
+        let page = addr & !(Self::PAGE - 1);
+        let index = (page >> 12) as usize & (Self::SLOTS - 1);
+        let generation = space.generation();
+        let fresh = self
+            .slots
+            .get(index)
+            .is_some_and(|s| s.page == page && s.generation == generation && s.need == need);
+        if !fresh {
+            self.fill(space, index, page, generation, need);
+        }
+        self.slots.get(index)?.span.as_ref()
+    }
+
+    fn fill(
+        &mut self,
+        space: &AddressSpace,
+        index: usize,
+        page: u64,
+        generation: u64,
+        need: Perms,
+    ) {
+        if self.slots.is_empty() {
+            self.slots.resize_with(Self::SLOTS, || Slot {
+                page: Slot::EMPTY,
+                generation: 0,
+                need: Perms::NONE,
+                span: None,
+            });
+        }
+        let span = space.direct_span(page, Self::PAGE, need);
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        // The span's own generation where there is one: it was read under the
+        // guard that walked the map. Otherwise the one read before the probe,
+        // which is the older of the two a racing retopology could leave and so
+        // the one that makes the next use probe again.
+        slot.generation = span.as_ref().map_or(generation, DirectSpan::generation);
+        slot.page = page;
+        slot.need = need;
+        slot.span = span;
     }
 }
 
@@ -392,5 +547,117 @@ mod tests {
         assert!(space.direct_span(0, PAGE, Perms::RW).is_none());
         assert!(space.direct_span(0, 0, Perms::READ).is_none());
         assert!(space.direct_span(u64::MAX, 2, Perms::READ).is_none());
+    }
+
+    /// A space with one of everything a read can land on: RAM, a ROM, a
+    /// device, a read-protected page, a banked window and a hole. The window
+    /// is handed back so a test can slide it.
+    fn mixed() -> (AddressSpace, RegionRef) {
+        let space = space();
+        let ram: RegionRef = Region::ram("ram", patterned_ram(4 * PAGE)).into();
+        let window: RegionRef = Region::alias("bank", ram.clone(), PAGE, PAGE)
+            .unwrap()
+            .into();
+        let image: Vec<u8> = (0..2 * PAGE).map(|i| (i * 13) as u8).collect();
+        {
+            let mut t = space.topology();
+            t.map(ram, 0).unwrap();
+            t.map(
+                Region::rom("rom", Arc::new(RomStore::new(image)), RomWrite::Ignore),
+                0x1_0000,
+            )
+            .unwrap();
+            t.map(Region::io("dev", PAGE, Arc::new(Dev)), 0x2_0000)
+                .unwrap();
+            t.map_with_perms(
+                Region::ram("wo", Arc::new(RamStore::new(PAGE))),
+                0x3_0000,
+                Perms::WRITE,
+            )
+            .unwrap();
+            t.map(window.clone(), 0x4_0000).unwrap();
+        }
+        (space, window)
+    }
+
+    /// Every address the cache is asked about, at every width, against the
+    /// space itself — values and errors both.
+    fn agree(cache: &mut ReadCache, space: &AddressSpace) {
+        let bases = [0, PAGE, 0x1_0000, 0x2_0000, 0x3_0000, 0x4_0000, 0x8_0000];
+        // A fetch is checked for a different permission and must not be
+        // answered from a slot a load filled.
+        let fetch = MemAttrs::DEFAULT.with_purpose(crate::core::space::AccessPurpose::FETCH);
+        for attrs in [MemAttrs::DEFAULT, fetch] {
+            for base in bases {
+                // The page's first bytes, its last ones, and the widths that
+                // run off its end into whatever is next.
+                for at in [0, 1, 0x7fd, PAGE - 8, PAGE - 4, PAGE - 2, PAGE - 1] {
+                    for width in [Width::U8, Width::U16, Width::U32, Width::U64] {
+                        let addr = base + at;
+                        assert_eq!(
+                            cache.read(space, addr, width, attrs),
+                            space.read(addr, width, attrs),
+                            "{width:?} at {addr:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cache_reads_what_the_space_reads_errors_included() {
+        let (space, _) = mixed();
+        let mut cache = ReadCache::new();
+        // Twice: once filling, once answering from what was filled.
+        agree(&mut cache, &space);
+        agree(&mut cache, &space);
+    }
+
+    #[test]
+    fn the_cache_follows_a_store_a_remap_and_a_bank_switch() {
+        let (space, window) = mixed();
+        let mut cache = ReadCache::new();
+        agree(&mut cache, &space);
+        // A store is seen because nothing was copied.
+        space
+            .write(0x10, Width::U32, 0xdead_beef, MemAttrs::DEFAULT)
+            .unwrap();
+        assert_eq!(
+            cache.read(&space, 0x10, Width::U32, MemAttrs::DEFAULT),
+            Ok(0xdead_beef)
+        );
+        // A bank switch moves no generation at all, which is why a banked
+        // page was never cached in the first place.
+        let generation = space.generation();
+        let before = cache.read(&space, 0x4_0000, Width::U32, MemAttrs::DEFAULT);
+        space.rebase(&window, 2 * PAGE).unwrap();
+        assert_eq!(space.generation(), generation);
+        let after = cache.read(&space, 0x4_0000, Width::U32, MemAttrs::DEFAULT);
+        assert_ne!(
+            before, after,
+            "the window slid and the cache did not see it"
+        );
+        agree(&mut cache, &space);
+        // A remap moves the generation every slot is checked against.
+        space
+            .topology()
+            .map_with_priority(Region::ram("over", patterned_ram(PAGE)), 0x1_0000, 1)
+            .unwrap();
+        assert_ne!(space.generation(), generation);
+        agree(&mut cache, &space);
+    }
+
+    #[test]
+    fn a_cloned_or_cleared_cache_is_empty_and_still_right() {
+        let (space, _) = mixed();
+        let mut cache = ReadCache::new();
+        agree(&mut cache, &space);
+        let mut copy = cache.clone();
+        assert!(copy.slots.is_empty(), "derived state is not copied");
+        agree(&mut copy, &space);
+        cache.clear();
+        assert!(cache.slots.is_empty());
+        agree(&mut cache, &space);
     }
 }

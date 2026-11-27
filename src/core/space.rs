@@ -456,7 +456,7 @@ pub use attrs::{
     RequesterId,
 };
 pub use buslock::{BusLock, BusLockGuard};
-pub use direct::DirectSpan;
+pub use direct::{DirectSpan, ReadCache};
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
 pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView, RegionId};
 pub use monitor::{
