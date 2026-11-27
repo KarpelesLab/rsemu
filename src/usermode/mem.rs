@@ -300,6 +300,11 @@ impl UserMemory {
     /// runs off the end of the address space.
     pub fn map_at(&self, base: u64, len: u64, prot: Prot, name: &str) -> Result<()> {
         self.check_range(base, len)?;
+        if len == 0 {
+            return Err(config(alloc::format!(
+                "a mapping at {base:#x} needs a length: an empty range is nothing to map"
+            )));
+        }
         let mut inner = self.inner.lock();
         self.unmap_locked(&mut inner, base, len)?;
         self.insert_locked(&mut inner, base, len, prot, name, None)
@@ -349,7 +354,8 @@ impl UserMemory {
     ///
     /// Ranges that only partly overlap are trimmed and, where the removal is
     /// in their middle, split. Unmapping a range nothing is mapped in is not
-    /// an error — the caller asked for it to be gone and it is.
+    /// an error — the caller asked for it to be gone and it is — and neither
+    /// is a `len` of zero, which names no page and changes nothing.
     ///
     /// # Errors
     ///
@@ -357,6 +363,12 @@ impl UserMemory {
     /// of the address space.
     pub fn unmap(&self, base: u64, len: u64) -> Result<()> {
         self.check_range(base, len)?;
+        if len == 0 {
+            // No page is named, so there is nothing to remove — and going on
+            // would split whatever range `base` falls inside into two copies
+            // of itself for no reason.
+            return Ok(());
+        }
         let mut inner = self.inner.lock();
         self.unmap_locked(&mut inner, base, len)
     }
@@ -366,7 +378,7 @@ impl UserMemory {
     /// Ranges that only partly overlap are split, exactly as [`unmap`] splits
     /// them. A range that is not mapped is skipped rather than created:
     /// permission is a property of a mapping and there is nothing to give it
-    /// to.
+    /// to. A `len` of zero names no page and changes nothing.
     ///
     /// [`unmap`]: UserMemory::unmap
     ///
@@ -376,6 +388,12 @@ impl UserMemory {
     /// of the address space.
     pub fn protect(&self, base: u64, len: u64, prot: Prot) -> Result<()> {
         self.check_range(base, len)?;
+        if len == 0 {
+            // `mprotect` of an empty range is a successful no-op, and here it
+            // has to be an early one: the split below would ask for a
+            // zero-length middle piece inside the range `base` points into.
+            return Ok(());
+        }
         let end = base + len;
         let mut inner = self.inner.lock();
         for vbase in Self::overlapping(&inner, base, end) {

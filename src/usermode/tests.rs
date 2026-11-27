@@ -336,6 +336,31 @@ fn protect_splits_and_changes_only_the_range_asked_for() {
 }
 
 #[test]
+fn a_zero_length_request_changes_nothing() {
+    // `mprotect(addr, 0, ..)` is a successful no-op and a consumer passes the
+    // guest's length straight through. An empty range touches no page, so it
+    // must not split the mapping it happens to point into — and it certainly
+    // must not lose the far side of it.
+    let mem = UserMemory::new(48);
+    mem.map_at(0x1_0000, 0x3000, Prot::RW, "a").unwrap();
+    mem.write_bytes(0x1_2ff8, &0xfeed_face_u64.to_le_bytes())
+        .unwrap();
+    let before = mem.mappings();
+
+    mem.protect(0x1_1000, 0, Prot::READ).unwrap();
+    assert_eq!(mem.mappings(), before, "protect of nothing");
+    mem.unmap(0x1_1000, 0).unwrap();
+    assert_eq!(mem.mappings(), before, "unmap of nothing");
+    assert_eq!(mem.read_u64(0x1_2ff8).unwrap(), 0xfeed_face);
+    mem.write_u64(0x1_1000, 1).expect("still writable");
+
+    // Creating nothing is the one that is refused, as `map` already does.
+    assert!(mem.map_at(0x2_0000, 0, Prot::RW, "empty").is_err());
+    assert!(mem.map(0, Prot::RW, "empty").is_err());
+    assert_eq!(mem.mappings(), before);
+}
+
+#[test]
 fn an_unaligned_range_is_refused() {
     let mem = UserMemory::new(48);
     assert!(mem.map_at(0x1001, 0x1000, Prot::RW, "x").is_err());
