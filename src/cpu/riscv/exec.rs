@@ -1103,7 +1103,14 @@ impl<'a> Exec<'a> {
         }
         let mut value = 0u64;
         for i in 0..bytes {
-            let byte = self.read_once(vaddr.wrapping_add(i), Width::U8, Access::Load)?;
+            // In the guest's width: Volume I, "The memory address space is
+            // circular, so that the byte at address 2^XLEN-1 is adjacent to
+            // the byte at address zero. Accordingly, memory address
+            // computations done by the hardware ignore overflow and instead
+            // wrap around modulo 2^XLEN." On RV32 that is not where a `u64`
+            // wraps.
+            let at = self.cfg.xlen.trunc(vaddr.wrapping_add(i));
+            let byte = self.read_once(at, Width::U8, Access::Load)?;
             value |= (byte & 0xff) << (8 * i);
         }
         Ok(value)
@@ -1134,7 +1141,9 @@ impl<'a> Exec<'a> {
             });
         }
         for i in 0..bytes {
-            self.write_once(vaddr.wrapping_add(i), Width::U8, value >> (8 * i))?;
+            // Modulo 2^XLEN, as the load above.
+            let at = self.cfg.xlen.trunc(vaddr.wrapping_add(i));
+            self.write_once(at, Width::U8, value >> (8 * i))?;
         }
         Ok(())
     }
@@ -1162,7 +1171,10 @@ impl<'a> Exec<'a> {
             let word = expanded.ok_or(Trap::illegal(u64::from(low)))?;
             return Ok((word, u64::from(low), 2));
         }
-        let high = self.read_once(pc.wrapping_add(2), Width::U16, Access::Fetch)? as u16;
+        // The second half is two bytes on in the guest's address space,
+        // which on RV32 wraps at 4 GiB (see `load`).
+        let next = self.cfg.xlen.trunc(pc.wrapping_add(2));
+        let high = self.read_once(next, Width::U16, Access::Fetch)? as u16;
         let word = u32::from(low) | (u32::from(high) << 16);
         Ok((word, u64::from(word), 4))
     }

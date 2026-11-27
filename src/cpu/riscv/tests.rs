@@ -242,6 +242,72 @@ fn shifts_use_the_configured_width() {
     );
 }
 
+/// On RV32 the address space ends at 4 GiB and the byte after the last one
+/// is byte zero — for the second half of an instruction and for the later
+/// bytes of a misaligned access alike.
+///
+/// Volume I (20240411), "Introduction", "Memory": "The memory address space
+/// is circular, so that
+/// the byte at address 2^XLEN-1 is adjacent to the byte at address zero.
+/// Accordingly, memory address computations done by the hardware ignore
+/// overflow and instead wrap around modulo 2^XLEN." The three split paths
+/// added their byte offset in sixty-four bits and went looking at
+/// `0x1_0000_0000`, where there is nothing.
+#[test]
+fn rv32_split_accesses_wrap_at_the_top_of_the_address_space() {
+    let top = Arc::new(RamStore::new(0x1000));
+    let bottom = Arc::new(RamStore::new(0x1000));
+    let put = |ram: &RamStore, at: u64, bytes: &[u8]| {
+        for (k, byte) in bytes.iter().enumerate() {
+            ram.write_u8(at + k as u64, *byte).unwrap();
+        }
+    };
+    // `addi a0, x0, 0x55` astride the wrap: its low half is the last two
+    // bytes of the address space and its high half the first two.
+    let split = addi(10, 0, 0x55).to_le_bytes();
+    put(&top, 0xffe, &split[..2]);
+    put(&bottom, 0, &split[2..]);
+    // At 2: `lw a1, -2(x0)` — four bytes from 0xfffffffe, which are that
+    // instruction. At 6: `sw a0, -2(x0)`, back over the same four.
+    put(&bottom, 2, &i(0x03, 2, 11, 0, -2).to_le_bytes());
+    put(&bottom, 6, &s(0x23, 2, 0, 10, -2).to_le_bytes());
+
+    let space = AddressSpace::new("mem", 64);
+    space
+        .topology()
+        .map(Region::ram("bottom", Arc::clone(&bottom)), 0)
+        .unwrap();
+    space
+        .topology()
+        .map(Region::ram("top", Arc::clone(&top)), 0xffff_f000)
+        .unwrap();
+    let mut cfg = Config::rv64i();
+    cfg.xlen = Xlen::Rv32;
+    let hart = Hart::new(cfg.with_reset_vector(0xffff_fffe));
+    hart.attach_space(Arc::new(space));
+
+    hart.step();
+    assert_eq!(hart.csrs().mcause, 0, "the split fetch did not fault");
+    assert_eq!(hart.x(10), 0x55, "and decoded both halves");
+    assert_eq!(hart.pc(), 2, "the next instruction is past the wrap");
+    hart.step();
+    assert_eq!(
+        hart.x(11),
+        u64::from(addi(10, 0, 0x55)),
+        "a misaligned load reads across the wrap"
+    );
+    hart.step();
+    assert_eq!(
+        hart.csrs().mcause,
+        0,
+        "and a misaligned store writes across it"
+    );
+    assert_eq!(top.read_u8(0xffe).unwrap(), 0x55);
+    assert_eq!(top.read_u8(0xfff).unwrap(), 0);
+    assert_eq!(bottom.read_u8(0).unwrap(), 0);
+    assert_eq!(bottom.read_u8(1).unwrap(), 0);
+}
+
 #[test]
 fn logical_right_shift_respects_rv32() {
     // -1 >> 1 must be 0x7fff_ffff on RV32, not 0x7fff_ffff_ffff_ffff.
