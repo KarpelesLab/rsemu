@@ -2389,6 +2389,84 @@ fn paging_translates_through_the_directory_and_the_table() {
     assert_eq!(pc.read32(at::PDIR) & 0b10_0000, 0b10_0000, "accessed");
 }
 
+/// An access that straddles the top of the 32-bit linear space continues at
+/// linear zero — the *same* linear zero every other access means.
+///
+/// *Intel SDM* volume 3A §5.1.1: "legacy protected mode cannot produce
+/// linear addresses larger than 32 bits". [`prot::linear32`] encodes that for
+/// a segment base plus an offset; the page-crossing loop then added the byte
+/// index to the result in sixty-four bits, so the third byte of a doubleword
+/// at `0xfffffffe` was translated as linear `0x1_0000_0000`. A legacy walk masks
+/// its indices and found page zero's frame anyway, but the translation cache
+/// is keyed by the whole address: the entry it made is one `INVLPG 0` never
+/// reaches, and the next such access used the mapping the guest had just
+/// replaced. A write did the same through the stale entry.
+///
+/// [`prot::linear32`]: super::prot::linear32
+#[test]
+fn an_access_across_the_top_of_the_linear_space_wraps_to_linear_zero() {
+    const PTAB_TOP: u64 = 0xb000;
+    const FRAME_A: u64 = 0xc000;
+    const FRAME_B: u64 = 0xd000;
+    const FRAME_TOP: u64 = 0xe000;
+    let pc = pc386();
+    pc.start_protected();
+    pc.write32(at::PDIR, at::PTAB | 0b111);
+    for page in 0..1024u64 {
+        pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
+    }
+    // Linear page zero is frame A to begin with, and the last page of the
+    // space is its own frame.
+    pc.write32(at::PTAB, FRAME_A | 0b111);
+    pc.write32(at::PDIR + 1023 * 4, PTAB_TOP | 0b111);
+    pc.write32(PTAB_TOP + 1023 * 4, FRAME_TOP | 0b111);
+    pc.write(FRAME_TOP + 0xffe, &[0x11, 0x22]);
+    pc.write(FRAME_A, &[0xaa, 0xbb]);
+    pc.write(FRAME_B, &[0xcc, 0xdd]);
+
+    let mut sys = pc.cpu.sys();
+    sys.cr3 = at::PDIR;
+    sys.cr0 |= cr0::PG;
+    // A flat segment cannot reach across: offset `0xfffffffe` plus three is
+    // past any limit. One based a page up can, from offset `0xffffeffe`.
+    sys.segs[usize::from(isa::seg::FS)].base = 0x1000;
+    pc.cpu.set_sys(sys);
+
+    let mut code = alloc::vec![
+        0x64, 0xa1, 0xfe, 0xef, 0xff, 0xff, // mov eax, fs:[0xffffeffe]
+        0x89, 0xc3, // mov ebx, eax
+        0xc7, 0x05, // mov dword [PTAB], FRAME_B | 7
+    ];
+    code.extend_from_slice(&(at::PTAB as u32).to_le_bytes());
+    code.extend_from_slice(&(FRAME_B as u32 | 0b111).to_le_bytes());
+    code.extend_from_slice(&[
+        0x0f, 0x01, 0x3d, 0x00, 0x00, 0x00, 0x00, // invlpg [0]
+        0x64, 0x8b, 0x0d, 0xfe, 0xef, 0xff, 0xff, // mov ecx, fs:[0xffffeffe]
+        // mov dword fs:[0xffffeffe], 0x11223344
+        0x64, 0xc7, 0x05, 0xfe, 0xef, 0xff, 0xff, 0x44, 0x33, 0x22, 0x11, 0xf4,
+    ]);
+    pc.write(at::CODE0, &code);
+    let steps = pc.run(10);
+    assert!(steps < 10, "the program halted");
+    let regs = pc.regs();
+    assert_eq!(regs.rbx, 0xbbaa_2211, "the high half came from linear zero");
+    assert_eq!(
+        regs.rcx, 0xddcc_2211,
+        "and from where linear zero pointed after the INVLPG"
+    );
+    assert_eq!(
+        pc.read32(FRAME_TOP + 0xffc) >> 16,
+        0x3344,
+        "the store's low half"
+    );
+    assert_eq!(pc.read32(FRAME_B) & 0xffff, 0x1122, "and its high half");
+    assert_eq!(
+        pc.read32(FRAME_A) & 0xffff,
+        0xbbaa,
+        "not through the old mapping"
+    );
+}
+
 /// A part with the first 4 MiB identity-mapped, paging on, and a program that
 /// reads the same far linear address `reads` times before halting.
 ///

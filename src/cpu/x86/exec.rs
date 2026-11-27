@@ -1537,7 +1537,7 @@ impl<'a> Exec<'a> {
         if Self::crosses_page(lin, size) {
             let mut value = 0u64;
             for i in 0..u64::from(size) {
-                let addr = lin.wrapping_add(i);
+                let addr = self.linear_byte(lin, i);
                 let phys = self.translate(addr, false, user)?;
                 value |= self.phys_read(phys, 1) << (8 * i);
             }
@@ -1545,6 +1545,28 @@ impl<'a> Exec<'a> {
         }
         let phys = self.translate(lin, false, user)?;
         Ok(self.phys_read(phys, size))
+    }
+
+    /// The linear address of byte `i` of a page-crossing access at `lin`.
+    ///
+    /// Outside 64-bit mode a linear address is thirty-two bits, and an
+    /// access that starts in the last page of that space continues in the
+    /// first: the sum is truncated exactly as [`prot::linear32`] truncates a
+    /// base plus an offset. Formed in sixty-four bits instead, the second
+    /// half was a linear address above 4 GiB — which a legacy or PAE walk
+    /// happens to index like its low thirty-two bits, but which the
+    /// translation cache keys on whole, so the entry was one no `INVLPG` of
+    /// the real page ever reached, and `CR2` named an address that does not
+    /// exist.
+    ///
+    /// [`prot::linear32`]: super::prot::linear32
+    #[inline]
+    fn linear_byte(&self, lin: u64, i: u64) -> u64 {
+        if self.sixty_four() {
+            lin.wrapping_add(i)
+        } else {
+            prot::linear32(lin, i)
+        }
     }
 
     /// Write `size` bytes to a linear address.
@@ -1562,7 +1584,8 @@ impl<'a> Exec<'a> {
         if Self::crosses_page(lin, size) {
             let mut phys = [0u64; 8];
             for i in 0..u64::from(size) {
-                phys[i as usize] = self.translate(lin.wrapping_add(i), true, user)?;
+                let addr = self.linear_byte(lin, i);
+                phys[i as usize] = self.translate(addr, true, user)?;
             }
             for i in 0..u64::from(size) {
                 self.phys_write(phys[i as usize], 1, (value >> (8 * i)) & 0xff);
