@@ -477,12 +477,20 @@ impl FetchWindow {
     /// one per byte — a page of MMIO included.
     #[inline]
     fn read(&mut self, mem: &AddressSpace, addr: u64, need: Perms) -> Option<u8> {
+        self.span_at(mem, addr, need)?
+            .read_u8(addr & (Self::PAGE - 1))
+    }
+
+    /// The store behind the page holding physical `addr`, if it has one the
+    /// window may read directly. The span starts at the page, not at `addr`.
+    #[inline]
+    fn span_at(&mut self, mem: &AddressSpace, addr: u64, need: Perms) -> Option<&DirectSpan> {
         let page = addr & !(Self::PAGE - 1);
         let generation = mem.generation();
         if self.page != page || self.generation != generation || self.need != need {
             self.fill(mem, page, generation, need);
         }
-        self.span.as_ref()?.read_u8(addr & (Self::PAGE - 1))
+        self.span.as_ref()
     }
 
     fn fill(&mut self, mem: &AddressSpace, page: u64, generation: u64, need: Perms) {
@@ -2195,28 +2203,10 @@ impl<'a> Exec<'a> {
         self.fill_queue()?;
         let map = self.variant().map();
         let bits = self.code_bits();
-        // The decoder pulls bytes through a closure so that one decoder serves
-        // the interpreter and the disassembler; a fetch fault has to escape it,
-        // and a closure cannot return `Err`, so it is latched here.
-        let mut fetch_fault: Option<Fault> = None;
-        let fields = {
-            let this = &mut *self;
-            isa::decode_stream_as(map, bits, &mut || {
-                if fetch_fault.is_some() {
-                    return None;
-                }
-                match this.fetch_byte() {
-                    Ok(byte) => Some(byte),
-                    Err(fault) => {
-                        fetch_fault = Some(fault);
-                        None
-                    }
-                }
-            })
+        let fields = match self.decode_in_page(map, bits) {
+            Some(fields) => fields,
+            None => self.decode_by_byte(map, bits)?,
         };
-        if let Some(fault) = fetch_fault {
-            return Err(fault);
-        }
         self.insn_len = fields.len;
         // An instruction longer than fifteen bytes is not an instruction: the
         // 386 raises #GP rather than executing an arbitrarily long prefix run.
@@ -2255,6 +2245,136 @@ impl<'a> Exec<'a> {
             return self.execute(&fields);
         }
         self.execute(&fields)
+    }
+
+    /// Decode the instruction at `CS:rIP` one fetched byte at a time: the
+    /// general path, and the only one that can raise a fetch fault.
+    fn decode_by_byte(&mut self, map: isa::Gen, bits: Bits) -> Ex<Fields> {
+        // The decoder pulls bytes through a closure so that one decoder serves
+        // the interpreter and the disassembler; a fetch fault has to escape it,
+        // and a closure cannot return `Err`, so it is latched here.
+        let mut fetch_fault: Option<Fault> = None;
+        let fields = {
+            let this = &mut *self;
+            isa::decode_stream_as(map, bits, &mut || {
+                if fetch_fault.is_some() {
+                    return None;
+                }
+                match this.fetch_byte() {
+                    Ok(byte) => Some(byte),
+                    Err(fault) => {
+                        fetch_fault = Some(fault);
+                        None
+                    }
+                }
+            })
+        };
+        match fetch_fault {
+            Some(fault) => Err(fault),
+            None => Ok(fields),
+        }
+    }
+
+    /// Decode the instruction at `CS:rIP` when every byte of it lies in the
+    /// page `rIP` is in and that page is one [`FetchWindow`] reads directly;
+    /// `None`, with **nothing changed**, when it does not or cannot be shown
+    /// to, and [`Exec::decode_by_byte`] then does the whole thing.
+    ///
+    /// # What is hoisted
+    ///
+    /// [`Exec::fetch_at`] answers four questions per byte — is the offset
+    /// inside the code segment, where is it linearly, where is that
+    /// physically, and what store is behind it — and for the bytes of one
+    /// instruction in one page all four have one answer. So they are asked
+    /// once, for the whole remainder of the page:
+    ///
+    /// * **The limit.** `SegReg::in_bounds(offset, n)` holds exactly when it
+    ///   holds for each of the `n` bytes singly — its bound is on the last
+    ///   byte, and an expand-down segment's on the first — and it refuses a
+    ///   span that passes 4 GiB, so `EIP` cannot wrap inside the run. In
+    ///   64-bit mode the test is canonicality, which is a property of the
+    ///   bits above the page offset. A run the segment does not wholly cover
+    ///   is declined rather than shortened: it is the last page of a segment.
+    /// * **The translation.** One instruction-TLB entry maps the whole 4 KiB
+    ///   page, and nothing between two fetches of one instruction can evict
+    ///   it. Only a *hit* is used ([`Exec::fetch_translation`]); a miss owes a
+    ///   walk, with its bus cycles and its accessed bits, and is declined.
+    /// * **The store.** The window's, keyed as it always is.
+    ///
+    /// The run is measured on the *linear* address, because a segment base
+    /// need not be page-aligned and the linear page is the one a translation
+    /// covers.
+    ///
+    /// # What is not
+    ///
+    /// The bytes are still read one at a time, live, in order, from the store
+    /// the bus would have reached — the decoder may be reading an instruction
+    /// the previous one has just written. And the per-byte effects are all
+    /// applied, after the fact and in one go: the clocks (a sum, and nothing
+    /// reads the counter between two fetches — a fetch is not published,
+    /// see [`Exec::fetch_read`]), the instruction pointer, and the open-bus
+    /// latch, which holds the last byte fetched.
+    ///
+    /// An instruction that runs out of page before it runs out of bytes
+    /// reports the stream truncated, and is decoded again from the start by
+    /// the general path — which fetches the first page's bytes exactly as it
+    /// would have, since nothing here was committed.
+    #[inline]
+    fn decode_in_page(&mut self, map: isa::Gen, bits: Bits) -> Option<Fields> {
+        if self.legacy() || self.state.queue.len() != 0 {
+            // The 8086's fetches are bus cycles through a visible queue.
+            return None;
+        }
+        let rip = self.state.regs.rip;
+        let long = self.sixty_four();
+        let lin = if long {
+            if !prot::canonical(rip) {
+                return None;
+            }
+            rip
+        } else {
+            prot::linear32(self.state.sys.seg(seg::CS).base, rip)
+        };
+        // At least one byte, at most a page.
+        let run = FetchWindow::PAGE - (lin & (FetchWindow::PAGE - 1));
+        if !long && !self.state.sys.seg(seg::CS).in_bounds(rip, run) {
+            return None;
+        }
+        let phys = if self.state.sys.paging() {
+            let user = self.cpl() == 3;
+            self.fetch_translation(lin, user)?
+        } else {
+            lin
+        };
+        let masked = self.masked(phys);
+        let need = self.attrs.read_perm();
+        let span = self.state.fetch.span_at(self.mem, masked, need)?;
+        let base = masked & (FetchWindow::PAGE - 1);
+        let mut taken = 0u64;
+        let mut last = 0u8;
+        let fields = isa::decode_stream_as(map, bits, &mut || {
+            if taken >= run {
+                return None;
+            }
+            let byte = span.read_u8(base + taken)?;
+            taken += 1;
+            last = byte;
+            Some(byte)
+        });
+        if fields.truncated {
+            return None;
+        }
+        // `taken` is at most a page, so neither product below can overflow.
+        self.charge(self.variant().bus_clocks() * taken as u32);
+        self.state.open_bus = last;
+        // In the guest's own width, as `fetch_byte` advances it; the limit
+        // check above is what says the low half does not wrap.
+        self.state.regs.rip = if long {
+            rip.wrapping_add(taken)
+        } else {
+            (rip & !0xffff_ffff) | u64::from((rip as u32).wrapping_add(taken as u32))
+        };
+        Some(fields)
     }
 
     /// Whether this instruction asserts `LOCK#`.

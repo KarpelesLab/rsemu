@@ -13170,6 +13170,68 @@ mod fetch_window {
         );
     }
 
+    /// Run both machines from `0000:start` for `steps` instructions and hold
+    /// them to the same registers, clocks, open-bus latch and fault counters
+    /// after every one.
+    fn in_step(start: u64, steps: usize, fill: impl Fn(&RamStore)) {
+        let (fast, fast_ram, _) = build(true, &[]);
+        let (slow, slow_ram, _) = build(false, &[]);
+        fill(&fast_ram);
+        fill(&slow_ram);
+        for cpu in [&fast, &slow] {
+            let mut regs = cpu.regs();
+            regs.rip = start;
+            cpu.set_regs(regs);
+        }
+        for step in 0..steps {
+            assert_eq!(
+                fast.step(),
+                slow.step(),
+                "clocks charged by step {step} from {start:#x}"
+            );
+            assert_eq!(
+                observe(&fast),
+                observe(&slow),
+                "after step {step} from {start:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_instruction_that_straddles_a_page_is_the_same_instruction() {
+        // `add ax, 1` end to end across a page boundary, entered at every
+        // alignment: an instruction that ends on the last byte of the page,
+        // one that starts on it, and one with the boundary in its immediate.
+        for start in 0x1ff0..0x1ff3u64 {
+            in_step(start, 12, |ram| {
+                for at in (start..0x2020).step_by(3) {
+                    ram.write_u8(at, 0x05).unwrap();
+                    ram.write_u8(at + 1, 0x01).unwrap();
+                    ram.write_u8(at + 2, 0x00).unwrap();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_code_segment_faults_where_it_always_did() {
+        // Real mode's limit is `ffff`. From `fffd` the instruction ends on the
+        // last byte the segment has and the *next* fetch is the fault; from
+        // `fffe` and `ffff` the fault is inside the instruction. Either way
+        // the processor takes #GP through a vector table of zeros and goes on
+        // executing zeros from `0000:0000`, and the two paths must agree at
+        // every step of that.
+        for start in 0xfffa..=0xffffu64 {
+            in_step(start, 8, |ram| {
+                for at in (start..0x1_0006).step_by(3) {
+                    ram.write_u8(at, 0x05).unwrap();
+                    ram.write_u8(at + 1, 0x01).unwrap();
+                    ram.write_u8(at + 2, 0x00).unwrap();
+                }
+            });
+        }
+    }
+
     #[test]
     fn a_store_into_the_page_being_executed_is_fetched_back() {
         // mov byte [0x1006], 0x7f ; mov al, 0x11 -- the store rewrites the
