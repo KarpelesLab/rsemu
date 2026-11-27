@@ -106,10 +106,14 @@
 //! Sprite vertical start and stop positions must be of the same parity, i.e.
 //! both odd or both even."
 //!
-//! `SH10` is `SPRxPOS` bit 0 — §4: "If SSCAN2 bit in FMODE is set, then
-//! disable SH10 horizontal coincidence detect. This bit is then free to be
-//! used by ALICE as an individual scan double enable." `SV0` is `SPRxPOS` bit
-//! 8. On a line a doubled sprite skips, **nothing happens at all**: no fetch,
+//! `SH10` is `SPRxPOS` bit 7 — §4's table for the register is "15-08 SV7-SV0
+//! … 07-00 SH10-SH3 Sprite horizontal start value. Low order 3 bits are in
+//! SPRxCTL registers", most significant first — and: "If SSCAN2 bit in FMODE
+//! is set, then disable SH10 horizontal coincidence detect. This bit is then
+//! free to be used by ALICE as an individual scan double enable." It is the
+//! bit Lisa drops from her comparator (`denise::aga`), so both chips read the
+//! same one; bit 0 is `SH3`, a position bit like any other. `SV0` is `SPRxPOS`
+//! bit 8. On a line a doubled sprite skips, **nothing happens at all**: no fetch,
 //! no pointer advance and no write into Lisa, who is still showing the
 //! previous line's data because nothing overwrote it. The vertical comparisons
 //! that start and stop the channel are not skipped — they are the beam's
@@ -132,9 +136,9 @@ pub const BPAGEM: u16 = 1 << 1;
 /// `FMODE` bit 0: "Bitplane 32 Bit Wide Mode".
 pub const BPL32: u16 = 1 << 0;
 
-/// `SPRxPOS` bit 0: `SH10`, and Alice's per-sprite scan-double enable under
-/// `SSCAN2` (§4, `SPRxPOS`).
-pub const SH10: u16 = 1 << 0;
+/// `SPRxPOS` bit 7: `SH10` — "07-00 SH10-SH3" — and Alice's per-sprite
+/// scan-double enable under `SSCAN2` (§4, `SPRxPOS`).
+pub const SH10: u16 = 1 << 7;
 
 /// `DDFSTRT` and `DDFSTOP` on an AA part: `H8`–`H2`, bits 7–1.
 ///

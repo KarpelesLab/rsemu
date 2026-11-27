@@ -1811,15 +1811,21 @@ fn sscan2_skips_a_sprite_fetch_on_a_line_of_the_wrong_parity() {
     // vertical beam counter, the given sprite's DMA is allowed to proceed as
     // before. If they don't match, then sprite DMA is disabled and LISA reuses
     // the sprite data from the previous line."
+    //
+    // `SH10` is the top of `SPRxPOS`'s low byte — §4's table has "07-00
+    // SH10-SH3" — which is the bit Lisa takes out of her comparison, so the
+    // two chips are looking at the same one. Bit 0 is `SH3`, an ordinary
+    // position bit, and doubles nothing.
     for (fmode, sh10, lines) in [
-        (aga::SSCAN2, 1u16, 2u32), // doubled: four lines, two fetches
-        (aga::SSCAN2, 0, 4),       // SH10 clear: this sprite is not doubled
-        (0, 1, 4),                 // SSCAN2 clear: nor is any
+        (aga::SSCAN2, 0x80u16, 2u32), // doubled: four lines, two fetches
+        (aga::SSCAN2, 0, 4),          // SH10 clear: this sprite is not doubled
+        (aga::SSCAN2, 0x01, 4),       // SH3 set: nor is this one
+        (0, 0x80, 4),                 // SSCAN2 clear: nor is any
     ] {
         let c = Chipset::aga(CHIP);
         let base = 0x2_0000u32;
         // VSTART $2C, VSTOP $30 — four display lines, same parity (§2's note).
-        c.store(base, &[0x2c40 | sh10, 0x3000]);
+        c.store(base, &[0x2c00 | sh10, 0x3000]);
         c.store(base + 4, &[0u16; 64]);
         c.poke(E_FMODE, fmode);
         c.poke(SPR0PTR, (base >> 16) as u16);
