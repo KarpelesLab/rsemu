@@ -2467,6 +2467,44 @@ fn an_access_across_the_top_of_the_linear_space_wraps_to_linear_zero() {
     );
 }
 
+/// `MOV r/m, Sreg` naming segment register 6 or 7 is `#UD` on a 386 and
+/// later, as the load already was.
+///
+/// The SDM calls the two encodings reserved and stops there (volume 2,
+/// appendix B, table B-8, "Encoding of the Segment Register (sreg) Field":
+/// "110 Reserved", "111 Reserved", "Do not use reserved encodings."), so what
+/// they *do* was
+/// measured: on an x86 host (AMD Zen 5) `8C F0`, `8C F8` and the memory form
+/// `8C 74 24 F8` each raise `#UD`, as `8E F0` does. The store returned before
+/// the check the load made and wrote a zero instead.
+#[test]
+fn a_store_from_a_segment_register_that_does_not_exist_is_invalid_opcode() {
+    const HANDLER: u32 = 0x3100;
+    for (name, code) in [
+        ("mov eax, seg6", &[0x8c, 0xf0][..]),
+        ("mov eax, seg7", &[0x8c, 0xf8]),
+        ("mov [0x7000], seg6", &[0x8c, 0x35, 0x00, 0x70, 0x00, 0x00]),
+    ] {
+        let pc = pc386();
+        pc.start_protected();
+        pc.idt(6, gate(0x08, HANDLER, sys_type::INT_GATE32, 0));
+        pc.write(u64::from(HANDLER), &[0xf4]);
+        pc.write32(at::MARK, 0x5555_5555);
+        // mov eax, 0x12345678 ; <the store> ; hlt
+        let mut program = alloc::vec![0xb8, 0x78, 0x56, 0x34, 0x12];
+        program.extend_from_slice(code);
+        program.push(0xf4);
+        pc.write(at::CODE0, &program);
+        let steps = pc.run(10);
+        assert!(steps < 10, "{name}: halted");
+        let regs = pc.regs();
+        assert_eq!(regs.rip, u64::from(HANDLER) + 1, "{name}: #UD was taken");
+        assert_eq!(pc.read32(regs.rsp), at::CODE0 + 5, "{name}: at the store");
+        assert_eq!(regs.rax, 0x1234_5678, "{name}: which stored nothing");
+        assert_eq!(pc.read32(at::MARK), 0x5555_5555, "{name}: anywhere");
+    }
+}
+
 /// A part with the first 4 MiB identity-mapped, paging on, and a program that
 /// reads the same far linear address `reads` times before halting.
 ///

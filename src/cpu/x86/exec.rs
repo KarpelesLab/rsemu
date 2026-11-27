@@ -3370,6 +3370,22 @@ impl<'a> Exec<'a> {
     /// `MOV`, which needs three special cases the generic path cannot express.
     fn mov(&mut self, f: &Fields, size: u8) -> Ex<()> {
         let insn = f.insn;
+        // `MOV Sreg,r/m` on a 386 cannot name `CS`: the only way to change the
+        // code segment is a control transfer. An 8086 allows it, and the
+        // corpus exercises it. Segment numbers 6 and 7 name no register at
+        // all, and a 386 rejects them rather than aliasing down as an 8086's
+        // two-bit decode does — in **both** directions, so this comes before
+        // the store below returns. The SDM only calls the encodings reserved
+        // (volume 2, table B-8: "110 Reserved ... 111 Reserved ... Do not use
+        // reserved encodings."); that the store is `#UD` like the load was
+        // measured on an x86 host, `8C F0` and `8C F8` in register and memory
+        // forms.
+        if !self.legacy() && (insn.dst == Arg::Sw || insn.src == Arg::Sw) {
+            let index = f.modrm.map_or(0, |m| m.reg);
+            if index > seg::GS || (index == seg::CS && insn.dst == Arg::Sw) {
+                return Err(Fault::bare(VEC_UD));
+            }
+        }
         // `MOV r/m,Sreg` stores sixteen bits to memory but zero-extends to a
         // whole register, which is why the operand size and the transfer size
         // disagree here and nowhere else.
@@ -3381,17 +3397,6 @@ impl<'a> Exec<'a> {
                 self.write_arg(f, insn.dst, 2, value)?;
             }
             return Ok(());
-        }
-        // `MOV Sreg,r/m` on a 386 cannot name `CS`: the only way to change the
-        // code segment is a control transfer. An 8086 allows it, and the
-        // corpus exercises it. Segment numbers 6 and 7 name no register at
-        // all, and a 386 rejects them rather than aliasing down as an 8086's
-        // two-bit decode does.
-        if !self.legacy() && (insn.dst == Arg::Sw || insn.src == Arg::Sw) {
-            let index = f.modrm.map_or(0, |m| m.reg);
-            if index > seg::GS || (index == seg::CS && insn.dst == Arg::Sw) {
-                return Err(Fault::bare(VEC_UD));
-            }
         }
         let value = self.read_arg(f, insn.src, size)?;
         self.write_arg(f, insn.dst, size, value)
