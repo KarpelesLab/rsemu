@@ -374,6 +374,16 @@ impl<'a> Lexer<'a> {
                 Some(c) if c.is_whitespace() => {
                     self.pos += c.len_utf8();
                 }
+                // A byte-order mark, at the very start and nowhere else. It is
+                // what Notepad and a good many Windows editors put in front of
+                // a UTF-8 file, it is invisible, and "unexpected character ``"
+                // at 1:1 with a caret under nothing is not an error anybody
+                // can act on. Unicode calls it a signature there and a
+                // zero-width space anywhere else, so anywhere else it is still
+                // refused.
+                Some('\u{feff}') if self.pos == 0 => {
+                    self.pos += '\u{feff}'.len_utf8();
+                }
                 Some('#') => {
                     while let Some(c) = self.peek() {
                         if c == '\n' {
@@ -847,6 +857,20 @@ mod tests {
         // The cursor must stay on character boundaries even when it gives up.
         let err = error("# héllo\nλ");
         assert_eq!(err, "unexpected character `λ`");
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_is_not_a_character_of_the_file() {
+        // What a Windows editor saves. The mark is skipped and the spans still
+        // count it, so a caret further down the file lands where it should.
+        let text = "\u{feff}machine";
+        let src = SourceFile::new("t", text);
+        let toks = tokenize(&src).expect("a signature is not an error");
+        assert_eq!(toks[0].kind, TokenKind::Ident(String::from("machine")));
+        assert_eq!(toks[0].span, Span::new(3, 10));
+        // Only at the start: in the middle of a file it is a stray invisible
+        // character, and saying so is the helpful thing.
+        assert_eq!(error("a \u{feff} b"), "unexpected character `\u{feff}`");
     }
 
     #[test]
