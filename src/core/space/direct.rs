@@ -238,7 +238,19 @@ impl ReadCache {
     /// # Errors
     ///
     /// Exactly those of the read it replaces.
-    #[inline]
+    ///
+    /// # `inline(always)`
+    ///
+    /// `CLAUDE.md` allows `#[inline]` on a hot-path accessor and nothing
+    /// stronger, so the stronger form owes a reason, and it is the one
+    /// [`RamStore::read_value`] gives: with a plain `#[inline]` LLVM inlines
+    /// this into its caller while there is one caller and into none of them
+    /// once there are two. Every core that adopts the cache is another call
+    /// site, so the first adopter's fast path got slower each time another
+    /// core gained one — measured on a riscv64 Linux boot, the interpreter
+    /// went from 760 to 800 host instructions per guest instruction when
+    /// `cpu::arm::a64` became the second, and is at 773 with this.
+    #[inline(always)]
     pub fn read(
         &mut self,
         space: &AddressSpace,
@@ -263,7 +275,10 @@ impl ReadCache {
     /// For a holder that reads many bytes of one page in a row and would
     /// rather index the span itself than come back through
     /// [`read`](ReadCache::read) for each.
-    #[inline]
+    ///
+    /// `inline(always)` with [`read`](ReadCache::read), and for its reason:
+    /// this is the whole of that function's fast path.
+    #[inline(always)]
     pub fn span_at(&mut self, space: &AddressSpace, addr: u64, need: Perms) -> Option<&DirectSpan> {
         let page = addr & !(Self::PAGE - 1);
         let index = (page >> 12) as usize & (Self::SLOTS - 1);
@@ -278,6 +293,9 @@ impl ReadCache {
         self.slots.get(index)?.span.as_ref()
     }
 
+    /// Out of line on purpose: this is the miss, and its probe of the flat
+    /// view has no business in the hit's code.
+    #[inline(never)]
     fn fill(
         &mut self,
         space: &AddressSpace,
