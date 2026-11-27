@@ -1000,8 +1000,16 @@ POST, and nothing in the tree models one.
 - **`INT 10h AH=06h` scrolls the whole screen** when the line count is
   non-zero; the rectangle is honoured for a clear (`AL=0`), which is what
   programs use it for.
-- **US layout, base scan codes only.** Extended (`E0`-prefixed) keys are
-  dropped rather than half-decoded, and the lock states are not tracked.
+- **US layout, and the grey navigation block types nothing.** `INT 09h`
+  remembers an `E0` prefix for one byte. The arrow keys, Insert, Delete, Home,
+  End and the two page keys (`E0 47`-`E0 53`) are then dropped rather than
+  half-decoded — they used to type the keypad digit they share a code with —
+  and so are the fake shifts a keyboard brackets them with (`E0 2A`, `E0 36`),
+  which used to release a shift key that was still held. Every other extended
+  key is the key it shares a code with: the right-hand Ctrl and Alt are Ctrl
+  and Alt, and the keypad's Enter and `/` type what they say. F1-F10 are
+  reported by scan code. The lock states are not tracked.
+  `src/fw/pcbios/keyboard.rs` has the argument.
 
 ### Which boards actually reach this firmware
 
