@@ -2756,6 +2756,46 @@ fn enter_and_leave_build_and_unmake_a_frame() {
     assert_eq!(regs.rsp, at::STACK0);
 }
 
+/// `ENTER` with a nesting level reserves its locals **below** the display.
+///
+/// *Intel SDM* volume 2, `ENTER`, "Operation": after the `Push([EBP])` loop
+/// and `Push(FrameTemp)`, "EBP := FrameTemp; ESP := ESP − AllocSize" — and
+/// `ESP` there is the pointer the pushes have moved. Taking the allocation off
+/// the frame pointer instead put the locals on top of the display.
+#[test]
+fn enter_with_a_nesting_level_allocates_below_the_display() {
+    let pc = pc386();
+    pc.start_protected();
+    pc.write32(0x8800 - 4, 0xaabb_ccdd);
+    pc.write32(0x8800 - 8, 0x1122_3344);
+    pc.write(
+        at::CODE0,
+        &[
+            0xbd, 0x00, 0x88, 0x00, 0x00, // mov ebp, 0x8800
+            0xc8, 0x10, 0x00, 0x03, // enter 0x10, 3
+            0xf4,
+        ],
+    );
+    pc.cpu.step();
+    pc.cpu.step();
+    let regs = pc.regs();
+    let top = at::STACK0;
+    assert_eq!(pc.read32(top - 4), 0x8800, "the old EBP");
+    assert_eq!(pc.read32(top - 8), 0xaabb_ccdd, "the frame one level out");
+    assert_eq!(pc.read32(top - 12), 0x1122_3344, "and the one beyond it");
+    assert_eq!(
+        pc.read32(top - 16),
+        top - 4,
+        "then this frame's own pointer"
+    );
+    assert_eq!(regs.rbp, top - 4, "which is what EBP becomes");
+    assert_eq!(
+        regs.rsp,
+        top - 16 - 0x10,
+        "and the 16 bytes of locals are below all four"
+    );
+}
+
 #[test]
 fn the_shift_count_is_masked_to_five_bits_from_the_80186_on() {
     // The 8086 uses the whole of `CL`, so `shl al, 32` shifts thirty-two

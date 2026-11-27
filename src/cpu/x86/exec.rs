@@ -3177,12 +3177,19 @@ impl<'a> Exec<'a> {
         let bp = self.state.regs.read(5, size, false);
         self.push(bp, size)?;
         let frame_ptr = self.sp();
+        // The walk down the enclosing frames steps by the *operand* size and
+        // addresses through the frame pointer at the *stack's* width — `BP`
+        // on a 16-bit stack, `EBP` on a 32-bit one — whichever operand size
+        // the instruction has (*Intel SDM* volume 2, `ENTER`, "Operation":
+        // "IF StackSize = 32 EBP := EBP - 4; Push([EBP]); ELSE (* StackSize =
+        // 16 *) BP := BP - 4; Push([BP]);").
+        let stack = self.stack_addr_size();
         for _ in 1..level {
             // Each nesting level copies the pointer to the frame one level out,
             // building the display the callee walks.
-            let bp = self.state.regs.read(5, size, false);
-            let bp = bp.wrapping_sub(u64::from(size));
-            self.state.regs.write(5, size, false, bp);
+            let bp = self.state.regs.read(5, stack, false);
+            let bp = bp.wrapping_sub(u64::from(size)) & Self::mask(stack);
+            self.state.regs.write(5, stack, false, bp);
             let value = self.read_mem(seg::SS, bp, size)?;
             self.push(value, size)?;
         }
@@ -3190,7 +3197,12 @@ impl<'a> Exec<'a> {
             self.push(frame_ptr, size)?;
         }
         self.state.regs.write(5, size, false, frame_ptr);
-        let sp = frame_ptr.wrapping_sub(frame);
+        // The locals go below the display, not below the frame pointer: the
+        // same section ends "EBP := FrameTemp; ESP := ESP − AllocSize", and
+        // `ESP` there has been moved by every push above. Subtracting from
+        // the frame pointer instead laid the locals over the display a
+        // nesting level above zero had just built.
+        let sp = self.sp().wrapping_sub(frame);
         self.set_sp(sp);
         Ok(())
     }
