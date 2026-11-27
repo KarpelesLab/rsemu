@@ -278,6 +278,20 @@ fn the_byte_count_limit_limits() {
 }
 
 #[test]
+fn a_byte_count_limit_of_zero_still_announces_blocks_the_register_can_describe() {
+    // The Byte Count registers are sixteen bits. Whatever a limit of zero is
+    // taken to mean, a block announced under it has to be one whose size
+    // those registers can report: a 65536-byte block reads back as a count of
+    // zero, and a host that believes its drive transfers nothing for ever.
+    let cd = drive(64);
+    clear_attention(&cd);
+    let (ended, data) = packet_command_in(&cd, &cdb_read10(0, 40), 0);
+    assert_eq!(ended.status & ST_CHK, 0);
+    let want: Vec<u8> = (0..40).flat_map(stamp).collect();
+    assert_eq!(data, want);
+}
+
+#[test]
 fn an_odd_byte_count_limit_is_rounded_down() {
     // §8.21.5: the data register is sixteen bits wide, so a device cannot
     // honour an odd limit and rounds down rather than transferring a half word.

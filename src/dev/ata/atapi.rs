@@ -888,11 +888,14 @@ impl AtapiDrive {
         // ATA/ATAPI-6 §8.21.5: the byte count limit is the most the device may
         // move in one DRQ block, and an odd value is rounded down because the
         // data register is sixteen bits wide. Zero is a reserved value; reading
-        // it as the full 65536 is the lenient choice and costs nothing, because
-        // no host deliberately asks for a limit of no bytes, while aborting
-        // would turn a driver's oversight into an unexplained hang.
+        // it as "as much as the register can say" is the lenient choice and
+        // costs nothing, because no host deliberately asks for a limit of no
+        // bytes, while aborting would turn a driver's oversight into an
+        // unexplained hang. That is 65534, not 65536: the block's size goes
+        // back to the host in these same sixteen bits, and a 65536-byte block
+        // would announce itself as zero bytes — the very hang this avoids.
         let limit = if state.byte_count == 0 {
-            65536u64
+            0xfffeu64
         } else {
             u64::from(state.byte_count & !1)
         };
