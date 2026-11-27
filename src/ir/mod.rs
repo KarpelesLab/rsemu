@@ -532,6 +532,8 @@ pub use op::{
     bitfield_parts,
 };
 pub use pass::{Liveness, TempLife, eliminate_dead_code, hoist_slot_reads};
-pub use regalloc::{Allocation, CallSites, Home, MAX_REGS, RegBanks, linear_scan};
+pub use regalloc::{
+    Allocation, CallSites, Home, MAX_REGS, RegBanks, linear_scan, linear_scan_except,
+};
 pub use types::{Const, Temp, Type};
 pub use verify::verify;

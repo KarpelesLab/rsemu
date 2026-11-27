@@ -181,6 +181,44 @@
 //! how many calls a block has, which the deferred bookkeeping cut from two per
 //! guest instruction to roughly one per block.
 //!
+//! # Constants
+//!
+//! The IR has no immediate operands: a guest `addi` is a `mov` of the
+//! immediate into a temporary and an `add` of two temporaries, and a flag is a
+//! `setcond` against a temporary holding zero. Lowered literally, every one of
+//! those is a host register for the constant and a `mov` to fill it, and a
+//! frontend that shares one zero across a block (`cpu::arm::a64::lift` does)
+//! holds a register for the length of the block — across every call in it,
+//! which means one of the three saved ones.
+//!
+//! So a temporary whose only definition is a `mov` of an immediate is *known*
+//! (`constants`), and two things follow:
+//!
+//! * **A reader that has an immediate form takes it** — the right-hand side of
+//!   `add`/`sub`/`and`/`or`/`xor` and of every comparison where the value fits
+//!   a sign-extended `imm32`, and the amount of every shift and rotate. A
+//!   constant shift amount is the one that matters most: whether it is in
+//!   range is known at compile time, so the compare and the two branches
+//!   described under "Out-of-range shifts" below are not emitted at all.
+//! * **A constant no boundary names has no home.** It is offered to
+//!   [`linear_scan_except`], takes no register and no frame slot, and emits
+//!   nothing where it is defined; a reader with no immediate form loads it
+//!   into the scratch register it would have copied it into anyway.
+//!
+//! A constant an [`InsnStart`](crate::ir::InsnStart) names is architectural
+//! state — a guest `li` — and keeps a home like any other temporary; its
+//! readers still take the immediate. Under [`Regs::Frame`] nothing is absent,
+//! and the immediate forms are used all the same.
+//!
+//! Measured by callgrind over `benches/a64_linux_boot.rs`'s default span
+//! (154 233 793 guest instructions, the same 14 267 494 blocks before and
+//! after): host instructions executed **inside generated code** went from
+//! 3 450 994 429 to 3 115 622 058, **−9.7%**, and the whole boot from
+//! 37 772 092 408 to 37 453 968 085, −0.84% — the second number is small
+//! because generated code is a tenth of that profile, and it is the honest
+//! one. Compiling got 21% dearer per block (`compile_with`'s own instructions,
+//! 130.7 M to 158.6 M over 8 885 blocks) and that is inside the total.
+//!
 //! # Out-of-range shifts
 //!
 //! [`Opcode::SHL`], [`Opcode::SHR`] and [`Opcode::SAR`] are undefined in the
@@ -206,7 +244,7 @@ use alloc::vec::Vec;
 use crate::core::value::Width;
 use crate::ir::{
     Allocation, Block, CallSites, Cond, Home, Inst, Liveness, MemOp, MemSpace, Opcode, RegBanks,
-    Sign, Temp, Type, bitfield_parts, linear_scan,
+    Sign, Temp, Type, bitfield_parts, linear_scan_except,
 };
 use crate::jit::PAGE_MASK;
 use crate::jit::tlb::FastSet;
@@ -710,12 +748,88 @@ fn descriptors(block: &Block) -> Box<[MemOp]> {
     out.into_boxed_slice()
 }
 
+/// What each temporary holds, for the ones that hold a compile-time constant.
+///
+/// `Some(v)` exactly when the temporary's **only** definition in the block is
+/// a `mov` of an immediate, and `v` is that immediate as [`Compiler::write`]
+/// would have stored it: masked to the instruction's type and then to the
+/// temporary's own. A temporary assigned twice is not one of these — the block
+/// is malformed and [`verify`](crate::ir::verify) says so, but nothing obliges
+/// a caller to have run it, and `ir::Interp` would simply keep the later
+/// value.
+///
+/// This is the whole of what this backend knows about constants. It is not
+/// constant *propagation*: nothing is folded through an `add`. It is what
+/// lets the instruction that reads an immediate take it as one — see
+/// [`Compiler::imm`] — and what lets the temporary itself go without a
+/// register.
+fn constants(block: &Block) -> Vec<Option<u64>> {
+    let mut defs = vec![0u8; block.temp_count()];
+    let mut consts = vec![None; block.temp_count()];
+    for (i, inst) in block.insts().iter().enumerate() {
+        for dst in [inst.dst, inst.dst2].into_iter().flatten() {
+            if let Some(n) = defs.get_mut(dst.index()) {
+                *n = n.saturating_add(1);
+            }
+        }
+        if inst.op != Opcode::MOV || !block.srcs(i).is_empty() {
+            continue;
+        }
+        let (Some(dst), Some(imm)) = (inst.dst, inst.imm) else {
+            continue;
+        };
+        let Some(dst_ty) = block.type_of(dst) else {
+            continue;
+        };
+        // The shapes `Compiler::write` refuses are left alone, so the `mov`
+        // is still lowered and still refused there.
+        if check_type(inst.ty).is_err()
+            || check_type(dst_ty).is_err()
+            || dst_ty.bits() > inst.ty.bits()
+        {
+            continue;
+        }
+        if let Some(slot) = consts.get_mut(dst.index()) {
+            *slot = Some(imm.bits() as u64 & type_mask(inst.ty) & type_mask(dst_ty));
+        }
+    }
+    for (slot, n) in consts.iter_mut().zip(&defs) {
+        if *n != 1 {
+            *slot = None;
+        }
+    }
+    consts
+}
+
+/// The mask [`Compiler::mask`] applies for `ty`, as a number.
+const fn type_mask(ty: Type) -> u64 {
+    match ty {
+        Type::I1 => 1,
+        Type::I32 => 0xffff_ffff,
+        _ => u64::MAX,
+    }
+}
+
+/// `value` as the sign-extended 32-bit immediate an `op r/m64, imm32` takes,
+/// when it is one.
+const fn simm32(value: u64) -> Option<i32> {
+    let v = value as i64;
+    if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+        Some(v as i32)
+    } else {
+        None
+    }
+}
+
 struct Compiler<'a> {
     block: &'a Block,
     asm: Asm,
     mems: Box<[MemOp]>,
     /// Where every temporary lives.
     alloc: Allocation,
+    /// What each temporary is known to hold, where that is known at compile
+    /// time — see [`constants`].
+    consts: Vec<Option<u64>>,
     /// The next descriptor to hand out, in the order [`descriptors`] collected.
     next_mem: usize,
     /// Where each IR instruction's code begins — **after** any flush emitted
@@ -798,13 +912,19 @@ impl<'a> Compiler<'a> {
             }
         }
         let plan = plan(block)?;
+        let consts = constants(block);
         let alloc = match regs {
             Regs::Frame => Allocation::none(block),
             Regs::Scan => {
                 let live = Liveness::compute(block);
                 let inside: Vec<bool> = block.insts().iter().map(|i| calls_inside(i.op)).collect();
                 let before: Vec<bool> = plan.at.iter().map(Option::is_some).collect();
-                linear_scan(
+                // A constant needs no home: every read of one is an immediate
+                // or a `mov` of one. The allocator declines the offer where a
+                // boundary names the temporary, and `Allocation::absent` is
+                // what the lowerings ask.
+                let known: Vec<bool> = consts.iter().map(Option::is_some).collect();
+                linear_scan_except(
                     block,
                     &live,
                     &RegBanks {
@@ -815,6 +935,7 @@ impl<'a> Compiler<'a> {
                         inside: &inside,
                         before: &before,
                     },
+                    &known,
                 )
             }
         };
@@ -823,6 +944,7 @@ impl<'a> Compiler<'a> {
             asm: Asm::new(),
             mems: descriptors(block),
             alloc,
+            consts,
             next_mem: 0,
             starts: Vec::with_capacity(block.insts().len()),
             plan,
@@ -956,6 +1078,29 @@ impl<'a> Compiler<'a> {
         (temp.index() as i32) * 8
     }
 
+    /// The value of a constant the allocator gave no home, which every read
+    /// of it has to produce for itself.
+    ///
+    /// `None` for everything else — including a constant a boundary names,
+    /// which has a home like any other temporary and is read from it.
+    fn absent(&self, temp: Temp) -> Option<u64> {
+        if self.alloc.absent(temp) {
+            self.consts.get(temp.index()).copied().flatten()
+        } else {
+            None
+        }
+    }
+
+    /// Operand `k` of instruction `at`, when it is a constant.
+    ///
+    /// Whether or not the temporary has a home: a constant a boundary names is
+    /// in a register *and* known, and reading the immediate is still one
+    /// instruction fewer than reading the register.
+    fn imm(&self, at: usize, k: usize) -> Option<u64> {
+        let temp = self.block.srcs(at).get(k)?;
+        self.consts.get(temp.index()).copied().flatten()
+    }
+
     /// The host register `temp` lives in, if it lives in one.
     fn home(&self, temp: Temp) -> Option<Reg> {
         match self.alloc.home(temp) {
@@ -971,6 +1116,11 @@ impl<'a> Compiler<'a> {
     /// bought: it is renamed away on any out-of-order host, where the load is
     /// an address computation and an L1 access even on a hit.
     fn load_temp(&mut self, reg: Reg, temp: Temp) {
+        if let Some(value) = self.absent(temp) {
+            // A constant with no home: this `mov` is the only place it exists.
+            self.asm.mov_ri(reg, value);
+            return;
+        }
         match self.home(temp) {
             Some(home) => {
                 if home != reg {
@@ -996,6 +1146,8 @@ impl<'a> Compiler<'a> {
     /// bug that shows up three instructions later as a wrong guest register.
     fn operand(&mut self, scratch: Reg, temp: Temp) -> Reg {
         match self.home(temp) {
+            // An absent constant has no home either, so it takes the same arm
+            // a frame-homed temporary does and `load_temp` materializes it.
             Some(home) => home,
             None => {
                 self.load_temp(scratch, temp);
@@ -1234,6 +1386,11 @@ impl<'a> Compiler<'a> {
         let w = inst.ty.bits();
 
         match op {
+            // A constant with no home emits nothing here: its readers take
+            // it as an immediate. `constants` only admits a `mov` that
+            // `write` would have accepted, so nothing is skipped that would
+            // have been refused.
+            Opcode::MOV if inst.dst.is_some_and(|d| self.absent(d).is_some()) => {}
             Opcode::MOV => {
                 let acc = self.acc(inst, &[]);
                 match (self.block.srcs(at).first().copied(), inst.imm) {
@@ -1354,9 +1511,6 @@ impl<'a> Compiler<'a> {
             Opcode::ADD | Opcode::SUB | Opcode::AND | Opcode::OR | Opcode::XOR => {
                 let a = self.src(at, 0)?;
                 let b = self.src(at, 1)?;
-                let acc = self.acc(inst, &[b]);
-                self.load_temp(acc, a);
-                let rhs = self.operand(Reg::Rcx, b);
                 let alu = match op {
                     Opcode::ADD => Alu::Add,
                     Opcode::SUB => Alu::Sub,
@@ -1364,8 +1518,22 @@ impl<'a> Compiler<'a> {
                     Opcode::OR => Alu::Or,
                     _ => Alu::Xor,
                 };
-                self.asm.alu_rr(alu, acc, rhs);
-                self.write(inst, acc)?;
+                // `op r/m64, imm32` sign-extends its immediate, so it is the
+                // same operation as the register form exactly when the
+                // constant survives that round trip.
+                if let Some(imm) = self.imm(at, 1).and_then(simm32) {
+                    // `b` is not read at all, so nothing is blocked.
+                    let acc = self.acc(inst, &[]);
+                    self.load_temp(acc, a);
+                    self.asm.alu_ri(alu, acc, imm);
+                    self.write(inst, acc)?;
+                } else {
+                    let acc = self.acc(inst, &[b]);
+                    self.load_temp(acc, a);
+                    let rhs = self.operand(Reg::Rcx, b);
+                    self.asm.alu_rr(alu, acc, rhs);
+                    self.write(inst, acc)?;
+                }
             }
             Opcode::ANDC => {
                 let a = self.src(at, 0)?;
@@ -1410,19 +1578,31 @@ impl<'a> Compiler<'a> {
                 }
                 let a = self.src_typed(at, 0, inst.ty)?;
                 let b = self.src(at, 1)?;
-                self.load_temp(Reg::Rax, a);
-                self.load_temp(Reg::Rcx, b);
                 let sh = if op == Opcode::ROTL {
                     Shift::Rol
                 } else {
                     Shift::Ror
                 };
-                // `cl` is masked to six bits at 64 and five at 32, which is
-                // exactly the amount modulo the width the IR asks for.
-                if w == 64 {
-                    self.asm.shift_rcl(sh, Reg::Rax);
+                self.load_temp(Reg::Rax, a);
+                if let Some(amount) = self.imm(at, 1) {
+                    // Reduced here, as `ir::Interp` reduces it. A whole number
+                    // of turns emits nothing: the value is the op's own type
+                    // (`src_typed`), so it is already canonical.
+                    let n = (amount % u64::from(w)) as u8;
+                    if n != 0 && w == 64 {
+                        self.asm.shift_ri(sh, Reg::Rax, n);
+                    } else if n != 0 {
+                        self.asm.shift_ri32(sh, Reg::Rax, n);
+                    }
                 } else {
-                    self.asm.shift_rcl32(sh, Reg::Rax);
+                    self.load_temp(Reg::Rcx, b);
+                    // `cl` is masked to six bits at 64 and five at 32, which
+                    // is exactly the amount modulo the width the IR asks for.
+                    if w == 64 {
+                        self.asm.shift_rcl(sh, Reg::Rax);
+                    } else {
+                        self.asm.shift_rcl32(sh, Reg::Rax);
+                    }
                 }
                 self.write(inst, Reg::Rax)?;
             }
@@ -1438,9 +1618,7 @@ impl<'a> Compiler<'a> {
                 let cond = inst
                     .cond
                     .ok_or(Refusal::Shape("a comparison needs a condition"))?;
-                let a = self.src(at, 0)?;
-                let b = self.src(at, 1)?;
-                let cc = self.compare(cond, w, a, b);
+                let cc = self.compare(at, cond, w)?;
                 self.asm.setcc(cc, Reg::Rax);
                 self.write(inst, Reg::Rax)?;
             }
@@ -1508,36 +1686,63 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    /// `cmp` the two operands and return the condition to branch on.
+    /// `cmp` the first two operands of instruction `at` and return the
+    /// condition to branch on.
     ///
     /// Signed comparisons at a width below 64 need the values sign-extended
     /// first: temporaries are held zero-extended, so `-1` as an `i32` is
     /// `0xffff_ffff` and would compare *above* zero rather than below it.
-    fn compare(&mut self, cond: Cond, w: u32, a: Temp, b: Temp) -> Cc {
+    ///
+    /// A constant right-hand side is compared as an immediate where it fits
+    /// one — which is most of them, and all of the commonest: a flag is a
+    /// comparison against zero. For a signed comparison the constant is
+    /// sign-extended at the comparison's width *here*, exactly as the register
+    /// form does it at run time, and it is that value which has to fit.
+    fn compare(&mut self, at: usize, cond: Cond, w: u32) -> Result<Cc, Refusal> {
+        let (a, b) = (self.src(at, 0)?, self.src(at, 1)?);
         let signed = matches!(cond, Cond::LtS | Cond::LeS | Cond::GtS | Cond::GeS);
-        self.load_temp(Reg::Rax, a);
-        // A signed comparison rewrites both operands, so neither may be the
-        // register a live temporary is sitting in; an unsigned one only reads
-        // the right-hand side.
-        let rhs = if signed {
-            self.load_temp(Reg::Rcx, b);
+        let imm = self.imm(at, 1).and_then(|c| {
+            let c = if signed && w < 64 {
+                let shift = 64 - w;
+                (((c << shift) as i64) >> shift) as u64
+            } else {
+                c
+            };
+            simm32(c)
+        });
+        if signed {
+            // A signed comparison rewrites its operands, so neither may be
+            // the register a live temporary is sitting in.
+            self.load_temp(Reg::Rax, a);
             self.sext(Reg::Rax, w);
-            self.sext(Reg::Rcx, w);
-            Reg::Rcx
+            match imm {
+                Some(imm) => self.asm.alu_ri(Alu::Cmp, Reg::Rax, imm),
+                None => {
+                    self.load_temp(Reg::Rcx, b);
+                    self.sext(Reg::Rcx, w);
+                    self.asm.alu_rr(Alu::Cmp, Reg::Rax, Reg::Rcx);
+                }
+            }
         } else {
-            self.operand(Reg::Rcx, b)
-        };
-        self.asm.alu_rr(Alu::Cmp, Reg::Rax, rhs);
-        cc_of(cond)
+            // An unsigned one only reads them, so both stay where they live.
+            let lhs = self.operand(Reg::Rax, a);
+            match imm {
+                Some(imm) => self.asm.alu_ri(Alu::Cmp, lhs, imm),
+                None => {
+                    let rhs = self.operand(Reg::Rcx, b);
+                    self.asm.alu_rr(Alu::Cmp, lhs, rhs);
+                }
+            }
+        }
+        Ok(cc_of(cond))
     }
 
     fn movcond(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
         let srcs = self.block.srcs(at);
         match (inst.cond, srcs.len()) {
             (Some(cond), 4) => {
-                let (a, b) = (self.src(at, 0)?, self.src(at, 1)?);
                 let (t, f) = (self.src(at, 2)?, self.src(at, 3)?);
-                let cc = self.compare(cond, w, a, b);
+                let cc = self.compare(at, cond, w)?;
                 // `mov` does not touch the flags, so the two candidates can be
                 // fetched between the compare and the conditional move.
                 self.load_temp(Reg::Rax, t);
@@ -1575,10 +1780,7 @@ impl<'a> Compiler<'a> {
             ));
         }
         let cc = match (inst.cond, self.block.srcs(at).len()) {
-            (Some(cond), 2) => {
-                let (a, b) = (self.src(at, 0)?, self.src(at, 1)?);
-                self.compare(cond, w, a, b)
-            }
+            (Some(cond), 2) => self.compare(at, cond, w)?,
             (_, 1) => {
                 let sel = self.src(at, 0)?;
                 let bit = self.operand(Reg::Rax, sel);
@@ -1599,9 +1801,35 @@ impl<'a> Compiler<'a> {
     fn shift(&mut self, at: usize, inst: &Inst, w: u32) -> Result<(), Refusal> {
         let a = self.src(at, 0)?;
         let b = self.src(at, 1)?;
+        let arithmetic = inst.op == Opcode::SAR;
+        let sh = match inst.op {
+            Opcode::SHL => Shift::Shl,
+            Opcode::SHR => Shift::Shr,
+            _ => Shift::Sar,
+        };
+        if let Some(amount) = self.imm(at, 1) {
+            // A constant amount, which is what a guest's shift-by-immediate
+            // lifts to and what every flag extraction is. Whether it is in
+            // range is known now, so the compare and both branches below go
+            // and what is left is the shift — or, out of range, the answer.
+            let acc = self.acc(inst, &[]);
+            self.load_temp(acc, a);
+            if arithmetic {
+                self.sext(acc, w);
+            }
+            if amount < u64::from(w) {
+                if amount != 0 {
+                    self.asm.shift_ri(sh, acc, amount as u8);
+                }
+            } else if arithmetic {
+                self.asm.shift_ri(Shift::Sar, acc, 63);
+            } else {
+                self.asm.mov_ri(acc, 0);
+            }
+            return self.write(inst, acc);
+        }
         self.load_temp(Reg::Rax, a);
         self.load_temp(Reg::Rcx, b);
-        let arithmetic = inst.op == Opcode::SAR;
         if arithmetic {
             // The value is held zero-extended, so an arithmetic shift has to
             // see the sign bit where the host expects it.
@@ -1612,11 +1840,6 @@ impl<'a> Compiler<'a> {
         // mask-the-count behaviour is not used.
         self.asm.alu_ri(Alu::Cmp, Reg::Rcx, w as i32);
         let out_of_range = self.asm.jcc(Cc::Ae);
-        let sh = match inst.op {
-            Opcode::SHL => Shift::Shl,
-            Opcode::SHR => Shift::Shr,
-            _ => Shift::Sar,
-        };
         self.asm.shift_rcl(sh, Reg::Rax);
         let done = self.asm.jmp();
         self.asm.bind(out_of_range);

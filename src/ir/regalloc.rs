@@ -153,6 +153,8 @@ pub struct CallSites<'a> {
 pub struct Allocation {
     homes: Vec<Home>,
     boundary: Vec<bool>,
+    /// The temporaries that live nowhere at all — see [`Allocation::absent`].
+    absent: Vec<bool>,
 }
 
 impl Allocation {
@@ -182,8 +184,25 @@ impl Allocation {
     #[inline]
     #[must_use]
     pub fn frame_backed(&self, temp: Temp) -> bool {
-        matches!(self.home(temp), Home::Frame)
-            || self.boundary.get(temp.index()).copied().unwrap_or(false)
+        !self.absent(temp)
+            && (matches!(self.home(temp), Home::Frame)
+                || self.boundary.get(temp.index()).copied().unwrap_or(false))
+    }
+
+    /// Whether `temp` lives **nowhere**: not in a register and not in the
+    /// frame, because the backend produces its value afresh wherever it is
+    /// read.
+    ///
+    /// Only ever true for a temporary the backend offered to
+    /// [`linear_scan_except`], and only where that was safe — see there.
+    /// [`Allocation::home`] answers [`Home::Frame`] for one, which is the
+    /// conservative answer for a caller that does not ask this first, and
+    /// [`Allocation::frame_backed`] answers `false`, because its slot is never
+    /// written.
+    #[inline]
+    #[must_use]
+    pub fn absent(&self, temp: Temp) -> bool {
+        self.absent.get(temp.index()).copied().unwrap_or(false)
     }
 
     /// How many temporaries got a register.
@@ -208,6 +227,7 @@ impl Allocation {
         Allocation {
             homes: vec![Home::Frame; block.temp_count()],
             boundary: vec![true; block.temp_count()],
+            absent: vec![false; block.temp_count()],
         }
     }
 }
@@ -224,10 +244,46 @@ pub fn linear_scan(
     banks: &RegBanks<'_>,
     sites: &CallSites<'_>,
 ) -> Allocation {
+    linear_scan_except(block, live, banks, sites, &[])
+}
+
+/// [`linear_scan`], leaving out the temporaries a backend does not need a home
+/// for.
+///
+/// `rematerialized[t]` offers temporary `t` as one whose value the backend can
+/// produce at every read without having kept it — a constant is the case this
+/// exists for: an immediate operand where the host has one, a load of the
+/// immediate into a scratch register where it does not. Such a temporary takes
+/// no register, which matters more than its one instruction does: a frontend
+/// that shares one zero across a block holds an interval the length of the
+/// block, across every call in it, and that is one of the three saved
+/// registers the x86-64 backend has.
+///
+/// An offer is **declined** in the two cases where having no home would be a
+/// wrong answer rather than a cheaper one, and [`Allocation::absent`] is how
+/// the backend learns which were taken:
+///
+/// * a temporary an [`InsnStart`](crate::ir::InsnStart) names — the exception
+///   path reads it out of the frame, from outside generated code, so it needs
+///   its slot written whatever else is true of it;
+/// * a temporary rule 1 or its neighbour pins — a definition a branch can jump
+///   over, or a read before the assignment. What such a read sees is the
+///   frame's business, and a value produced afresh would be a third answer.
+///
+/// A short or missing entry is read as *not offered*.
+#[must_use]
+pub fn linear_scan_except(
+    block: &Block,
+    live: &Liveness,
+    banks: &RegBanks<'_>,
+    sites: &CallSites<'_>,
+    rematerialized: &[bool],
+) -> Allocation {
     let n = block.temp_count();
     let mut alloc = Allocation {
         homes: vec![Home::Frame; n],
         boundary: vec![false; n],
+        absent: vec![false; n],
     };
     for (temp, life) in live.iter() {
         if let Some(slot) = alloc.boundary.get_mut(temp.index()) {
@@ -236,6 +292,9 @@ pub fn linear_scan(
     }
 
     let pinned = pinned(block, live, n);
+    for (t, slot) in alloc.absent.iter_mut().enumerate() {
+        *slot = rematerialized.get(t).copied().unwrap_or(false) && !alloc.boundary[t] && !pinned[t];
+    }
     let inside = prefix(sites.inside, block.insts().len());
     let gaps = prefix(sites.before, block.insts().len());
 
@@ -272,7 +331,7 @@ pub fn linear_scan(
                 true
             }
         });
-        if pinned[idx] {
+        if pinned[idx] || alloc.absent[idx] {
             continue;
         }
 
@@ -699,5 +758,80 @@ mod tests {
         for t in 0..block.temp_count() {
             assert!(alloc.frame_backed(Temp(t as u32)));
         }
+    }
+
+    #[test]
+    fn a_rematerialized_temporary_takes_no_register_and_leaves_one_for_its_neighbour() {
+        // Five values live at once over four registers, as in
+        // `running_out_of_registers_spills_the_longest_lived` — except that
+        // the backend has said it can produce the first of them at every read.
+        // That one then needs no home, and the four that are left fit.
+        let mut b = BlockBuilder::new(0, 0);
+        b.insn_start(mark(0, &[]));
+        let mut temps = Vec::new();
+        for i in 0..5u128 {
+            temps.push(b.imm(Type::I64, Const::Int(i)));
+        }
+        let mut acc = temps[4];
+        for t in temps.iter().rev().skip(1) {
+            acc = b.binary(Opcode::ADD, Type::I64, acc, *t);
+        }
+        b.insn_start(mark(4, &[(RegSlot(0), acc)]));
+        b.exit_tb();
+        let block = b.finish();
+        let live = Liveness::compute(&block);
+        let sites = CallSites::default();
+
+        let plain = linear_scan(&block, &live, &banks(), &sites);
+        assert_eq!(plain.home(temps[0]), Home::Frame, "the control spills it");
+        assert!(plain.frame_backed(temps[0]));
+        assert!(!plain.absent(temps[0]));
+
+        let mut offered = vec![false; block.temp_count()];
+        offered[temps[0].index()] = true;
+        let alloc = linear_scan_except(&block, &live, &banks(), &sites, &offered);
+        assert!(alloc.absent(temps[0]));
+        // Not in a register, and not in the frame either: nothing writes it.
+        assert_eq!(alloc.home(temps[0]), Home::Frame);
+        assert!(!alloc.frame_backed(temps[0]));
+        for t in &temps[1..] {
+            assert!(matches!(alloc.home(*t), Home::Reg(_)), "{alloc:?}");
+            assert!(!alloc.absent(*t));
+        }
+        // An offer that names nothing is the plain allocation.
+        assert_eq!(
+            linear_scan_except(&block, &live, &banks(), &sites, &[]),
+            plain
+        );
+    }
+
+    #[test]
+    fn an_offer_is_declined_where_the_frame_has_to_hold_the_value() {
+        // Two temporaries the backend would happily rematerialize and may
+        // not: one a boundary names, which the exception path reads out of
+        // the frame, and one whose definition a branch jumps over, where what
+        // a later read sees is the frame's business (rule 1).
+        let mut b = BlockBuilder::new(0, 0);
+        b.insn_start(mark(0, &[]));
+        let named = b.imm(Type::I64, Const::Int(5));
+        let sel = b.imm(Type::I1, Const::Int(1));
+        let branch = b.emit_raw(Opcode::BRCOND, Type::I1, None, None, &[sel], None, None, 0);
+        let skipped = b.imm(Type::I64, Const::Int(7));
+        b.patch_aux(branch, b.next_index() as u32);
+        let _ = b.unary(Opcode::NEG, Type::I64, skipped);
+        b.insn_start(mark(4, &[(RegSlot(0), named)]));
+        b.exit_tb();
+        let block = b.finish();
+        let live = Liveness::compute(&block);
+        let everything = vec![true; block.temp_count()];
+        let alloc = linear_scan_except(&block, &live, &banks(), &CallSites::default(), &everything);
+
+        assert!(!alloc.absent(named), "{alloc:?}");
+        assert!(alloc.frame_backed(named));
+        assert!(!alloc.absent(skipped), "{alloc:?}");
+        assert_eq!(alloc.home(skipped), Home::Frame);
+        assert!(alloc.frame_backed(skipped));
+        // And the ordinary case beside them is taken.
+        assert!(alloc.absent(sel));
     }
 }

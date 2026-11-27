@@ -940,8 +940,18 @@ fn emit_one(b: &mut BlockBuilder, r: &mut Rng, pool: &[(Temp, Type)]) -> Vec<(Te
             Vec::new()
         }
         _ => {
+            // Half of them from the values an immediate operand turns on:
+            // sixty-four random bits are never a shift amount in range and
+            // almost never fit a sign-extended `imm32`, so without these the
+            // constant forms of the lowerings would be reached by the fixed
+            // corpus below and by nothing random at all.
             let ty = r.pick(&[Type::I32, Type::I64]);
-            vec![(b.imm(ty, Const::Int(u128::from(r.next()))), ty)]
+            let value = if r.below(2) == 0 {
+                r.pick(&EDGES)
+            } else {
+                r.next()
+            };
+            vec![(b.imm(ty, Const::Int(u128::from(value))), ty)]
         }
     }
 }
@@ -2504,4 +2514,281 @@ fn the_inlined_probe_really_serves_the_loads() {
         .expect("ok");
     assert_eq!(engine.stats().fast_loads, 0);
     assert_eq!(host.ticks, 17, "and the ticks are the same either way");
+}
+
+// ---------------------------------------------------------------------------
+// Constant operands
+// ---------------------------------------------------------------------------
+
+/// The constants an immediate operand can get wrong.
+///
+/// Both sides of every edge the lowering decides on: what a sign-extended
+/// 32-bit immediate can and cannot say, at 32 and at 64 bits; and every shift
+/// and rotate amount that is the last one in range, the first one out, or a
+/// whole number of turns.
+const EDGES: [u64; 20] = [
+    0,
+    1,
+    2,
+    31,
+    32,
+    33,
+    63,
+    64,
+    65,
+    0x7f,
+    0x80,
+    0x7fff_ffff,
+    0x8000_0000,
+    0xffff_ffff,
+    0x1_0000_0000,
+    0xffff_ffff_7fff_ffff,
+    0xffff_ffff_8000_0000,
+    0x8000_0000_0000_0000,
+    u64::MAX - 1,
+    u64::MAX,
+];
+
+/// One block applying every op that takes an immediate to `lhs` and the
+/// constant `c`, at `ty`, and publishing each result.
+///
+/// `named` is the difference between the two homes a constant can have. A
+/// constant no boundary names lives nowhere, and each reader produces it; one
+/// a boundary names sits in a register and in the frame like any other
+/// temporary, and the readers that can still take it as an immediate.
+fn immediates(ty: Type, lhs: u64, c: u64, named: bool) -> Block {
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    // A slot read, so the left-hand side is opaque to the compiler, and then
+    // narrowed, so it is canonical at `ty` whatever the slot held.
+    let wide = b.get_slot(Type::I64, RegSlot(0));
+    let mixed = b.imm(Type::I64, Const::Int(u128::from(lhs)));
+    let wide = b.binary(Opcode::XOR, Type::I64, wide, mixed);
+    let x = b.unary(Opcode::TRUNC, ty, wide);
+    let k = b.imm(ty, Const::Int(u128::from(c)));
+
+    let mut out: Vec<Temp> = Vec::new();
+    for op in [
+        Opcode::ADD,
+        Opcode::SUB,
+        Opcode::AND,
+        Opcode::OR,
+        Opcode::XOR,
+        Opcode::SHL,
+        Opcode::SHR,
+        Opcode::SAR,
+        Opcode::ROTL,
+        Opcode::ROTR,
+    ] {
+        out.push(b.binary(op, ty, x, k));
+        // And the other way round, where the constant is the value and not
+        // the operand an immediate form exists for.
+        out.push(b.binary(op, ty, k, x));
+    }
+    for cond in CONDS {
+        out.push(b.setcond(cond, ty, x, k));
+        out.push(b.setcond(cond, ty, k, x));
+        let dst = b.temp(ty);
+        b.emit_raw(
+            Opcode::MOVCOND,
+            ty,
+            Some(dst),
+            None,
+            &[x, k, k, x],
+            None,
+            Some(cond),
+            0,
+        );
+        out.push(dst);
+    }
+    // A branch on a comparison with the constant, over a definition, so the
+    // third shape `compare` serves is taken both ways across the corpus.
+    let over = b.emit_raw(
+        Opcode::BRCOND,
+        ty,
+        None,
+        None,
+        &[x, k],
+        None,
+        Some(Cond::LtU),
+        0,
+    );
+    b.charge(2);
+    b.patch_aux(over, b.next_index() as u32);
+
+    let mut live: Vec<(RegSlot, Temp)> = out
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (RegSlot(1 + i as u16), *t))
+        .collect();
+    if named {
+        live.push((RegSlot(0), k));
+    }
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live,
+    });
+    b.exit_tb();
+    b.finish()
+}
+
+#[test]
+fn every_immediate_operand_agrees_with_the_interpreter_at_its_edges() {
+    // The random corpus draws its constants from sixty-four random bits, so
+    // it almost never lands on the values the immediate forms turn on. These
+    // are those values, each against each, with the constant in both homes.
+    let mut blocks = 0;
+    for ty in [Type::I32, Type::I64] {
+        for &c in &EDGES {
+            for &lhs in &[
+                0u64,
+                1,
+                0x8000_0000,
+                0xffff_ffff_ffff_fff0,
+                0x1234_5678_9abc_def0,
+            ] {
+                for named in [false, true] {
+                    assert!(agree(&immediates(ty, lhs, c, named), true));
+                    blocks += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(blocks, 2 * 20 * 5 * 2);
+}
+
+#[test]
+fn a_constant_no_boundary_names_has_no_home_and_one_that_is_named_does() {
+    let block = immediates(Type::I64, 7, 3, false);
+    let compiled = super::compile::compile_with(&block, Regs::Scan).expect("compiles");
+    let k = Temp(4);
+    assert_eq!(
+        block.insts()[6].dst,
+        Some(k),
+        "the constant is not where this test thinks it is\n{block}"
+    );
+    assert_eq!(compiled.home(k), crate::ir::Home::Frame);
+    assert!(
+        !compiled.frame_backed(k),
+        "a constant every reader produces for itself was stored anyway"
+    );
+
+    // Named at a boundary it is architectural state, and the exception path
+    // reads the frame: it has to be there.
+    let block = immediates(Type::I64, 7, 3, true);
+    let compiled = super::compile::compile_with(&block, Regs::Scan).expect("compiles");
+    assert!(compiled.frame_backed(k));
+
+    // And the control keeps everything, as it always has.
+    let block = immediates(Type::I64, 7, 3, false);
+    let compiled = super::compile::compile_with(&block, Regs::Frame).expect("compiles");
+    assert!(compiled.frame_backed(k));
+}
+
+#[test]
+fn a_constant_costs_no_code_where_it_is_defined() {
+    // The same block with and without forty constants nothing reads. A
+    // constant with no home emits nothing at its definition, so the two are
+    // the same bytes — which is the statement that what a constant costs is
+    // paid by its readers and by nobody else.
+    fn bytes(extra: usize) -> usize {
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        b.charge(1);
+        let x = b.get_slot(Type::I64, RegSlot(0));
+        for i in 0..extra {
+            let _ = b.imm(Type::I64, Const::Int(0x1000 + i as u128));
+        }
+        let one = b.imm(Type::I64, Const::Int(1));
+        let y = b.binary(Opcode::ADD, Type::I64, x, one);
+        b.insn_start(InsnStart {
+            pc: BASE + 4,
+            next_pc: BASE + 8,
+            ticks: 1,
+            live: vec![(RegSlot(0), y)],
+        });
+        b.exit_tb();
+        super::compile::compile_with(&b.finish(), Regs::Scan)
+            .expect("compiles")
+            .code()
+            .len()
+    }
+    assert_eq!(bytes(0), bytes(40));
+}
+
+#[test]
+fn a_shift_by_a_constant_is_a_shift_and_not_a_compare_and_two_branches() {
+    // What a guest's shift-by-immediate lifts to. The variable form has to
+    // ask at run time whether the amount is in range; a constant one already
+    // knows, so it emits no `jcc` (`0f 8x`) and no `jmp` (`e9`) at all beyond
+    // the ones every block has.
+    fn code(amount: Option<u64>) -> Vec<u8> {
+        let mut b = BlockBuilder::new(BASE, 0);
+        b.insn_start(InsnStart {
+            pc: BASE,
+            next_pc: BASE + 4,
+            ticks: 0,
+            live: Vec::new(),
+        });
+        let x = b.get_slot(Type::I64, RegSlot(0));
+        let n = match amount {
+            Some(n) => b.imm(Type::I64, Const::Int(u128::from(n))),
+            None => b.get_slot(Type::I64, RegSlot(1)),
+        };
+        let y = b.binary(Opcode::SHL, Type::I64, x, n);
+        b.insn_start(InsnStart {
+            pc: BASE + 4,
+            next_pc: BASE + 8,
+            ticks: 0,
+            live: vec![(RegSlot(0), y)],
+        });
+        b.exit_tb();
+        super::compile::compile_with(&b.finish(), Regs::Scan)
+            .expect("compiles")
+            .code()
+            .to_vec()
+    }
+    let variable = code(None);
+    let constant = code(Some(5));
+    // `shl r64, imm8` is `REX.W c1 /4 ib` (*Intel SDM* volume 2B, SAL/SAR/
+    // SHL/SHR), and `shl r64, cl` is `REX.W d3 /4`.
+    let by_imm = |c: &[u8]| {
+        c.windows(2)
+            .filter(|w| w[0] == 0xc1 && w[1] & 0x38 == 0x20)
+            .count()
+    };
+    let by_cl = |c: &[u8]| {
+        c.windows(2)
+            .filter(|w| w[0] == 0xd3 && w[1] & 0x38 == 0x20)
+            .count()
+    };
+    assert!(by_cl(&variable) >= 1, "the control has no variable shift");
+    assert_eq!(
+        by_cl(&constant),
+        0,
+        "a constant amount still went through `cl`"
+    );
+    assert!(
+        by_imm(&constant) >= 1,
+        "a constant amount is not an immediate"
+    );
+    assert!(
+        constant.len() < variable.len(),
+        "{} bytes against {}",
+        constant.len(),
+        variable.len()
+    );
 }
