@@ -731,6 +731,13 @@ fn sub_contrast_q10(value: u8) -> u32 {
 pub struct St7272a {
     shared: Arc<Shared>,
     pins: Arc<SlavePins>,
+    /// The `grb`, `disp` and `bist_en` pins handed out by
+    /// [`Device::sink`], kept alive because a net refers to its sinks weakly
+    /// (`core::device`, §4.3's weak edge).
+    ///
+    /// Here and not in [`Shared`]: a pin holds `Shared`, so keeping it there
+    /// would be a cycle that no drop of the device could reach.
+    control: Mutex<alloc::vec::Vec<Arc<ControlSink>>>,
 }
 
 /// Everything both halves of the device reach.
@@ -750,10 +757,6 @@ struct Shared {
     /// SPI reaches it through wires, not through a bus — but holding it keeps
     /// the seam symmetrical with every other lazy device.
     lazy: Mutex<Option<LazyHandle>>,
-    /// The `grb`, `disp` and `bist_en` pins handed out by
-    /// [`Device::sink`], kept alive because a net refers to its sinks weakly
-    /// (`core::device`, §4.3's weak edge).
-    control: Mutex<alloc::vec::Vec<Arc<ControlSink>>>,
 }
 
 /// Everything the guest can see or change.
@@ -900,7 +903,6 @@ impl St7272a {
             ticks: AtomicU64::new(0),
             next_event: AtomicU64::new(htotal.saturating_mul(vtotal)),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
-            control: Mutex::with_rank(LockRank::WIRE, alloc::vec::Vec::new()),
         });
         let pins = Arc::new(SlavePins::new(Arc::clone(&shared) as Arc<dyn SpiSlave>));
 
@@ -914,7 +916,11 @@ impl St7272a {
         // considered exception: the controller only reaches its slaves when the
         // guest drives a transfer, so moving it is a behaviour change nobody
         // has needed yet rather than a refactor.
-        let panel = St7272a { shared, pins };
+        let panel = St7272a {
+            shared,
+            pins,
+            control: Mutex::with_rank(LockRank::WIRE, alloc::vec::Vec::new()),
+        };
         if let Some(name) = bus_name {
             let bus = buses::attach(props, &name)?;
             if cs >= u64::from(crate::bus::spi::MAX_CHIP_SELECTS as u8) {
@@ -1383,7 +1389,7 @@ impl Device for St7272a {
                 line,
             });
             // Kept, because a net refers to its sinks weakly.
-            self.shared.control.lock().push(Arc::clone(&pin));
+            self.control.lock().push(Arc::clone(&pin));
             SinkPin {
                 sink: pin as Arc<dyn WireSink>,
                 line,

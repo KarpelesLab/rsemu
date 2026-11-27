@@ -754,3 +754,17 @@ fn a_frame_that_never_ends_commits_nothing() {
     assert_eq!(panel.active().get(REG_CONTRAST), 0x40);
     assert_eq!(panel.shadow().get(REG_CONTRAST), 0x40);
 }
+
+#[test]
+fn a_panel_whose_control_pins_are_on_nets_is_freed_when_it_is_dropped() {
+    // The `grb`, `disp` and `bist_en` sinks are kept by the device, because a
+    // net holds them weakly. When they were kept inside the state they point
+    // at, a panel with one of them wired owned itself and its frame memory.
+    let panel = panel();
+    for port in [pin::GRB, pin::DISP, pin::BIST_EN] {
+        assert!(Device::sink(&panel, port, &[]).is_some(), "{port}");
+    }
+    let shared = Arc::downgrade(&panel.shared);
+    drop(panel);
+    assert_eq!(shared.strong_count(), 0, "the panel outlived itself");
+}
