@@ -227,12 +227,20 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // position, and bit 1 of AL says each character carries its own attribute.
     // ES:BP rather than ES:SI is the awkward part — BP is this handler's frame
     // pointer, so the caller's is taken out of the frame.
+    //
+    // Bit 0 of AL is "Update cursor after writing" (RBIL, `INT 10h AH=13h`,
+    // "AL = write mode"). The string is written by moving the cursor to DX
+    // and calling the teletype for each character, so with the bit clear the
+    // cursor the caller had is kept on the stack and put back afterwards. It
+    // used to be left at the end of the string in both modes.
     a.bind(write_str);
-    a.mov(AX, Mem::bp(F_DX));
-    a.movto(Mem::abs(BDA_CURSOR), AX);
     a.mov(CX, Mem::bp(F_CX));
     a.alui(Alu::CMP, CX, 0);
     a.jcc(Cc::E, done);
+    a.mov(AX, Mem::abs(BDA_CURSOR));
+    a.push(AX);
+    a.mov(AX, Mem::bp(F_DX));
+    a.movto(Mem::abs(BDA_CURSOR), AX);
     a.mov(SI, Mem::bp(F_BP));
     a.mov8(BL, Mem::bp(F_BX));
     a.movsr(ES, Mem::bp(F_ES));
@@ -252,6 +260,11 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.pop(CX);
     a.dec(CX);
     a.jcc(Cc::NE, str_loop);
+    a.pop(AX);
+    a.testi8(Mem::bp(F_AX), 0x01);
+    a.jcc(Cc::NE, done);
+    a.movto(Mem::abs(BDA_CURSOR), AX);
+    a.call(l.set_cursor_hw);
 
     a.bind(done);
     leave(a);

@@ -416,3 +416,65 @@ fn ah_0ah_writes_the_character_and_keeps_the_cells_attribute() {
     assert_eq!(cell(&m, 6, 1), (b'y', 0x1e));
     assert_eq!(cell(&m, 6, 2), (b'x', 0x1e), "the count was overrun");
 }
+
+/// `INT 10h AH=13h` moves the cursor only when the caller asks it to.
+///
+/// RBIL, `INT 10h AH=13h`: "AL = write mode; bit 0: Update cursor after
+/// writing". With the bit clear the string is written at `DH`,`DL` and the
+/// cursor is where it was; the firmware left it at the end of the string in
+/// both modes, so a program that drew a status line with mode 0 lost its
+/// place.
+#[test]
+fn ah_13h_leaves_the_cursor_alone_unless_bit_0_of_al_is_set() {
+    use rsemu::fw::asm16::{BP, BX, CX, DX};
+
+    let (m, _hosts) = run("write string", |a| {
+        let text = a.label();
+        let over = a.label();
+        a.movi(AX, 0x0200);
+        a.movi(BX, 0x0000);
+        a.movi(DX, 0x0203);
+        a.int(0x10);
+        // Mode 0 at row 8, column 5.
+        a.movi(AX, 0x1300);
+        a.movi(BX, 0x0007);
+        a.movi(CX, 3);
+        a.movi(DX, 0x0805);
+        a.movi_label(BP, text);
+        a.int(0x10);
+        a.movi(AX, 0x0300);
+        a.movi(BX, 0x0000);
+        a.int(0x10);
+        a.movto(Mem::abs(R), DX);
+        // Mode 1 at row 9, column 5.
+        a.movi(AX, 0x1301);
+        a.movi(BX, 0x0007);
+        a.movi(CX, 3);
+        a.movi(DX, 0x0905);
+        a.movi_label(BP, text);
+        a.int(0x10);
+        a.movi(AX, 0x0300);
+        a.movi(BX, 0x0000);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 2), DX);
+        a.jmp(over);
+        a.bind(text);
+        a.db(b"abc");
+        a.bind(over);
+    });
+
+    for (column, character) in (5..).zip(*b"abc") {
+        assert_eq!(cell(&m, 8, column).0, character, "mode 0 wrote the string");
+        assert_eq!(cell(&m, 9, column).0, character, "mode 1 wrote the string");
+    }
+    assert_eq!(
+        peek16(&m, R),
+        0x0203,
+        "mode 0 must leave the cursor where it was"
+    );
+    assert_eq!(
+        peek16(&m, R + 2),
+        0x0908,
+        "mode 1 must leave the cursor after the string"
+    );
+}
