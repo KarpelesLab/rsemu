@@ -153,9 +153,11 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.jmp(done);
 
     // AH=09h, write a character and attribute CX times at the cursor without
-    // moving it. AH=0Ah is the same with the attribute left alone, which here
-    // means the default one: this board has no per-cell attribute to preserve
-    // that a caller could not have written itself.
+    // moving it. AH=0Ah is the same with the attribute left alone — each
+    // cell keeps the one it has. RBIL gives `BL` for AH=0Ah as "attribute
+    // (PCjr, Tandy 1000 only) or color (graphics mode)", so on this board in
+    // a text mode it is not an input at all; it used to be written as the
+    // attribute anyway, and a caller with zero in `BL` drew black on black.
     a.bind(write_ca);
     a.bind(write_c);
     a.call(l.cell_offset);
@@ -165,9 +167,19 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.movi(AX, TEXT_SEGMENT);
     a.movsr(ES, AX);
     a.mov8(AL, Mem::bp(F_AX));
+    let character_only = a.label();
+    a.alui8(Alu::CMP, Mem::bp(F_AX + 1), 0x0a);
+    a.jcc(Cc::E, character_only);
     a.mov8(AH, Mem::bp(F_BX));
     a.rep();
     a.stosw();
+    a.jmp(done);
+    // The character byte of each cell, stepping over the attribute byte.
+    a.bind(character_only);
+    let next_cell = a.here_label();
+    a.movto8(Mem::di(0).seg(ES), AL);
+    a.alui(Alu::ADD, DI, 2);
+    a.loop_(next_cell);
     a.jmp(done);
 
     // AH=08h, read the character and attribute under the cursor: AL is the

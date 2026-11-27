@@ -384,3 +384,35 @@ fn int_10h_writes_forwards_whatever_the_callers_direction_flag_says() {
     }
     assert_ne!(cell(&m, 5, 9).0, b'A', "the run went leftwards");
 }
+
+/// `INT 10h AH=0Ah` writes the character and leaves the attribute alone.
+///
+/// RBIL, `INT 10h AH=0Ah`: "VIDEO - WRITE CHARACTER ONLY AT CURSOR POSITION",
+/// with "BL = attribute (PCjr, Tandy 1000 only) or color (graphics mode)". On
+/// an AT in a text mode `BL` is therefore not an attribute at all, and the
+/// firmware used it as one: a caller with zero in `BL` got black on black.
+#[test]
+fn ah_0ah_writes_the_character_and_keeps_the_cells_attribute() {
+    use rsemu::fw::asm16::{BX, CX, DX};
+
+    let (m, _hosts) = run("write character only", |a| {
+        a.movi(AX, 0x0200);
+        a.movi(BX, 0x0000);
+        a.movi(DX, 0x0600);
+        a.int(0x10);
+        // Three cells in yellow on blue with AH=09h...
+        a.movi(AX, 0x0978);
+        a.movi(BX, 0x001e);
+        a.movi(CX, 3);
+        a.int(0x10);
+        // ...and the first two of them overwritten with AH=0Ah and BL=0.
+        a.movi(AX, 0x0a79);
+        a.movi(BX, 0x0000);
+        a.movi(CX, 2);
+        a.int(0x10);
+    });
+
+    assert_eq!(cell(&m, 6, 0), (b'y', 0x1e));
+    assert_eq!(cell(&m, 6, 1), (b'y', 0x1e));
+    assert_eq!(cell(&m, 6, 2), (b'x', 0x1e), "the count was overrun");
+}
