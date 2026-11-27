@@ -1157,6 +1157,15 @@ pub fn parse_duration(text: &str) -> Result<Duration> {
                 "`{text}` is not a valid {what}: expected a number at `{rest}`"
             )));
         }
+        // The leading `-` was refused above; a sign on a later component has
+        // to be refused here, or `1h-30m` reads as ninety minutes — the sign
+        // parsed, discarded, and the half hour added.
+        if rest.len() != s.len() && num.starts_with(['+', '-']) {
+            return Err(prop_err(format!(
+                "`{text}` is not a valid {what}: a sign is not allowed at `{rest}` \
+                 (components add, as in `1h30m`)"
+            )));
+        }
         let (_, value) = digits_to_u64(text, num, what)?;
 
         let unit_len = after
@@ -2161,6 +2170,12 @@ mod tests {
         assert!(e.contains("unknown unit"), "{e}");
         assert!(parse_duration("-1s").is_err());
         assert!(parse_duration("").is_err());
+        // A sign inside is not subtraction, and must not be quietly dropped:
+        // `1h-30m` used to come back as ninety minutes.
+        let e = parse_duration("1h-30m").unwrap_err().to_string();
+        assert!(e.contains("sign"), "{e}");
+        assert!(parse_duration("1h+30m").is_err());
+        assert_eq!(parse_duration("+10ms").unwrap().as_nanos(), 10_000_000);
         // 213 days fits; a year does not.
         assert!(parse_duration("5000h").unwrap().as_secs() > 0);
         let e = parse_duration("9000h").unwrap_err().to_string();
