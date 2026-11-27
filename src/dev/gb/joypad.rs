@@ -512,7 +512,16 @@ impl MemOps for JoypadPort {
             return Err(BusError::BadAccess);
         };
         // Only the two select bits are writable; the rest are inputs.
-        self.pad.state.lock().select = *value & 0x30;
+        let asserted = {
+            let mut state = self.pad.state.lock();
+            state.select = *value & 0x30;
+            state.asserted()
+        };
+        // Selecting the row of a button that is already held pulls its column
+        // low, and deselecting it lets the column back up: the request line
+        // follows the columns, not the buttons, so it moves here too. Driven
+        // after the state lock is released, like every other outward call.
+        self.pad.drive(asserted);
         Ok(())
     }
 

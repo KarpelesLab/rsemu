@@ -979,6 +979,51 @@ fn the_joypad_is_a_matrix_and_zero_means_pressed() {
 }
 
 #[test]
+fn selecting_a_row_with_a_button_already_held_moves_the_request_line() {
+    use crate::core::wire::{Level, Wire, WireId, WireIdAllocator, WireSink, WireSource};
+
+    /// The level the line was last driven to.
+    #[derive(Debug, Default)]
+    struct Last(crate::core::sync::Mutex<Option<bool>>);
+    impl WireSink for Last {
+        fn set_level(&self, _src: WireId, _line: u32, level: Level) {
+            *self.0.lock() = Some(level.is_high());
+        }
+    }
+
+    // Pan Docs, *Interrupt Sources*: "The Joypad interrupt is requested when
+    // any of JOYP's bits 0-3 change from High to Low. This happens when a
+    // button is pressed (provided that the action/direction buttons are
+    // enabled by bit 5/4, respectively)". A column also goes from high to low
+    // when the *row* of a button that is already held is selected, and back up
+    // when it is deselected — and the write that does either used to leave the
+    // line wherever the last button change had put it.
+    let pad = GbJoypad::new();
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let sink = Arc::new(Last::default());
+    let wire = Wire::builder()
+        .source(id)
+        .sink(Arc::clone(&sink) as Arc<dyn WireSink>, 0)
+        .build_shared();
+    pad.pad().attach_irq(WireSource::new(wire, id));
+    let region = Device::region(&pad, super::joypad::REGISTER_REGION).expect("the register");
+    let ops = io(&region);
+
+    ops.write(0, &[0x30], MemAttrs::DEFAULT).expect("accepts");
+    pad.pad().set_pressed(Button::A, true);
+    assert_ne!(*sink.0.lock(), Some(true), "no row is selected yet");
+
+    ops.write(0, &[0x10], MemAttrs::DEFAULT).expect("accepts");
+    assert_eq!(pad.read() & 0x01, 0, "the A column is now low");
+    assert_eq!(*sink.0.lock(), Some(true), "and that is a request");
+
+    ops.write(0, &[0x30], MemAttrs::DEFAULT).expect("accepts");
+    assert_eq!(pad.read() & 0x0f, 0x0f);
+    assert_eq!(*sink.0.lock(), Some(false), "deselecting releases the line");
+}
+
+#[test]
 fn a_joypad_round_trips_its_buttons_and_its_select_lines() {
     let pad = GbJoypad::new();
     pad.pad().set_buttons(0b1010_0101);
