@@ -511,6 +511,15 @@ impl Registers {
             0x04 => {
                 state.w = value & T_MASK;
                 state.wdgtb = (value & self.wdgtb_mask()) >> self.wdgtb_shift;
+                // `prescale < divider()` is what every subtraction in
+                // [`State::step`] and [`State::next_event`] relies on (and what
+                // `load` checks), and a smaller `WDGTB` written under a running
+                // counter is how a guest breaks it. The manual does not say
+                // what the divider's phase does there; this model keeps the
+                // low bits, which is what selecting an earlier tap of one
+                // binary divider chain would leave. Dividers are powers of
+                // two, so the remainder is exactly those bits.
+                state.prescale %= state.divider();
                 // `EWI` is set-only: "this bit is set by software and cleared
                 // by hardware after a reset."
                 state.ewi |= value & CFR_EWI != 0;
@@ -1072,6 +1081,37 @@ mod tests {
         assert_eq!(edges(&reset), 1);
         assert_eq!(edges(&irq), 0);
         assert!(!d.early_wakeup());
+    }
+
+    #[test]
+    fn lowering_wdgtb_under_a_running_counter_keeps_the_prescaler_in_range() {
+        // Twenty thousand cycles into a 32768-cycle decrement, the divider is
+        // dropped to 4096. The phase is more than one new period, and a model
+        // that kept it as it stood subtracted it from the divider: a panic in
+        // a debug build, a watchdog that never counts again in a release one.
+        let d = wwdg();
+        poke(&d, 0x04, (3 << F4_WDGTB_SHIFT) | 0x7f);
+        poke(&d, 0x00, CR_WDGA | 0x7f);
+        d.advance_to(20_000);
+        assert_eq!(peek(&d, 0x00) & T_MASK, 0x7f, "no decrement yet");
+        poke(&d, 0x04, 0x7f);
+        // The low twelve bits of the phase survive: 20000 mod 4096 is 3616,
+        // so the next decrement is 480 cycles away.
+        let next = d.next_event_tick().expect("the watchdog is running");
+        assert!(
+            next > 20_000,
+            "the next event is ahead, not wrapped: {next}"
+        );
+        d.advance_to(20_000 + 479);
+        assert_eq!(peek(&d, 0x00) & T_MASK, 0x7f);
+        d.advance_to(20_000 + 480);
+        assert_eq!(peek(&d, 0x00) & T_MASK, 0x7e);
+        d.advance_to(20_000 + 480 + BASE_DIVIDER);
+        assert_eq!(
+            peek(&d, 0x00) & T_MASK,
+            0x7d,
+            "and a whole period after that"
+        );
     }
 
     #[test]
