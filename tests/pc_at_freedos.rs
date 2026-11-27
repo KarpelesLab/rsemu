@@ -577,6 +577,16 @@ fn drive_the_installer(pc: &mut Pc, disks: &Diskettes) -> bool {
 #[test]
 fn freedos_installs_onto_a_hard_disk_and_boots_off_it() {
     let Some(disks) = Diskettes::open() else {
+        // Returning is right for every job that never fetched the set, and
+        // wrong for the one job whose whole purpose is this test: there a
+        // missing or renamed diskette would make it pass in milliseconds
+        // having installed nothing. `RSEMU_FREEDOS_REQUIRED` is that job
+        // saying so, in the shape `RSEMU_LONGRUN_REQUIRED` established.
+        assert!(
+            std::env::var_os("RSEMU_FREEDOS_REQUIRED").is_none(),
+            "RSEMU_FREEDOS_REQUIRED is set, so the installation had to run, and \
+             the diskette set could not be read (the reason is printed above)"
+        );
         return;
     };
 
