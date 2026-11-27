@@ -2019,7 +2019,10 @@ fn monitor_session(
     if !args.quiet {
         eprint!("{}", monitor.banner(&target));
         if let Some(end) = deadline {
-            eprintln!("  --for bounds this session at {} ns", end.as_nanos());
+            eprintln!(
+                "  --for bounds this session at {} ns",
+                end.as_nanos_nearest()
+            );
         }
         eprintln!();
     }
@@ -3646,7 +3649,10 @@ fn describe_media(_machine: &Machine) {}
 
 /// Where the machine got to.
 fn summarise(machine: &Machine) {
-    println!("ran to {} ns of virtual time", machine.now().as_nanos());
+    println!(
+        "ran to {} ns of virtual time",
+        machine.now().as_nanos_nearest()
+    );
     // A space built with `log-unassigned = true` says which pages nothing
     // answered: the list a board's bring-up works from.
     for entry in machine.spaces() {

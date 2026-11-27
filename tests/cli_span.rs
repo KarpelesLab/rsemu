@@ -85,9 +85,10 @@ fn a_console_session_runs_the_whole_span_it_was_given() {
 /// at a different instant depending on whether a terminal happened to be
 /// attached.
 ///
-/// The bound below is the span itself; the one above it allows for the
-/// timeline's own rounding, which lands a nanosecond short (`--headless
-/// --for 1ms` reports 999999).
+/// The bound above is the span itself; the one below it is slack for a
+/// console loop that is entitled to stop a little early, not for rounding —
+/// the summary reports the nearest nanosecond (see
+/// `the_summary_reports_the_span_it_was_given`).
 #[cfg(feature = "machine-apple1")]
 #[test]
 fn a_console_session_stops_at_the_span_rather_than_at_the_next_slice() {
@@ -105,4 +106,38 @@ fn a_console_session_stops_at_the_span_rather_than_at_the_next_slice() {
         (24_999_000..=25_000_000).contains(&reached),
         "--for 25ms ran to {reached} ns; the console loop took a whole slice past the deadline"
     );
+}
+
+/// The summary names the instant that was asked for, to the nanosecond.
+///
+/// `--for 1s` reported `ran to 1000000000 ns` and `--for 1ms` reported
+/// `999999`: the timeline counts 2⁻⁶⁴ s and both conversions floor, so every
+/// span that is not a whole number of those units read one nanosecond short
+/// of a deadline the machine had in fact reached. The summary now prints the
+/// nearest nanosecond; the machine, its deadline and its state hash are what
+/// they were.
+#[cfg(feature = "machine-apple1")]
+#[test]
+fn the_summary_reports_the_span_it_was_given() {
+    for (span, nanos) in [
+        ("1ms", 1_000_000u64),
+        ("25ms", 25_000_000),
+        ("1s", 1_000_000_000),
+        ("333us", 333_000),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rsemu"))
+            .args(["run", "apple1", "--headless", "--for", span])
+            .output()
+            .expect("the binary this test was built alongside");
+        assert!(
+            out.status.success(),
+            "rsemu run apple1 --headless --for {span} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            ran_to(&String::from_utf8_lossy(&out.stdout)),
+            nanos,
+            "--for {span}"
+        );
+    }
 }

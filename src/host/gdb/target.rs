@@ -1836,7 +1836,7 @@ impl DebugTarget for MachineTarget<'_> {
             "x" => Some(self.monitor_dump(cpu, words.next(), words.next(), false)),
             "xp" => Some(self.monitor_dump(cpu, words.next(), words.next(), true)),
             "translate" => Some(self.monitor_translate(cpu, words.next())),
-            "time" => Some(format!("{} ns\n", self.machine.now().as_nanos())),
+            "time" => Some(format!("{} ns\n", self.machine.now().as_nanos_nearest())),
             "hash" => Some(match self.machine.state_hash() {
                 Ok(hash) => format!("{hash:#018x}\n"),
                 Err(e) => format!("cannot hash state: {e}\n"),

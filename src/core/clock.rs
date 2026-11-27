@@ -360,6 +360,40 @@ impl GlobalTime {
         }
     }
 
+    /// This instant to the *nearest* nanosecond, saturating — for telling a
+    /// person where the machine is.
+    ///
+    /// [`from_nanos`](GlobalTime::from_nanos) rounds down and so does
+    /// [`as_nanos`](GlobalTime::as_nanos), and a billionth of a second is not
+    /// a whole number of 2⁻⁶⁴-second units, so the pair does not round-trip:
+    /// `from_nanos(1_000_000).as_nanos()` is `999_999`. Both floors are right
+    /// for arithmetic — a deadline must never be late, and elapsed time must
+    /// never be overstated — and both are wrong on a status line, where
+    /// `--for 1ms` reported `ran to 999999 ns` of a machine that stopped
+    /// 5 × 10⁻²⁰ s short of the millisecond. The same goes for a sum of spans,
+    /// which `ROADMAP.md` §11.6 notes is a unit short per addend.
+    ///
+    /// Display only. Nothing that feeds the machine may use it: a rounded-up
+    /// instant is one the machine has not reached.
+    pub const fn as_nanos_nearest(self) -> u64 {
+        let whole = self.0 >> GLOBAL_TIME_FRAC_BITS;
+        let frac = self.0 & ((1u128 << GLOBAL_TIME_FRAC_BITS) - 1);
+        let secs_ns = match whole.checked_mul(1_000_000_000) {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
+        // `frac < 2^64`, so the product is below 2^94 and the half-unit added
+        // to it cannot carry out of a u128.
+        let half = 1u128 << (GLOBAL_TIME_FRAC_BITS - 1);
+        let frac_ns = (frac * 1_000_000_000 + half) >> GLOBAL_TIME_FRAC_BITS;
+        let total = secs_ns + frac_ns;
+        if total > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            total as u64
+        }
+    }
+
     /// Addition that saturates at [`GlobalTime::MAX`].
     #[inline]
     pub const fn saturating_add(self, other: GlobalTime) -> GlobalTime {
@@ -2521,6 +2555,26 @@ mod tests {
             assert!(back == ns || back == ns - 1, "{ns} -> {back}");
         }
         assert_eq!(GlobalTime::MAX.as_nanos(), u64::MAX);
+    }
+
+    #[test]
+    fn the_nearest_nanosecond_is_the_one_that_was_asked_for() {
+        // What a status line prints. `as_nanos` floors a value `from_nanos`
+        // already floored, so `--for 1ms` was reported as `ran to 999999 ns`.
+        for ns in [0u64, 1, 999, 1_000_000, 123_456_789, 4_000_000_000] {
+            assert_eq!(GlobalTime::from_nanos(ns).as_nanos_nearest(), ns);
+        }
+        assert_eq!(GlobalTime::from_nanos(1_000_000).as_nanos(), 999_999);
+        // A sum of spans is a unit short per addend, and still reads right.
+        let ms = GlobalTime::from_nanos(1_000_000);
+        let ten = (0..10).fold(GlobalTime::ZERO, |t, _| t.saturating_add(ms));
+        assert_eq!(ten.as_nanos(), 9_999_999);
+        assert_eq!(ten.as_nanos_nearest(), 10_000_000);
+        // Nearest, not up: half a nanosecond short stays where it is.
+        let half = GlobalTime::from_raw((1u128 << 64) / 2_000_000_000);
+        assert_eq!(GlobalTime::from_raw(half.raw() - 1).as_nanos_nearest(), 0);
+        assert_eq!(GlobalTime::from_raw(half.raw() + 1).as_nanos_nearest(), 1);
+        assert_eq!(GlobalTime::MAX.as_nanos_nearest(), u64::MAX);
     }
 
     // -- the clock-control seam ---------------------------------------------

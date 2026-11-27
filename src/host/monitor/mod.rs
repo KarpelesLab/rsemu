@@ -201,7 +201,7 @@ impl Monitor {
             "monitor attached to \"{}\" — the machine is stopped at {} ns\n\
              {} processor{}; `help` lists what this console can answer\n",
             machine.name(),
-            machine.now().as_nanos(),
+            machine.now().as_nanos_nearest(),
             target.cpu_count(),
             if target.cpu_count() == 1 { "" } else { "s" },
         )
@@ -355,8 +355,8 @@ impl Monitor {
         let _ = writeln!(
             out,
             "stopped at {} ns (+{} ns)",
-            now.as_nanos(),
-            now.as_nanos().saturating_sub(start.as_nanos())
+            now.as_nanos_nearest(),
+            now.saturating_sub(start).as_nanos_nearest()
         );
         out
     }
@@ -366,7 +366,7 @@ impl Monitor {
         let machine = target.machine();
         let mut out = String::new();
         let _ = writeln!(out, "machine    \"{}\"", machine.name());
-        let _ = writeln!(out, "stopped at {} ns", machine.now().as_nanos());
+        let _ = writeln!(out, "stopped at {} ns", machine.now().as_nanos_nearest());
         let _ = writeln!(out, "threading  {}", machine.threading_mode());
         let _ = writeln!(
             out,
@@ -552,16 +552,16 @@ fn sched(machine: &Machine) -> String {
     let config = scheduler.config();
     let queue = scheduler.queue();
     let mut out = String::new();
-    let _ = writeln!(out, "now       {} ns", machine.now().as_nanos());
+    let _ = writeln!(out, "now       {} ns", machine.now().as_nanos_nearest());
     let _ = writeln!(out, "threading {}", config.mode);
-    let _ = writeln!(out, "quantum   {} ns", config.quantum.as_nanos());
+    let _ = writeln!(out, "quantum   {} ns", config.quantum.as_nanos_nearest());
     let _ = writeln!(out, "queued    {} event(s)", queue.len());
     let events = queue.events();
     for event in events.iter().take(EVENTS_SHOWN) {
         let _ = writeln!(
             out,
             "  {:>16} ns  {}  token {}",
-            event.time.as_nanos(),
+            event.time.as_nanos_nearest(),
             target_path(machine, event.target),
             event.token
         );
@@ -1006,7 +1006,7 @@ fn load(machine: &mut Machine, path: Option<&str>) -> String {
         Ok(()) => format!(
             "loaded {} bytes; the machine is at {} ns\n",
             bytes.len(),
-            machine.now().as_nanos()
+            machine.now().as_nanos_nearest()
         ),
     }
 }
@@ -1019,7 +1019,11 @@ fn timeline(env: &Env<'_>) -> String {
         );
     };
     let mut out = String::new();
-    let _ = writeln!(out, "cadence   {} ns", timeline.cadence().as_nanos());
+    let _ = writeln!(
+        out,
+        "cadence   {} ns",
+        timeline.cadence().as_nanos_nearest()
+    );
     let _ = writeln!(
         out,
         "keyframes {} ({} bytes held)",
@@ -1027,7 +1031,7 @@ fn timeline(env: &Env<'_>) -> String {
         timeline.bytes_held()
     );
     for instant in timeline.instants() {
-        let _ = writeln!(out, "  {} ns", instant.as_nanos());
+        let _ = writeln!(out, "  {} ns", instant.as_nanos_nearest());
     }
     out
 }
@@ -1052,10 +1056,10 @@ fn rewind(target: &mut MachineTarget<'_>, env: &mut Env<'_>, span: Option<&str>)
         // way to tell whether it had.
         Ok(landed) => format!(
             "rewound to {} ns (asked for {} ns)\n",
-            landed.as_nanos(),
-            at.as_nanos()
+            landed.as_nanos_nearest(),
+            at.as_nanos_nearest()
         ),
-        Err(e) => format!("cannot rewind to {} ns: {e}\n", at.as_nanos()),
+        Err(e) => format!("cannot rewind to {} ns: {e}\n", at.as_nanos_nearest()),
     }
 }
 
