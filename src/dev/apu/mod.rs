@@ -411,7 +411,11 @@ impl Core {
         // taken on. Omitting it lost a pending frame interrupt across a save
         // state, and neither a byte round-trip nor a state hash could see that,
         // because both are functions of what `save` writes.
-        w.write_bool(self.irq_out)
+        w.write_bool(self.irq_out)?;
+        // v4: the cycle DMC playback last stopped on. It opens the window the
+        // one-cycle aborted DMA lives in, so it is as architectural as the
+        // fetch it schedules.
+        self.dmc.save_stop(w)
     }
 
     fn load<'a>(&mut self, r: &mut dyn crate::core::state::Source<'a>) -> Result<()> {
@@ -424,6 +428,7 @@ impl Core {
         self.ticks = r.read_u64()?;
         self.phase = r.read_u64()? & 1;
         self.irq_out = r.read_bool()?;
+        self.dmc.load_stop(r)?;
         // Samples already handed to the host are not replayed, and the ring is
         // output rather than architectural state (`ROADMAP.md` §4.5).
         self.samples.clear();
@@ -1188,14 +1193,15 @@ pub static APU_CLASS: DeviceClass = DeviceClass {
     name: "nes.apu",
     // v2 appended the DMC's enable latch: the cycle a `$4015` write that
     // started playback lets a fetch halt the CPU from. v3 appended `irq_out`,
-    // the `/IRQ` level a 6502 samples; see [`migrations`].
-    version: 3,
+    // the `/IRQ` level a 6502 samples, and v4 the cycle DMC playback last
+    // stopped on; see [`migrations`].
+    version: 4,
     summary: "NES APU (RP2A03 / RP2A07 / UA6527P audio): two pulse, triangle, noise, DMC",
     properties: APU_PROPERTIES,
     construct: |props| Ok(Box::new(Apu::new(props)?) as Box<dyn Device>),
 };
 
-/// Carry a v2 `nes.apu` chunk forward.
+/// Carry v2 and v3 `nes.apu` chunks forward.
 ///
 /// v3 appends one byte: `Core::irq_out`, the `/IRQ` level as it stood one CPU
 /// cycle ago. A v2 chunk does not carry it, and the honest value to invent is
@@ -1221,6 +1227,16 @@ pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()>
         let body = r.take(r.remaining())?;
         out.extend_from_slice(body);
         out.write_bool(false)
+    })?;
+    // v4 appends `Dmc::stopped_at`. "No stop on record" is what a v3 `load`
+    // left behind on a fresh device, and it is exact for every snapshot not
+    // taken within two CPU cycles of DMC playback stopping; one taken inside
+    // that window loses the one-cycle aborted DMA it never recorded.
+    migrations.register(APU_CLASS.name, 3, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_bool(false)?;
+        out.write_u64(0)
     })
 }
 

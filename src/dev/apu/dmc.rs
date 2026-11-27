@@ -496,6 +496,23 @@ impl Dmc {
         self.dma = None;
     }
 
+    /// Serialize the aborted-DMA window: the cycle playback last stopped on.
+    ///
+    /// Separate from [`Dmc::save`] because it was appended to the *device's*
+    /// chunk, after fields that follow the DMC's own; see `nes.apu` v4.
+    pub fn save_stop(&self, w: &mut dyn Sink) -> Result<()> {
+        w.write_bool(self.stopped_at.is_some())?;
+        w.write_u64(self.stopped_at.unwrap_or(0))
+    }
+
+    /// Restore what [`Dmc::save_stop`] wrote.
+    pub fn load_stop<'a>(&mut self, r: &mut dyn Source<'a>) -> Result<()> {
+        let stopped = r.read_bool()?;
+        let at = r.read_u64()?;
+        self.stopped_at = stopped.then_some(at);
+        Ok(())
+    }
+
     /// Serialize architectural state.
     pub fn save(&self, w: &mut dyn Sink) -> Result<()> {
         w.write_bool(self.irq_enabled)?;

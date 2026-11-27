@@ -1404,3 +1404,90 @@ fn the_class_constructs_through_the_registry_with_a_region() {
             .is_err()
     );
 }
+
+/// The aborted-DMA window survives a round trip.
+///
+/// `Dmc::stopped_at` — the cycle playback last stopped on — decides whether a
+/// buffer that empties just afterwards schedules the one-cycle aborted DMA
+/// ("This aborted DMA schedules regardless of how playback was stopped",
+/// NESdev, "DMA"). `save` did not write it, so a machine snapshotted inside
+/// that window came back without the halt and one CPU cycle ahead of the run
+/// it was taken from. As with `irq_out`, neither a byte round trip nor a state
+/// hash could see an omitted field; only a restore into a fresh device can.
+#[test]
+fn the_aborted_dma_window_survives_a_round_trip() {
+    let mut aborts = 0;
+    for k in 0..1000u64 {
+        let original = apu();
+        original.write(0x10, 0x0F); // fastest rate, no loop
+        original.write(0x12, 0x00);
+        original.write(0x13, 0xFF); // long enough not to end by itself
+        original.write(0x15, 0x10);
+        for _ in 0..k {
+            if let Some(request) = original.dma_request() {
+                assert!(original.dma_complete(request.serial, 0xAA));
+            }
+            original.advance(1);
+        }
+        original.write(0x15, 0x00); // stop: the window opens here
+
+        let bytes = snapshot(&original);
+        let restored = apu();
+        let reader = StateReader::new(&bytes).unwrap();
+        let (_, _, data) = reader.load_raw("apu").unwrap();
+        let mut chunk = ChunkReader::new(data);
+        restored.load(&mut chunk).unwrap();
+        chunk.end().expect("load consumes every byte save wrote");
+
+        for step in 0..4 {
+            let want = original.dma_request().map(|r| r.kind);
+            let got = restored.dma_request().map(|r| r.kind);
+            assert_eq!(got, want, "stop after {k} cycles, {step} cycles on");
+            if want == Some(DmaKind::Abort) {
+                aborts += 1;
+                break;
+            }
+            original.advance(1);
+            restored.advance(1);
+        }
+    }
+    assert!(aborts > 0, "the sweep must cross the window it is testing");
+}
+
+/// A restore replaces the aborted-DMA window rather than inheriting one.
+///
+/// `load` left `Dmc::stopped_at` as it found it, so rewinding a running
+/// machine to an earlier snapshot kept a stop that, in the restored timeline,
+/// has not happened yet — and `schedule` reads a stop in the future as "the
+/// sample has bytes left", so the rewound machine fetched a byte the original
+/// run never did.
+#[test]
+fn a_restore_does_not_inherit_the_previous_stop() {
+    let early = apu();
+    early.write(0x10, 0x0F);
+    early.write(0x13, 0x00); // one byte
+    let bytes = snapshot(&early);
+
+    // Run on: play the one-byte sample to its end, which records a stop two
+    // cycles in the future, then rewind to the snapshot from before any of it.
+    let apu = apu();
+    apu.write(0x10, 0x0F);
+    apu.write(0x13, 0x00);
+    apu.advance(500);
+    apu.write(0x15, 0x10);
+    let request = apu.dma_request().unwrap();
+    assert!(apu.dma_complete(request.serial, 0x00));
+    let reader = StateReader::new(&bytes).unwrap();
+    let (_, _, data) = reader.load_raw("apu").unwrap();
+    apu.load(&mut ChunkReader::new(data)).unwrap();
+
+    for _ in 0..2000 {
+        assert_eq!(
+            apu.dma_request(),
+            early.dma_request(),
+            "a channel that was never enabled asks for nothing"
+        );
+        apu.advance(1);
+        early.advance(1);
+    }
+}
