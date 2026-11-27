@@ -566,13 +566,21 @@ impl EventQueue {
         // this before the cascades is what keeps the two from colliding —
         // anything a cascade re-places is, by construction, strictly ahead of
         // the range swept here.
-        let steps = (new_granule - old_granule).min(WHEEL_SLOTS as u128);
-        for step in 1..=steps {
-            let slot = ((old_granule + step) & (WHEEL_SLOTS as u128 - 1)) as usize;
-            self.level_len[0] -= self.near[slot].len();
-            let drained = core::mem::take(&mut self.near[slot]);
-            for e in drained {
-                self.due.push(Reverse(e));
+        //
+        // An empty level has nothing to sweep, and that is the ordinary case:
+        // a console's devices are lazily advanced and post no events at all,
+        // while one scheduling round moves the position tens of thousands of
+        // granules — so without this test every round walked all 256 slots
+        // of every level to drain nothing.
+        if self.level_len[0] != 0 {
+            let steps = (new_granule - old_granule).min(WHEEL_SLOTS as u128);
+            for step in 1..=steps {
+                let slot = ((old_granule + step) & (WHEEL_SLOTS as u128 - 1)) as usize;
+                self.level_len[0] -= self.near[slot].len();
+                let drained = core::mem::take(&mut self.near[slot]);
+                for e in drained {
+                    self.due.push(Reverse(e));
+                }
             }
         }
 
@@ -581,7 +589,7 @@ impl EventQueue {
             let shift = WHEEL_SLOT_BITS * level as u32;
             let old_index = old_granule >> shift;
             let new_index = new_granule >> shift;
-            if old_index == new_index {
+            if old_index == new_index || self.level_len[level] == 0 {
                 continue;
             }
             let steps = (new_index - old_index).min(WHEEL_SLOTS as u128);
