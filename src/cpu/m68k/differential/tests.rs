@@ -751,6 +751,39 @@ fn a_store_onto_a_word_already_in_the_prefetch_queue_is_not_seen_by_it() {
 }
 
 #[test]
+fn a_store_into_the_running_block_through_a_high_byte_alias_is_still_seen() {
+    // A 68000 drives twenty-four address lines, so `$FF001004` *is* `$001004`
+    // — and a pointer with something in its top byte is ordinary on the
+    // machines this core runs (a Macintosh keeps flags there). The store
+    // guard has to compare the address the bus sees, not the register:
+    //
+    // ```text
+    //   001000: 3080       move.w d0,(a0)   ; a0 = $FF001004, d0 = $7201
+    //   001002: 4e71       nop
+    //   001004: 7200       moveq #0,d1      ; rewritten to moveq #1,d1
+    //   001006: 4e72 2700  stop #$2700
+    // ```
+    let program = vec![0x3080, 0x4e71, 0x7200, STOP[0], STOP[1]];
+    for alias in [0xff00_0000u32, 0x0100_0000, 0x8000_0000, 0] {
+        let case = Case::seeded(program.clone())
+            .with_a(0, alias | (CODE + 4))
+            .with_d(0, 0x7201)
+            .with_units(6);
+        agreed(&case);
+    }
+    // And the other way round: the block running at an aliased PC, the store
+    // through the plain address.
+    let jump = vec![0x4ef9, 0xff00, (CODE + 8) as u16, 0x4e71];
+    let mut program = jump;
+    program.extend_from_slice(&[0x3080, 0x4e71, 0x7200, STOP[0], STOP[1]]);
+    let case = Case::seeded(program)
+        .with_a(0, CODE + 12)
+        .with_d(0, 0x7201)
+        .with_units(8);
+    agreed(&case);
+}
+
+#[test]
 fn an_engine_switch_is_refused_for_a_model_the_frontend_does_not_lift() {
     use crate::core::props::Props;
     let props = Props::new()

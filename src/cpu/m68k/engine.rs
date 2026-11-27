@@ -914,7 +914,7 @@ impl<'a, 'h> Frontend<Host<'h>> for Lifter<'a> {
         // Whatever this boundary resolves to, the block that runs after it is
         // a different block in a different window, so the window the store
         // guard compares against is replaced rather than kept.
-        host.code_window = pc & !lift::WINDOW_MASK;
+        host.code_window = (pc & host.mask) & !lift::WINDOW_MASK;
         Ok(Entry::Ready)
     }
 
@@ -1102,7 +1102,7 @@ impl<'a> Host<'a> {
             stores: 0,
             smc: false,
             ipl_mask,
-            code_window: pc & !lift::WINDOW_MASK,
+            code_window: (pc & cfg.model.address_mask()) & !lift::WINDOW_MASK,
             dirty: DirtyPages::new(),
         }
     }
@@ -1165,7 +1165,12 @@ impl IrHost for Host<'_> {
              instruction\")",
             self.stores
         );
-        if addr & !lift::WINDOW_MASK == self.code_window {
+        // On the address the **bus** sees. A 68000 drives twenty-four lines,
+        // so a store through `$FF001004` lands in the block running at
+        // `$001000` exactly as one through `$001004` does, and a guard that
+        // compared the registers' thirty-two bits let the block run on with
+        // the words it was lifted from.
+        if (addr & self.mask) & !lift::WINDOW_MASK == self.code_window {
             self.smc = true;
         }
         self.bus_cycle();
