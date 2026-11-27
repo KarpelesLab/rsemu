@@ -776,6 +776,71 @@ fn lazy_stacking_reserves_the_frame_but_defers_the_store() {
     }
 }
 
+/// The "ready" bits a reservation records compare the interrupted code's
+/// priority with each fault's, as `UpdateFPCCR()` does.
+///
+/// DDI 0403E.b B1.5.6, `UpdateFPCCR()`: "if ExecutionPriority() > -1 then
+/// FPCCR.HFRDY = '1'; else FPCCR.HFRDY = '0'; if SHCSR.BUSFAULTENA == '1' &&
+/// ExecutionPriority() > UInt(SHPR1.PRI_5) then FPCCR.BFRDY = '1'; else
+/// FPCCR.BFRDY = '0'; if SHCSR.MEMFAULTENA == '1' && ExecutionPriority() >
+/// UInt(SHPR1.PRI_4) then FPCCR.MMRDY = '1'; else FPCCR.MMRDY = '0';". The
+/// core recorded only whether each fault was *enabled*, and `HFRDY` as "not
+/// under `FAULTMASK`" — so it said a BusFault could be pended by code that
+/// outranked BusFault, and a HardFault by the HardFault handler itself.
+#[test]
+fn a_reservation_records_which_faults_the_interrupted_code_could_pend() {
+    use super::sys::shcsr;
+    let ready = fpccr::HFRDY | fpccr::BFRDY | fpccr::MMRDY;
+
+    // Thread mode under `BASEPRI` 0x20, with BusFault at 0x40 (it cannot
+    // preempt) and MemManage at 0x10 (it can).
+    let mut halves = program(&[VMOV_S0_R0]);
+    halves.push(SVC0);
+    halves.push(PARK);
+    let h = Harness::m4f(&halves);
+    h.handler(&[PARK]);
+    h.cpu.with_sys(|s| {
+        s.shcsr |= shcsr::BUSFAULTENA | shcsr::MEMFAULTENA;
+        s.priority[5] = 0x40;
+        s.priority[4] = 0x10;
+    });
+    let mut regs = h.cpu.regs();
+    regs.basepri = 0x20;
+    h.cpu.set_regs(regs);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::SVCALL);
+    let ccr = h.cpu.with_sys(|s| s.fpccr);
+    assert_ne!(ccr & fpccr::LSPACT, 0, "the frame was reserved");
+    assert_eq!(
+        ccr & ready,
+        fpccr::HFRDY | fpccr::MMRDY,
+        "HardFault and MemManage could have been pended; BusFault could not"
+    );
+
+    // With nothing masked, all three.
+    let h = Harness::m4f(&halves);
+    h.handler(&[PARK]);
+    h.cpu
+        .with_sys(|s| s.shcsr |= shcsr::BUSFAULTENA | shcsr::MEMFAULTENA);
+    h.steps(2);
+    assert_eq!(h.cpu.with_sys(|s| s.fpccr) & ready, ready);
+
+    // In the HardFault handler, preempted by NMI: the execution priority is
+    // -1, which is not above -1.
+    let h = Harness::m4f(&[0xde00]); // UDF: a HardFault, UsageFault being off
+    let mut handler = program(&[VMOV_S0_R0]);
+    handler.push(PARK);
+    h.handler(&handler);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    h.cpu.with_sys(|s| s.set_pending(Exception::NMI, true));
+    h.steps(1);
+    assert_eq!(h.cpu.current_exception(), Exception::NMI);
+    let ccr = h.cpu.with_sys(|s| s.fpccr);
+    assert_ne!(ccr & fpccr::LSPACT, 0, "the frame was reserved");
+    assert_eq!(ccr & ready, 0, "nothing can be pended from HardFault");
+}
+
 #[test]
 fn the_first_vfp_instruction_in_the_handler_performs_the_deferred_push() {
     let mut halves = program(&[VMOV_S0_R0]);

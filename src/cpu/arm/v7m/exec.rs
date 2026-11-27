@@ -1252,7 +1252,7 @@ impl<'a> Exec<'a> {
         // are still current, because `FPCCR.USER`/`THREAD` record them.
         #[cfg(feature = "cpu-arm-v7m-fp")]
         if fp_frame {
-            stack_failed |= self.stack_fp_frame(sp, privileged);
+            stack_failed |= self.stack_fp_frame(sp, privileged, preempted);
         }
 
         #[cfg(feature = "cpu-arm-v8m")]
@@ -3487,7 +3487,11 @@ impl Exec<'_> {
     /// `FPCAR` records where it is, and `LSPACT` says a push is owed. That is
     /// what keeps interrupt latency off the floating-point register file for
     /// a handler that never touches it.
-    fn stack_fp_frame(&mut self, frame: u32, privileged: bool) -> bool {
+    ///
+    /// `preempted` is `ExecutionPriority()` of the context the frame belongs
+    /// to — taken before the new handler is made active — which is what the
+    /// "ready" bits are measured against.
+    fn stack_fp_frame(&mut self, frame: u32, privileged: bool, preempted: i32) -> bool {
         let base = frame.wrapping_add(exc_return::FP_OFFSET);
         if self.state.sys.fpccr & fpccr::LSPEN == 0 {
             let mut failed = false;
@@ -3531,13 +3535,36 @@ impl Exec<'_> {
         if !self.state.in_handler() {
             ccr |= fpccr::THREAD;
         }
-        if !self.state.faultmask {
+        // Whether each fault *could have been pended* by the code the frame
+        // was reserved for: enabled is half of that, and the other half is
+        // that code not outranking it. `UpdateFPCCR()` (DDI 0403E.b B1.5.6):
+        // "if ExecutionPriority() > -1 then FPCCR.HFRDY = '1'; ... if
+        // SHCSR.BUSFAULTENA == '1' && ExecutionPriority() > UInt(SHPR1.PRI_5)
+        // then FPCCR.BFRDY = '1'; ... if SHCSR.MEMFAULTENA == '1' &&
+        // ExecutionPriority() > UInt(SHPR1.PRI_4) then FPCCR.MMRDY = '1';".
+        // `MONRDY` needs `DEMCR.MON_EN`, which this core does not implement,
+        // so it stays clear. Armv8-M has its own `UpdateFPCCR()`, so it
+        // keeps what it recorded before.
+        #[cfg(feature = "cpu-arm-v8m")]
+        let by_priority = !self.cfg.is_v8m();
+        #[cfg(not(feature = "cpu-arm-v8m"))]
+        let by_priority = true;
+        let above = |sys: &super::sys::Sys, exc: Exception| {
+            !by_priority || preempted > i32::from(sys.priority[usize::from(exc.0)])
+        };
+        let hard_fault_ready = if by_priority {
+            preempted > -1
+        } else {
+            !self.state.faultmask
+        };
+        if hard_fault_ready {
             ccr |= fpccr::HFRDY;
         }
-        if self.state.sys.is_enabled(Exception::MEM_MANAGE) {
+        let sys = &self.state.sys;
+        if sys.is_enabled(Exception::MEM_MANAGE) && above(sys, Exception::MEM_MANAGE) {
             ccr |= fpccr::MMRDY;
         }
-        if self.state.sys.is_enabled(Exception::BUS_FAULT) {
+        if sys.is_enabled(Exception::BUS_FAULT) && above(sys, Exception::BUS_FAULT) {
             ccr |= fpccr::BFRDY;
         }
         self.state.sys.fpccr = ccr;
