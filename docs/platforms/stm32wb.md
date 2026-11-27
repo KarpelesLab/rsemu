@@ -88,7 +88,7 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 | RTC, IWDG, WWDG, CRC, RNG, DBGMCU | `st.rtc`, `st.iwdg`, `st.wwdg`, `st.crc`, `st.rng`, `st.dbgmcu` | `DEV_ID = 0x495` |
 | I2C1, I2C3 | `st.i2c-v2`, `link = "wired"` | the `TIMINGR` block; nothing on the bus, so a transfer is NACKed; `tx-drq`/`rx-drq` reach DMAMUX1 as requests 10–13 |
 | SPI1, SPI2 (WB55 only) | `stm32.spi`, `variant = "f7"`, `link = "wired"` | nothing attached; no DMA request outputs yet |
-| USB full-speed device | `st.usbfs`, `bus = "usb"` | registers at `0x40006800`, 1 KiB packet memory at `0x40006C00`, gated by `APB1ENR1.USBEN`, on NVIC 20 (`USB_LP`); on the named USB bus `usb`, which a host — a test harness, or anything that opens that bus — enumerates the guest's device stack through |
+| USB full-speed device | `st.usbfs`, `bus = "usb"` | registers at `0x40006800`, 1 KiB packet memory at `0x40006C00`, gated by `APB1ENR1.USBEN`, on NVIC 20 (`USB_LP`); the packet memory takes byte and half-word accesses only (RM0434 §40.6.2), and `BCDR`'s battery-charging detection answers as a standard host port (`port-type = "sdp"`, the default); on the named USB bus `usb`, which a host — a test harness, or anything that opens that bus — enumerates the guest's device stack through |
 | OTP area | `rom`, `fill = 0xff` | 1 KiB at `0x1FFF7000`, blank as from the factory; programming it is not modelled |
 | Device signature | `st.devinfo` | `FLASH_SIZE`, both UIDs (seeded) and the package code at `0x1FFF7500` |
 

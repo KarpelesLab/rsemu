@@ -125,8 +125,8 @@ RCC registers are offsets in `RCC_TypeDef`: `AHB1ENR` `0x48`, `AHB2ENR`
 | I2C1 | `0x4000_5400` | `0x2C` | `st.i2c-v2` | 30 `I2C1_EV`, 31 `I2C1_ER` | `APB1ENR1.I2C1EN` 21 / 21 |
 | I2C3 | `0x4000_5C00` | `0x2C` | `st.i2c-v2` | 32 `I2C3_EV`, 33 `I2C3_ER` | `APB1ENR1.I2C3EN` 23 / 23 |
 | CRS | `0x4000_6000` | 1K | **no class** | 42 `CRS_IRQn` | `APB1ENR1.CRSEN` 24 / 24 |
-| USB FS | `0x4000_6800` | `0x60` | `st.usbfs` (the F0x2-style device: `LPMCSR` `+0x54`, `BCDR` `+0x58`) | 19 `USB_HP`, 20 `USB_LP` | `APB1ENR1.USBEN` 26 / 26 |
-| USB packet memory | `0x4000_6C00` | `0x400` | `st.usbfs` region `pma` (1024 bytes, RM0434 §40) | — | — |
+| USB FS | `0x4000_6800` | `0x60` (1K slot; decoded through `BCDR` `+0x58`) | `st.usbfs` (RM0434 §40 is word-for-word RM0091 §30, the F0x2 block, less its CAN share of packet memory; `can-enable` is left unwired; `port-type` defaults to `sdp` for `BCDR`) | 19 `USB_HP`, 20 `USB_LP` | `APB1ENR1.USBEN` 26 / 26 |
+| USB packet memory | `0x4000_6C00` | `0x400` | `st.usbfs` region `pma` (1024 bytes, byte or half-word access only: RM0434 §40.6.2 "Word (32-bit) accesses are not allowed", so a word access faults) | — | — |
 | LPTIM1 | `0x4000_7C00` | 1K | **no class** | 47 `LPTIM1_IRQn` | `APB1ENR1.LPTIM1EN` 31 / 31 |
 | LPUART1 | `0x4000_8000` | `0x34` | `st.usart` `variant = "u5"`, `lpuart = true` (FIFO and `PRESC` present: RM0434 Table 228) | 37 `LPUART1_IRQn` | `APB1ENR2.LPUART1EN` 0 / `APB1RSTR2.LPUART1RST` 0 |
 | LPTIM2 | `0x4000_9400` | 1K | **no class** | 48 `LPTIM2_IRQn` | `APB1ENR2.LPTIM2EN` 5 / 5 |
