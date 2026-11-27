@@ -337,7 +337,29 @@ fn keysym(key: Key) -> Option<Keysym> {
     if let Some(i) = digits.iter().position(|&k| k == key) {
         return Some(Keysym(u32::from(b'0') + i as u32));
     }
+    // F1 to F12 are consecutive keysyms (0xffbe..=0xffc9), and they are not
+    // optional: the Amiga map has ten of them, the AT keyboard map all
+    // twelve, and the navigation unit's setup key is F1. `Keysym` names the
+    // two ends of the run.
+    let function = [
+        K::F1,
+        K::F2,
+        K::F3,
+        K::F4,
+        K::F5,
+        K::F6,
+        K::F7,
+        K::F8,
+        K::F9,
+        K::F10,
+        K::F11,
+        K::F12,
+    ];
+    if let Some(i) = function.iter().position(|&k| k == key) {
+        return Some(Keysym(Keysym::F1.0 + i as u32));
+    }
     Some(match key {
+        K::Delete => Keysym::DELETE,
         K::Space => Keysym(0x20),
         K::Enter => Keysym::RETURN,
         K::Escape => Keysym::ESCAPE,
@@ -385,6 +407,19 @@ mod tests {
         assert_eq!(keysym(Key::Key7), Some(Keysym(0x37)));
         assert_eq!(keysym(Key::Enter), Some(Keysym::RETURN));
         assert_eq!(keysym(Key::LeftShift), Some(Keysym::SHIFT_L));
-        assert_eq!(keysym(Key::F12), None, "unmapped keys send nothing");
+        assert_eq!(keysym(Key::Pause), None, "unmapped keys send nothing");
+    }
+
+    /// The keys a VNC client can already send and this window could not: the
+    /// guest keyboards in `host::input` map all of them, so dropping them here
+    /// made the native window the one frontend a firmware setup screen or an
+    /// Amiga function key could not be reached from.
+    #[test]
+    fn the_function_keys_and_delete_reach_the_guest() {
+        assert_eq!(keysym(Key::F1), Some(Keysym::F1));
+        assert_eq!(keysym(Key::F6), Some(Keysym(0xffc3)));
+        assert_eq!(keysym(Key::F10), Some(Keysym(0xffc7)));
+        assert_eq!(keysym(Key::F12), Some(Keysym::F12));
+        assert_eq!(keysym(Key::Delete), Some(Keysym::DELETE));
     }
 }
