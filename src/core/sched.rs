@@ -2983,6 +2983,34 @@ pub struct Scheduler {
     readers: Arc<Readers>,
 }
 
+/// Break the reference cycle every lazily-advanced device is part of.
+///
+/// A [`LazySlot`] owns its device, and the device owns the slot back: the
+/// [`LazyHandle`] it is given so that an access can ask for catch-up is an
+/// `Arc` of that same slot. Neither edge can be weak without paying for an
+/// upgrade on every access, and while the scheduler lives the cycle is
+/// harmless. When it goes, though, nothing else would ever release the pair,
+/// and a device holds a great deal — its regions, its wires, a ROM or a
+/// megabyte of flash — so a machine with one lazy device in it was never
+/// freed. A fuzz target that realizes a board per input found it as a leak of
+/// every board it tried but one.
+///
+/// So the scheduler, which is the only thing that can advance a lazy device,
+/// lets go of them on its way out. A device somebody else still holds keeps
+/// working: its handle finds an empty slot, which is the answer it already
+/// gets when the device is busy, and with no scheduler there is no later tick
+/// to have caught up to.
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        for slot in &self.lazy {
+            // Taken under the lock and dropped outside it: a device's own
+            // `Drop` may take locks of any rank.
+            let device = slot.state.lock().device.take();
+            drop(device);
+        }
+    }
+}
+
 impl fmt::Debug for Scheduler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Scheduler")
@@ -8499,6 +8527,64 @@ mod tests {
             sched.forest().domain_frequency(sys).unwrap(),
             Rational::integer(16_000_000),
             "and leaves the forest exactly as it was"
+        );
+    }
+
+    /// A lazy device that keeps the handle it was given, the way every real
+    /// one does (`Device::attach_lazy`) — which is what closes the cycle.
+    #[derive(Debug)]
+    struct Keeper {
+        /// Owned and never read: owning it is the whole of the device.
+        _state: Arc<KeeperState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct KeeperState {
+        handle: Mutex<Option<LazyHandle>>,
+    }
+
+    impl LazyDevice for Keeper {
+        fn current_tick(&self) -> u64 {
+            0
+        }
+        fn advance_to(&mut self, _tick: u64) {}
+    }
+
+    #[test]
+    fn dropping_the_scheduler_frees_a_lazy_device_that_holds_its_own_handle() {
+        let mut forest = ClockForest::new();
+        let osc = forest
+            .add_oscillator("osc", Rational::integer(1_000_000))
+            .unwrap();
+        let domain = forest.add_domain("dev", osc, 1, 1).unwrap();
+        let mut sched = Scheduler::new(forest, SchedulerConfig::default());
+
+        let state = Arc::new(KeeperState::default());
+        let alive = Arc::downgrade(&state);
+        let id = sched.add_lazy_device(
+            domain,
+            Box::new(Keeper {
+                _state: Arc::clone(&state),
+            }),
+        );
+        // The slot owns the device, and now the device owns the slot.
+        let handle = sched.lazy_handle(id).unwrap();
+        *state.handle.lock() = Some(handle.clone());
+        drop(state);
+        assert!(alive.upgrade().is_some(), "the scheduler keeps it alive");
+
+        drop(sched);
+        // An orphaned handle still answers, and says the device is not there
+        // to advance — which is what a device ignores on every access anyway.
+        assert!(matches!(
+            handle.sync(AccessKind::Guest),
+            Err(SchedError::LazyDeviceBusy(_))
+        ));
+        drop(handle);
+        assert!(
+            alive.upgrade().is_none(),
+            "the device outlived its scheduler: the slot and the handle inside \
+             the device hold each other, and nothing else will ever free them"
         );
     }
 }
