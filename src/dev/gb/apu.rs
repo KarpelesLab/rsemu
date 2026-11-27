@@ -857,18 +857,41 @@ fn write_reg(engine: &mut Engine, offset: u64, value: u8) {
         engine.powered = on;
         if !on {
             // Powering off zeroes every register and silences every channel.
-            // Wave RAM survives, which is the one exception (Pan Docs, *Audio
-            // Registers*).
+            // Wave RAM survives (Pan Docs, *Audio Registers*), and on this,
+            // the monochrome machine, so do the four length timers: the
+            // power-down "clears all APU registers and makes them read-only
+            // until turned back on, except `AUDENA`" — "...and the length
+            // timers (in `AUD*LEN`) on monochrome models."
             let ram = engine.ch3.ram;
             let sample_timer = engine.sample_timer;
+            let lengths = [
+                engine.ch1.length.counter,
+                engine.ch2.length.counter,
+                engine.ch3.length.counter,
+                engine.ch4.length.counter,
+            ];
             *engine = Engine::default();
             engine.ch3.ram = ram;
             engine.sample_timer = sample_timer;
+            engine.ch1.length.counter = lengths[0];
+            engine.ch2.length.counter = lengths[1];
+            engine.ch3.length.counter = lengths[2];
+            engine.ch4.length.counter = lengths[3];
         }
         return;
     }
     if !engine.powered {
-        // Every other register ignores writes while the unit is off.
+        // Every other register ignores writes while the unit is off — except,
+        // by the same footnote, the length timers. Only the timer is loaded:
+        // the duty bits that share `NR11` and `NR21` are ordinary register
+        // bits and stay read-only.
+        match offset {
+            0x01 => engine.ch1.length.set(u16::from(value & 0x3f), 64),
+            0x06 => engine.ch2.length.set(u16::from(value & 0x3f), 64),
+            0x0b => engine.ch3.length.set(u16::from(value), 256),
+            0x10 => engine.ch4.length.set(u16::from(value & 0x3f), 64),
+            _ => {}
+        }
         return;
     }
     match offset {

@@ -1145,6 +1145,42 @@ fn the_sound_unit_ignores_every_register_while_it_is_powered_down() {
 }
 
 #[test]
+fn a_dmg_keeps_its_length_timers_through_a_power_down() {
+    // Pan Docs, *Audio Registers*, FF26: "Turning the APU off [...] clears all
+    // APU registers and makes them read-only until turned back on, except
+    // `AUDENA`", with the footnote "...and the length timers (in `AUD*LEN`) on
+    // monochrome models." This machine is the monochrome one.
+    let apu = GbApu::new();
+    assert!(!apu.powered());
+    // Written while off: channel 2's timer is loaded with one step to go.
+    apu.write_register(0x06, 0x3f); // NR21
+    apu.write_register(0x16, 0x80); // power on
+    apu.write_register(0x07, 0xf0); // NR22: DAC on
+    apu.write_register(0x09, 0xc0); // NR24: trigger, length enabled
+    assert_eq!(apu.status() & 0x02, 0x02);
+    apu.step_frame_sequencer();
+    assert_eq!(apu.status() & 0x02, 0x00, "one step was all it had left");
+
+    // And not cleared by the power-down either: two steps to go, loaded
+    // before the unit is switched off and on again.
+    apu.write_register(0x06, 0x3e);
+    apu.write_register(0x16, 0x00);
+    apu.write_register(0x16, 0x80);
+    assert_eq!(
+        apu.read_register(0x06) & 0xc0,
+        0x00,
+        "the duty bits were cleared"
+    );
+    apu.write_register(0x07, 0xf0);
+    apu.write_register(0x09, 0xc0);
+    apu.step_frame_sequencer(); // step 0 clocks the length timers
+    assert_eq!(apu.status() & 0x02, 0x02);
+    apu.step_frame_sequencer(); // step 1 does not
+    apu.step_frame_sequencer(); // step 2 does
+    assert_eq!(apu.status() & 0x02, 0x00, "the timer kept its two steps");
+}
+
+#[test]
 fn powering_down_zeroes_everything_except_the_wave_ram() {
     let apu = GbApu::new();
     apu.write_register(0x16, 0x80);
