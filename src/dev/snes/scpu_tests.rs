@@ -268,3 +268,25 @@ fn a_snapshot_round_trips() {
     assert_eq!(got, want);
     assert!(restored.shared.memsel.load(Ordering::Relaxed));
 }
+
+#[test]
+fn starting_a_multiplication_also_loads_the_quotient_register() {
+    // nocash, *fullsnes*, "SNES Maths Multiply/Divide", 4203h - WRMPYB: "For
+    // some reason, the hardware does additionally set RDDIVL=WRMPYB, and
+    // RDDIVH=00h."
+    let f = scpu();
+    // A division first, so the quotient register holds something else: $1234.
+    wr(&f, REGS + 0x04, 0x34);
+    wr(&f, REGS + 0x05, 0x12);
+    wr(&f, REGS + 0x06, 0x01);
+    assert_eq!((rd(&f, REGS + 0x14), rd(&f, REGS + 0x15)), (0x34, 0x12));
+
+    wr(&f, REGS + 0x02, 5);
+    wr(&f, REGS + 0x03, 7);
+    assert_eq!((rd(&f, REGS + 0x16), rd(&f, REGS + 0x17)), (35, 0));
+    assert_eq!(
+        (rd(&f, REGS + 0x14), rd(&f, REGS + 0x15)),
+        (7, 0),
+        "RDDIV is the multiplier, zero-extended"
+    );
+}

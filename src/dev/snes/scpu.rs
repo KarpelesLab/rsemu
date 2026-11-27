@@ -816,6 +816,10 @@ impl Regs {
                 0x02 => s.wrmpya = v,
                 0x03 => {
                     s.rdmpy = u16::from(s.wrmpya) * u16::from(v);
+                    // "For some reason, the hardware does additionally set
+                    // RDDIVL=WRMPYB, and RDDIVH=00h" (fullsnes, "SNES Maths
+                    // Multiply/Divide").
+                    s.rddiv = u16::from(v);
                 }
                 0x04 => s.wrdiv = (s.wrdiv & 0xFF00) | u16::from(v),
                 0x05 => s.wrdiv = (s.wrdiv & 0x00FF) | (u16::from(v) << 8),
