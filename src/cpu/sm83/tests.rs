@@ -748,6 +748,36 @@ fn the_halt_bug_reads_the_next_byte_twice() {
 }
 
 #[test]
+fn halt_straight_after_ei_is_returned_to_by_the_pending_interrupt() {
+    // Pan Docs, *halt*, "halt bug": "The `halt` comes immediately after a `ei`
+    // instruction (whose effect is typically delayed by one instruction, hence
+    // `IME` still being zero for the `halt`): the interrupt is serviced and the
+    // handler called, but the interrupt returns to the `halt`, which is
+    // executed again, and thus waits for another interrupt."
+    let (cpu, ram) = cpu_with(&[0xfb, 0x76, 0x3c]); // EI; HALT; INC A
+    let mut regs = Regs::post_boot_dmg();
+    regs.sp = 0xc010;
+    regs.a = 0;
+    cpu.set_regs(regs);
+    cpu.set_interrupt_enable(1 << interrupt::TIMER);
+    cpu.request_interrupt(interrupt::TIMER);
+    step(&cpu); // EI
+    step(&cpu); // HALT, with the interrupt already pending
+    assert!(
+        !cpu.is_halted(),
+        "a pending interrupt ends the halt at once"
+    );
+    assert_eq!(step(&cpu), 5, "the handler is called");
+    assert_eq!(cpu.regs().pc, 0x0050);
+    assert_eq!(
+        (ram.read_u8(0xc00f).unwrap(), ram.read_u8(0xc00e).unwrap()),
+        (0x01, 0x01),
+        "the return address is the HALT at $0101, not the byte after it"
+    );
+    assert_eq!(cpu.regs().a, 0, "and the byte after it was not executed");
+}
+
+#[test]
 fn halt_with_ime_set_runs_the_handler_on_wake() {
     let (cpu, _ram) = cpu_with(&[0x76, 0x00]);
     let mut regs = Regs::post_boot_dmg();

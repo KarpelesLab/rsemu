@@ -172,6 +172,10 @@ pub(super) struct Exec<'a> {
     cursor: Option<&'a TickCursor>,
     /// Cycles this step has charged.
     used: u64,
+    /// Whether this step's instruction is the one straight after an `EI` — the
+    /// one `IME` was still clear for on the chip, whatever `State::ime` says by
+    /// the time it executes here. Only `HALT` can tell the difference.
+    ei_landed: bool,
 }
 
 impl<'a> Exec<'a> {
@@ -189,6 +193,7 @@ impl<'a> Exec<'a> {
             attrs: MemAttrs::DEFAULT.with_requester(cfg.requester),
             cursor: None,
             used: 0,
+            ei_landed: false,
         }
     }
 
@@ -241,6 +246,7 @@ impl<'a> Exec<'a> {
         if self.state.ei_pending {
             self.state.ime = true;
             self.state.ei_pending = false;
+            self.ei_landed = true;
         }
         self.instruction();
         self.used
@@ -782,7 +788,17 @@ impl<'a> Exec<'a> {
             Op::EI => self.state.ei_pending = true,
 
             Op::HALT => {
-                if !self.state.ime && self.pending() != 0 {
+                if self.ei_landed && self.pending() != 0 {
+                    // The HALT bug behind an `EI`. `IME` was still clear as
+                    // this `HALT` executed, so it ends at once with `PC` not
+                    // incremented — and the interrupt `EI` has just let
+                    // through is then taken from there: "the interrupt is
+                    // serviced and the handler called, but the interrupt
+                    // returns to the `halt`, which is executed again, and thus
+                    // waits for another interrupt" (Pan Docs, *halt*, "halt
+                    // bug"). The dispatch is the next step's, as always.
+                    self.state.regs.pc = self.state.regs.pc.wrapping_sub(1);
+                } else if !self.state.ime && self.pending() != 0 {
                     // The HALT bug: the chip does not halt, and the *next* byte
                     // is fetched twice (Pan Docs, *Halt*).
                     self.state.halt_bug = true;
