@@ -1343,14 +1343,38 @@ impl<'a> Exec<'a> {
     /// Return from an exception (DDI 0403 B1.5.8).
     fn exception_return(&mut self, magic: u32) -> Ex {
         let returning = self.state.current_exception();
+        // ARMv7-M's integrity checks fail *in place*: `ExceptionReturn()`
+        // (DDI 0403E.b B1.5.8) answers each of them with
+        //
+        //   DeActivate(ReturningExceptionNumber);
+        //   UFSR.INVPC = '1';
+        //   LR = '1111':EXC_RETURN;
+        //   ExceptionTaken(UsageFault);
+        //
+        // and no `PushStack()` — "Any failed check causes an INVPC
+        // UsageFault, with the EXC_RETURN value in the LR". ARMv6-M has no
+        // UsageFault and leaves these UNPREDICTABLE, and Armv8-M's sequence
+        // is its own; both keep the ordinary fault entry.
+        let in_place = !self.cfg.is_v6m() && !self.cfg.is_v8m();
         if !self.state.sys.is_active(returning) {
+            if in_place {
+                self.fail_exception_return(returning, magic);
+                return Ok(());
+            }
             return Err(Trap::INVPC);
         }
         // Six legal values: the three integer ones, and the three with bit 4
         // clear that name the extended frame. A part with no FPU never
         // produces one of the latter, so it rejects them here — which is what
         // makes a stray `EXC_RETURN` a fault rather than a wild unstack.
-        let (to_handler, use_psp, fp_frame) = self.decode_exc_return(magic)?;
+        let (to_handler, use_psp, fp_frame) = match self.decode_exc_return(magic) {
+            Ok(decoded) => decoded,
+            Err(_) if in_place => {
+                self.fail_exception_return(returning, magic);
+                return Ok(());
+            }
+            Err(trap) => return Err(trap),
+        };
         if fp_frame && !self.fp_present() {
             return Err(Trap::INVPC);
         }
@@ -1362,10 +1386,13 @@ impl<'a> Exec<'a> {
             return Err(Trap::NOCP);
         }
         let nested = self.state.sys.active_count() > 1;
-        if !to_handler && nested && self.state.sys.ccr & ccr::NONBASETHRDENA == 0 {
-            return Err(Trap::INVPC);
-        }
-        if to_handler && !nested {
+        let mismatched = (!to_handler && nested && self.state.sys.ccr & ccr::NONBASETHRDENA == 0)
+            || (to_handler && !nested);
+        if mismatched {
+            if in_place {
+                self.fail_exception_return(returning, magic);
+                return Ok(());
+            }
             return Err(Trap::INVPC);
         }
 
@@ -1446,25 +1473,10 @@ impl<'a> Exec<'a> {
         // the `EXC_RETURN` that names it. ARMv6-M has no UsageFault and its
         // `PopStack()` forces the field instead (below); Armv8-M is left to
         // `super::v8m`.
-        if !unstack_failed && !self.cfg.is_v6m() && !self.cfg.is_v8m() {
+        if !unstack_failed && in_place {
             let stacked_ipsr = frame[7] & xpsr::EXCEPTION;
             if to_handler == (stacked_ipsr == 0) {
-                self.state.sys.cfsr |= fsr::UF_INVPC;
-                let prio = self.state.execution_priority();
-                let mut target = Exception::USAGE_FAULT;
-                if !self.state.sys.is_enabled(target) || self.state.sys.priority_of(target) >= prio
-                {
-                    self.state.sys.hfsr |= fsr::HF_FORCED;
-                    target = Exception::HARD_FAULT;
-                }
-                if target == Exception::HARD_FAULT && prio <= -1 {
-                    self.state.locked_up = true;
-                    self.state.r[15] = 0xffff_fffe;
-                    self.branched = true;
-                    return Ok(());
-                }
-                self.state.sys.set_active(target, true);
-                self.exception_taken_on_frame(target, magic);
+                self.invpc_on_frame(magic);
                 return Ok(());
             }
         }
@@ -1538,6 +1550,43 @@ impl<'a> Exec<'a> {
         self.branched = true;
         self.cycle(10);
         Ok(())
+    }
+
+    /// An ARMv7-M exception return that failed an integrity check before
+    /// anything was popped: `DeActivate()`, then the UsageFault on the frame
+    /// that is already there (DDI 0403E.b B1.5.8, `ExceptionReturn()`).
+    fn fail_exception_return(&mut self, returning: Exception, magic: u32) {
+        // `DeActivate()`: "ExceptionActive[ReturningExceptionNumber] = '0';
+        // if IPSR<8:0> != '000000010' then FAULTMASK<0> = '0';".
+        self.state.sys.set_active(returning, false);
+        if returning != Exception::NMI {
+            self.state.faultmask = false;
+        }
+        self.it_settled = true;
+        self.invpc_on_frame(magic);
+    }
+
+    /// `UFSR.INVPC = '1'; LR = '1111':EXC_RETURN; ExceptionTaken(UsageFault)`
+    /// — the tail every failed ARMv7-M integrity check shares. The UsageFault
+    /// escalates to HardFault where it is disabled or cannot preempt, and a
+    /// HardFault that cannot be taken either is a lockup, as for any other
+    /// fault.
+    fn invpc_on_frame(&mut self, magic: u32) {
+        self.state.sys.cfsr |= fsr::UF_INVPC;
+        let prio = self.state.execution_priority();
+        let mut target = Exception::USAGE_FAULT;
+        if !self.state.sys.is_enabled(target) || self.state.sys.priority_of(target) >= prio {
+            self.state.sys.hfsr |= fsr::HF_FORCED;
+            target = Exception::HARD_FAULT;
+        }
+        if target == Exception::HARD_FAULT && prio <= -1 {
+            self.state.locked_up = true;
+            self.state.r[15] = 0xffff_fffe;
+            self.branched = true;
+            return;
+        }
+        self.state.sys.set_active(target, true);
+        self.exception_taken_on_frame(target, magic);
     }
 
     /// Enter `exc`'s handler on a frame that is already on the stack, with

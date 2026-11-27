@@ -1052,6 +1052,97 @@ fn a_return_to_thread_mode_with_a_stacked_ipsr_is_an_invpc_usage_fault() {
     assert_ne!(h.cpu.with_sys(|s| s.hfsr) & fsr::HF_FORCED, 0);
 }
 
+/// An exception return that fails an integrity check enters the UsageFault
+/// handler on the frame that is already there, with the returning exception
+/// deactivated and the offending `EXC_RETURN` in `LR`.
+///
+/// DDI 0403E.b B1.5.8, "Integrity checks on exception return": "Any failed
+/// check causes an INVPC UsageFault, with the EXC_RETURN value in the LR."
+/// `ExceptionReturn()`, for each of the three checks made before the frame
+/// is popped — the handler not active, a mismatched return to Thread mode, a
+/// reserved `EXC_RETURN<3:0>`:
+///
+/// ```text
+/// DeActivate(ReturningExceptionNumber);
+/// UFSR.INVPC = '1';
+/// LR = '1111':EXC_RETURN;
+/// ExceptionTaken(UsageFault);
+/// return;
+/// ```
+///
+/// There is no `PushStack()` in that. The core raised it as an ordinary
+/// fault instead: a second frame went on the stack under a handler that was
+/// still marked active, and `LR` held an `EXC_RETURN` of the core's own
+/// making rather than the one that had failed.
+#[test]
+fn a_failed_exception_return_takes_the_usage_fault_on_the_frame_it_has() {
+    // A reserved value: `EXC_RETURN<3:0>` of 0b0101.
+    const RESERVED: u32 = 0xffff_fff5;
+    // `SVC #0`, whose handler loads the bad value and branches to it:
+    // `LDR r0, [pc, #4]` ; `BX r0` ; (pad) ; the literal.
+    let h = Harness::m4(&[0xdf00, 0xe7fe]);
+    h.set_word(11 * 4, 0x301);
+    h.set_word(0x300, 0x4700_4801);
+    h.set_word(0x304, 0x0000_0000);
+    h.set_word(0x308, RESERVED);
+    h.set_word(6 * 4, 0x401);
+    h.set_word(0x400, 0xe7fe);
+    h.cpu.with_sys(|s| s.shcsr |= shcsr::USGFAULTENA);
+    h.cpu.step(); // svc
+    let frame = h.cpu.msp();
+    h.cpu.step(); // ldr
+    h.cpu.step(); // bx
+    assert_eq!(h.cpu.current_exception(), Exception::USAGE_FAULT);
+    assert_eq!(h.cpu.pc(), 0x400);
+    assert_ne!(h.cpu.with_sys(|s| s.cfsr) & fsr::UF_INVPC, 0);
+    assert_eq!(h.cpu.msp(), frame, "nothing was pushed");
+    assert_eq!(h.cpu.reg(14), RESERVED, "LR is the EXC_RETURN that failed");
+    assert!(
+        h.cpu.with_sys(|s| !s.is_active(Exception::SVCALL)),
+        "the returning handler was deactivated"
+    );
+    assert!(h.cpu.with_sys(|s| s.is_active(Exception::USAGE_FAULT)));
+
+    // A return to Handler mode with no other handler active. The frame was
+    // pushed from Thread mode, so the `IPSR` it would restore is zero —
+    // "On a return to Handler mode, the value restored to the IPSR Exception
+    // number field must not be 0" — and the outcome is the same.
+    let h = Harness::m4(&[0xdf00, 0xe7fe]);
+    h.set_word(11 * 4, 0x301);
+    h.set_word(0x300, 0x4700_4801);
+    h.set_word(0x304, 0x0000_0000);
+    h.set_word(0x308, exc_return::HANDLER_MSP);
+    h.set_word(6 * 4, 0x401);
+    h.set_word(0x400, 0xe7fe);
+    h.cpu.with_sys(|s| s.shcsr |= shcsr::USGFAULTENA);
+    h.cpu.step();
+    let frame = h.cpu.msp();
+    h.cpu.step();
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::USAGE_FAULT);
+    assert_eq!(h.cpu.msp(), frame);
+    assert_eq!(h.cpu.reg(14), exc_return::HANDLER_MSP);
+    assert!(h.cpu.with_sys(|s| !s.is_active(Exception::SVCALL)));
+
+    // With UsageFault disabled the failed return escalates to HardFault, on
+    // the same frame.
+    let h = Harness::m4(&[0xdf00, 0xe7fe]);
+    h.set_word(11 * 4, 0x301);
+    h.set_word(0x300, 0x4700_4801);
+    h.set_word(0x304, 0x0000_0000);
+    h.set_word(0x308, RESERVED);
+    h.set_word(3 * 4, 0x401);
+    h.set_word(0x400, 0xe7fe);
+    h.cpu.step();
+    let frame = h.cpu.msp();
+    h.cpu.step();
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_ne!(h.cpu.with_sys(|s| s.hfsr) & fsr::HF_FORCED, 0);
+    assert_eq!(h.cpu.msp(), frame);
+    assert_eq!(h.cpu.reg(14), RESERVED);
+}
+
 #[test]
 fn a_block_transfer_that_faults_leaves_its_base_register_alone() {
     // DDI 0403E.b B1.5.10, the fault condition: "The base register is
