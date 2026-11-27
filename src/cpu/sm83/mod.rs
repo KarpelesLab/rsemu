@@ -473,6 +473,13 @@ pub(crate) struct Lines {
     joypad_active: AtomicBool,
     /// A reset assertion nobody has acted on yet.
     reset_req: AtomicBool,
+    /// The level each request line last resolved to, one bit per interrupt:
+    /// what an [`InterruptPin`] detects its rising edge against.
+    ///
+    /// Here rather than in the pin because it is architectural and the pin is
+    /// not a device: a snapshot has to carry it, or the level re-announced
+    /// after a load reads as an edge that never happened.
+    levels: AtomicU8,
 }
 
 impl Lines {
@@ -526,6 +533,17 @@ impl Lines {
 
     fn take_reset_request(&self) -> bool {
         self.reset_req.swap(false, Ordering::AcqRel)
+    }
+
+    /// Record the level line `bit` now resolves to, returning the one it held.
+    fn swap_level(&self, bit: u8, high: bool) -> bool {
+        let mask = 1 << bit;
+        let was = if high {
+            self.levels.fetch_or(mask, Ordering::AcqRel)
+        } else {
+            self.levels.fetch_and(!mask, Ordering::AcqRel)
+        };
+        was & mask != 0
     }
 
     fn snapshot(&self) -> (u8, u8, bool, bool) {
@@ -1007,7 +1025,8 @@ impl MemOps for RegPort {
 /// The `cpu.sm83` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.sm83",
-    version: 1,
+    // v2 appended the request lines' levels; see [`migrations`].
+    version: 2,
     summary: "Sharp SM83 8-bit CPU core (Game Boy), M-cycle-accurate interpreter",
     properties: &[
         PropertySpec {
@@ -1036,6 +1055,25 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// If something already claimed the name.
 pub fn register(reg: &mut Registry) -> Result<()> {
     reg.add(&CLASS)
+}
+
+/// Carry a v1 `cpu.sm83` chunk forward.
+///
+/// v2 appends one byte: the level each interrupt request line last resolved
+/// to. A v1 chunk never recorded it, and "all low" is what a v1 `load` left a
+/// fresh machine's pins believing — so a v1 snapshot behaves exactly as it
+/// always did, a line that was high when it was taken requesting once more on
+/// the way in. v2 snapshots do not.
+///
+/// # Errors
+///
+/// If the step is already registered.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS.name, 1, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_u8(0)
+    })
 }
 
 impl Device for Sm83 {
@@ -1127,6 +1165,9 @@ impl Device for Sm83 {
         w.write_u8(enable)?;
         w.write_bool(joypad)?;
         w.write_bool(reset)?;
+        // v2: the request lines' levels, which the pins' edge detectors stand
+        // on. Not touched by a reset — a level belongs to whatever drives it.
+        w.write_u8(self.lines.levels.load(Ordering::Acquire))?;
         Ok(())
     }
 
@@ -1156,8 +1197,10 @@ impl Device for Sm83 {
         let enable = r.read_u8()?;
         let joypad = r.read_bool()?;
         let reset = r.read_bool()?;
+        let levels = r.read_u8()?;
         self.session.lock().state = state;
         self.lines.restore((request, enable, joypad, reset));
+        self.lines.levels.store(levels, Ordering::Release);
         Ok(())
     }
 }
@@ -1228,10 +1271,6 @@ pub struct InterruptPin {
     bit: u8,
     inputs: FanIn,
     resolve: Resolve,
-    /// The last resolved level, for edge detection. An atomic rather than a
-    /// field under a lock: a sink is driven from inside whatever device changed
-    /// the line, which may be several frames below a CPU access.
-    last: AtomicBool,
 }
 
 impl InterruptPin {
@@ -1247,7 +1286,6 @@ impl InterruptPin {
             bit,
             inputs: FanIn::new(sources),
             resolve: Resolve::Or,
-            last: AtomicBool::new(false),
         }
     }
 
@@ -1268,7 +1306,11 @@ impl WireSink for InterruptPin {
     fn set_level(&self, src: WireId, _line: u32, level: Level) {
         self.inputs.set(src, level);
         let now = self.inputs.resolve(self.resolve).is_high();
-        let was = self.last.swap(now, Ordering::AcqRel);
+        // The previous level lives with the core's other line state — an
+        // atomic there, because a sink is driven from inside whatever device
+        // changed the line, which may be several frames below a CPU access —
+        // so that the core's snapshot carries it.
+        let was = self.lines.swap_level(self.bit, now);
         if now && !was {
             self.lines.request(self.bit);
         }

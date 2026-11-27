@@ -111,6 +111,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::cpu::arm::aprofile::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-x86")]
     crate::cpu::x86::migrations(&mut migrations)?;
+    #[cfg(feature = "cpu-sm83")]
+    crate::cpu::sm83::migrations(&mut migrations)?;
     #[cfg(feature = "dev-sgx")]
     crate::dev::sgx::migrations(&mut migrations)?;
     #[cfg(feature = "dev-amiga-akiko")]
@@ -140,6 +142,8 @@ mod tests {
         "cpu.x86",
         #[cfg(feature = "dev-amiga-akiko")]
         crate::dev::amiga::akiko::CLASS_NAME,
+        #[cfg(feature = "cpu-sm83")]
+        "cpu.sm83",
     ];
 
     #[test]

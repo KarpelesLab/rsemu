@@ -882,6 +882,69 @@ fn a_snapshot_round_trip_reproduces_the_state_exactly() {
     assert!(restored.ime() || restored.pending_interrupts() != 0);
 }
 
+/// A request line that is high across a snapshot is not a new edge afterwards.
+///
+/// `Machine::load` restores every device and then re-announces every wire's
+/// level (`Wire::refresh`), because a sink's fan-in is derived state. The pin's
+/// edge detector was a field of the pin, which nothing saved — so the refresh
+/// of a line that was *already* high looked like a rising edge and set an `IF`
+/// bit the snapshot had clear. STAT is a level that stays high for whole modes,
+/// so a restored Game Boy took a STAT interrupt its original never did.
+#[test]
+fn a_line_held_high_across_a_snapshot_requests_nothing_on_restore() {
+    use crate::core::wire::{Level, Wire, WireIdAllocator, WireSink};
+
+    let ids = WireIdAllocator::new();
+    let src = ids.alloc();
+    let wired = |cpu: &Arc<Sm83>| {
+        let pin = Arc::new(super::InterruptPin::for_cpu(cpu, interrupt::STAT, &[src]));
+        Wire::builder()
+            .source(src)
+            .sink(pin as Arc<dyn WireSink>, 0)
+            .build_shared()
+    };
+
+    let (cpu, _ram) = cpu_with(&[]);
+    let wire = wired(&cpu);
+    wire.set(src, Level::High);
+    cpu.clear_interrupt(interrupt::STAT); // serviced; the line is still high
+
+    let mut writer = StateWriter::new(MachineShape::new());
+    {
+        let mut chunk: ChunkWriter<'_> = writer
+            .chunk("cpu", super::CLASS.name, super::CLASS.version)
+            .expect("a chunk");
+        Device::save(cpu.as_ref(), &mut chunk).expect("saves");
+    }
+    let bytes = writer.to_vec().expect("serialises");
+
+    let (restored, _ram2) = cpu_with(&[]);
+    let restored_wire = wired(&restored);
+    let reader = crate::core::state::StateReader::new(&bytes).expect("well formed");
+    let chunk = reader
+        .load(
+            "cpu",
+            super::CLASS.name,
+            super::CLASS.version,
+            &crate::core::state::Migrations::new(),
+        )
+        .expect("finds the chunk");
+    Device::load(restored.as_ref(), &mut chunk.reader()).expect("loads");
+    // What `Machine::load` does next: put the drive back and re-announce it.
+    restored_wire.set(src, Level::High);
+    restored_wire.refresh();
+
+    assert_eq!(
+        restored.interrupt_flags() & (1 << interrupt::STAT),
+        0,
+        "the level was already high when the snapshot was taken"
+    );
+    // And the detector is standing on that level: only a real edge requests.
+    restored_wire.set(src, Level::Low);
+    restored_wire.set(src, Level::High);
+    assert_eq!(restored.interrupt_flags() & (1 << interrupt::STAT), 0x02);
+}
+
 #[test]
 fn the_class_constructs_from_properties() {
     let cpu = Sm83::from_props(&Props::new().with("post-boot", false)).expect("valid");
