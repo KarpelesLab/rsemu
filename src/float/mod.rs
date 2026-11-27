@@ -433,7 +433,8 @@ pub enum MinMax {
     NonNan,
     /// The second source operand whenever the comparison does not strictly
     /// select the first — so a NaN in either operand, and `min(±0, ∓0)`, both
-    /// return the second. x86 `MINSS`/`MAXSS` (SDM Volume 2).
+    /// return the second. x86 `MINSS`/`MAXSS` (SDM Volume 2). A NaN of either
+    /// kind is an invalid operation here, quiet included.
     SecondOperand,
     /// The NaN rules of [`Nan::propagate`] apply, and the zero comparison is
     /// signed. ARM `FMIN`/`FMAX` with `FPCR.DN` clear.

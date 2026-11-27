@@ -782,7 +782,8 @@ pub(super) fn compare(a: Parts, b: Parts) -> core::cmp::Ordering {
 ///
 /// Returns the index of the winning operand, or an [`Outcome`] when the answer
 /// is a NaN that no operand supplies verbatim. A signaling operand raises
-/// invalid under every rule (IEEE 754-2019 §7.2), whichever value wins.
+/// invalid under every rule (IEEE 754-2019 §7.2), whichever value wins; under
+/// x86's rule a quiet one does too.
 pub(super) fn min_max(
     a: Parts,
     b: Parts,
@@ -808,7 +809,11 @@ pub(super) fn min_max(
         // which is why min(-0, +0) and min(+0, -0) both give the second.
         MinMax::SecondOperand => {
             if nan_a || nan_b {
-                return (Ok(1), flags);
+                // Unlike every other operation, a *quiet* NaN is an invalid
+                // operand here: `MINSD` lists "Invalid (including QNaN Source
+                // Operand), Denormal." (SDM Volume 2, `MINSD`, "SIMD
+                // Floating-Point Exceptions").
+                return (Ok(1), Flags::INVALID);
             }
             let ord = compare(a, b);
             let first_wins = if want_min {

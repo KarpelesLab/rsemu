@@ -569,7 +569,11 @@ fn x86_reports_a_denormal_operand_only_where_the_processor_does() {
         convert::<B64, B32>(sub, sse),
         (0, Flags::DENORMAL | Flags::UNDERFLOW | Flags::INEXACT)
     );
-    // MINSD of a number and a subnormal: DE.
+    // MINSD: a quiet NaN in either operand is IE, and outranks DE; a
+    // subnormal beside a number is DE.
+    assert_eq!(min::<B64>(qnan, d(1.0), sse), (d(1.0), Flags::INVALID));
+    assert_eq!(min::<B64>(d(1.0), qnan, sse), (qnan, Flags::INVALID));
+    assert_eq!(max::<B64>(qnan, sub, sse), (sub, Flags::INVALID));
     assert_eq!(min::<B64>(d(1.0), sub, sse), (sub, Flags::DENORMAL));
 
     // The x87 unit follows the same list.
