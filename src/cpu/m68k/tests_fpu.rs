@@ -266,22 +266,44 @@ fn an_integer_store_that_does_not_fit_is_an_operand_error() {
 
 #[test]
 fn fmovem_puts_the_registers_in_memory_in_the_same_order_either_way() {
-    // M68000PRM §5, *FMOVEM*: the mask's bit 7 is FP7 in predecrement order
-    // and FP0 in postincrement order, and the transfer runs from bit 0 in
-    // both — so the registers land in memory the same way round whichever
-    // form was used, and a save/restore pair agrees.
+    // M68000PRM §5, *FMOVEM*. Control modes: "the registers are transferred
+    // between the processor and memory starting at the specified address and
+    // up through higher addresses. The order of the transfer is from FP0 –
+    // FP7." Predecrement: "The registers are stored starting at the address
+    // contained in the address register and down through lower addresses …
+    // The order of the transfer is from FP7 – FP0." Up from FP0 and down from
+    // FP7 are the same picture: `FP0` at the lowest address either way, which
+    // is what a handler reading one saved register by offset counts on.
     let b = board(&[0x4e71]);
     for n in 0..8 {
         set_fp(&b, n, F80::new(0x3fff + n as u16, 1 << 63));
     }
     b.with_regs(|r| r.a[0] = 0x2100);
     run(&b, &[0xf210, 0xf0ff]); // FMOVEM.X FP0-FP7,(A0)  (control order)
-    // Ascending memory holds FP7 first.
+    // Ascending memory holds FP0 first.
     for slot in 0..8u64 {
         let at = 0x2100 + 12 * slot;
-        let expected = 0x3fff + (7 - slot) as u32;
+        let expected = 0x3fff + slot as u32;
         assert_eq!(b.peek_long(at) >> 16, expected, "slot {slot}");
     }
+    // A partial list keeps the order and closes the gaps: FP1, FP4, FP6.
+    // Control order has FP0 at bit 7, so those are bits 6, 3 and 1.
+    b.with_regs(|r| r.a[0] = 0x2300);
+    run(&b, &[0xf210, 0xf04a]); // FMOVEM.X FP1/FP4/FP6,(A0)
+    for (slot, n) in [1u32, 4, 6].into_iter().enumerate() {
+        let at = 0x2300 + 12 * slot as u64;
+        assert_eq!(b.peek_long(at) >> 16, 0x3fff + n, "slot {slot}");
+    }
+    // And the predecrement form, whose list is the other way round (FP0 at
+    // bit 0): the same registers, the same picture, A7 on FP1's image.
+    set_sp(&b, 0x2600);
+    run(&b, &[0xf227, 0xe052]); // FMOVEM.X FP1/FP4/FP6,-(A7)
+    assert_eq!(b.cpu.regs().a[7], 0x2600 - 36);
+    for (slot, n) in [1u32, 4, 6].into_iter().enumerate() {
+        let at = 0x2600 - 36 + 12 * slot as u64;
+        assert_eq!(b.peek_long(at) >> 16, 0x3fff + n, "slot {slot}");
+    }
+    b.with_regs(|r| r.a[0] = 0x2100);
     for n in 0..8 {
         set_fp(&b, n, ZERO);
     }
@@ -310,7 +332,9 @@ fn fmovem_puts_the_registers_in_memory_in_the_same_order_either_way() {
     b.poke_long(0x2104, 0x8000_0000);
     b.poke_long(0x2108, 0);
     run(&b, &[0xf210, 0xd830]); // FMOVEM.X (A0),D3  (dynamic, control order)
-    assert_eq!(fp(&b, 7), TWO, "bit 7 of the mask is FP0 in control order");
+    // `$81` in control order is FP0 (bit 7) and FP7 (bit 0), and the first
+    // image in memory is FP0's.
+    assert_eq!(fp(&b, 0), TWO, "bit 7 of the mask is FP0 in control order");
 }
 
 #[test]

@@ -5150,11 +5150,19 @@ impl<'a> Exec<'a> {
     ///
     /// The mask's bit numbering is reversed between the two list formats —
     /// bit 7 is `FP7` in predecrement order and `FP0` in postincrement or
-    /// control order (M68000PRM §5, *FMOVEM*, *Register List field*) — and
-    /// the transfer runs from bit 0 in both, exactly as an integer `MOVEM`
-    /// does. The two reversals cancel: whichever form was used, the selected
-    /// registers appear in memory in decreasing register order, `FP7` at the
-    /// lowest address.
+    /// control order (M68000PRM §5, *FMOVEM*, *Register List field*) — and so
+    /// is the direction of travel. Control modes: "the registers are
+    /// transferred between the processor and memory starting at the specified
+    /// address and up through higher addresses. The order of the transfer is
+    /// from FP0 – FP7." Predecrement: "The registers are stored starting at
+    /// the address contained in the address register and down through lower
+    /// addresses … The order of the transfer is from FP7 – FP0."
+    ///
+    /// Up from `FP0` and down from `FP7` lay the same picture, as an integer
+    /// `MOVEM`'s two forms do: whichever was used, the selected registers are
+    /// in memory in increasing register order, **`FP0` at the lowest
+    /// address**. Only the order of the bus cycles differs, which is what a
+    /// fault part-way through can see.
     fn op_fmovem(&mut self, to_fpu: bool, mode: ListMode, list: u8) -> Result<(), Trap> {
         let Some((ea, _)) = ea_of(Arg::Ea, self.opcode) else {
             return Err(self.fp_line_f());
@@ -5180,8 +5188,18 @@ impl<'a> Exec<'a> {
             return Err(self.fp_line_f());
         };
         self.facts.registers = mask.count_ones();
-        let mut at = addr;
-        for index in (0..8u8).rev() {
+        // `fp_address` has already stepped a predecrement register down by
+        // the whole list, so `addr` is the lowest address in every mode and
+        // the walk down starts twelve bytes below the top of the list. Guest
+        // addresses, so both walks wrap.
+        let down = ea == Mode::PreDec;
+        let mut at = if down {
+            addr.wrapping_add(12 * count).wrapping_sub(12)
+        } else {
+            addr
+        };
+        for step in 0..8u8 {
+            let index = if down { 7 - step } else { step };
             let bit = if mode.predecrement_order() {
                 index
             } else {
@@ -5201,7 +5219,11 @@ impl<'a> Exec<'a> {
                 self.write_long(at.wrapping_add(4), words[1])?;
                 self.write_long(at.wrapping_add(8), words[2])?;
             }
-            at = at.wrapping_add(12);
+            at = if down {
+                at.wrapping_sub(12)
+            } else {
+                at.wrapping_add(12)
+            };
         }
         self.state.fpu.null = false;
         self.settle()
