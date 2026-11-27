@@ -673,7 +673,30 @@ fn int13(a: &mut Asm, l: &Labels) {
     a.mov(AX, Mem::si(6));
     a.mov(BX, Mem::si(8));
     a.mov(DX, Mem::si(10));
+    // The block number's high double word, folded into `SI` — which has
+    // served its purpose — so that it outlives the caller's `DS`.
+    a.push(AX);
+    a.mov(AX, Mem::si(12));
+    a.alu(Alu::OR, AX, Mem::si(14));
+    a.mov(SI, AX);
+    a.pop(AX);
     a.pops(DS);
+    // **The block number is checked against what the command can carry.** The
+    // packet has room for 64 bits and `READ(10)` sends 32, so anything with a
+    // bit set above the 32nd is refused rather than truncated: block
+    // `1_0000_0010h` used to be block 16, read and reported as a success. It
+    // is the fixed disk's rule (`disk.rs`, `ext_xfer`) at this drive's width,
+    // and like it the packet's block count comes back as zero — Ralf Brown's
+    // Interrupt List, INT 13h AH=42h, "disk address packet's block count
+    // field set to number of blocks successfully transferred".
+    let carried = a.label();
+    a.alui(Alu::CMP, SI, 0);
+    a.jcc(Cc::E, carried);
+    a.movsr(ES, Mem::bp(F_DS));
+    a.mov(DI, Mem::bp(F_SI));
+    a.movmi(Mem::di(2).seg(ES), 0);
+    a.jmp(l.disk_fail);
+    a.bind(carried);
     a.movto(Mem::abs(EBDA_CD_LBA), BX);
     a.movto(Mem::abs(EBDA_CD_LBA + 2), DX);
     a.movsr(ES, AX);

@@ -67,6 +67,11 @@ const BOOT_DRIVE: u16 = SCRATCH;
 const SPEC_AX: u16 = SCRATCH + 2;
 /// Whether the read-back succeeded, and its `AX`.
 const READ_AX: u16 = SCRATCH + 4;
+/// What a read of a block number past 32 bits answered: `AX`, or `FFFFh` if it
+/// came back with carry set.
+const FAR_AX: u16 = SCRATCH + 6;
+/// The block count that read's packet held afterwards.
+const FAR_COUNT: u16 = SCRATCH + 8;
 
 /// Where the nineteen-byte El Torito specification packet is asked for.
 const SPEC_PACKET: u16 = 0x0600;
@@ -74,6 +79,8 @@ const SPEC_PACKET: u16 = 0x0600;
 const DAP: u16 = 0x0640;
 /// Where the block read back off the disc lands.
 const READBACK: u16 = 0x0800;
+/// Where the read of a block number past 32 bits would land, if it did.
+const FAR_BUFFER: u16 = 0x1800;
 
 /// What the one file on every disc here says.
 const FILE_TEXT: &[u8] = b"rsemu el torito\n";
@@ -203,6 +210,28 @@ fn no_emulation_image() -> Vec<u8> {
     a.movi8(AL, b'\n');
     a.movi8(AH, 0x0e);
     a.int(0x10);
+
+    // -- INT 13h AH=42h again, for a block that is not on any disc ----------
+    //
+    // Block `1_0000_0010h`: the same low double word as the read above and a
+    // one above it. A CD-ROM's `READ(10)` carries thirty-two bits, so the
+    // only honest answers are that block or a refusal — and block 16 is
+    // neither.
+    let far_done = a.label();
+    a.movmi(Mem::abs(DAP + 2), 1);
+    a.movmi(Mem::abs(DAP + 4), FAR_BUFFER);
+    a.movmi32(Mem::abs(DAP + 8), 16);
+    a.movmi32(Mem::abs(DAP + 12), 1);
+    a.movi(AX, 0x4200);
+    a.mov8(DL, Mem::abs(BOOT_DRIVE));
+    a.movi(SI, DAP);
+    a.int(0x13);
+    a.movto(Mem::abs(FAR_AX), AX);
+    a.jcc(Cc::AE, far_done);
+    a.movmi(Mem::abs(FAR_AX), 0xffff);
+    a.bind(far_done);
+    a.mov(AX, Mem::abs(DAP + 2));
+    a.movto(Mem::abs(FAR_COUNT), AX);
 
     a.bind(parked);
     a.hlt();
@@ -624,4 +653,49 @@ fn a_drive_with_no_disc_in_it_does_not_stop_the_boot() {
         "an empty CD-ROM drive wedged the bootstrap:\n{}",
         show(&m)
     );
+}
+
+#[test]
+fn an_extended_read_of_a_block_past_32_bits_is_refused_not_aliased() {
+    // The disk address packet has sixty-four bits of block number and a
+    // CD-ROM's `READ(10)` has thirty-two. The firmware used to drop the top
+    // half, so block `1_0000_0010h` came back as block 16 — the primary volume
+    // descriptor — with carry clear: wrong data, reported as a success. The
+    // fixed disk refuses a block number it cannot carry; so does this.
+    let image = iso9660::bootable_disc(
+        FILE_TEXT,
+        &no_emulation_image(),
+        iso9660::Emulation::None {
+            load_segment: 0,
+            sectors: NO_EMULATION_SECTORS,
+        },
+        true,
+    );
+    let (mut m, _cpu) = board(disc("far", image), vec![0u8; 1_474_560]);
+    m.run_for(BOOTED).expect("the machine runs");
+    assert!(
+        says(&m, "NOEMU BOOTED"),
+        "the boot image did not run:\n{}",
+        show(&m)
+    );
+    // The honest read still works, so what follows is not a drive that reads
+    // nothing at all.
+    assert_eq!(peek16(&m, READ_AX) & 0xff00, 0x0000);
+
+    assert_eq!(
+        peek16(&m, FAR_AX),
+        0xffff,
+        "a block number past 32 bits came back without carry"
+    );
+    assert_eq!(
+        peek16(&m, FAR_COUNT),
+        0,
+        "and the packet says how many blocks were transferred: none"
+    );
+    // Nothing landed where the read was aimed. Block 16 starts with the
+    // volume descriptor's type byte and `CD001`.
+    let landed: Vec<u8> = (0..6)
+        .map(|i| peek(&m, u64::from(FAR_BUFFER) + i))
+        .collect();
+    assert_eq!(landed, [0u8; 6], "block 16 was read into the buffer");
 }
