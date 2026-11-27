@@ -1,7 +1,10 @@
 # A q35-class PC: an Intel 82Q35 (G)MCH and an ICH9, with ACPI.
 #
-#   rsemu run q35 --hd0 disk.img
+#   rsemu run q35 --bios bios.bin --hd0 disk.img
 #   rsemu run q35 --bios OVMF.fd
+#
+# `--bios` is not optional here: this board has no built-in firmware (see the
+# firmware section below for why), and `rsemu run q35` without one is refused.
 #
 # # What this board is, against `pc-at`
 #
