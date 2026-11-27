@@ -1308,6 +1308,43 @@ fn the_undocumented_encodings_execute_rather_than_fault() {
     assert_eq!(decode(0x64).class, Class::Alias);
 }
 
+/// `/6` of the shift group is `SETMO` on an 8086 and on nothing later.
+///
+/// sandpile.org's group table lists it as `SAL*` — "The opcodes marked with *
+/// are aliases to other opcodes" — from the 80186 on, and the all-ones
+/// behaviour under "On 8086/8088 processors the following behavior was
+/// supported instead". A 386 that set the operand to all ones here turned an
+/// assembler's second spelling of `shl` into `or r, -1`.
+#[test]
+fn group_two_extension_six_is_a_left_shift_from_the_386_on() {
+    use isa::Gen;
+    for opcode in [0xc0u8, 0xc1, 0xd0, 0xd1, 0xd2, 0xd3] {
+        let row = isa::resolve_as(Gen::I386, isa::decode_as(Gen::I386, opcode), 6);
+        assert_eq!(row.op, Op::SHL, "{opcode:#x} /6");
+        assert_eq!(row.class, Class::Alias, "{opcode:#x} /6");
+    }
+    // The 8086 keeps the behaviour its hardware corpus measures.
+    assert_eq!(isa::resolve_as(Gen::I8086, decode(0xd0), 6).op, Op::SETMO);
+
+    for variant in [Variant::I80386, Variant::I80486, Variant::X86_64] {
+        let pc = Pc::new(variant);
+        // sal al, 1 ; sal ax, 4 (the `C1` form, behind a `66`... not needed in
+        // real mode, where the operand is already sixteen bits).
+        pc.write(0x1000, &[0xd0, 0xf0, 0xc1, 0xf0, 0x04]);
+        pc.start_real(0, 0x1000);
+        let mut regs = pc.cpu.regs();
+        regs.rax = 0x1241;
+        pc.cpu.set_regs(regs);
+        pc.cpu.step();
+        let regs = pc.cpu.regs();
+        assert_eq!(regs.rax & 0xffff, 0x1282, "{variant:?}: sal al, 1");
+        assert_eq!(regs.eflags & flags::CF, 0, "{variant:?}");
+        assert_ne!(regs.eflags & flags::OF, 0, "{variant:?}: the sign changed");
+        pc.cpu.step();
+        assert_eq!(pc.cpu.regs().rax & 0xffff, 0x2820, "{variant:?}: sal ax, 4");
+    }
+}
+
 #[test]
 fn the_disassembler_and_the_interpreter_read_the_same_bytes() {
     let m = machine();

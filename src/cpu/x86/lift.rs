@@ -28,8 +28,9 @@
 //!   `CBW`/`CWDE`, `CWD`/`CDQ`, `BSF`, `BSR`, `SETcc`, `CMOVcc`,
 //!   `LAHF`/`SAHF`, `NOP`.
 //! * Every shift and rotate except `RCL`/`RCR` by more than one:
-//!   `SHL`/`SHR`/`SAR`/`ROL`/`ROR` by an immediate and by `CL`, `RCL`/`RCR`
-//!   by one, and the undocumented `SETMO`.
+//!   `SHL`/`SHR`/`SAR`/`ROL`/`ROR` by an immediate and by `CL`, and
+//!   `RCL`/`RCR` by one. (`/6` of the group decodes as `SHL` on every part
+//!   this frontend lifts for; `SETMO` is the 8086's alone.)
 //! * `MUL`, `IMUL` — one-operand, two-operand and three-operand.
 //! * `PUSH`, `POP`, `LEAVE`, `CALL rel32`, `CALL r/m`, `RET`, `RET imm16`,
 //!   `JMP rel8`/`rel32`/`r/m`, all sixteen `Jcc` in both encodings.
@@ -3486,15 +3487,10 @@ impl<'a> Lifter<'a> {
             Op::ROL => self.rol(a, n, bits, mask),
             Op::ROR => self.ror(a, n, bits, mask),
             Op::RCL => self.rcl1(a, bits, mask),
-            Op::RCR => self.rcr1(a, bits, mask),
-            _ => {
-                // `SETMO`: the operand becomes all ones and the flags follow it
-                // as a logical result would. Undocumented, and every one of
-                // those flags is a lift-time constant.
-                let ones = self.konst(mask);
-                self.logic_flags(ones, size);
-                ones
-            }
+            // `classify` admits the seven operations above and this one, and
+            // nothing else: `SETMO` is an 8086 encoding and no world this
+            // frontend lifts for decodes it.
+            _ => self.rcr1(a, bits, mask),
         };
 
         // Only the three arithmetic shifts touch sign, zero, parity and the
@@ -4079,7 +4075,7 @@ fn classify(world: &World, f: &Fields, next_eip: u64) -> Option<Plan> {
             src_size: 4,
         },
         Op::LEA => Plan::Lea,
-        Op::ROL | Op::ROR | Op::RCL | Op::RCR | Op::SHL | Op::SHR | Op::SAR | Op::SETMO => {
+        Op::ROL | Op::ROR | Op::RCL | Op::RCR | Op::SHL | Op::SHR | Op::SAR => {
             let count = match insn.src {
                 Arg::One => Count::Fixed(1),
                 Arg::Cl => {

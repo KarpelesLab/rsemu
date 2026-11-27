@@ -5091,6 +5091,9 @@ pub static GROUP_ALU: [Op; 8] = [
 /// all ones. With a `CL` count it is conditional on `CL != 0`, exactly like
 /// the shifts beside it, which is why it needs no separate row — the count
 /// operand of the primary opcode already says which form it is.
+///
+/// **On an 8086 only.** From the 80186 on the extension is a second encoding
+/// of `SHL`, and [`resolve_as`] says so before it reaches this table.
 pub static GROUP_SHIFT: [Op; 8] = [
     Op::ROL,
     Op::ROR,
@@ -5839,6 +5842,18 @@ pub const fn resolve_as(map: Gen, insn: Insn, reg: u8) -> Insn {
         }
         Grp::Alu => Insn {
             op: GROUP_ALU[idx],
+            ..insn
+        },
+        // `/6` is `SETMO` on an 8086 and on nothing after it: from the 80186
+        // on the extension is a second encoding of `SHL`. sandpile.org's
+        // group table (`opc_grp.htm`), group #2 `D0h`: "ROL Eb,1 ROR Eb,1
+        // RCL Eb,1 RCR Eb,1 SHL Eb,1 SHR Eb,1 SAL* Eb,1 SAR Eb,1", with "The
+        // opcodes marked with * are aliases to other opcodes", and then "On
+        // 8086/8088 processors the following behavior was supported instead
+        // ... bit0=1, bit1=bit0, etc. hence: like OR Eb,-1".
+        Grp::Shift if strict && idx == 6 => Insn {
+            op: Op::SHL,
+            class: Class::Alias,
             ..insn
         },
         Grp::Shift => Insn {

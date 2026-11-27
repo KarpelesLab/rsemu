@@ -83,7 +83,7 @@
 //! There is no hardware corpus for a 386, so this is the closest honest
 //! substitute for one: the 8088's vectors replayed on the later part, with
 //! every disagreement traced to a documented difference between them rather
-//! than waved away. [`DIFFERENCES_386`] is that list — six categories, 68
+//! than waved away. [`DIFFERENCES_386`] is that list — six categories, 70
 //! opcode files — and an opcode failing outside it fails the test. What the
 //! second run gates is the 16-bit real-mode path of the 32-bit core, which is
 //! where a firmware image spends its first few million instructions.
@@ -901,6 +901,11 @@ const DIFFERENCES_386: &[(&str, &str)] = &[
         "8E",
         "a 386 decodes all three bits of the segment field: FS, GS, #UD",
     ),
+    (
+        "D0.6",
+        "a second encoding of SHL from the 80186 on, where an 8086 has SETMO",
+    ),
+    ("D1.6", "the same, at the word size"),
     // 2. The flags register's top nibble.
     ("9C", "PUSHF stores IOPL and NT where an 8086 stores ones"),
     ("9D", "POPF loads IOPL and NT where an 8086 forces ones"),
@@ -921,7 +926,10 @@ const DIFFERENCES_386: &[(&str, &str)] = &[
     ("D2.3", "RCR by CL: the count is masked to five bits"),
     ("D2.4", "SHL by CL: the count is masked to five bits"),
     ("D2.5", "SHR by CL: the count is masked to five bits"),
-    ("D2.6", "SETMO by CL: undocumented, and the count is masked"),
+    (
+        "D2.6",
+        "SHL again, where an 8086 has SETMO — and the count is masked",
+    ),
     ("D2.7", "SAR by CL: the count is masked to five bits"),
     ("D3.0", "ROL by CL, word: the count is masked to five bits"),
     ("D3.1", "ROR by CL, word: the count is masked to five bits"),
@@ -931,7 +939,7 @@ const DIFFERENCES_386: &[(&str, &str)] = &[
     ("D3.5", "SHR by CL, word: the count is masked to five bits"),
     (
         "D3.6",
-        "SETMO by CL, word: undocumented, and the count is masked",
+        "SHL again at the word size, and the count is masked",
     ),
     ("D3.7", "SAR by CL, word: the count is masked to five bits"),
     // 5. The divide error, and the flags it leaves.
