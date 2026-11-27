@@ -2048,7 +2048,11 @@ impl M68k {
         // becomes execution state, before the step, so a pulse is honoured at
         // the very next instruction boundary.
         state.reset_pending |= reset;
-        let Some(space) = space.clone() else {
+        // Borrowed out of the session, not cloned: the lock is held for the
+        // whole step, so the space cannot be detached underneath it, and a
+        // clone here was a reference-count round trip -- two locked
+        // read-modify-writes -- per guest instruction.
+        let Some(space) = space.as_deref() else {
             return 0;
         };
         #[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
@@ -2061,9 +2065,9 @@ impl M68k {
             if state.reset_pending {
                 rt.flush();
             }
-            return engine::advance(rt, state, &space, &cfg, &self.lines, allowance);
+            return engine::advance(rt, state, space, &cfg, &self.lines, allowance);
         }
-        Exec::new(state, &space, &cfg, &self.lines).step()
+        Exec::new(state, space, &cfg, &self.lines).step()
     }
 
     /// Execute until at least `budget` cycles have been charged.

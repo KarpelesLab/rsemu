@@ -998,13 +998,17 @@ impl Hart {
             // CLINT publishes is ordered against it.
             state.csrs.mtime = timer.load(Ordering::Relaxed);
         }
-        let Some(space) = space.clone() else {
+        // Borrowed out of the session, not cloned: the lock is held for the
+        // whole step, so the space cannot be detached underneath it, and a
+        // clone here was a reference-count round trip -- two locked
+        // read-modify-writes -- per guest instruction.
+        let Some(space) = space.as_deref() else {
             return (0, None);
         };
         let mut exec = Exec::new(
             state,
             tlb,
-            &space,
+            space,
             &cfg,
             &self.lines,
             exits,

@@ -715,10 +715,14 @@ impl Cpu {
             session.state = State::new(&cfg);
         }
         let Session { state, space } = &mut *session;
-        let Some(space) = space.clone() else {
+        // Borrowed out of the session, not cloned: the lock is held for the
+        // whole step, so the space cannot be detached underneath it, and a
+        // clone here was a reference-count round trip -- two locked
+        // read-modify-writes -- per guest instruction.
+        let Some(space) = space.as_deref() else {
             return (0, None);
         };
-        let mut exec = Exec::new(state, &space, &cfg, &self.lines, exits);
+        let mut exec = Exec::new(state, space, &cfg, &self.lines, exits);
         let used = exec.step();
         (used, exec.take_exit())
     }
