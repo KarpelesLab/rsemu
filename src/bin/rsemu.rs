@@ -2249,22 +2249,30 @@ fn debug_session(
 /// at one port, capture another — and the run is paced again, because a person
 /// is watching it.
 fn console_port(args: &RunArgs, hosts: &HostObjects) -> Result<Option<Console>, String> {
-    if args.headless || (args.console.is_none() && !args.capture.is_empty()) {
-        return Ok(None);
-    }
     let opened = |name: &str| {
         ports::get(hosts, name).ok().flatten().map(|port| Console {
             name: name.to_string(),
             port,
         })
     };
-    if let Some(name) = &args.console {
-        return opened(name).map(Some).ok_or_else(|| {
+    // A port that was named is checked whether or not a terminal ends up on
+    // it. `--headless --console nosuch` used to run to the end and exit 0,
+    // because the name was only looked at on the path `--headless` skips —
+    // and a script that drops `--headless` later inherits a typo nobody saw.
+    let named = match &args.console {
+        Some(name) => Some(opened(name).ok_or_else(|| {
             format!(
-                "no character port named `{name}`; this machine opened {}",
+                "--console {name}: no character port named `{name}`; this machine opened {}",
                 list(&ports::names(hosts))
             )
-        });
+        })?),
+        None => None,
+    };
+    if args.headless || (args.console.is_none() && !args.capture.is_empty()) {
+        return Ok(None);
+    }
+    if named.is_some() {
+        return Ok(named);
     }
     let names = ports::names(hosts);
     match names.len() {

@@ -363,3 +363,42 @@ fn an_empty_class_name_gets_no_suggestion() {
         assert!(!stderr.contains("did you mean"), "`{name}`: {stderr}");
     }
 }
+
+/// A `--console` naming a port the machine never opened is refused under
+/// `--headless` too.
+///
+/// The name was only looked at on the path that attaches a terminal, which
+/// `--headless` skips: the run went to its end and exited 0, and the typo
+/// waited for the day somebody dropped `--headless` from the script.
+#[cfg(feature = "machine-apple1")]
+#[test]
+fn a_console_that_does_not_exist_is_refused_even_headless() {
+    let (code, stdout, stderr) = run(&[
+        "run",
+        "apple1",
+        "--headless",
+        "--console",
+        "nosuch",
+        "--for",
+        "1ms",
+    ]);
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("no character port named `nosuch`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("`console`"), "the ports it has: {stderr}");
+
+    // And a port that does exist is still accepted and still not attached.
+    let (code, stdout, stderr) = run(&[
+        "run",
+        "apple1",
+        "--headless",
+        "--console",
+        "console",
+        "--for",
+        "1ms",
+    ]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("ran to"), "{stdout}");
+}
