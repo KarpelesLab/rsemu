@@ -38,7 +38,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `riscv_lift`      | `cpu::riscv::lift` → `ir::verify` → `ir::Interp`, against `cpu::riscv`'s interpreter | the lifted block and the interpreter agree on registers, PC, ticks, memory and faults |
 | `record_log`      | `core::record::InputLog` — a recorded session, plus the replay path that reads it | never panics; canonical encoding; a replay cursor always advances |
 | `journal_log`     | `usermode::journal::Journal` — the second seam's recording, and the snapshot form that embeds it | never panics; canonical encoding; the two forms agree |
-| `machine_mmio`    | every non-RAM range of every address space of a whole board from `machine::catalog` (STM32 U5, PC/AT, riscv-virt, Mac Plus; STM32 F4/WB and the Amiga 500 behind `RSEMU_FUZZ_LEAKY_BOARDS`, until they stop leaking on drop), with the machine run between accesses | never panics; a debug read leaves the machine's snapshot byte-identical; save, load, save is a round trip; a dropped machine is freed |
+| `machine_mmio`    | every non-RAM range of every address space of a whole board from `machine::catalog` (STM32 U5, F4 and WB, PC/AT, riscv-virt, Mac Plus, Amiga 500), with the machine run between accesses | never panics; a debug read leaves the machine's snapshot byte-identical; save, load, save is a round trip; a dropped machine is freed |
 
 This table is not the list of targets — `cargo +nightly fuzz list` is, and
 `fuzz/Cargo.toml` says what each of the rest is for.

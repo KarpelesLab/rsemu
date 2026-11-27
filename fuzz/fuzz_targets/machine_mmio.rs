@@ -38,8 +38,10 @@
 //!    and `load` drops, or one `load` reconstructs differently, shows up as
 //!    the chunk that differs.
 //! 5. **A dropped machine is freed.** Nothing asserts it; LeakSanitizer does,
-//!    because a board is built and dropped on every input. `BOARDS` says what
-//!    that found.
+//!    because a board is built and dropped on every input. The first run
+//!    found that none of them was — `tests/machine_teardown.rs` has the
+//!    account — and every board here is clean now, so a leak this target
+//!    reports is a cycle somebody has just introduced.
 //!
 //! What it does *not* do is replace the per-device targets. Those drive
 //! structures the guest builds in RAM behind a register write (a queue, a
@@ -48,7 +50,7 @@
 //! # Input encoding
 //!
 //! ```text
-//!   byte 0                board, modulo the boards in play (see `BOARDS`)
+//!   byte 0                board, modulo the number of `BOARDS`
 //!   then a stream of ops:
 //!   0x00 ww ww oo oo oo vv*  write: window, offset, then 1/2/4/8 value bytes
 //!   0x01 ww ww oo oo oo      read
@@ -91,7 +93,7 @@ static M68K_MAC: [u8; 10] = [0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x6
 static M68K_AMIGA: [u8; 10] = [0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x60, 0xfe];
 
 /// One board: its catalog name, what goes in the media slots that need
-/// something, the parameters to override, and what is known to be wrong.
+/// something, and the parameters to override.
 struct Board {
     name: &'static str,
     media: &'static [(&'static str, &'static [u8])],
@@ -101,8 +103,6 @@ struct Board {
     /// machine, and both that and each whole-machine snapshot are linear in
     /// the RAM.
     params: &'static [(&'static str, &'static str)],
-    /// Why dropping this board leaks, if it does — see [`BOARDS`].
-    leaks: Option<&'static str>,
 }
 
 /// The boards.
@@ -110,26 +110,6 @@ struct Board {
 /// Chosen for the devices they carry that no other target reaches. A media
 /// slot not named here gets an empty image, which every one of these boards
 /// reads as "nothing inserted".
-///
-/// # The ones that leak
-///
-/// This target builds a machine and drops it on every input, under
-/// LeakSanitizer, so it is also the only thing in the tree that notices a
-/// machine which is never freed — and the first run found that none of them
-/// was. The cycle every board shared is fixed (`core::sched`: a lazy device
-/// and its slot own each other). Three boards have a second one of their own,
-/// named below, and a board with `leaks` set is **left out** of an ordinary
-/// run so that the target stays green and goes on catching the next cycle
-/// somebody introduces on the others. To fuzz those boards for everything
-/// else — both switches, because libFuzzer's flag stops its own check after
-/// each input and the sanitizer still runs one when the process exits:
-///
-/// ```sh
-/// RSEMU_FUZZ_LEAKY_BOARDS=1 ASAN_OPTIONS=detect_leaks=0 \
-///     cargo +nightly fuzz run machine_mmio -- -detect_leaks=0
-/// ```
-///
-/// Clear the field in the commit that fixes the cycle; this list only shrinks.
 ///
 /// `alphard-navi` is not here at all, and that is a cost: its DRAM is a fixed
 /// gigabyte, which under AddressSanitizer is ten seconds to allocate and free,
@@ -140,7 +120,6 @@ static BOARDS: &[Board] = &[
         name: "stm32u585",
         media: &[("firmware", &STM32U5)],
         params: &[],
-        leaks: None,
     },
     Board {
         name: "pc-at",
@@ -150,64 +129,33 @@ static BOARDS: &[Board] = &[
             ("floppy", &[0; 1_474_560]),
         ],
         params: &[("extmem", "1M")],
-        leaks: None,
     },
     Board {
         name: "riscv-virt",
         media: &[("firmware", &RISCV_SPIN)],
         params: &[("ram", "2M"), ("storage", "64K"), ("flash", "256K")],
-        leaks: None,
     },
     Board {
         name: "mac-plus",
         media: &[("macrom", &M68K_MAC)],
         params: &[],
-        leaks: None,
     },
     Board {
         name: "stm32f407",
         media: &[("firmware", &STM32F407)],
         params: &[],
-        leaks: Some(
-            "st.i2c: `Shared` owns its `ControllerWires`, which own the slave face, which \
-             owns `Shared`; and the face is attached to the `I2cBus` that `Shared` owns too",
-        ),
     },
     Board {
         name: "stm32wb55",
         media: &[("firmware", &STM32WB)],
         params: &[],
-        leaks: Some("st.i2c-v2: the same two cycles as st.i2c, in its own copy of the code"),
     },
     Board {
         name: "amiga-a500",
         media: &[("kickstart", &M68K_AMIGA)],
         params: &[],
-        leaks: Some(
-            "amiga.agnus, amiga.paula and the custom bus hold one another through the \
-             exports `Instance::bind` hands out, and nothing lets go",
-        ),
     },
 ];
-
-/// The boards an input may select: all of them when `RSEMU_FUZZ_LEAKY_BOARDS`
-/// is set, otherwise the ones that free what they allocate.
-fn boards() -> &'static [&'static Board] {
-    static ACTIVE: OnceLock<Vec<&'static Board>> = OnceLock::new();
-    ACTIVE.get_or_init(|| {
-        let all = std::env::var_os("RSEMU_FUZZ_LEAKY_BOARDS").is_some();
-        BOARDS
-            .iter()
-            .filter(|b| {
-                if let (Some(why), false) = (b.leaks, all) {
-                    eprintln!("machine_mmio: leaving out `{}`, which leaks: {why}", b.name);
-                    return false;
-                }
-                true
-            })
-            .collect()
-    })
-}
 
 /// Realize `board` the way `rsemu run` does: the catalog's own text, registry
 /// and build options, with the media and parameters above.
@@ -348,8 +296,7 @@ fn differing(a: &[u8], b: &[u8]) -> String {
 
 fuzz_target!(|data: &[u8]| {
     let mut input = Input { data, at: 0 };
-    let boards = boards();
-    let board = boards[usize::from(input.u8()) % boards.len()];
+    let board = &BOARDS[usize::from(input.u8()) % BOARDS.len()];
     let name = board.name;
 
     // A board that will not realize is a harness bug, never an input's fault:
