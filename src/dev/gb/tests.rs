@@ -1280,6 +1280,50 @@ fn a_channel_whose_dac_is_off_adds_nothing_to_the_mix() {
 }
 
 #[test]
+fn a_noise_clock_shift_of_14_or_15_stops_the_shift_register() {
+    // Pan Docs, *Audio Registers*, FF22: the LFSR is clocked at
+    // 262144 / (divider x 2^shift) Hz, "except that shift being equal to 14 or
+    // 15 stops the channel from being clocked entirely."
+    //
+    // The register starts as all ones and the output is its low bit inverted,
+    // so the channel is silent until fifteen clocks have walked the first zero
+    // down to bit 0. With a shift of 13 that takes 15 x (8 << 13) crystal
+    // periods; with 14 or 15 it never happens.
+    let run = |nr43: u8, clocks: u64| {
+        let apu = GbApu::new();
+        apu.set_recording(true);
+        apu.write_register(0x16, 0x80); // power
+        apu.write_register(0x14, 0x77); // NR50
+        apu.write_register(0x15, 0x88); // NR51: channel 4 to both sides
+        apu.write_register(0x11, 0xf0); // NR42: full volume, DAC on
+        apu.write_register(0x12, nr43);
+        apu.write_register(0x13, 0x80); // NR44: trigger
+        let mut levels = alloc::vec::Vec::new();
+        // In slices, so the ring never has to drop anything.
+        let mut now = 0;
+        while now < clocks {
+            now += super::apu::SAMPLE_DIVISOR * 1024;
+            apu.advance_to(now);
+            levels.extend(apu.take_samples().into_iter().map(|(l, _)| l));
+        }
+        levels
+    };
+    let moved = |levels: &[i16]| levels.iter().any(|&l| l != levels[0]);
+    assert!(
+        moved(&run(0xd0, 20 * (8 << 13))),
+        "a shift of 13 is the slowest the register is clocked"
+    );
+    for nr43 in [0xe0u8, 0xf0] {
+        // Longer than fifteen clocks would take at the rate the formula gives.
+        let clocks = 20 * (8u64 << (nr43 >> 4));
+        assert!(
+            !moved(&run(nr43, clocks.min(20 * (8 << 15)))),
+            "NR43=${nr43:02x}: the register is not clocked at all"
+        );
+    }
+}
+
+#[test]
 fn powering_down_zeroes_everything_except_the_wave_ram() {
     let apu = GbApu::new();
     apu.write_register(0x16, 0x80);

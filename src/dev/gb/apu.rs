@@ -419,7 +419,11 @@ impl Noise {
     }
 
     fn advance(&mut self, clocks: u64) {
-        if !self.enabled {
+        // The LFSR is clocked at 262144 / (divider x 2^shift) Hz, "except that
+        // shift being equal to 14 or 15 stops the channel from being clocked
+        // entirely" (Pan Docs, *Audio Registers*, FF22). The channel stays on
+        // and holds whatever its low bit is.
+        if !self.enabled || self.poly >> 4 >= 14 {
             return;
         }
         let mut left = clocks;
