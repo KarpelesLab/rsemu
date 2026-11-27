@@ -310,26 +310,37 @@ fn regime(regs: &SysRegs, va: u64) -> Option<Regime> {
 
 /// Whether an access is permitted by an accumulated permission set.
 ///
-/// DDI 0487 D8.4: `AP[1]` grants EL0 access and `AP[2]` makes the region
-/// read-only, at both levels. `APTable` bits accumulate down the walk by a
-/// bitwise OR, so a table descriptor can only ever remove permission.
+/// `AArch64.CheckPermission()` (DDI 0487C.a J1.1), for the EL1&0 regime:
+///
+/// ```text
+/// priv_r = TRUE;
+/// priv_w = perms.ap<2> == '0';
+/// user_r = perms.ap<1> == '1';
+/// user_w = perms.ap<2:1> == '01';
+/// user_xn = perms.xn == '1' || (user_w && wxn);
+/// priv_xn = perms.pxn == '1' || (priv_w && wxn) || user_w;
+/// ```
+///
+/// Two lines of that are easy to get wrong, and this function once got both
+/// wrong. A fetch is decided by the execute-never term **alone**, so an EL0
+/// fetch does not need `user_r` — table D4-34's `UXN = 0`, `AP[2:1] = 00` row
+/// is "Executable" from EL0, which is how a kernel builds execute-only user
+/// memory. And `priv_xn` includes `user_w` whatever `WXN` says: "AArch64
+/// execution treats all regions writable at EL0 as being PXN" (D4-34, note
+/// c).
+///
+/// `ap` is `AP[2:1]` with the walk's `APTable` restrictions already applied.
 fn permitted(ap: u32, pxn: bool, uxn: bool, wxn: bool, kind: Access, el: El) -> bool {
-    let el0_access = ap & 1 != 0;
-    let read_only = ap & 2 != 0;
-    let writable = !read_only && (el == El::El1 || el0_access);
-    match kind {
-        Access::Load => el == El::El1 || el0_access,
-        Access::Store => writable,
-        Access::Fetch => {
-            // SCTLR_EL1.WXN: anything writable at this level is execute-never.
-            if wxn && writable {
-                return false;
-            }
-            match el {
-                El::El1 => !pxn,
-                El::El0 => el0_access && !uxn,
-            }
-        }
+    let user_r = ap & 1 != 0;
+    let priv_w = ap & 2 == 0;
+    let user_w = ap == 0b01;
+    match (kind, el) {
+        (Access::Load, El::El1) => true,
+        (Access::Load, El::El0) => user_r,
+        (Access::Store, El::El1) => priv_w,
+        (Access::Store, El::El0) => user_w,
+        (Access::Fetch, El::El1) => !(pxn || (priv_w && wxn) || user_w),
+        (Access::Fetch, El::El0) => !(uxn || (user_w && wxn)),
     }
 }
 
@@ -412,7 +423,18 @@ fn walk<M: ReadDescriptor>(
         if check && d & desc::AF == 0 {
             return Err(Fault::AccessFlag(level));
         }
-        let ap = (((d >> desc::AP_SHIFT) & 3) as u32) | ap_table;
+        // `AArch64.TranslationTableWalk()` (DDI 0487C.a J1.1):
+        //
+        //   result.perms.ap<2> = ap<2> OR ap_table<1>;          // Force read-only
+        //   result.perms.ap<1> = ap<1> AND NOT(ap_table<0>);    // Force privileged only
+        //
+        // The two `APTable` bits restrict in opposite directions — one sets a
+        // bit of `AP`, the other clears one — because `AP[2]` *removes* write
+        // access where `AP[1]` *grants* EL0 access. OR-ing both in handed EL0
+        // every page under a table marked "access at EL0 not permitted"
+        // (table D4-32).
+        let leaf_ap = ((d >> desc::AP_SHIFT) & 3) as u32;
+        let ap = ((leaf_ap | ap_table) & 2) | (leaf_ap & !ap_table & 1);
         let pxn = (d & desc::PXN != 0) | pxn_table;
         let uxn = (d & desc::UXN != 0) | uxn_table;
         if check && !permitted(ap, pxn, uxn, wxn, kind, el) {
@@ -766,6 +788,81 @@ mod tests {
             translate(&regs, &mut ram, 0, Access::Fetch, El::El0).unwrap_err(),
             Fault::Permission(3)
         );
+    }
+
+    /// DDI 0487C.a table D4-32: `APTable[1:0] = 01` is "Access at EL0 not
+    /// permitted, regardless of permissions in subsequent levels of lookup",
+    /// and the walk applies it as `ap<1> AND NOT(ap_table<0>)`. It used to be
+    /// OR-ed into `AP[1]`, where a set bit *grants* EL0 access — so the
+    /// restriction opened every page beneath it instead.
+    #[test]
+    fn aptable_bit_zero_takes_el0_access_away_rather_than_granting_it() {
+        let el0_only_table = 0x3000 | desc::VALID | desc::TABLE | (1u64 << desc::AP_TABLE_SHIFT);
+        // A leaf EL0 may read and write, under a table that says it may not.
+        let (regs, mut ram) = three_level(desc::AF | (1 << desc::AP_SHIFT));
+        ram.put(0x2000, el0_only_table);
+        for kind in [Access::Load, Access::Store] {
+            assert_eq!(
+                translate(&regs, &mut ram, 0, kind, El::El0).unwrap_err(),
+                Fault::Permission(3),
+                "{kind:?}"
+            );
+            assert!(translate(&regs, &mut ram, 0, kind, El::El1).is_ok());
+        }
+        // A privileged-only leaf under the same table stays privileged-only.
+        let (regs, mut ram) = three_level(desc::AF);
+        ram.put(0x2000, el0_only_table);
+        assert_eq!(
+            translate(&regs, &mut ram, 0, Access::Load, El::El0).unwrap_err(),
+            Fault::Permission(3)
+        );
+        // Both bits: read-only for EL1 as well.
+        ram.put(
+            0x2000,
+            0x3000 | desc::VALID | desc::TABLE | (3u64 << desc::AP_TABLE_SHIFT),
+        );
+        assert!(translate(&regs, &mut ram, 0, Access::Load, El::El1).is_ok());
+        assert_eq!(
+            translate(&regs, &mut ram, 0, Access::Store, El::El1).unwrap_err(),
+            Fault::Permission(3)
+        );
+    }
+
+    /// DDI 0487C.a table D4-34, row `UXN = 0`, `PXN = 0`, `AP[2:1] = 00`:
+    /// "R, W, Executable" from the higher level and "Executable" from EL0 —
+    /// execute-only user memory. `AArch64.CheckPermission()` decides a fetch
+    /// on the execute-never term alone.
+    #[test]
+    fn el0_may_execute_a_page_it_may_not_read() {
+        let (regs, mut ram) = three_level(desc::AF);
+        assert!(translate(&regs, &mut ram, 0, Access::Fetch, El::El0).is_ok());
+        assert_eq!(
+            translate(&regs, &mut ram, 0, Access::Load, El::El0).unwrap_err(),
+            Fault::Permission(3)
+        );
+        // `UXN` is what stops it.
+        let (regs, mut ram) = three_level(desc::AF | desc::UXN);
+        assert_eq!(
+            translate(&regs, &mut ram, 0, Access::Fetch, El::El0).unwrap_err(),
+            Fault::Permission(3)
+        );
+    }
+
+    /// DDI 0487C.a table D4-34, note c: "Not executable, because AArch64
+    /// execution treats all regions writable at EL0 as being PXN" — with
+    /// `PXN` clear and `WXN` clear.
+    #[test]
+    fn el1_never_executes_a_page_el0_may_write() {
+        let (regs, mut ram) = three_level(desc::AF | (1 << desc::AP_SHIFT));
+        assert_eq!(regs.sctlr & sctlr::WXN, 0);
+        assert_eq!(
+            translate(&regs, &mut ram, 0, Access::Fetch, El::El1).unwrap_err(),
+            Fault::Permission(3)
+        );
+        // EL0 itself may, and EL1 may once EL0 can only read it.
+        assert!(translate(&regs, &mut ram, 0, Access::Fetch, El::El0).is_ok());
+        let (regs, mut ram) = three_level(desc::AF | (3 << desc::AP_SHIFT));
+        assert!(translate(&regs, &mut ram, 0, Access::Fetch, El::El1).is_ok());
     }
 
     #[test]
