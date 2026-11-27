@@ -776,6 +776,8 @@ impl Dispatcher {
     #[must_use]
     pub fn with_backend(mut self, engine: Engine) -> Dispatcher {
         self.backend = Some(engine);
+        // What the last backend would not take says nothing about this one.
+        self.cache.forget_refusals();
         self
     }
 
@@ -816,6 +818,8 @@ impl Dispatcher {
             self.backend = None;
         }
         self.wasm = Some(engine);
+        // What the last backend would not take says nothing about this one.
+        self.cache.forget_refusals();
         self
     }
 
@@ -1132,14 +1136,31 @@ impl Dispatcher {
                     .block(id)
                     .expect("a block just found or just inserted is resident");
                 let temps = block.temp_count();
+                let mut refused = false;
                 let code = match cache.code(id).filter(|c| engine.is_live(*c)) {
                     Some(code) => Some(code),
-                    // A refusal is not an error and is not recorded against
-                    // the block: the engine counts it, and the next time this
-                    // block is reached it is refused again for the same
-                    // reason, which costs a compile attempt and nothing else.
-                    None => engine.compile(block).ok(),
+                    // Asked once already, and the answer is a property of the
+                    // block.
+                    None if cache.refused(id) => None,
+                    None => match engine.compile(block) {
+                        Ok(code) => Some(code),
+                        // A refusal is not an error — the block is
+                        // interpreted — but it *is* recorded against the
+                        // block, because a compile attempt is tens of
+                        // thousands of host instructions and an op the
+                        // backend does not lower is refused identically every
+                        // time. A full code buffer is the one answer that is
+                        // about the buffer rather than the block, so that one
+                        // is asked again.
+                        Err(refusal) => {
+                            refused = !matches!(refusal, crate::jit::host::Refusal::CodeBufferFull);
+                            None
+                        }
+                    },
                 };
+                if refused {
+                    cache.set_refused(id);
+                }
                 if let Some(code) = code {
                     cache.set_code(id, code);
                     // The temporary frame the whole chain shares, grown here
@@ -1203,20 +1224,28 @@ impl Dispatcher {
                 cache, wasm, stats, ..
             } = self;
             if let Some(engine) = wasm.as_mut() {
+                let mut refused = false;
                 let code = {
                     let block = cache
                         .block(id)
                         .expect("a block just found or just inserted is resident");
                     match cache.code(id).filter(|c| engine.is_live(*c)) {
                         Some(code) => Some(code),
-                        // A refusal is not an error and is not recorded
-                        // against the block: the engine counts it, and the
-                        // next time this block is reached it is refused again
-                        // for the same reason, which costs a compile attempt
-                        // and nothing else.
-                        None => engine.compile(block).ok(),
+                        None if cache.refused(id) => None,
+                        // Recorded against the block, as the native arm above
+                        // records it and for the same reason. Every refusal
+                        // this backend has is a property of the block — it
+                        // has no code buffer to fill — so every one is kept.
+                        None => {
+                            let code = engine.compile(block).ok();
+                            refused = code.is_none();
+                            code
+                        }
                     }
                 };
+                if refused {
+                    cache.set_refused(id);
+                }
                 if let Some(code) = code {
                     cache.set_code(id, code);
                     let block = cache.block(id).expect("still resident");
@@ -1496,6 +1525,96 @@ mod tests {
     /// points, whichever ran the block — and the run is done twice, once each
     /// way, on the same programs, so the numbers are compared rather than
     /// merely asserted.
+    /// A frontend over two blocks that jump to each other, each holding an op
+    /// no host backend lowers.
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    struct Dividing;
+
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    impl<H: ?Sized> Frontend<H> for Dividing {
+        fn epoch(&mut self) -> Epoch {
+            Epoch::default()
+        }
+        fn key(&mut self) -> u64 {
+            0
+        }
+        fn pc_slot(&self) -> RegSlot {
+            PC
+        }
+        fn translate(&mut self, pc: u64) -> Result<Translation> {
+            let next = pc ^ 0x10;
+            let mut b = BlockBuilder::new(pc, 0);
+            b.insn_start(InsnStart {
+                pc,
+                next_pc: next,
+                ticks: 0,
+                live: Vec::new(),
+            });
+            b.charge(1);
+            let n = b.imm(Type::I64, Const::Int(84));
+            let d = b.imm(Type::I64, Const::Int(2));
+            let _ = b.binary(Opcode::DIV_U, Type::I64, n, d);
+            let t = b.imm(Type::I64, Const::Int(u128::from(next)));
+            b.insn_start(InsnStart {
+                pc: next,
+                next_pc: next,
+                ticks: 1,
+                live: vec![(PC, t)],
+            });
+            b.exit_tb();
+            Ok(Translation {
+                block: b.finish(),
+                page: pc & !PAGE_MASK,
+                insns: 1,
+            })
+        }
+    }
+
+    /// A block the backend will not take is offered to it **once**.
+    ///
+    /// A refusal that names an op is a property of the block, and a compile
+    /// attempt costs what a compile costs — lowering, liveness and the
+    /// register allocator all run before the instruction that cannot be
+    /// lowered is reached. Paying that on every execution of a block a
+    /// frontend leans on is the difference between "this op is interpreted"
+    /// and "this op is interpreted after a failed compile".
+    #[cfg(any(
+        all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
+        all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_refused_block_is_not_offered_to_the_backend_again() {
+        assert!(
+            !crate::jit::host::compiles(Opcode::DIV_U),
+            "this test needs an op the backend refuses"
+        );
+        let mut d = Dispatcher::new()
+            .with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
+        let mut host = Host::default();
+        let run = d.run(&mut Dividing, &mut host, 0x1000, 40).expect("runs");
+        assert_eq!((run.blocks, run.insns), (40, 40));
+        assert_eq!(run.stop, Stop::Budget);
+        assert_eq!(host.ticks, 40, "interpreted, and charged as such");
+        assert_eq!(d.stats().compiled, 0);
+        assert_eq!(d.stats().translated, 2);
+        let stats = d.backend().expect("attached above").stats();
+        assert_eq!(
+            stats.refused, 2,
+            "two blocks, forty executions, and one compile attempt each"
+        );
+
+        // And a different backend is asked afresh.
+        let mut d = d.with_backend(crate::jit::host::Engine::new().expect("a W^X code buffer"));
+        d.run(&mut Dividing, &mut host, 0x1000, 40).expect("runs");
+        assert_eq!(d.backend().expect("attached above").stats().refused, 2);
+    }
+
     #[cfg(any(
         all(feature = "jit-x86", target_os = "linux", target_arch = "x86_64"),
         all(feature = "jit-arm64", target_os = "linux", target_arch = "aarch64")

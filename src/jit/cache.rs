@@ -185,6 +185,11 @@ struct Slot {
     preds: Vec<(u32, u8)>,
     /// This block's compiled host code, once a backend has produced some.
     code: Option<CodeRef>,
+    /// The backend was offered this block and will not take it.
+    ///
+    /// A property of the block, so it lives and dies with the slot exactly as
+    /// [`Slot::code`] does. See [`BlockCache::set_refused`].
+    refused: bool,
 }
 
 /// What a [`BlockCache`] has been asked to do.
@@ -425,6 +430,7 @@ impl BlockCache {
             exits: [Link::empty(); EXITS],
             preds: Vec::new(),
             code: None,
+            refused: false,
         };
         let id = match self.free.pop() {
             Some(i) => {
@@ -484,6 +490,43 @@ impl BlockCache {
             .filter(|s| s.stamp == id.stamp)
         {
             slot.code = Some(code);
+        }
+    }
+
+    /// Whether a backend has already declined this block.
+    #[inline]
+    #[must_use]
+    pub fn refused(&self, id: BlockId) -> bool {
+        self.slot(id).is_some_and(|s| s.refused)
+    }
+
+    /// Record that the backend will not compile this block, so it is not
+    /// offered again.
+    ///
+    /// A refusal that names an op, a type or a shape is a function of the
+    /// block and of nothing else, so the answer the next time is the answer
+    /// this time — and getting it again costs a whole compile attempt, on
+    /// every execution of the block, for as long as it stays in the cache. A
+    /// caller records only that kind: a refusal for want of room in the code
+    /// buffer is about the buffer, and is worth asking again.
+    ///
+    /// A no-op for an id whose block has gone, as [`BlockCache::set_code`] is.
+    pub fn set_refused(&mut self, id: BlockId) {
+        if let Some(slot) = self
+            .slots
+            .get_mut(id.slot as usize)
+            .and_then(Option::as_mut)
+            .filter(|s| s.stamp == id.stamp)
+        {
+            slot.refused = true;
+        }
+    }
+
+    /// Forget every recorded refusal: a different backend may answer
+    /// differently.
+    pub fn forget_refusals(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            slot.refused = false;
         }
     }
 
