@@ -651,7 +651,7 @@ fn device(machine: &Machine, path: Option<&str>) -> String {
     let state = format!("{:#?}", entry.device());
     let _ = writeln!(out, "state");
     if state.len() > STATE_MAX {
-        for line in state[..STATE_MAX].lines() {
+        for line in clipped(&state, STATE_MAX).lines() {
             let _ = writeln!(out, "  {line}");
         }
         let _ = writeln!(
@@ -1151,6 +1151,22 @@ fn bytes_of(words: &[&str]) -> Result<Vec<u8>, String> {
         bytes.push(u8::from_str_radix(text, 16).map_err(|_| format!("`{text}` is not a byte\n"))?);
     }
     Ok(bytes)
+}
+
+/// At most the first `max` bytes of `text`, cut on a character boundary.
+///
+/// `&text[..max]` panics when byte `max` is in the middle of a character, and
+/// what this cuts is a device's own `Debug` rendering: a mounted image's name,
+/// a description string, anything a `{:?}` prints as itself rather than as an
+/// escape. Whether the cut lands inside one is an accident of everything
+/// printed before it, so the cut backs up to the boundary instead.
+fn clipped(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    // Terminates: offset zero is always a boundary.
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// A register's bytes as a number.

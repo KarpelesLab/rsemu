@@ -8,6 +8,28 @@
 
 use super::*;
 
+/// `device` cuts a long `Debug` rendering at a byte count, and a rendering is
+/// not ASCII just because most of one is. Ungated on purpose: it needs no
+/// machine, so it still runs in a `--features monitor` build that has none.
+#[test]
+fn a_long_rendering_is_cut_on_a_character_boundary() {
+    // One ASCII byte and then two-byte characters: every *even* offset is
+    // inside one, and `STATE_MAX` is even.
+    let state = format!("a{}", "\u{e9}".repeat(STATE_MAX));
+    assert!(!state.is_char_boundary(STATE_MAX), "the case under test");
+    let cut = clipped(&state, STATE_MAX);
+    assert_eq!(cut.len(), STATE_MAX - 1, "backed up to the boundary");
+    assert!(state.starts_with(cut));
+
+    // On a boundary already, and shorter than the limit: untouched.
+    assert_eq!(clipped("abcdef", 3), "abc");
+    assert_eq!(clipped("abc", 8192), "abc");
+    assert_eq!(clipped("", 0), "");
+    // A limit inside the very first character leaves nothing rather than
+    // half of it.
+    assert_eq!(clipped("\u{e9}", 1), "");
+}
+
 /// Build and drive an Apple 1, which is the smallest machine in the catalog
 /// with a processor, a clocked device, an MMIO device with side effects and a
 /// character port — everything a monitor command touches.
