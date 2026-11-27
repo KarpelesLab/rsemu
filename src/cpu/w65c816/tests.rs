@@ -409,6 +409,56 @@ fn state_round_trips_through_a_snapshot() {
     );
 }
 
+/// An edge a detector has not been clocked past survives a snapshot.
+///
+/// The detectors compare the pin against the level they saw on the previous
+/// cycle, and that previous level was not in the chunk: `load` rebuilt it as
+/// the pin's current level, so an NMI (or ABORT) that arrived after the core's
+/// last cycle came back already "seen" and was never taken.
+#[test]
+fn an_edge_the_detectors_have_not_seen_yet_survives_a_snapshot() {
+    for abort in [false, true] {
+        let raise = |cpu: &W65c816| {
+            if abort {
+                cpu.set_abort(true);
+            } else {
+                cpu.set_nmi(true);
+            }
+        };
+        let m = Machine::new(&[0xea; 16]);
+        m.run(2);
+        // The pin moves between two of the core's cycles.
+        raise(&m.cpu);
+        let bytes = snapshot(&m.cpu);
+
+        let other = Machine::new(&[0xea; 16]);
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("cpu", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        let mut cr = chunk.reader();
+        other.cpu.load(&mut cr).unwrap();
+        cr.end().unwrap();
+        // What `Machine::load` does next: re-announce the line's level.
+        raise(&other.cpu);
+
+        let straight = m.cpu.regs().pc.wrapping_add(4);
+        for machine in [&m, &other] {
+            machine.run(4);
+        }
+        assert_ne!(
+            m.cpu.regs().pc,
+            straight,
+            "abort={abort}: the original leaves the NOPs for the vector"
+        );
+        assert_eq!(
+            other.cpu.regs(),
+            m.cpu.regs(),
+            "abort={abort}: and so does the restored core"
+        );
+    }
+}
+
 #[test]
 fn a_snapshot_naming_an_unknown_interrupt_is_rejected() {
     let m = Machine::new(&NATIVE);

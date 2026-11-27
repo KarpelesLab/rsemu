@@ -1331,6 +1331,63 @@ fn save_and_load_round_trip_to_an_identical_state() -> Result<()> {
     Ok(())
 }
 
+/// An NMI edge the detector has not been clocked past survives a snapshot.
+///
+/// "This edge detector polls the status of the NMI line during φ2 of each CPU
+/// cycle [...] and raises an internal signal if the input goes from being high
+/// during one cycle to being low during the next" (NESdev, *CPU interrupts*).
+/// The level of the previous cycle is therefore state, and `save` did not
+/// write it: `load` rebuilt it as "whatever the line is at now", so a line
+/// that fell after the core's last cycle — a PPU catching up to the end of a
+/// quantum and raising vblank is exactly that — came back with the detector
+/// already standing on it, and the NMI never happened.
+#[test]
+fn an_nmi_edge_the_detector_has_not_seen_yet_survives_a_snapshot() -> Result<()> {
+    let build = || {
+        let h = Harness::running(&[0xea; 8]);
+        h.bus.poke(0xfffa, &[0x00, 0xd0]);
+        h
+    };
+    let h = build();
+    h.step();
+    // The pin moves between two of the core's cycles; no cycle has run since.
+    h.cpu.set_nmi(true);
+    assert!(
+        !h.cpu.nmi_pending(),
+        "the detector has not been clocked yet"
+    );
+
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", CLASS.name)?;
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("cpu", CLASS.name, CLASS.version)?;
+        h.cpu.save(&mut chunk)?;
+    }
+    let bytes = w.to_vec()?;
+
+    let other = build();
+    let reader = StateReader::new(&bytes)?;
+    let chunk = reader.load("cpu", CLASS.name, CLASS.version, &Migrations::new())?;
+    let mut cr = chunk.reader();
+    other.cpu.load(&mut cr)?;
+    cr.end()?;
+    // What `Machine::load` does next: re-announce the line's level.
+    other.cpu.set_nmi(true);
+
+    for core in [&h, &other] {
+        core.step(); // the NOP the edge is detected during
+        core.step(); // the interrupt sequence
+    }
+    assert_eq!(h.cpu.regs().pc, 0xd000, "the original takes the NMI");
+    assert_eq!(
+        other.cpu.regs(),
+        h.cpu.regs(),
+        "and so does the restored core"
+    );
+    Ok(())
+}
+
 #[test]
 fn construction_from_properties_validates_what_it_is_given() {
     let cpu = Mos6502::from_props(&Props::new().with("decimal", false)).unwrap();

@@ -482,7 +482,9 @@ impl Lines {
         self.irq.store(irq, Ordering::Release);
         self.nmi_level.store(level, Ordering::Release);
         // The detector comes back holding the level it is standing on, so a
-        // restore does not manufacture an edge out of the load itself.
+        // restore does not manufacture an edge out of the load itself. `load`
+        // then overwrites this with the level the detector really last saw,
+        // which is not the same thing when the pin moved after the last cycle.
         self.nmi_sampled.store(level, Ordering::Release);
         self.nmi_latch.store(latch, Ordering::Release);
         self.reset_req.store(reset, Ordering::Release);
@@ -958,8 +960,9 @@ pub static CLASS: DeviceClass = DeviceClass {
     // v4 added the core's own data bus, which is not the same latch as the
     // external one once a DMA can steal a cycle; v3 added the CMOS `WAI` stall
     // flag; v2 added the cycle debt `run_budget` carries between quanta and the
-    // latched `/RES` request; v1 snapshots predate any released build.
-    version: 4,
+    // latched `/RES` request; v1 snapshots predate any released build. v5
+    // added the level the NMI edge detector last sampled; see [`migrations`].
+    version: 5,
     summary: "MOS 6502 / RP2A03 / W65C02S 8-bit CPU core, cycle-accurate interpreter",
     properties: &[
         PropertySpec {
@@ -1007,6 +1010,32 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// If something already claimed the name.
 pub fn register(reg: &mut Registry) -> Result<()> {
     reg.add(&CLASS)
+}
+
+/// Carry a v4 `cpu.mos6502` chunk forward.
+///
+/// v5 appends the level the NMI edge detector last sampled. A v4 `load`
+/// rebuilt that as the pin's own level, so that is what the step writes: the
+/// pin's level is the fifth byte from the end of a v4 chunk (`nmi_level`, then
+/// `nmi_latch`, `reset_req`, `waiting`, `core_bus`). A v4 snapshot therefore
+/// behaves exactly as it always did — an edge that arrived after the core's
+/// last cycle is lost, because the chunk never recorded that it was one.
+///
+/// # Errors
+///
+/// If the step is already registered.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS.name, 4, |r, out| {
+        let body = r.take(r.remaining())?;
+        let level = body
+            .len()
+            .checked_sub(5)
+            .and_then(|at| body.get(at))
+            .copied()
+            .ok_or_else(|| Error::State(String::from("a v4 cpu.mos6502 chunk is too short")))?;
+        out.extend_from_slice(body);
+        out.write_u8(level)
+    })
 }
 
 impl Device for Mos6502 {
@@ -1127,6 +1156,10 @@ impl Device for Mos6502 {
         // for the same reason.
         w.write_bool(state.waiting)?;
         w.write_u8(state.core_bus)?;
+        // v5: the level the NMI edge detector saw on the last cycle it was
+        // clocked. Not the pin's level — the pin can have moved since, and the
+        // edge that makes is the one a restore must not lose.
+        w.write_bool(self.lines.nmi_sampled.load(Ordering::Acquire))?;
         Ok(())
     }
 
@@ -1161,8 +1194,10 @@ impl Device for Mos6502 {
         let reset_req = r.read_bool()?;
         state.waiting = r.read_bool()?;
         state.core_bus = r.read_u8()?;
+        let nmi_sampled = r.read_bool()?;
         self.session.lock().state = state;
         self.lines.restore((irq, nmi_level, nmi_latch, reset_req));
+        self.lines.nmi_sampled.store(nmi_sampled, Ordering::Release);
         Ok(())
     }
 }

@@ -115,6 +115,10 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::cpu::x86::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-sm83")]
     crate::cpu::sm83::migrations(&mut migrations)?;
+    #[cfg(feature = "cpu-mos6502")]
+    crate::cpu::mos6502::migrations(&mut migrations)?;
+    #[cfg(feature = "cpu-w65c816")]
+    crate::cpu::w65c816::migrations(&mut migrations)?;
     #[cfg(feature = "dev-sgx")]
     crate::dev::sgx::migrations(&mut migrations)?;
     #[cfg(feature = "dev-amiga-akiko")]
@@ -148,6 +152,10 @@ mod tests {
         "cpu.sm83",
         #[cfg(feature = "dev-nes-ppu")]
         "nes.ppu",
+        #[cfg(feature = "cpu-mos6502")]
+        "cpu.mos6502",
+        #[cfg(feature = "cpu-w65c816")]
+        "cpu.w65c816",
     ];
 
     #[test]

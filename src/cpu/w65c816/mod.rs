@@ -773,7 +773,9 @@ impl W65c816 {
 /// The `cpu.w65c816` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.w65c816",
-    version: 1,
+    // v2 appended the levels the NMI and ABORT edge detectors last sampled;
+    // see [`migrations`].
+    version: 2,
     summary: "WDC W65C816S 16-bit CPU core (SNES, Apple IIGS), cycle-accurate interpreter",
     properties: &[
         PropertySpec {
@@ -806,6 +808,33 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// If something already claimed the name.
 pub fn register(reg: &mut Registry) -> Result<()> {
     reg.add(&CLASS)
+}
+
+/// Carry a v1 `cpu.w65c816` chunk forward.
+///
+/// v2 appends the levels the NMI and ABORT edge detectors last sampled. A v1
+/// `load` rebuilt each as its pin's own level, so that is what the step
+/// writes: a v1 chunk ends with the six line bytes `irq`, `nmi_level`,
+/// `nmi_latch`, `abort_level`, `abort_latch`, `reset`. A v1 snapshot therefore
+/// behaves exactly as it always did — an edge that arrived after the core's
+/// last cycle is lost, because the chunk never recorded that it was one.
+///
+/// # Errors
+///
+/// If the step is already registered.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS.name, 1, |r, out| {
+        let body = r.take(r.remaining())?;
+        let lines = body
+            .len()
+            .checked_sub(6)
+            .and_then(|at| body.get(at..))
+            .ok_or_else(|| Error::State(String::from("a v1 cpu.w65c816 chunk is too short")))?;
+        let (nmi_level, abort_level) = (lines[1], lines[3]);
+        out.extend_from_slice(body);
+        out.write_u8(nmi_level)?;
+        out.write_u8(abort_level)
+    })
 }
 
 impl Device for W65c816 {
@@ -900,6 +929,11 @@ impl Device for W65c816 {
         for b in self.lines.snapshot() {
             w.write_bool(b)?;
         }
+        // v2: the levels the two edge detectors saw on the last cycle they
+        // were clocked. Not the pins' levels — a pin can have moved since, and
+        // the edge that makes is the one a restore must not lose.
+        w.write_bool(self.lines.nmi_sampled.load(Ordering::Acquire))?;
+        w.write_bool(self.lines.abort_sampled.load(Ordering::Acquire))?;
         Ok(())
     }
 
@@ -940,8 +974,14 @@ impl Device for W65c816 {
         for b in &mut lines {
             *b = rd.read_bool()?;
         }
+        let nmi_sampled = rd.read_bool()?;
+        let abort_sampled = rd.read_bool()?;
         self.session.lock().state = s;
         self.lines.restore(lines);
+        self.lines.nmi_sampled.store(nmi_sampled, Ordering::Release);
+        self.lines
+            .abort_sampled
+            .store(abort_sampled, Ordering::Release);
         Ok(())
     }
 }
