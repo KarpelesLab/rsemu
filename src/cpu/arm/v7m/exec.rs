@@ -1580,15 +1580,20 @@ impl<'a> Exec<'a> {
         if !wide && it != 0 {
             insn = suppress_flags(insn);
         }
-        let passed = self.state.current_cond().passes(self.state.xpsr)
-            && match insn {
-                // A conditional branch carries its own condition; inside an
-                // `IT` block the architecture calls the combination
-                // UNPREDICTABLE, and requiring both is the reading that never
-                // executes something neither condition wanted.
-                Insn::Branch { cond: Some(c), .. } => c.passes(self.state.xpsr),
-                _ => true,
-            };
+        let passed = match insn {
+            // DDI 0403E.b A7.7.17: "BKPT is an unconditional instruction and
+            // executes as such both inside and outside an IT instruction
+            // block."
+            Insn::Bkpt { .. } => true,
+            // A conditional branch carries its own condition; inside an
+            // `IT` block the architecture calls the combination
+            // UNPREDICTABLE, and requiring both is the reading that never
+            // executes something neither condition wanted.
+            Insn::Branch { cond: Some(c), .. } => {
+                self.state.current_cond().passes(self.state.xpsr) && c.passes(self.state.xpsr)
+            }
+            _ => self.state.current_cond().passes(self.state.xpsr),
+        };
 
         #[cfg(feature = "cpu-arm-v8m")]
         {

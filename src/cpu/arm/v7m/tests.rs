@@ -995,6 +995,24 @@ fn an_svc_inside_an_it_block_stacks_the_itstate_of_the_next_instruction() {
 }
 
 #[test]
+fn a_bkpt_inside_an_it_block_executes_whatever_the_condition() {
+    // `IT EQ` ; `BKPT 0xab` with `Z` clear. DDI 0403E.b A7.7.17: "BKPT is an
+    // unconditional instruction and executes as such both inside and outside
+    // an IT instruction block."
+    let h = Harness::m4(&[0xbf08, 0xbeab]);
+    h.set_word(3 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
+    h.cpu.set_xpsr(xpsr::T);
+    h.cpu.step();
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_eq!(h.cpu.last_bkpt(), 0xab);
+    let sp = h.cpu.msp();
+    assert_eq!(h.word(sp + 24), ENTRY + 2);
+    assert_eq!(stacked_itstate(h.word(sp + 28)), 0x08);
+}
+
+#[test]
 fn thread_mode_can_run_on_the_process_stack() {
     // `MSR psp, r0` ; `MSR control, r1` ; `ISB` ; `MOV r2, sp`
     let mut code = Vec::new();
