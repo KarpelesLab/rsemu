@@ -627,6 +627,9 @@ struct Resolver<'a> {
     decls: BTreeMap<String, usize>,
     /// How many statements the expansion has produced.
     produced: u32,
+    /// How many loop iterations and template instantiations have produced
+    /// nothing at all. See [`Resolver::spend_barren`].
+    barren: u32,
     /// How many expression nodes substitution has produced.
     ///
     /// A `Cell` because substitution runs behind `&self`, and the count has to
@@ -694,6 +697,7 @@ impl<'a> Resolver<'a> {
             decl_order: Vec::new(),
             decls: BTreeMap::new(),
             produced: 0,
+            barren: 0,
             nodes: core::cell::Cell::new(0),
         }
     }
@@ -1116,10 +1120,46 @@ impl Resolver<'_> {
                 Binding::new(int_expr(index, f.var.span), f.var.span),
             );
             env.frames.push(frame);
+            let before = self.produced;
             let result = self.expand(&f.body, scope, env, trail, depth + 1, out);
             env.frames.pop();
             result?;
+            if self.produced == before {
+                self.spend_barren(f.span)?;
+            }
             value += 1;
+        }
+        Ok(())
+    }
+
+    /// Charge one expansion that produced no statement against the budget.
+    ///
+    /// Every other limit here counts something that was *made*: statements,
+    /// expression nodes. An expansion that makes nothing is invisible to all
+    /// of them, and it nests — four empty `for i in 0..4096` loops inside one
+    /// another are 2^48 iterations, and thirty argument-less templates that
+    /// each instantiate the one below twice are 2^30 instantiations. Both are
+    /// a few hundred bytes of file, both pass the per-loop and the depth
+    /// limits, and both used to keep the resolver busy for longer than anyone
+    /// would wait, with no diagnostic at the end of it.
+    ///
+    /// The budget is [`ResolveOptions::max_statements`] again rather than a
+    /// number of its own: an expansion that produces a statement is already
+    /// bounded by that limit, so charging the ones that do not against the
+    /// same figure bounds the total work at twice it, and no description that
+    /// resolved before can fail now unless it spent more than sixty-five
+    /// thousand expansions on nothing.
+    fn spend_barren(&mut self, span: Span) -> Result<(), Diagnostic> {
+        self.barren = self.barren.saturating_add(1);
+        if self.barren > self.options.max_statements {
+            return Err(Diagnostic::new(
+                span,
+                format!(
+                    "expansion ran more than {} loop iterations and template instances that \
+                     produced nothing",
+                    self.options.max_statements
+                ),
+            ));
         }
         Ok(())
     }
@@ -1229,10 +1269,15 @@ impl Resolver<'_> {
         let inner_scope = format!("{scope}{instance}.");
         env.frames.push(frame);
         trail.push((template_name, inst.template.span));
+        let before = self.produced;
         let result = self.expand(&template.body, &inner_scope, env, trail, depth + 1, out);
         trail.pop();
         env.frames.pop();
-        result
+        result?;
+        if self.produced == before {
+            self.spend_barren(inst.span)?;
+        }
+        Ok(())
     }
 
     /// Substitute bindings through one declaration statement.
@@ -3180,6 +3225,51 @@ error: clock cycle: `a` → `b` → `a`; every domain must descend from an `osc`
              }\n",
         );
         assert!(rendered.contains("the limit is 4096"), "{rendered}");
+    }
+
+    #[test]
+    fn loops_that_produce_nothing_are_bounded_too() {
+        // 2^48 iterations in a hundred bytes. No single loop is over the
+        // per-loop limit and nothing is ever produced, so before the barren
+        // budget this did not fail — it did not return.
+        let rendered = error(
+            "machine \"m\" {\n  \
+               for i in 0..4096 { for j in 0..4096 { for k in 0..4096 { for l in 0..4096 { } } } }\n\
+             }\n",
+        );
+        assert!(
+            rendered.contains("more than 65536 loop iterations and template instances"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn templates_that_produce_nothing_are_bounded_too() {
+        // The same bomb without a loop in it: each level instantiates the one
+        // below twice, with no arguments for the node budget to count.
+        let mut text = String::from("template t0() { }\n");
+        for level in 1..30 {
+            text.push_str(&format!(
+                "template t{level}() {{ instance l = t{0}()\n instance r = t{0}() }}\n",
+                level - 1
+            ));
+        }
+        text.push_str("machine \"m\" { instance top = t29() }\n");
+        let rendered = error(&text);
+        assert!(
+            rendered.contains("more than 65536 loop iterations and template instances"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_empty_loop_within_the_budget_is_still_no_error() {
+        // `for i in 0..0` and a body that declares nothing are both ordinary:
+        // a parameterised count of zero, a loop whose body is commented out.
+        let text =
+            "machine \"m\" {\n  for i in 0..4096 { }\n  for i in 0..16 { for j in 0..16 { } }\n}\n";
+        crate::machine::resolve_file("t.machine", text, &ResolveOptions::new())
+            .expect("barren, and within budget");
     }
 
     #[test]
