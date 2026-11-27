@@ -267,21 +267,6 @@ impl Shared {
         });
     }
 
-    /// The DMC seam, cloned out so nothing is called with our lock held.
-    fn dmc(&self) -> Option<Arc<DmcFetch>> {
-        self.state.lock().dmc.clone()
-    }
-
-    /// The get/put phase this unit was configured with.
-    fn phase(&self) -> u64 {
-        self.state.lock().phase
-    }
-
-    /// The serial of the fetch being serviced, if any.
-    fn job_serial(&self) -> Option<u64> {
-        self.state.lock().job.map(|j| j.serial)
-    }
-
     /// The bus and the attributes an access from this unit carries.
     fn master(&self) -> Option<(Arc<AddressSpace>, MemAttrs)> {
         let state = self.state.lock();
@@ -543,6 +528,11 @@ impl Gate {
     /// Perform whatever [`Shared::decide`] chose, outside the state lock, and
     /// report the byte this cycle left on the data bus.
     fn perform(&self, act: Act, held: u64, data: u8, dmc: Option<&Arc<DmcFetch>>) -> u8 {
+        // Before the bus is looked up, not after: these three touch nothing,
+        // and they are every cycle on which no transfer is running.
+        if matches!(act, Act::Release | Act::Halted | Act::Hold) {
+            return data;
+        }
         let Some((space, attrs)) = self.shared.master() else {
             return data;
         };
@@ -664,13 +654,23 @@ impl Gate {
 
 impl CycleGate for Gate {
     fn arbitrate(&self, cycle: u64, held: u64, bus: u8, write: bool) -> Arbitration {
-        let dmc = self.shared.dmc();
+        // One critical section for everything the ordinary cycle needs. This
+        // runs once per CPU cycle, and on all but a few hundred of them per
+        // frame there is no transfer and nothing to decide.
+        let (dmc, phase, job, idle) = {
+            let state = self.shared.state.lock();
+            (
+                state.dmc.clone(),
+                state.phase,
+                state.job.map(|j| j.serial),
+                !state.halted && state.oam.is_none() && state.job.is_none(),
+            )
+        };
         // The DMC is on the same die and the same clock: its request appears on
         // an exact cycle, so it has to be caught up before it is asked.
         let (request, alive) = match &dmc {
             Some(dmc) => {
                 dmc.sync();
-                let phase = self.shared.phase();
                 let request = dmc.request().map(|r| Ready {
                     serial: r.serial,
                     addr: r.addr,
@@ -687,11 +687,17 @@ impl CycleGate for Gate {
                     },
                     abort: r.kind == DmaKind::Abort,
                 });
-                let alive = self.shared.job_serial().map(|s| dmc.is_pending(s));
+                let alive = job.map(|s| dmc.is_pending(s));
                 (request, alive)
             }
             None => (None, None),
         };
+        // Core not held, no sprite copy armed, no fetch in hand and none asked
+        // for: `decide` would answer `Release` and change nothing, so it is
+        // not asked.
+        if idle && request.is_none() {
+            return Arbitration::Release;
+        }
 
         let mut after = Aftermath::default();
         let act = self.shared.decide(cycle, write, request, alive, &mut after);
