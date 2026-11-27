@@ -631,10 +631,16 @@ impl Labels {
 // shared emission helpers
 // ---------------------------------------------------------------------------
 
-/// A service handler's prologue: interrupts back on, and a frame `[bp+n]`
-/// addresses the caller's registers through.
+/// A service handler's prologue: interrupts back on, the direction flag
+/// cleared, and a frame `[bp+n]` addresses the caller's registers through.
+///
+/// `CLD` because the handlers move memory with `REP MOVS`, `REP STOS` and
+/// `REP INS`, all of which go whichever way `DF` says, and `INT n` does not
+/// touch `DF` — it arrives as the caller left it. The caller gets its own back
+/// from `IRET`, so this costs it nothing.
 pub(crate) fn enter(a: &mut Asm) {
     a.sti();
+    a.cld();
     a.pushs(DS);
     a.pushs(crate::fw::asm16::ES);
     a.pushad();

@@ -339,3 +339,48 @@ fn ah_08h_limits_the_cylinder_count_instead_of_wrapping_it() {
         assert_eq!(cx & 0x3f, 63, "and the sectors per track are untouched");
     }
 }
+
+/// The colour text page, as a physical address.
+const TEXT_PAGE: u64 = 0xb8000;
+
+/// The character and attribute of one cell of the text page.
+fn cell(m: &Machine, row: u64, column: u64) -> (u8, u8) {
+    let at = TEXT_PAGE + (row * 80 + column) * 2;
+    (peek(m, at), peek(m, at + 1))
+}
+
+/// The services run with the direction flag *they* need, not the caller's.
+///
+/// `INT 10h` moves and fills the text page with `REP MOVSW` and `REP STOSW`
+/// and never cleared the direction flag, so a caller that arrived with it set
+/// — in the middle of a backward copy, say — had its three characters written
+/// leftwards from the cursor and its scroll run off the top of the page.
+/// `INT 13h` and `INT 15h` have always opened with `CLD` for this reason.
+#[test]
+fn int_10h_writes_forwards_whatever_the_callers_direction_flag_says() {
+    use rsemu::fw::asm16::{BX, CX, DX};
+
+    let (m, _hosts) = run("direction flag", |a| {
+        // The cursor to row 5, column 10.
+        a.movi(AX, 0x0200);
+        a.movi(BX, 0x0000);
+        a.movi(DX, 0x050a);
+        a.int(0x10);
+        // STD (SDM Vol. 2B, `STD`: FD), then three `A`s in yellow on blue.
+        a.db(&[0xfd]);
+        a.movi(AX, 0x0941);
+        a.movi(BX, 0x001e);
+        a.movi(CX, 3);
+        a.int(0x10);
+        a.cld();
+    });
+
+    for column in 10..13 {
+        assert_eq!(
+            cell(&m, 5, column),
+            (b'A', 0x1e),
+            "row 5 column {column} was not written"
+        );
+    }
+    assert_ne!(cell(&m, 5, 9).0, b'A', "the run went leftwards");
+}

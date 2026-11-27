@@ -82,7 +82,6 @@ const FORMAT_FILLER: u8 = 0xf6;
 pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.bind(l.int13);
     enter(a);
-    a.cld();
     // The whole handler runs with `DS` on the EBDA, where the geometry POST
     // read out of `IDENTIFY DEVICE` lives. The frame is `SS`-relative, so the
     // caller's registers stay reachable either way.
