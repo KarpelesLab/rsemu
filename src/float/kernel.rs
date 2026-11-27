@@ -259,15 +259,14 @@ pub(super) fn nan_result(ops: &[Parts], env: Env) -> Option<(Outcome, Flags)> {
         Propagate::LargerSignificand => {
             // Table 4-7: a quiet NaN beside a signaling one wins outright, so
             // the significand comparison only ever runs between NaNs of the
-            // same kind. `max_by_key` keeps the *last* maximum, and the first
-            // operand is the documented tie-break, so the search runs
-            // backwards.
+            // same kind. Equal significands are decided by sign, the positive
+            // NaN winning (measured — see `Propagate::LargerSignificand`), and
+            // two NaNs equal in that too are the same NaN.
             let quiet = first(false).is_some();
             pick(
                 ops.iter()
-                    .rev()
                     .filter(|p| p.class == Class::Nan && p.snan != quiet)
-                    .max_by_key(|p| p.frac)?,
+                    .max_by_key(|p| (p.frac, !p.sign))?,
             )
         }
     };

@@ -700,9 +700,10 @@ fn nan_propagation_is_a_parameter() {
         add::<B64>(snan, snan_big, Env::X87),
         (snan_big | B64::QUIET, Flags::INVALID)
     );
-    // Equal significands: the documented tie-break is the first operand.
+    // Equal significands: the positive one, whichever operand it is.
     let a2 = a | B64::SIGN;
-    assert_eq!(add::<B64>(a2, a, Env::X87).0, a2);
+    assert_eq!(add::<B64>(a2, a, Env::X87).0, a);
+    assert_eq!(add::<B64>(a, a2, Env::X87).0, a);
 }
 
 #[test]
@@ -1403,6 +1404,23 @@ fn the_eighty_bit_nan_rules_are_x87s() {
     // Two quiet NaNs: the larger significand wins.
     assert_eq!(x87::add(a, b, Precision::Extended, X87).0, b);
     assert_eq!(x87::add(b, a, Precision::Extended, X87).0, b);
+    // Equal significands: the positive one wins, in either position — read
+    // back from an x86 host for quiet and for signaling pairs alike.
+    let neg = F80::new(0xffff, 0xffff_ffff_ffff_fffe);
+    let pos = F80::new(0x7fff, 0xffff_ffff_ffff_fffe);
+    assert_eq!(x87::add(neg, pos, Precision::Extended, X87).0, pos);
+    assert_eq!(x87::add(pos, neg, Precision::Extended, X87).0, pos);
+    assert_eq!(x87::mul(neg, neg, Precision::Extended, X87).0, neg);
+    let sneg = F80::new(0xffff, 0xbfff_ffff_ffff_fffe);
+    let spos = F80::new(0x7fff, 0xbfff_ffff_ffff_fffe);
+    assert_eq!(
+        x87::add(sneg, spos, Precision::Extended, X87),
+        (pos, Flags::INVALID)
+    );
+    assert_eq!(
+        x87::add(spos, sneg, Precision::Extended, X87),
+        (pos, Flags::INVALID)
+    );
     // A quiet NaN beside a signaling one wins outright, and invalid is still
     // raised.
     let (v, f) = x87::add(snan, a, Precision::Extended, X87);

@@ -342,8 +342,11 @@ pub enum Propagate {
     /// significand.
     ///
     /// The manual does not say which operand wins when two same-kind NaNs have
-    /// **equal** significands; this implementation takes the first, and the
-    /// choice is marked here rather than hidden.
+    /// **equal** significands. A processor does: the positive one, whichever
+    /// operand it is. `FADD` and `FMUL` of `FFFF:FFFFFFFFFFFFFFFE` and
+    /// `7FFF:FFFFFFFFFFFFFFFE`, in either order and with either register as
+    /// the destination, deliver the positive NaN on an AMD Zen 5, and so do
+    /// two signaling NaNs that differ only in sign.
     LargerSignificand,
 }
 
