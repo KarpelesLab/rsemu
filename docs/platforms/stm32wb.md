@@ -88,7 +88,7 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
 | RTC, IWDG, WWDG, CRC, RNG, DBGMCU | `st.rtc`, `st.iwdg`, `st.wwdg`, `st.crc`, `st.rng`, `st.dbgmcu` | `DEV_ID = 0x495` |
 | I2C1, I2C3 | `st.i2c-v2`, `link = "wired"` | the `TIMINGR` block; nothing on the bus, so a transfer is NACKed; `tx-drq`/`rx-drq` reach DMAMUX1 as requests 10–13 |
 | SPI1, SPI2 (WB55 only) | `stm32.spi`, `variant = "f7"`, `link = "wired"` | nothing attached; no DMA request outputs yet |
-| USB full-speed device | `st.usbfs`, `bus = "usb"` | registers at `0x40006800`, 1 KiB packet memory at `0x40006C00`, gated by `APB1ENR1.USBEN`, on NVIC 20 (`USB_LP`); the packet memory takes byte and half-word accesses only (RM0434 §40.6.2), and `BCDR`'s battery-charging detection answers as a standard host port (`port-type = "sdp"`, the default); on the named USB bus `usb`, which a host — a test harness, or anything that opens that bus — enumerates the guest's device stack through |
+| USB full-speed device | `st.usbfs`, `bus = "usb"` | registers at `0x40006800`, 1 KiB packet memory at `0x40006C00`, gated by `APB1ENR1.USBEN`, on NVIC 19 (`USB_HP`, from `irq_hp`) and 20 (`USB_LP`, from `irq`); the packet memory takes byte and half-word accesses only (RM0434 §40.6.2), and `BCDR`'s battery-charging detection answers as a standard host port (`port-type = "sdp"`, the default); on the named USB bus `usb`, which a host — a test harness, or anything that opens that bus — enumerates the guest's device stack through |
 | OTP area | `rom`, `fill = 0xff` | 1 KiB at `0x1FFF7000`, blank as from the factory; programming it is not modelled |
 | Device signature | `st.devinfo` | `FLASH_SIZE`, both UIDs (seeded) and the package code at `0x1FFF7500` |
 
@@ -121,9 +121,13 @@ read. No emulator source of any licence was consulted (`ROADMAP.md` §1).
   no class in the tree; an access to any of these addresses is a BusFault.
   I2C1/3, SPI1/2 and the USB device are placed with **nothing on their
   buses**: no host plugs into `usb` unless something opens it.
-- **`USB_HP`** (NVIC 19): `st.usbfs` has one request line and it is wired
-  to `USB_LP`; a driver that services double-buffered or isochronous
-  endpoints from the high-priority vector will not see them there.
+- **Which events reach `USB_HP`** (NVIC 19) is not stated in RM0434: the
+  manual names the vector and says "an endpoint dedicated interrupt condition
+  is activated independently from the CTRM bit", nothing more. `st.usbfs`
+  drives it from a pending `CTR_RX`/`CTR_TX` on an isochronous or
+  double-buffered bulk endpoint, unmasked by `CTRM` — the set `ISTR.EP_ID`
+  already ranks first. That choice is an assumption; `USB_LP` carries every
+  enabled `ISTR` flag, `CTR` included, as before.
 - **DMA requests from anything but the U(S)ARTs and I2Cs.** DMAMUX1's
   request inputs 10–17 are wired; the timers, SPI, SAI, ADC, QUADSPI and AES
   requests are not, so a channel pointed at one of them never moves.

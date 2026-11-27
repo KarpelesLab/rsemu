@@ -345,7 +345,8 @@ def body(name, p):
         ("i2c3.ev", 32, "I2C3_EV"),
         ("i2c3.er", 33, "I2C3_ER"),
         ("spi1.irq", 34, "SPI1"),
-        ("usb.irq", 20, "USB_LP (the block has one request line)"),
+        ("usb.irq_hp", 19, "USB_HP (iso/double-buffered CTR)"),
+        ("usb.irq", 20, "USB_LP"),
         ("usart1.irq", 36, "USART1"),
         ("lpuart1.irq", 37, "LPUART1"),
     ]

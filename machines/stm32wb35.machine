@@ -281,7 +281,8 @@ machine "stm32wb35" {
   wire i2c3.ev       -> cpu.irq32  # I2C3_EV
   wire i2c3.er       -> cpu.irq33  # I2C3_ER
   wire spi1.irq      -> cpu.irq34  # SPI1
-  wire usb.irq       -> cpu.irq20  # USB_LP (the block has one request line)
+  wire usb.irq_hp    -> cpu.irq19  # USB_HP (iso/double-buffered CTR)
+  wire usb.irq       -> cpu.irq20  # USB_LP
   wire usart1.irq    -> cpu.irq36  # USART1
   wire lpuart1.irq   -> cpu.irq37  # LPUART1
   wire tim16.irq     -> cpu.irq25  # shared with TIM1 (TIM16)
