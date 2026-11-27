@@ -676,6 +676,41 @@ impl MediaTable {
     }
 }
 
+/// The media slots `machine` names: what a caller has to bind before
+/// [`realize()`] will build it.
+///
+/// Each slot once, in the order the description's objects name them. It reads
+/// what [`realize()`] reads and nothing else — an object whose class declares a
+/// property of kind [`ValueKind::Media`], holding the slot's name as a string —
+/// so the answer cannot drift from what the build then asks for.
+///
+/// This is what lets a host tell its user *before* a build that `--cart` is
+/// missing, or that the `--media kernal=…` they typed names a slot no device
+/// in the machine has. An object of a class this registry lacks contributes
+/// nothing: that is [`realize()`]'s error to report, with the near-miss
+/// suggestion the registry composes.
+#[must_use]
+pub fn media_slots(machine: &Resolved, registry: &Registry) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for object in &machine.objects {
+        let Some(class) = registry.get(&object.class) else {
+            continue;
+        };
+        for spec in class
+            .properties
+            .iter()
+            .filter(|p| p.kind == ValueKind::Media)
+        {
+            if let Some(Value::Str(slot)) = object.props.get(spec.name)
+                && !out.iter().any(|had| had == slot)
+            {
+                out.push(slot.clone());
+            }
+        }
+    }
+    out
+}
+
 /// What realize needs beyond the description itself.
 ///
 /// Cloning shares the host objects rather than copying them: two builds from
@@ -2852,6 +2887,38 @@ machine "handheld" {
             .expect_err("the wrong slot")
             .to_string();
         assert!(e.contains("`disk`"), "{e}");
+    }
+
+    #[test]
+    fn the_slots_a_description_names_can_be_asked_for_before_it_is_built() {
+        // Three objects, one of them naming a slot another already named: the
+        // answer is each slot once, in the order the file names them, and it
+        // is exactly the set `realize` then refuses to build without.
+        let source = r#"
+machine "handheld" {
+  space bus { width = 16, unassigned = read-as-ones }
+  object cart "test.cart" { image = "rom" }
+  object save "test.cart" { image = "battery" }
+  object twin "test.cart" { image = "rom" }
+}
+"#;
+        let resolved = crate::machine::resolve_file(
+            "handheld.machine",
+            source,
+            &crate::machine::ResolveOptions::new(),
+        )
+        .expect("it resolves");
+        assert_eq!(media_slots(&resolved, &registry()), ["rom", "battery"]);
+
+        // One short of that set is refused, and exactly that set builds.
+        let image: &[u8] = &[1, 2, 3, 4];
+        build_with_media(source, MediaTable::new().with("rom", image))
+            .expect_err("`battery` is named and unbound");
+        build_with_media(
+            source,
+            MediaTable::new().with("rom", image).with("battery", image),
+        )
+        .expect("every named slot is bound");
     }
 
     #[test]

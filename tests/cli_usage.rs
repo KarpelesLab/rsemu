@@ -124,6 +124,102 @@ fn a_refusal_is_one_sentence_with_no_gaps_in_it() {
     assert!(!stderr.contains("  "), "a gap in: {stderr:?}");
 }
 
+/// A NES with no cartridge says `--cart`, and nothing about slots it lacks.
+///
+/// It used to say: "`rom` names the media slot `cart`, which nothing is bound
+/// to; bound slots are `cd0`, `cdrom`, `df0`, `disk`, `ext`, `flash`, …" —
+/// seventeen empty defaults the binary had bound on the user's behalf, and no
+/// mention of the flag that fixes it.
+#[cfg(feature = "machine-nes")]
+#[test]
+fn a_forgotten_cartridge_names_the_flag_that_supplies_one() {
+    let (code, stdout, stderr) = run(&["run", "nes-ntsc", "--headless", "--for", "1ms"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("`cart`"), "{stderr}");
+    assert!(stderr.contains("--cart <file>"), "{stderr}");
+    for unrelated in ["flash0", "cdrom", "kwi", "vgabios"] {
+        assert!(!stderr.contains(unrelated), "{unrelated} in: {stderr}");
+    }
+    assert!(!stdout.contains("ran to"), "nothing ran: {stdout}");
+}
+
+/// The same for a slot with no flag of its own: it is spelled `--media`.
+#[cfg(feature = "machine-z80-mini")]
+#[test]
+fn a_missing_slot_with_no_flag_of_its_own_is_spelled_with_media() {
+    let (code, _, stderr) = run(&["run", "z80-mini", "--headless", "--for", "1ms"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("--media firmware=<file>"), "{stderr}");
+}
+
+/// A file given to a slot the machine does not have is said to be unused.
+///
+/// `rsemu run apple1 --cart game.nes` and `--media rmo=monitor.bin` both ran
+/// exactly as if the flag had not been typed: exit zero, the same state hash,
+/// not a word. The run is still a valid one, so this is a warning.
+#[cfg(feature = "machine-apple1")]
+#[test]
+fn a_file_for_a_slot_the_machine_lacks_is_reported_as_unused() {
+    for flag in [
+        ["--cart", SOME_FILE],
+        ["--media", &format!("rmo={SOME_FILE}")],
+    ] {
+        let (code, _, stderr) = run(&[
+            "run",
+            "apple1",
+            "--headless",
+            "--for",
+            "1ms",
+            flag[0],
+            flag[1],
+        ]);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stderr.contains("warning"), "{flag:?}: {stderr}");
+        assert!(stderr.contains("not used"), "{flag:?}: {stderr}");
+        // And what the machine does have, so a typo can be seen for one.
+        assert!(stderr.contains("`rom`"), "{flag:?}: {stderr}");
+    }
+
+    // The slot the machine names draws no warning.
+    let (code, _, stderr) = run(&[
+        "run",
+        "apple1",
+        "--headless",
+        "--for",
+        "1ms",
+        "--rom",
+        SOME_FILE,
+    ]);
+    assert!(!stderr.contains("warning"), "{code:?}: {stderr}");
+}
+
+/// `--drive` backs whichever slot it names, not only the ones on a list.
+///
+/// The drive's device finds its image by the slot's name, which it learns
+/// from a media binding — and the binary bound an empty one only for a
+/// hard-coded set of slots. `sata0` was not in it, so the one flag that binds
+/// the slot was refused with "nothing is bound to `sata0`".
+#[cfg(all(feature = "machine-ahci-mini", feature = "dev-blk"))]
+#[test]
+fn a_drive_binds_the_slot_it_names() {
+    let image = scratch("sata0.img");
+    std::fs::write(&image, vec![0u8; 1 << 20]).expect("a scratch image");
+    let spec = format!("sata0={}", image.to_str().expect("a UTF-8 temp dir"));
+    let (code, stdout, stderr) = run(&[
+        "run",
+        "ahci-mini",
+        "--headless",
+        "--for",
+        "1ms",
+        "--drive",
+        &spec,
+    ]);
+    let _ = std::fs::remove_file(&image);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("ran to"), "{stdout}");
+    assert!(!stderr.contains("never picked up"), "{stderr}");
+}
+
 /// A class this build lacks is reported at the line that names it.
 ///
 /// It was the one front-end mistake with no location: `registry: unknown

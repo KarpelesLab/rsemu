@@ -637,14 +637,16 @@ fn run(args: &[String]) -> ExitCode {
     // card's LOADING.KWI booted directly. Either one alone is a working
     // machine, so neither may be required — an empty `flash` is an erased
     // chip, and an empty `kwi` leaves the board booting its flash.
-    for slot in [
+    //
+    // Only a list here; the binding is further down, once the description has
+    // been read, because a slot is given its empty image only on a machine
+    // that *names* it. Binding all seventeen to every machine made the error
+    // for a forgotten `--cart` end in a list of seventeen "bound slots" the
+    // user had never heard of.
+    const EMPTY_WHEN_UNBOUND: &[&str] = &[
         "flash0", "flash1", "initrd", "disk", "hd0", "hd1", "scsi0", "floppy", "floppy2",
         "vgabios", "nvme0", "df0", "ext", "cd0", "cdrom", "flash", "kwi",
-    ] {
-        if !images.iter().any(|(bound, _)| bound == slot) {
-            images.push((String::from(slot), Vec::new()));
-        }
-    }
+    ];
 
     // A path wins over a catalog name, so a user editing a copy of a shipped
     // file gets their copy.
@@ -676,14 +678,85 @@ fn run(args: &[String]) -> ExitCode {
         Ok(o) => o,
         Err(e) => return fail(&e),
     };
+    for (key, value) in &parsed.params {
+        options = options.with_param(key.clone(), value.clone());
+    }
+    let registry = match catalog::registry() {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+
+    // Which media slots this description names, asked *before* the build so
+    // that the three things below are said in terms of the command line
+    // rather than discovered inside `realize`. A description that does not
+    // resolve fails here with the report the build would have given: the same
+    // text, the same `file:line:col`, the same caret.
+    let named = match rsemu::machine::resolve_file(&name, &source, &options.resolve) {
+        Ok(resolved) => rsemu::machine::media_slots(&resolved, &registry),
+        Err(e) => return fail(&e),
+    };
+    let names = |slot: &str| named.iter().any(|n| n == slot);
+
+    // A `--drive` backs its slot with the file itself, and the device finds it
+    // by the slot's *name* — which it only learns from a media binding. So a
+    // drive binds its slot, empty, exactly as `EMPTY_WHEN_UNBOUND` does for the
+    // slots on that list. Without this `--drive` worked only for those:
+    // `rsemu run ahci-mini --drive sata0=disk.img` was refused with "nothing is
+    // bound to `sata0`" by the very flag that binds it.
+    #[cfg(feature = "dev-blk")]
+    for drive in &parsed.drives {
+        if names(&drive.slot) && !images.iter().any(|(bound, _)| *bound == drive.slot) {
+            images.push((drive.slot.clone(), Vec::new()));
+        }
+    }
+    for slot in EMPTY_WHEN_UNBOUND {
+        if names(slot) && !images.iter().any(|(bound, _)| bound == slot) {
+            images.push((String::from(*slot), Vec::new()));
+        }
+    }
+
+    // A slot the machine names and nothing filled. `realize` refuses this too,
+    // but it can only name the slot; this names the flag.
+    let missing: Vec<&str> = named
+        .iter()
+        .map(String::as_str)
+        .filter(|slot| !images.iter().any(|(bound, _)| bound == slot))
+        .collect();
+    if !missing.is_empty() {
+        let slots: Vec<String> = missing.iter().map(|s| format!("`{s}`")).collect();
+        let flags: Vec<String> = missing.iter().map(|s| media_flag(s)).collect();
+        eprintln!(
+            "rsemu: {name}: nothing is bound to the media slot{} {}, and the machine cannot \
+             start without {}; give it with {}",
+            if missing.len() == 1 { "" } else { "s" },
+            slots.join(", "),
+            if missing.len() == 1 { "it" } else { "them" },
+            flags.join(" ")
+        );
+        return ExitCode::from(2);
+    }
+
+    // And the opposite mistake: a file given to a slot no device here has.
+    // It used to be dropped without a word — `--media kernal=bzImage` built a
+    // machine with no kernel in it, `--cart game.nes` on a board with no
+    // cartridge port ran as if the flag had not been typed. A warning rather
+    // than a refusal, as for a `--drive` nothing picked up below: the machine
+    // is a valid one, it is just not the one that was asked for.
+    for (slot, path) in &parsed.media {
+        if !names(slot) {
+            eprintln!(
+                "rsemu: warning: {path} was given to the media slot `{slot}`, which no device \
+                 in this machine names, so it is not used; the slots here are {}",
+                list(&named)
+            );
+        }
+    }
+
     for (slot, bytes) in &images {
         options
             .realize
             .media
             .insert(slot.as_str(), bytes.as_slice());
-    }
-    for (key, value) in &parsed.params {
-        options = options.with_param(key.clone(), value.clone());
     }
     // `--threading` is the *run* speaking, so it goes in the slot that
     // overrides the board; without the flag the machine file's own `threading`
@@ -756,10 +829,6 @@ fn run(args: &[String]) -> ExitCode {
         options.realize.recorder = Some(Arc::clone(recorder));
     }
 
-    let registry = match catalog::registry() {
-        Ok(r) => r,
-        Err(e) => return fail(&e),
-    };
     let mut machine = match rsemu::machine::build(&name, &source, &registry, &options) {
         Ok(m) => m,
         // Front-end failures already carry `file:line:col` and a caret; realize
