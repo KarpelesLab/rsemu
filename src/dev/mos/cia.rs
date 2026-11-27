@@ -1627,7 +1627,10 @@ impl Device for Cia {
         next.tod_halted = r.read_bool()?;
         next.sdr = r.read_u8()?;
         next.sr_shift = r.read_u8()?;
-        next.sr_bits = r.read_u8()? % 8;
+        // 0..=8, not 0..8: a byte that has just been shifted out leaves the
+        // counter standing at 8 until the next one starts, and folding that to
+        // 0 made a restored chip re-save as different bytes.
+        next.sr_bits = r.read_u8()?.min(8);
         next.sr_buffer = r.read_u8()?;
         next.sr_pending = r.read_bool()?;
         next.sr_active = r.read_bool()?;

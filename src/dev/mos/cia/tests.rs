@@ -793,6 +793,49 @@ fn a_snapshot_round_trips_to_identical_state() {
     assert_eq!(saved.port_b(), restored.port_b());
 }
 
+/// A snapshot taken after a byte has been shifted out is a fixed point.
+///
+/// `shift_out` leaves its bit counter standing at 8 once the byte is gone —
+/// it is only zeroed when the next one starts — and `load` read the counter
+/// back modulo 8. So the commonest serial state there is, "a byte has been
+/// sent" (an Amiga acknowledges every keystroke that way), restored as 0 and
+/// re-saved as different bytes: `save -> load -> save` was not the identity,
+/// and a state hash taken after a restore disagreed with the one taken before
+/// it.
+#[test]
+fn a_snapshot_after_a_byte_was_shifted_out_is_a_fixed_point() {
+    let image = |cia: &Cia| {
+        let mut shape = MachineShape::new();
+        shape.add_device("cia", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("cia", CLASS_NAME, STATE_VERSION).unwrap();
+            cia.save(&mut chunk).unwrap();
+        }
+        w.to_vec().unwrap()
+    };
+    let saved = Cia::bare();
+    poke(&saved, 0x4, 0);
+    poke(&saved, 0x5, 0);
+    poke(&saved, 0xe, CR_START | CRA_SPMODE);
+    poke(&saved, 0xc, 0xa5);
+    saved.advance_to(16);
+    assert_eq!(saved.icr() & ICR_SP, ICR_SP, "the byte has gone");
+    let bytes = image(&saved);
+
+    let restored = Cia::bare();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("cia", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    restored.load(&mut chunk.reader()).unwrap();
+    assert_eq!(
+        image(&restored),
+        bytes,
+        "a round trip must be a fixed point"
+    );
+}
+
 #[test]
 fn the_class_is_registrable_and_takes_no_properties() {
     let mut registry = crate::core::Registry::new();
