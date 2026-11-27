@@ -1166,6 +1166,24 @@ pub(super) fn emit(a: &mut Asm, l: &Labels, v: &Vbe) {
     a.bind(clearing);
     a.movi8(AH, 0x00);
     a.int(0x10);
+    // A VGA mode set without clearing is still a Function 02h mode set, and
+    // Function 03h owes its bit 15 back like any other ("D15 = 1 Memory not
+    // cleared at last mode set"; Ralf Brown's Interrupt List has the same,
+    // INT 10h AX=4F03h: "bit 15: Don't clear video memory"). `AH=00h` has
+    // just cleared the recorded VBE mode, which is what makes Function 03h
+    // answer from the BIOS Data Area's mode byte — and that byte has no bit
+    // 15. So the number is recorded here, flag and all, when the flag was
+    // asked for and the mode was actually set. `BX` is still the caller's:
+    // `INT 10h` hands back every register it does not return a value in.
+    a.testi8(BH, 0x80);
+    a.jcc(Cc::E, vbe_done);
+    a.mov8(AL, Mem::abs(super::BDA_VIDEO_MODE));
+    a.mov8(AH, BL);
+    a.alui8(Alu::AND, AH, 0x7f);
+    a.alu8(Alu::CMP, AL, AH);
+    a.jcc(Cc::NE, vbe_done);
+    a.movi8(AH, 0x80);
+    a.movto(Mem::abs(super::BDA_VBE_MODE), AX);
     a.jmp(vbe_done);
 
     a.bind(set_failed);
@@ -1177,7 +1195,8 @@ pub(super) fn emit(a: &mut Asm, l: &Labels, v: &Vbe) {
     // Functions Standard* 3.0, Function 03h), and Function 02h takes VGA mode
     // numbers too. Those leave no VBE mode recorded — `set_mode` clears it —
     // so the answer for them is the BIOS Data Area's own mode byte, where it
-    // used to be zero.
+    // used to be zero. (One set through Function 02h *with* bit 15 is
+    // recorded, by `f_set_mode`, because the mode byte cannot carry the bit.)
     a.bind(f_get_mode);
     let have_mode = a.label();
     a.mov(AX, Mem::abs(super::BDA_VBE_MODE));

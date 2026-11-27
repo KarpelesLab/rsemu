@@ -711,6 +711,23 @@ fn the_vbe_mode_read_back_is_the_mode_that_was_set() {
         a.movi(BX, 0xffff);
         a.int(0x10);
         a.movto(Mem::abs(R + 12), BX);
+        // A VGA mode *without* clearing memory: bit 15 on a mode number below
+        // 100h, which Function 02h turns into bit 7 of `AL` for `AH=00h`.
+        a.movi(AX, 0x4f02);
+        a.movi(BX, 0x8013);
+        a.int(0x10);
+        a.movi(AX, 0x4f03);
+        a.movi(BX, 0xffff);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 14), BX);
+        // And an ordinary `AH=00h` afterwards, which is not a Function 02h
+        // mode set and must not inherit the flag.
+        a.movi(AX, 0x0003);
+        a.int(0x10);
+        a.movi(AX, 0x4f03);
+        a.movi(BX, 0xffff);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 16), BX);
     });
 
     assert_eq!(peek16(&m, R), 0x004f, "setting mode 13h through 4F02h");
@@ -720,4 +737,10 @@ fn the_vbe_mode_read_back_is_the_mode_that_was_set() {
     assert_eq!(peek16(&m, R + 8), 0x004f);
     assert_eq!(peek16(&m, R + 10), 0xc112, "4F03h after a VBE mode set");
     assert_eq!(peek16(&m, R + 12), 0x0101);
+    assert_eq!(
+        peek16(&m, R + 14),
+        0x8013,
+        "4F03h after a VGA mode set that kept display memory"
+    );
+    assert_eq!(peek16(&m, R + 16), 0x0003, "and the flag does not linger");
 }
