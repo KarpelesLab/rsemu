@@ -914,6 +914,23 @@ impl Shared {
         }
     }
 
+    /// Let go of the fabric after a reset, if this controller was the master
+    /// of the transfer open on it.
+    ///
+    /// A wired controller that is reset stops driving its pins
+    /// ([`ControllerWires::reset`]): the lines rise, and SDA rising with SCL
+    /// high is a STOP to every device on them. A transactional link has no
+    /// pins — the fabric holds the transaction — so the same reset has to say
+    /// so in the fabric's terms, or the bus stays busy with a device still
+    /// addressed and `BUSY` reads set on a peripheral that has just been
+    /// reset. Never called with the state lock held: the fabric ranks above
+    /// it, and `stop` calls into the addressed devices.
+    fn release_bus(&self, held: bool) {
+        if held && let Some(bus) = self.transactional_bus() {
+            bus.stop();
+        }
+    }
+
     /// The transaction open on the fabric, for the snapshot. Takes no state
     /// lock, for [`Shared::bus_busy`]'s reason.
     fn bus_transaction(&self) -> Option<Transaction> {
@@ -1396,16 +1413,19 @@ impl Gated for Shared {
         // both open-drain drivers, because a block held in reset is not
         // holding SCL or SDA down. The tick is kept: a reset line does not
         // rewind a clock domain (`ROADMAP.md` §4.2).
-        {
+        let held = {
             let mut state = self.state.lock();
+            let held = state.msl;
             let ticks = state.ticks;
             *state = State {
                 ticks,
                 ..State::default()
             };
             self.publish(&state);
-        }
+            held
+        };
         self.wires.reset();
+        self.release_bus(held);
         self.update_interrupts();
     }
 }
@@ -1643,7 +1663,12 @@ enum After {
     /// Something may now be startable, and the flags may have moved.
     Pump,
     /// `SWRST`: abandon whatever is in flight and let both lines go.
-    Reset,
+    Reset {
+        /// Whether this controller was the master of an open transfer, which
+        /// on a transactional link is the fabric's to be told
+        /// ([`Shared::release_bus`]).
+        held: bool,
+    },
     /// `ACK` moved while a byte is being clocked in; the acknowledge this model
     /// will drive on the ninth clock has to follow it.
     ReadAck(Ack),
@@ -1739,13 +1764,14 @@ impl RegisterPort {
             0x00 => {
                 if value & CR1_SWRST != 0 {
                     // §25.6.1: "When set, the I2C is under reset state."
+                    let held = state.msl;
                     let ticks = state.ticks;
                     *state = State {
                         ticks,
                         cr1: value & CR1_MASK,
                         ..State::default()
                     };
-                    return After::Reset;
+                    return After::Reset { held };
                 }
                 let had_ack = state.cr1 & CR1_ACK != 0;
                 let arm = state.sr1_read;
@@ -1862,8 +1888,9 @@ impl RegisterPort {
                 self.shared.pump();
                 self.shared.update_interrupts();
             }
-            After::Reset => {
+            After::Reset { held } => {
                 self.shared.wires.reset();
+                self.shared.release_bus(held);
                 self.shared.update_interrupts();
             }
             After::ReadAck(ack) => {
@@ -1960,8 +1987,9 @@ impl Device for Stm32I2c {
     }
 
     fn reset(&self, _kind: ResetKind) {
-        {
+        let held = {
             let mut state = self.shared.state.lock();
+            let held = state.msl;
             // The tick is *not* zeroed: `Machine::reset` does not rewind clock
             // domains (`ROADMAP.md` §4.2).
             let ticks = state.ticks;
@@ -1970,8 +1998,10 @@ impl Device for Stm32I2c {
                 ..State::default()
             };
             self.shared.publish(&state);
-        }
+            held
+        };
         self.shared.wires.reset();
+        self.shared.release_bus(held);
         self.shared.update_interrupts();
     }
 

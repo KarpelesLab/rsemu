@@ -1412,6 +1412,58 @@ fn a_page_write_snapshotted_between_two_data_bytes_finishes_on_the_restored_boar
     assert_eq!(restored.isr() & ISR_BUSY, 0, "and the STOP freed the bus");
 }
 
+/// How a controller in the middle of a transfer is knocked over.
+#[derive(Debug, Clone, Copy)]
+enum Knock {
+    /// `CR1.PE` cleared: §35.4.6's software reset.
+    Pe,
+    /// `Device::reset`, as a watchdog's reset line delivers it.
+    Device,
+}
+
+#[test]
+fn a_reset_in_the_middle_of_a_transfer_lets_go_of_the_bus_on_either_link() {
+    // RM0434 §35.4.6, "I2C reset": "The reset of the I2C peripheral is
+    // performed by clearing the PE bit of the I2C_CR1 register. It has the
+    // effect of releasing the SCL and SDA lines." and "The impacted register
+    // bits are: [...] I2C_ISR register: BUSY, [...]". A wired controller does
+    // exactly that; a transactional one has no pins, the fabric holds the
+    // transaction, and it used to stay open — `ISR.BUSY` stuck at one.
+    for link in [Link::Wired, Link::Transactional] {
+        for knock in [Knock::Pe, Knock::Device] {
+            let what = alloc::format!("{link:?}, {knock:?}");
+            let mut board = Board::new(link);
+            board.init();
+            poke(
+                &board.region,
+                CR2,
+                sadd(0x50) | nb(3) | CR2_AUTOEND | CR2_START,
+            );
+            board.wait(ISR_TXIS);
+            poke(&board.region, TXDR, 0x10);
+            board.wait(ISR_TXIS);
+            assert_ne!(board.isr() & ISR_BUSY, 0, "{what}: a transfer is open");
+
+            match knock {
+                Knock::Pe => poke(&board.region, CR1, 0),
+                Knock::Device => board.ctrl.reset(ResetKind::Warm),
+            }
+            board.step(16);
+            assert_eq!(
+                board.isr() & ISR_BUSY,
+                0,
+                "{what}: the reset released the bus"
+            );
+
+            // And the device that was addressed is reachable again.
+            board.init();
+            board.write_page(0x50, 0x20, &[0x11]);
+            board.step(crate::dev::atmel::at24c::DEFAULT_WRITE_TICKS);
+            assert_eq!(board.eeprom.byte(0x20), Some(0x11), "{what}");
+        }
+    }
+}
+
 #[test]
 fn a_reset_keeps_the_tick_and_drops_everything_else() {
     let mut board = Board::new(Link::Wired);

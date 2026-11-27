@@ -677,6 +677,66 @@ fn a_page_write_snapshotted_between_two_data_bytes_finishes_on_the_restored_boar
     );
 }
 
+/// How a controller in the middle of a transfer is knocked over.
+#[derive(Debug, Clone, Copy)]
+enum Knock {
+    /// `CR1.SWRST`, set and released.
+    Swrst,
+    /// `Device::reset`, as a watchdog's reset line delivers it.
+    Device,
+}
+
+#[test]
+fn a_reset_in_the_middle_of_a_transfer_lets_go_of_the_bus_on_either_link() {
+    // A wired controller that is reset stops driving its two pins, the lines
+    // rise, and every device on them sees a STOP. A transactional one has no
+    // pins to release — the fabric is what holds the transaction — and used to
+    // leave it open: `SR2.BUSY` stuck at one on a freshly reset peripheral,
+    // which is the state a driver refuses to start a transfer from.
+    for link in [Link::Wired, Link::Transactional] {
+        for knock in [Knock::Swrst, Knock::Device] {
+            let what = alloc::format!("{link:?}, {knock:?}");
+            let mut board = Board::new(link);
+            board.init();
+            poke(&board.region, CR1, CR1_PE | CR1_ACK | CR1_START);
+            board.wait(SR1_SB);
+            peek(&board.region, SR1);
+            poke(&board.region, DR, 0x50 << 1);
+            board.wait(SR1_ADDR);
+            peek(&board.region, SR1);
+            peek(&board.region, SR2);
+            board.wait(SR1_TXE);
+            poke(&board.region, DR, 0x10);
+            board.wait(SR1_TXE | SR1_BTF);
+            assert_ne!(
+                peek_with(&board.region, SR2, MemAttrs::DEBUG) & SR2_BUSY,
+                0,
+                "{what}: a transfer is open"
+            );
+
+            match knock {
+                Knock::Swrst => {
+                    poke(&board.region, CR1, CR1_SWRST);
+                    poke(&board.region, CR1, 0);
+                }
+                Knock::Device => board.ctrl.reset(ResetKind::Warm),
+            }
+            board.step(16);
+            assert_eq!(
+                peek_with(&board.region, SR2, MemAttrs::DEBUG) & SR2_BUSY,
+                0,
+                "{what}: the reset released the bus"
+            );
+
+            // And the device that was addressed is reachable again.
+            board.init();
+            board.write_page(0x50, 0x20, &[0x11]);
+            board.step(crate::dev::atmel::at24c::DEFAULT_WRITE_TICKS);
+            assert_eq!(board.eeprom.byte(0x20), Some(0x11), "{what}");
+        }
+    }
+}
+
 #[test]
 fn a_reset_keeps_the_tick_and_drops_everything_else() {
     let mut board = Board::new(Link::Wired);
