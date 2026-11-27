@@ -2316,7 +2316,11 @@ impl Vcpu {
                 RawExit::Interrupted => return Ok(Run::completed(Consumed::new(entries))),
                 RawExit::Reason(reason) => reason,
             };
-            let pc = self.rip(&inner);
+            // `RIP` costs a `KVM_GET_REGS`, and only an exit that is reported
+            // needs it. The two that are not — a port or MMIO access serviced
+            // right here — are nearly every exit a booting guest takes, so it
+            // is asked for per arm rather than per entry.
+            let pc = || self.rip(&inner);
             match reason {
                 exit::IO => {
                     self.service_pio(&inner)?;
@@ -2332,13 +2336,13 @@ impl Vcpu {
                 exit::HLT => {
                     return Ok(Run::exited(
                         Consumed::new(entries),
-                        Exit::new(ExitReason::HALT, pc, 0),
+                        Exit::new(ExitReason::HALT, pc(), 0),
                     ));
                 }
                 exit::SHUTDOWN | exit::SYSTEM_EVENT => {
                     return Ok(Run::exited(
                         Consumed::new(entries),
-                        Exit::new(ExitReason::SHUTDOWN, pc, 0),
+                        Exit::new(ExitReason::SHUTDOWN, pc(), 0),
                     ));
                 }
                 exit::INTR => return Ok(Run::completed(Consumed::new(entries))),
@@ -2351,7 +2355,7 @@ impl Vcpu {
                     );
                     return Ok(Run::exited(
                         Consumed::new(entries),
-                        Exit::new(ExitReason::FAULT, pc, 0)
+                        Exit::new(ExitReason::FAULT, pc(), 0)
                             .with_detail(detail)
                             .with_access(0, Access::None),
                     ));
@@ -2365,7 +2369,7 @@ impl Vcpu {
                     );
                     return Ok(Run::exited(
                         Consumed::new(entries),
-                        Exit::new(ExitReason::INTERNAL, pc, 0).with_detail(detail),
+                        Exit::new(ExitReason::INTERNAL, pc(), 0).with_detail(detail),
                     ));
                 }
                 other => {
@@ -2374,7 +2378,7 @@ impl Vcpu {
                     // pretending it did not happen (`core::exec`).
                     return Ok(Run::exited(
                         Consumed::new(entries),
-                        Exit::new(ExitReason::INTERNAL, pc, 0).with_detail(u64::from(other)),
+                        Exit::new(ExitReason::INTERNAL, pc(), 0).with_detail(u64::from(other)),
                     ));
                 }
             }
