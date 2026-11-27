@@ -45,12 +45,25 @@ fi
 
 echo
 echo "== direct dependencies, all features =="
-direct=$(cargo metadata --no-deps --format-version 1 | python3 -c '
+# Every kind, not only `[dependencies]`. A `[dev-dependencies]` or
+# `[build-dependencies]` entry has `kind` "dev" or "build" in the metadata, and
+# a filter on `kind is None` let either through unexamined: CLAUDE.md's
+# "nothing else" has no exemption for a test harness or a build script, and a
+# build script runs on every embedder's machine.
+#
+# And the status is checked. `direct` is read by a `for` loop below, and a loop
+# over nothing passes: with `cargo metadata` or `python3` failing, this gate
+# used to print a traceback and then report that every one of zero
+# dependencies was permitted.
+if ! direct=$(cargo metadata --no-deps --format-version 1 | python3 -c '
 import json, sys
 pkg = json.load(sys.stdin)["packages"][0]
-names = sorted({d["name"] for d in pkg["dependencies"] if d["kind"] is None})
+names = sorted({d["name"] for d in pkg["dependencies"]})
 print("\n".join(names))
-')
+'); then
+  echo "::error title=dependency policy::could not list the direct dependencies, so none were checked"
+  exit 1
+fi
 printf '%s\n' "$direct"
 for d in $direct; do
   case " $PERMITTED " in
