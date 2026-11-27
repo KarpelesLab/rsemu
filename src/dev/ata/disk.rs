@@ -169,6 +169,10 @@ pub const SECTOR: u64 = 512;
 /// The largest LBA the 28-bit addressing scheme can name, plus one.
 pub const LBA28_LIMIT: u64 = 1 << 28;
 
+/// The largest native maximum address `READ NATIVE MAX ADDRESS` reports as it
+/// is: 268,435,455, the last sector 28 bits can name (ATA/ATAPI-6 §6.20).
+const NATIVE_MAX_28: u64 = LBA28_LIMIT - 1;
+
 /// The largest LBA the 48-bit addressing scheme can name, plus one.
 pub const LBA48_LIMIT: u64 = 1 << 48;
 
@@ -1695,19 +1699,51 @@ impl AtaDisk {
                 // and "is durable" are different claims once the medium is a
                 // host file, and FLUSH CACHE asks for the second one. A guest
                 // filesystem's barrier is exactly this command, so a failure
-                // has to be reported rather than swallowed (ATA/ATAPI-6 §8.16:
-                // a failed flush aborts and reports the failing LBA).
+                // has to be reported rather than swallowed (ATA/ATAPI-6 §8.12.6
+                // and §8.13.6: the command terminates and the registers hold
+                // the address of the first unrecoverable error).
                 match self.media.flush() {
                     Ok(()) => self.succeed(state),
                     Err(e) => {
+                        // A host `fsync` that fails names no sector, so the
+                        // address is the drive's last one. How it is written
+                        // depends on the command. `FLUSH CACHE EXT` has 48
+                        // bits for it. `FLUSH CACHE` has 28, and §8.12.6 says
+                        // what a large drive does with them: "If the device
+                        // supports the 48-bit Address feature set and the
+                        // error occurred in an address greater than FFFFFFFh,
+                        // the value set in the LBA Low, LBA Mid, and LBA High
+                        // registers shall be FFh and the value set in bits
+                        // (3:0) of the Device register shall be Fh." Storing
+                        // the low 28 bits instead named a sector near the
+                        // start of the disk.
                         let last = self.id.sectors - 1;
-                        self.fail(state, error_bit(e), last, Mode::Lba28);
+                        if opcode == cmd::FLUSH_CACHE_EXT {
+                            self.fail(state, error_bit(e), last, Mode::Lba48);
+                        } else {
+                            let last = last.min(LBA28_LIMIT - 1);
+                            self.fail(state, error_bit(e), last, Mode::Lba28);
+                        }
                     }
                 }
             }
             cmd::SET_FEATURES => self.set_features(state),
             cmd::READ_NATIVE_MAX => {
+                // ATA/ATAPI-6 §8.32.8: "If the 48-bit Address feature set is
+                // supported and the 48-bit native max address is greater than
+                // 268,435,455, the READ NATIVE MAX ADDRESS command shall
+                // return a maximum value of 268,435,454." That is 0FFFFFFEh —
+                // one *less* than the largest 28-bit address, so that a host
+                // can tell a drive that ends exactly there (§6.20: a native
+                // maximum "equal to or less than 268,435,455" is returned as
+                // it is) from one that goes on. The low 28 bits of the real
+                // address, which is what this used to store, is neither.
                 let last = self.id.sectors - 1;
+                let last = if last > NATIVE_MAX_28 {
+                    NATIVE_MAX_28 - 1
+                } else {
+                    last
+                };
                 self.succeed(state);
                 self.store_address(state, last, Mode::Lba28);
                 state.device |= DEV_LBA;

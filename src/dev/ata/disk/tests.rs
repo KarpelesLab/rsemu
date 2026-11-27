@@ -1603,3 +1603,129 @@ fn a_snapshot_taken_inside_a_dma_block_resumes_inside_it() {
     }
     assert_eq!(restored.taskfile_registers().lba, 304);
 }
+
+// ---------------------------------------------------------------------------
+// a drive larger than 28 bits can address, asked through a 28-bit command
+// ---------------------------------------------------------------------------
+
+/// A medium that is all capacity and no bytes, so a drive of more than 2^28
+/// sectors can exist in a test without 128 GiB behind it.
+#[derive(Debug)]
+struct Hollow {
+    bytes: u64,
+    flush_fails: bool,
+}
+
+impl Medium for Hollow {
+    fn capacity(&self) -> u64 {
+        self.bytes
+    }
+
+    fn read_at(&self, _offset: u64, dst: &mut [u8]) -> crate::core::space::MemResult {
+        dst.fill(0);
+        Ok(())
+    }
+
+    fn write_at(&self, _offset: u64, _src: &[u8]) -> crate::core::space::MemResult {
+        Ok(())
+    }
+
+    fn flush(&self) -> crate::core::space::MemResult {
+        if self.flush_fails {
+            Err(BusError::Unassigned)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn hollow(sectors: u64, flush_fails: bool) -> AtaDisk {
+    let id = Identity::new(sectors, default_geometry(sectors), true, 16).expect("a valid drive");
+    AtaDisk::with_medium(
+        id,
+        Position::Device0,
+        Arc::new(Hollow {
+            bytes: sectors * SECTOR,
+            flush_fails,
+        }),
+    )
+    .expect("the medium matches the identity")
+}
+
+/// The 28-bit address the command block holds.
+fn lba28_of(disk: &AtaDisk) -> u32 {
+    u32::from(disk.read_reg(Reg::LbaLow, false) as u8)
+        | (u32::from(disk.read_reg(Reg::LbaMid, false) as u8) << 8)
+        | (u32::from(disk.read_reg(Reg::LbaHigh, false) as u8) << 16)
+        | (u32::from(disk.read_reg(Reg::Device, false) as u8 & DEV_HEAD) << 24)
+}
+
+#[test]
+fn read_native_max_address_on_a_drive_past_28_bits_reports_0ffffffe() {
+    // ATA/ATAPI-6 §8.32.8: "If the 48-bit Address feature set is supported and
+    // the 48-bit native max address is greater than 268,435,455, the READ
+    // NATIVE MAX ADDRESS command shall return a maximum value of 268,435,454."
+    //
+    // A drive of 2^28 + 1000 sectors used to answer 999 — the low 28 bits of
+    // its last sector — which a BIOS reads as a half-megabyte disk.
+    let disk = hollow((1 << 28) + 1000, false);
+    select_lba(&disk, 0);
+    disk.write_reg(Reg::Command, u16::from(cmd::READ_NATIVE_MAX));
+    assert_eq!(status(&disk) & ST_ERR, 0);
+    assert_eq!(lba28_of(&disk), 268_435_454);
+
+    // The EXT form says where it really ends.
+    let regs = {
+        disk.taskfile_start(&taskfile::Taskfile {
+            command: cmd::READ_NATIVE_MAX_EXT,
+            device: DEV_LBA,
+            ..taskfile::Taskfile::default()
+        });
+        disk.taskfile_registers()
+    };
+    assert_eq!(regs.lba, (1 << 28) + 999);
+
+    // §6.20: a native maximum "equal to or less than 268,435,455" comes back
+    // as it is, and that includes the very last address 28 bits can name —
+    // which is why the clamp is to one less, so the two can be told apart.
+    let disk = hollow(1 << 28, false);
+    select_lba(&disk, 0);
+    disk.write_reg(Reg::Command, u16::from(cmd::READ_NATIVE_MAX));
+    assert_eq!(lba28_of(&disk), 268_435_455);
+
+    // One sector more is the first drive the clamp applies to.
+    let disk = hollow((1 << 28) + 1, false);
+    select_lba(&disk, 0);
+    disk.write_reg(Reg::Command, u16::from(cmd::READ_NATIVE_MAX));
+    assert_eq!(lba28_of(&disk), 268_435_454);
+}
+
+#[test]
+fn a_failed_flush_on_a_drive_past_28_bits_does_not_name_a_low_sector() {
+    // ATA/ATAPI-6 §8.12.6, FLUSH CACHE: "If the device supports the 48-bit
+    // Address feature set and the error occurred in an address greater than
+    // FFFFFFFh, the value set in the LBA Low, LBA Mid, and LBA High registers
+    // shall be FFh and the value set in bits (3:0) of the Device register
+    // shall be Fh."
+    let disk = hollow((1 << 28) + 1000, true);
+    select_lba(&disk, 0);
+    disk.write_reg(Reg::Command, u16::from(cmd::FLUSH_CACHE));
+    assert_ne!(status(&disk) & ST_ERR, 0);
+    assert_eq!(lba28_of(&disk), 0x0fff_ffff);
+
+    // FLUSH CACHE EXT has room for the address and reports it whole (§8.13.6).
+    disk.taskfile_start(&taskfile::Taskfile {
+        command: cmd::FLUSH_CACHE_EXT,
+        device: DEV_LBA,
+        ..taskfile::Taskfile::default()
+    });
+    let regs = disk.taskfile_registers();
+    assert_ne!(regs.status & ST_ERR, 0);
+    assert_eq!(regs.lba, (1 << 28) + 999);
+
+    // A drive that fits in 28 bits is unchanged: its own last sector.
+    let disk = hollow(4096, true);
+    select_lba(&disk, 0);
+    disk.write_reg(Reg::Command, u16::from(cmd::FLUSH_CACHE));
+    assert_eq!(lba28_of(&disk), 4095);
+}
