@@ -330,36 +330,57 @@ impl ThreadSet {
     /// Choose the next thread, waking sleepers and jumping the clock if that
     /// is what it takes.
     fn pick(&self) -> Option<(ThreadId, Arc<dyn ExitingCore>, u64)> {
-        for _ in 0..2 {
-            if let Some(picked) = self.pick_runnable() {
-                return Some(picked);
-            }
-            // Nothing runnable. If anything is sleeping, virtual time is
-            // allowed to skip to the moment it wakes — the scheduler owns
-            // time, so there is nothing to wait *for* (`ROADMAP.md` §4.2).
-            let earliest = {
-                let inner = self.inner.lock();
-                inner
-                    .threads
-                    .values()
-                    .filter_map(|e| match e.state {
-                        ThreadState::Blocked { until } => until,
-                        ThreadState::Runnable => None,
-                    })
-                    .min()?
-            };
-            self.clock.advance_to(earliest);
-            let now = self.clock.now();
-            let mut inner = self.inner.lock();
-            for entry in inner.threads.values_mut() {
-                if let ThreadState::Blocked { until: Some(when) } = entry.state
-                    && when <= now
-                {
-                    entry.state = ThreadState::Runnable;
-                }
+        // A deadline is a virtual instant and every thread that runs moves
+        // virtual time, so a sleeper can come due while something else is
+        // runnable. It is woken here, before the scan, or a thread that never
+        // blocks would keep it asleep for as long as it liked.
+        self.wake_expired();
+        if let Some(picked) = self.pick_runnable() {
+            return Some(picked);
+        }
+        // Nothing runnable. If anything is sleeping, virtual time is allowed
+        // to skip to the moment it wakes — the scheduler owns time, so there
+        // is nothing to wait *for* (`ROADMAP.md` §4.2).
+        let earliest = {
+            let inner = self.inner.lock();
+            inner
+                .threads
+                .values()
+                .filter_map(|e| match e.state {
+                    ThreadState::Blocked { until } => until,
+                    ThreadState::Runnable => None,
+                })
+                .min()?
+        };
+        self.clock.advance_to(earliest);
+        self.wake_expired();
+        self.pick_runnable()
+    }
+
+    /// Make every thread whose deadline has passed runnable.
+    ///
+    /// The clock is read with this type's lock released — the two sit at the
+    /// same rank — and only when somebody is actually asleep, so a set with no
+    /// sleepers pays one scan of its own table and nothing else.
+    fn wake_expired(&self) {
+        let sleeping = self
+            .inner
+            .lock()
+            .threads
+            .values()
+            .any(|e| matches!(e.state, ThreadState::Blocked { until: Some(_) }));
+        if !sleeping {
+            return;
+        }
+        let now = self.clock.now();
+        let mut inner = self.inner.lock();
+        for entry in inner.threads.values_mut() {
+            if let ThreadState::Blocked { until: Some(when) } = entry.state
+                && when <= now
+            {
+                entry.state = ThreadState::Runnable;
             }
         }
-        None
     }
 
     /// The next runnable thread at or after the cursor, wrapping once.

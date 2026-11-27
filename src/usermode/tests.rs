@@ -784,6 +784,27 @@ fn a_sleeping_thread_wakes_by_jumping_virtual_time() {
 }
 
 #[test]
+fn a_deadline_that_passes_while_another_thread_runs_still_wakes_its_sleeper() {
+    // A sleeper's deadline is a virtual instant, and virtual time moves
+    // whenever *any* thread runs. A thread that never blocks must not be able
+    // to keep a sleeping one asleep for ever.
+    let clock = Arc::new(GuestClock::new());
+    let threads = ThreadSet::new(Arc::clone(&clock));
+    threads.set_quantum(100);
+    let busy = threads.insert(Arc::new(Spinner::default()));
+    let sleeper = threads.insert(Arc::new(Spinner::default()));
+    threads.block(sleeper, Some(clock.at_tick(250)));
+
+    let order: Vec<_> = (0..6).map(|_| threads.run_next().unwrap().thread).collect();
+    // Three quanta take the clock to 300, past the deadline at 250; from then
+    // on the two take turns.
+    assert_eq!(order, alloc::vec![busy, busy, busy, sleeper, busy, sleeper]);
+    assert_eq!(threads.state(sleeper), Some(super::ThreadState::Runnable));
+    // Nothing jumped: time is exactly the six quanta that ran.
+    assert_eq!(clock.ticks(), 600);
+}
+
+#[test]
 fn a_schedule_round_trips_through_a_snapshot() {
     let clock = Arc::new(GuestClock::new());
     let threads = ThreadSet::new(Arc::clone(&clock));
