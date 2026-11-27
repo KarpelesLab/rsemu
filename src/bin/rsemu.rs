@@ -316,9 +316,22 @@ fn main() -> ExitCode {
             println!("{}", rsemu::build_info());
             ExitCode::SUCCESS
         }
-        "machines" => machines(),
-        "devices" => devices(),
-        "describe" => describe(args.get(1).map(String::as_str)),
+        // The listing commands take what they say they take and nothing more.
+        // `rsemu machines nes`, `rsemu devices --json` and `rsemu describe ram
+        // rom` each used to run as though the rest had not been typed, which
+        // reads as a filter that matched everything or a flag that worked.
+        "machines" => match surplus("machines", &args[1..]) {
+            Some(code) => code,
+            None => machines(),
+        },
+        "devices" => match surplus("devices", &args[1..]) {
+            Some(code) => code,
+            None => devices(),
+        },
+        "describe" => match surplus("describe <class>", args.get(2..).unwrap_or(&[])) {
+            Some(code) => code,
+            None => describe(args.get(1).map(String::as_str)),
+        },
         "run" => run(&args[1..]),
         #[cfg(feature = "gdb")]
         "debug" => debug(&args[1..]),
@@ -352,6 +365,16 @@ fn main() -> ExitCode {
 // ---------------------------------------------------------------------------
 // introspection
 // ---------------------------------------------------------------------------
+
+/// Refuse arguments a command has no use for.
+///
+/// `usage` is the command as it should have been typed. `None` when there is
+/// nothing left over, which is the only case the command goes on to run in.
+fn surplus(usage: &str, rest: &[String]) -> Option<ExitCode> {
+    let first = rest.first()?;
+    eprintln!("rsemu: unexpected argument `{first}`; usage: rsemu {usage}");
+    Some(ExitCode::from(2))
+}
 
 /// `rsemu machines` — the shipped catalog, filtered to what this build has.
 fn machines() -> ExitCode {

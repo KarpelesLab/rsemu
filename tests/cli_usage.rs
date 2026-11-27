@@ -402,3 +402,37 @@ fn a_console_that_does_not_exist_is_refused_even_headless() {
     assert_eq!(code, Some(0), "{stderr}");
     assert!(stdout.contains("ran to"), "{stdout}");
 }
+
+/// The listing commands refuse arguments they have no use for.
+///
+/// `rsemu machines nes` printed every machine, `rsemu devices --json` printed
+/// the plain listing, and `rsemu describe ram rom` described `ram` — each as
+/// though the rest had not been typed, which reads as a filter that matched
+/// everything or a flag that worked.
+#[test]
+fn the_listing_commands_refuse_surplus_arguments() {
+    for args in [
+        &["machines", "extra"][..],
+        &["devices", "--bogus"][..],
+        &["describe", "ram", "extra"][..],
+    ] {
+        let (code, stdout, stderr) = run(args);
+        assert_eq!(code, Some(2), "{args:?}: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "{args:?} still printed its listing");
+        let surplus = args.last().expect("non-empty");
+        assert!(
+            stderr.contains(&format!("unexpected argument `{surplus}`")),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("usage: rsemu"), "{args:?}: {stderr}");
+    }
+    // The commands themselves are unchanged.
+    for args in [
+        &["machines"][..],
+        &["devices"][..],
+        &["describe", "ram"][..],
+    ] {
+        let (code, _, stderr) = run(args);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+    }
+}
