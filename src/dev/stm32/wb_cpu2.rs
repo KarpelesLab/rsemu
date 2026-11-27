@@ -575,17 +575,28 @@ struct Engine {
 }
 
 /// Whether `WB_CPU2_TRACE` is set in the environment (read once). A debug seam
-/// for observing the mailbox handshake from outside the engine lock.
+/// for observing the mailbox handshake from outside the engine lock. It only
+/// reaches stderr, never guest-visible state, and exists only in a `std`
+/// build: the device itself is `no_std`.
+#[cfg(feature = "std")]
 fn traced() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("WB_CPU2_TRACE").is_ok())
 }
 
+/// `eprintln!` when `traced()`, and nothing at all without `std`.
+macro_rules! trace {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "std")]
+        if traced() {
+            std::eprintln!($($arg)*);
+        }
+    }};
+}
+
 impl Engine {
     fn note(&mut self, n: Note) {
-        if traced() {
-            eprintln!("[cpu2] note {n:?}");
-        }
+        trace!("[cpu2] note {n:?}");
         *self.notes.entry(n).or_insert(0) += 1;
         self.fresh.push(n);
     }
@@ -642,8 +653,11 @@ impl Engine {
             return Ok(());
         }
         let pending = port.read32(self.ipcc(C1TOC2SR))?;
-        if traced() && pending != 0 {
-            eprintln!("[cpu2] service pending={pending:#06x} ble_ready={}", self.ble.ready);
+        if pending != 0 {
+            trace!(
+                "[cpu2] service pending={pending:#06x} ble_ready={}",
+                self.ble.ready
+            );
         }
         if pending & low(CH_MM) != 0 {
             self.drain_free(port)?;
@@ -675,9 +689,9 @@ impl Engine {
             *w = port.read32(base.wrapping_add(4 * i as u32))?;
         }
         let (dit, ble_table, sys_table, mm) = (refs[0], refs[1], refs[3], refs[4]);
-        if traced() {
-            eprintln!("[cpu2] boot: dit={dit:#x} ble_table={ble_table:#x} sys_table={sys_table:#x} mm={mm:#x}");
-        }
+        trace!(
+            "[cpu2] boot: dit={dit:#x} ble_table={ble_table:#x} sys_table={sys_table:#x} mm={mm:#x}"
+        );
         if dit == 0 || sys_table == 0 || mm == 0 {
             // Nothing to talk through. The real core would spin.
             self.run = Run::Faulted;
@@ -830,9 +844,10 @@ impl Engine {
         if head[0] != PKT_SYS_CMD {
             self.note(Note::BadPacketType(head[0]));
         }
-        if traced() {
-            eprintln!("[cpu2] sys cmd opcode={opcode:#06x} ({})", command_name(opcode).unwrap_or("?"));
-        }
+        trace!(
+            "[cpu2] sys cmd opcode={opcode:#06x} ({})",
+            command_name(opcode).unwrap_or("?")
+        );
         let (status, ret, reboot) = self.system_answer(opcode, &payload);
         let mut rsp = vec![
             PKT_SYS_RSP,
@@ -947,9 +962,10 @@ impl Engine {
         let mut head = [0u8; 4];
         port.read(buf.wrapping_add(NODE), &mut head)?;
         let opcode = u16::from_le_bytes([head[1], head[2]]);
-        if traced() {
-            eprintln!("[cpu2] ble cmd opcode={opcode:#06x} ({})", command_name(opcode).unwrap_or("?"));
-        }
+        trace!(
+            "[cpu2] ble cmd opcode={opcode:#06x} ({})",
+            command_name(opcode).unwrap_or("?")
+        );
         let mut params = vec![0u8; usize::from(head[3])];
         port.read(buf.wrapping_add(NODE + 4), &mut params)?;
         let outcome = if head[0] == PKT_BLE_CMD {
