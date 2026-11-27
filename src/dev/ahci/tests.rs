@@ -681,6 +681,44 @@ fn the_register_file_round_trips_through_a_snapshot() {
 }
 
 #[test]
+fn a_snapshot_cannot_restore_a_command_list_base_the_register_could_not_hold() {
+    use crate::core::state::Sink;
+    // `PxCLB` is 1 KiB aligned and `PxFB` 256-byte aligned whatever software
+    // writes (§3.3.1, §3.3.3), and the engine adds slot and FIS offsets to
+    // them on that understanding. A chunk is not software and gets no more
+    // latitude: all-ones comes back aligned, and running a command from slot
+    // 31 off it is an access the space answers rather than an overflow.
+    let rig = rig_in(true, 64);
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.write_u32(0).unwrap(); // GHC
+    bytes.write_u32(0).unwrap(); // IS
+    bytes.write_u64(1).unwrap(); // one port
+    bytes.write_u64(u64::MAX).unwrap(); // PxCLB
+    bytes.write_u64(u64::MAX).unwrap(); // PxFB
+    bytes.write_u32(0).unwrap(); // PxIS
+    bytes.write_u32(0).unwrap(); // PxIE
+    bytes
+        .write_u32((1 << 15) | (1 << 14) | (1 << 4) | 1)
+        .unwrap(); // PxCMD: CR FR FRE ST
+    bytes.write_u32(0x50).unwrap(); // PxTFD
+    bytes.write_u32(0).unwrap(); // PxSCTL
+    bytes.write_u32(0).unwrap(); // PxSERR
+    bytes.write_u32(0).unwrap(); // PxSACT
+    bytes.write_u32(0).unwrap(); // PxCI
+    bytes.write_u32(0x101).unwrap(); // PxSIG
+    bytes.write_u32(0).unwrap(); // parked
+    bytes.write_u8(0).unwrap(); // device control
+    rig.hba
+        .load(&mut ChunkReader::new(&bytes))
+        .expect("a well-formed chunk");
+
+    assert_eq!(rig.reg(P_CLB), 0xffff_fc00, "PxCLB bits 9:0 are zero");
+    assert_eq!(rig.reg(P_FB), 0xffff_ff00, "PxFB bits 7:0 are zero");
+    // The last slot: `CLB + 31 * 20h`, which carried before the mask.
+    rig.set(P_CI, 1 << 31);
+}
+
+#[test]
 fn a_snapshot_chunk_of_arbitrary_bytes_is_refused_rather_than_believed() {
     // The loader is a parser on untrusted bytes. Rejecting is the expected
     // outcome; panicking is never one, and neither is coming back with a

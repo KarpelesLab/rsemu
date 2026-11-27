@@ -2005,8 +2005,13 @@ impl Hba {
         }
         let mut ports = [PortState::new(); MAX_PORTS];
         for port in ports.iter_mut().take(self.ports.len()) {
-            port.clb = r.read_u64()?;
-            port.fb = r.read_u64()?;
+            // §3.3.1 and §3.3.3: bits 09:00 of `PxCLB` and 07:00 of `PxFB`
+            // are read-only zeroes, and the register writes mask them. The
+            // snapshot gets the same mask rather than the benefit of the
+            // doubt: the engine relies on that alignment when it adds a slot
+            // or FIS offset to these bases.
+            port.clb = r.read_u64()? & !0x3ff;
+            port.fb = r.read_u64()? & !0xff;
             port.is = r.read_u32()?;
             port.ie = r.read_u32()?;
             port.cmd = r.read_u32()?;
