@@ -2112,6 +2112,74 @@ fn a_virtual_8086_task_below_iopl_three_traps_on_the_six_sensitive_instructions(
     assert_eq!(pc.read32(at::STACK0 - 40), 0, "#GP's error code is zero");
 }
 
+/// The nine protected-mode-only instructions are `#UD` inside a virtual-8086
+/// task, exactly as they are in real mode.
+///
+/// *Intel SDM* volume 2, under each one's "Virtual-8086 Mode Exceptions":
+/// "#UD The ARPL instruction is not recognized in virtual-8086 mode" — and
+/// likewise `SLDT`, `STR`, `LLDT`, `LTR`, `VERR`, `VERW`; "The LAR instruction
+/// cannot be executed in virtual-8086 mode", and `LSL`. They executed, because
+/// the test was "is `CR0.PE` set".
+#[test]
+fn the_protected_mode_instructions_are_undefined_in_a_virtual_8086_task() {
+    let cases: [(&[u8], &str); 9] = [
+        (&[0x63, 0xc8], "arpl ax, cx"),
+        (&[0x0f, 0x00, 0xc0], "sldt ax"),
+        (&[0x0f, 0x00, 0xc8], "str ax"),
+        (&[0x0f, 0x00, 0xd0], "lldt ax"),
+        (&[0x0f, 0x00, 0xd8], "ltr ax"),
+        (&[0x0f, 0x00, 0xe0], "verr ax"),
+        (&[0x0f, 0x00, 0xe8], "verw ax"),
+        (&[0x0f, 0x02, 0xc1], "lar ax, cx"),
+        (&[0x0f, 0x03, 0xc1], "lsl ax, cx"),
+    ];
+    for (code, name) in cases {
+        let pc = pc386();
+        pc.start_protected();
+        pc.gdt(
+            5,
+            descriptor(
+                at::TSS,
+                0x67,
+                ar::PRESENT | (u32::from(sys_type::TSS32_AVAIL) << 8),
+            ),
+        );
+        pc.write32(at::TSS + tss32::ESP0, at::STACK0);
+        pc.write32(at::TSS + tss32::SS0, 0x10);
+        // `#UD` stops the test at one address and `#GP` at another, so the
+        // vector is what the assertion below reads.
+        pc.idt(6, gate(0x08, v86_at::STOP, sys_type::INT_GATE32, 0));
+        pc.idt(13, gate(0x08, v86_at::RESUME, sys_type::INT_GATE32, 0));
+        pc.write(u64::from(v86_at::STOP), &[0xf4]);
+        pc.write(u64::from(v86_at::RESUME), &[0xf4]);
+        // `IOPL` 3, so nothing here is refused for being `IOPL`-sensitive.
+        pc.write(
+            at::CODE0,
+            &enter_v86_code(flags::VM | flags::IOPL | flags::ALWAYS_SET),
+        );
+        pc.write(u64::from(v86_at::CODE) << 4, code);
+
+        for _ in 0..12 {
+            pc.cpu.step();
+        }
+        assert_ne!(
+            pc.regs().eflags & flags::VM,
+            0,
+            "{name}: the task is running"
+        );
+        pc.cpu.step();
+        let regs = pc.regs();
+        assert_eq!(
+            regs.eflags & flags::VM,
+            0,
+            "{name}: the fault left the task"
+        );
+        assert_eq!(regs.rip, u64::from(v86_at::STOP), "{name} is #UD");
+        // The frame's `EIP` is the instruction itself: a fault, restartable.
+        assert_eq!(pc.read32(at::STACK0 - 36), 0, "{name}: the saved EIP");
+    }
+}
+
 #[test]
 fn a_segment_limit_violation_raises_general_protection() {
     let pc = pc386();

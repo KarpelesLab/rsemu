@@ -1501,8 +1501,18 @@ impl Exec<'_> {
     ///
     /// `SLDT`, `STR`, `LLDT`, `LTR`, `LAR`, `LSL`, `VERR`, `VERW` and `ARPL`
     /// are all `#UD` in real mode — not no-ops, and not silently useful.
+    ///
+    /// **And in virtual-8086 mode**, which is protected mode with `EFLAGS.VM`
+    /// set and is nonetheless an 8086 as far as these nine are concerned.
+    /// *Intel SDM* volume 2 says so once per instruction, under "Virtual-8086
+    /// Mode Exceptions": "#UD The ARPL instruction is not recognized in
+    /// virtual-8086 mode", and the same sentence for `SLDT`, `STR`, `LLDT`,
+    /// `LTR`, `VERR` and `VERW`; "#UD The LAR instruction cannot be executed
+    /// in virtual-8086 mode", and the same for `LSL`. A virtual-8086 monitor
+    /// can rely on it: `63` is a one-byte trap into the monitor that costs
+    /// the task no opcode it could have used.
     pub(super) fn require_protected(&self) -> Ex<()> {
-        if self.protected() {
+        if self.protected() && !self.v86() {
             Ok(())
         } else {
             Err(Fault::bare(VEC_UD))
