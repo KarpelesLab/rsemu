@@ -480,7 +480,18 @@ impl Registers {
             0x008 => self.backend.device_id(),
             0x00c => VENDOR_ID,
             0x010 => self.device_features(state.device_features_sel),
-            0x034 => QUEUE_SIZE_MAX,
+            // §4.2.2, `QueueNumMax`: "the maximum size (number of elements)
+            // of the queue the device is ready to process or zero (0x0) if
+            // the queue is not available. This applies to the queue selected
+            // by writing to QueueSel." Zero is how a driver counts a device's
+            // queues, so a selector past the last one must not be told 256.
+            0x034 => {
+                if (state.queue_sel as usize) < state.queues.len() {
+                    QUEUE_SIZE_MAX
+                } else {
+                    0
+                }
+            }
             0x044 => u32::from(
                 state
                     .queues
@@ -1055,6 +1066,19 @@ mod tests {
         assert_eq!(f.read(0x008), 0xbeef);
         assert_eq!(f.read(0x00c), VENDOR_ID);
         assert_eq!(f.read(0x034), QUEUE_SIZE_MAX);
+    }
+
+    #[test]
+    fn a_queue_the_device_does_not_have_reports_a_maximum_size_of_zero() {
+        // §4.2.2: `QueueNumMax` reads "zero (0x0) if the queue is not
+        // available". The echo device has one queue, so queue 1 is not.
+        let f = Fixture::new();
+        f.write(0x030, 1);
+        assert_eq!(f.read(0x034), 0, "queue 1 does not exist");
+        f.write(0x030, 0xffff_ffff);
+        assert_eq!(f.read(0x034), 0);
+        f.write(0x030, 0);
+        assert_eq!(f.read(0x034), QUEUE_SIZE_MAX, "queue 0 does");
     }
 
     #[test]
