@@ -18,7 +18,8 @@ use crate::core::props::Value;
 use crate::core::registry::Registry;
 use crate::core::space::RegionKind;
 use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
-use crate::core::wire::Level;
+use crate::core::sync::AtomicBool;
+use crate::core::wire::{Level, Wire, WireIdAllocator};
 
 /// `CNTR.CTRM` (15): enable the correct-transfer interrupt.
 const CNTR_CTRM: u16 = 1 << 15;
@@ -348,7 +349,7 @@ fn an_out_lands_in_the_rx_buffer_with_its_count() {
 }
 
 #[test]
-fn a_not_ready_endpoint_naks_a_stalled_one_stalls_and_an_unknown_address_stalls() {
+fn a_not_ready_endpoint_naks_a_stalled_one_stalls_and_an_unknown_or_disabled_one_is_silent() {
     let f = fixture();
     f.enumerate_ready();
     // TX is NAK out of enumerate_ready: an IN NAKs.
@@ -361,10 +362,18 @@ fn a_not_ready_endpoint_naks_a_stalled_one_stalls_and_an_unknown_address_stalls(
         f.bus.read(DeviceAddress::DEFAULT, 0, &mut [0u8; 64]).status,
         Status::Stall
     );
-    // No register answers endpoint address 5.
+    // No register answers endpoint address 5: only "a token for a valid
+    // function/endpoint pair" is acted on (RM0434 §40.4), so nothing answers.
     assert_eq!(
         f.bus.read(DeviceAddress::DEFAULT, 5, &mut [0u8; 64]).status,
-        Status::Stall
+        Status::NoDevice
+    );
+    // DISABLED: "all transmission requests addressed to this endpoint are
+    // ignored" (Table 261) — silence, not a STALL.
+    f.set_stat_tx(0, STAT_DISABLED);
+    assert_eq!(
+        f.bus.read(DeviceAddress::DEFAULT, 0, &mut [0u8; 64]).status,
+        Status::NoDevice
     );
 }
 
@@ -426,6 +435,567 @@ fn a_bus_reset_returns_the_device_to_address_zero_and_raises_the_flag() {
 }
 
 // ---------------------------------------------------------------------------
+// Reception buffers: BL_SIZE / NUM_BLOCK, the overrun, the CRC
+// ---------------------------------------------------------------------------
+
+fn rd16(f: &Fixture, off: u64) -> u16 {
+    u16::from_le_bytes(f.pma_read(off, 2).try_into().unwrap())
+}
+
+#[test]
+fn the_allocated_size_follows_table_262() {
+    let c = |bl: u16, num: u16| (bl << 15) | (num << 10);
+    assert_eq!(rx_capacity(c(0, 0)), 0, "\"Not allowed\": no room");
+    assert_eq!(rx_capacity(c(0, 1)), 2);
+    assert_eq!(rx_capacity(c(0, 3)), 6);
+    assert_eq!(rx_capacity(c(0, 31)), 62);
+    assert_eq!(rx_capacity(c(1, 0)), 32);
+    assert_eq!(rx_capacity(c(1, 1)), 64);
+    assert_eq!(rx_capacity(c(1, 3)), 128);
+    assert_eq!(rx_capacity(c(1, 14)), 480);
+    assert_eq!(
+        rx_capacity(c(1, 3) | 0x03ff),
+        128,
+        "the count bits are not the size"
+    );
+}
+
+#[test]
+fn the_crc_is_the_usb_crc16() {
+    // The CRC-16/USB check value over "123456789".
+    assert_eq!(crc16(b"123456789"), 0xb4c8);
+}
+
+#[test]
+fn an_oversized_out_stalls_and_never_writes_past_the_allocated_buffer() {
+    let f = fixture();
+    f.enumerate_ready();
+    // Eight bytes allocated (BL_SIZE = 0, NUM_BLOCK = 4), with a sentinel
+    // after them.
+    f.pma_write(0x06, &(4u16 << 10).to_le_bytes());
+    f.pma_write(0x48, &[0xa5; 8]);
+    f.wr(OFF_ISTR, 0); // the port reset's RESET flag, serviced
+    let before = f.ep(0);
+    let payload: Vec<u8> = (1..=12u8).collect();
+    let c = f.bus.write(DeviceAddress::DEFAULT, 0, &payload);
+    assert_eq!(c.status, Status::Stall, "\"a STALL handshake is sent\"");
+    assert_eq!(
+        f.pma_read(0x40, 8),
+        payload[..8],
+        "copied up to the last location"
+    );
+    assert_eq!(
+        f.pma_read(0x48, 8),
+        vec![0xa5; 8],
+        "the neighbour is untouched"
+    );
+    assert_eq!(rd16(&f, 0x06), 4 << 10, "COUNT_RX not written back");
+    assert_eq!(f.ep(0), before, "no CTR_RX, no toggle, STAT_RX still VALID");
+    assert_eq!(
+        f.core().irq_level(),
+        Level::Low,
+        "no interrupt is generated"
+    );
+}
+
+#[test]
+fn a_packet_that_exactly_fills_its_buffer_is_taken_and_its_crc_is_cut() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.pma_write(0x06, &(4u16 << 10).to_le_bytes()); // eight bytes
+    f.pma_write(0x48, &[0xa5; 2]);
+    let payload: Vec<u8> = (1..=8u8).collect();
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 0, &payload),
+        Completion::ack(8)
+    );
+    assert_eq!(f.pma_read(0x48, 2), vec![0xa5; 2], "no room for the CRC");
+    assert_eq!(rd16(&f, 0x06) & COUNT_MASK, 8);
+}
+
+#[test]
+fn a_short_packet_is_followed_in_the_buffer_by_its_crc() {
+    let f = fixture();
+    f.enumerate_ready(); // 64 bytes allocated
+    let c = f.bus.write(DeviceAddress::DEFAULT, 0, b"123456789");
+    assert_eq!(c, Completion::ack(9));
+    assert_eq!(
+        f.pma_read(0x49, 2),
+        vec![0xc8, 0xb4],
+        "the CRC, low byte first"
+    );
+    assert_eq!(rd16(&f, 0x06) & COUNT_MASK, 9, "COUNT is the payload");
+}
+
+// ---------------------------------------------------------------------------
+// Data toggles
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_acked_out_toggles_dtog_rx_and_an_acked_in_toggles_dtog_tx() {
+    let f = fixture();
+    f.enumerate_ready();
+    assert_eq!(f.ep(0) & EP_DTOG_RX, 0);
+    f.bus.write(DeviceAddress::DEFAULT, 0, &[1, 2]);
+    assert_eq!(f.ep(0) & EP_DTOG_RX, EP_DTOG_RX, "toggled on the ACK");
+
+    f.pma_write(0x02, &1u16.to_le_bytes());
+    f.set_stat_tx(0, STAT_VALID);
+    let mut buf = [0u8; 8];
+    // The peek changes nothing, the PID included.
+    assert_eq!(f.bus.peek(DeviceAddress::DEFAULT, 0, &mut buf).len, 1);
+    assert_eq!(f.ep(0) & EP_DTOG_TX, 0);
+    let (c, pid) = f.bus.read_pid(DeviceAddress::DEFAULT, 0, &mut buf);
+    assert_eq!(c, Completion::ack(1));
+    assert_eq!(pid, Some(DataPid::Data0), "sent \"according to DTOG_TX\"");
+    assert_eq!(
+        f.ep(0) & EP_DTOG_TX,
+        EP_DTOG_TX,
+        "toggled on the host's ACK"
+    );
+    f.set_stat_tx(0, STAT_VALID);
+    let (_, pid) = f.bus.read_pid(DeviceAddress::DEFAULT, 0, &mut buf);
+    assert_eq!(pid, Some(DataPid::Data1));
+    assert_eq!(f.ep(0) & EP_DTOG_TX, 0);
+}
+
+#[test]
+fn a_setup_leaves_dtog_tx_set_and_dtog_rx_expecting_data1() {
+    let f = fixture();
+    f.enumerate_ready();
+    for start in [0, EP_DTOG_RX | EP_DTOG_TX, EP_DTOG_RX, EP_DTOG_TX] {
+        {
+            let mut s = f.core().state.lock();
+            s.ep[0] = (s.ep[0] & !(EP_DTOG_RX | EP_DTOG_TX | EP_CTR_RX)) | start;
+        }
+        assert_eq!(
+            f.bus
+                .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18)),
+            Status::Ack
+        );
+        let ep = f.ep(0);
+        assert_eq!(
+            ep & EP_DTOG_TX,
+            EP_DTOG_TX,
+            "DTOG_TX set to 1 (from {start:#x})"
+        );
+        assert_eq!(
+            ep & EP_DTOG_RX,
+            EP_DTOG_RX,
+            "DTOG_RX cleared at the PID, toggled by the ACK (from {start:#x})"
+        );
+        // An OUT data stage carrying DATA1 is then the one expected.
+        f.set_stat_rx(0, STAT_VALID);
+        f.core().state.lock().ep[0] &= !EP_CTR_RX;
+        assert_eq!(
+            f.bus
+                .write_pid(DeviceAddress::DEFAULT, 0, &[9], DataPid::Data1),
+            Completion::ack(1)
+        );
+        assert_eq!(f.ep(0) & EP_CTR_RX, EP_CTR_RX, "taken as new data");
+        f.core().state.lock().ep[0] &= !EP_CTR_RX;
+        f.set_stat_rx(0, STAT_VALID);
+    }
+}
+
+#[test]
+fn a_toggle_mismatch_is_acked_but_discarded() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.pma_write(0x40, &[0xee; 4]);
+    let before = f.ep(0);
+    // DTOG_RX is 0, so DATA0 is expected: DATA1 is a retransmission.
+    let c = f
+        .bus
+        .write_pid(DeviceAddress::DEFAULT, 0, &[1, 2, 3, 4], DataPid::Data1);
+    assert_eq!(c, Completion::ack(4), "the host is let move on");
+    assert_eq!(f.ep(0), before, "no CTR_RX, no toggle, STAT_RX untouched");
+    assert_eq!(f.pma_read(0x40, 4), vec![0xee; 4], "no data transferred");
+    // The matching PID is taken.
+    let c = f
+        .bus
+        .write_pid(DeviceAddress::DEFAULT, 0, &[1, 2, 3, 4], DataPid::Data0);
+    assert_eq!(c, Completion::ack(4));
+    assert_eq!(f.pma_read(0x40, 4), vec![1, 2, 3, 4]);
+    assert_eq!(f.ep(0) & (EP_CTR_RX | EP_DTOG_RX), EP_CTR_RX | EP_DTOG_RX);
+}
+
+// ---------------------------------------------------------------------------
+// SETUP rules, the SETUP bit, EF, STATUS_OUT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_setup_on_a_stalled_or_naked_control_endpoint_is_still_taken() {
+    for rx in [STAT_STALL, STAT_NAK] {
+        let f = fixture();
+        f.enumerate_ready();
+        f.set_stat_rx(0, rx);
+        assert_eq!(
+            f.bus
+                .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18)),
+            Status::Ack,
+            "STAT_RX {rx:#b}"
+        );
+        assert_eq!(f.ep(0) & EP_CTR_RX, EP_CTR_RX);
+    }
+}
+
+#[test]
+fn a_setup_while_ctr_rx_is_pending_is_dropped_without_a_handshake() {
+    let f = fixture();
+    f.enumerate_ready();
+    let first = host::get_descriptor(1, 0, 18);
+    f.bus.setup(DeviceAddress::DEFAULT, 0, first);
+    let second = host::get_descriptor(2, 0, 9);
+    assert_eq!(
+        f.bus.setup(DeviceAddress::DEFAULT, 0, second),
+        Status::Error,
+        "simulating a reception error"
+    );
+    assert_eq!(f.pma_read(0x40, 8), first.encode(), "the first is kept");
+    // Once firmware clears CTR_RX, the retry lands.
+    f.wr(0, (f.ep(0) & EP_RW) | EP_CTR_TX);
+    assert_eq!(f.bus.setup(DeviceAddress::DEFAULT, 0, second), Status::Ack);
+    assert_eq!(f.pma_read(0x40, 8), second.encode());
+}
+
+#[test]
+fn a_setup_to_a_non_control_or_disabled_endpoint_is_ignored() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.set_stat_rx(0, STAT_DISABLED);
+    assert_eq!(
+        f.bus
+            .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18)),
+        Status::NoDevice
+    );
+    // Register 1: a bulk endpoint, address 1, reception VALID.
+    f.core().state.lock().ep[1] = (STAT_VALID << 12) | 1;
+    assert_eq!(
+        f.bus
+            .setup(DeviceAddress::DEFAULT, 1, host::get_descriptor(1, 0, 18)),
+        Status::NoDevice,
+        "only control endpoints handle SETUP"
+    );
+    assert_eq!(f.ep(1) & EP_CTR_RX, 0);
+}
+
+#[test]
+fn the_setup_bit_is_frozen_while_ctr_rx_is_set() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.bus
+        .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18));
+    // Firmware re-arms RX before clearing CTR_RX, and an OUT arrives.
+    f.set_stat_rx(0, STAT_VALID);
+    f.bus.write(DeviceAddress::DEFAULT, 0, &[]);
+    assert_eq!(f.ep(0) & EP_SETUP, EP_SETUP, "frozen while CTR_RX is 1");
+    f.core().state.lock().ep[0] &= !EP_CTR_RX;
+    f.set_stat_rx(0, STAT_VALID);
+    f.bus.write(DeviceAddress::DEFAULT, 0, &[]);
+    assert_eq!(f.ep(0) & EP_SETUP, 0, "an OUT, once it may change");
+}
+
+#[test]
+fn with_the_function_disabled_nothing_is_handled() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.pma_write(0x02, &1u16.to_le_bytes());
+    f.set_stat_tx(0, STAT_VALID);
+    f.wr(OFF_DADDR, 0); // EF = 0
+    let before = f.ep(0);
+    let pma = f.pma_read(0x40, 16);
+    assert_eq!(
+        f.bus
+            .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18)),
+        Status::NoDevice
+    );
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 0, &[1]),
+        Completion::absent()
+    );
+    assert_eq!(
+        f.bus.read(DeviceAddress::DEFAULT, 0, &mut [0u8; 8]),
+        Completion::absent()
+    );
+    assert_eq!(f.ep(0), before);
+    assert_eq!(f.pma_read(0x40, 16), pma);
+    f.wr(OFF_DADDR, 0x80);
+    assert_eq!(
+        f.bus.read(DeviceAddress::DEFAULT, 0, &mut [0u8; 8]),
+        Completion::ack(1),
+        "EF set again: handled"
+    );
+}
+
+#[test]
+fn status_out_stalls_a_non_empty_out_and_takes_a_zero_length_one() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.core().state.lock().ep[0] |= EP_KIND; // STATUS_OUT on a control endpoint
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 0, &[1]),
+        Completion::stall()
+    );
+    assert_eq!(f.ep(0) & EP_CTR_RX, 0, "a STALL sets no CTR_RX");
+    assert_eq!(f.stat_rx(0), STAT_VALID);
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 0, &[]),
+        Completion::ack(0)
+    );
+    assert_eq!(f.ep(0) & EP_CTR_RX, EP_CTR_RX);
+    // On a bulk endpoint the same bit is DBL_BUF, not STATUS_OUT.
+}
+
+// ---------------------------------------------------------------------------
+// Double-buffered bulk, isochronous
+// ---------------------------------------------------------------------------
+
+/// Register 1, endpoint address 1, its descriptor entry at 0x08: slot 0 at
+/// 0x100, slot 1 at 0x140, each with 64 bytes allocated.
+fn two_buffers(f: &Fixture, reg: u16) {
+    f.pma_write(0x08, &0x100u16.to_le_bytes());
+    f.pma_write(0x0a, &0x8400u16.to_le_bytes());
+    f.pma_write(0x0c, &0x140u16.to_le_bytes());
+    f.pma_write(0x0e, &0x8400u16.to_le_bytes());
+    f.core().state.lock().ep[1] = reg | 1;
+}
+
+const DBL_OUT: u16 = EP_KIND | (STAT_VALID << 12); // bulk, DBL_BUF, RX only
+
+#[test]
+fn a_double_buffered_out_alternates_buffers_and_naks_on_a_conflict() {
+    let f = fixture();
+    f.enumerate_ready();
+    // DTOG_RX = 0 (USB on buffer 0), SW_BUF (bit 6) = 1 (application on 1).
+    two_buffers(&f, DBL_OUT | EP_DTOG_TX);
+    // The first transaction after DBL_BUF is set ends the ordinary way.
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 1, &[1, 1]),
+        Completion::ack(2)
+    );
+    assert_eq!(f.pma_read(0x100, 2), vec![1, 1]);
+    assert_eq!(rd16(&f, 0x0a) & COUNT_MASK, 2, "COUNTn_RX_0");
+    assert_eq!(f.ep(1) & EP_DTOG_RX, EP_DTOG_RX, "DTOG swapped the buffer");
+    assert_eq!(f.stat_rx(1), STAT_NAK, "the first one NAKs STAT_RX");
+    // Firmware: re-arm, clear CTR_RX, release buffer 0 by toggling SW_BUF.
+    f.set_stat_rx(1, STAT_VALID);
+    f.wr(4, (f.ep(1) & EP_RW) | EP_CTR_TX | EP_DTOG_TX);
+    assert_eq!(f.ep(1) & EP_DTOG_TX, 0, "SW_BUF now 0");
+    // DTOG_RX = 1, SW_BUF = 0: USB on buffer 1.
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 1, &[2, 2, 2]),
+        Completion::ack(3)
+    );
+    assert_eq!(f.pma_read(0x140, 3), vec![2, 2, 2]);
+    assert_eq!(rd16(&f, 0x0e) & COUNT_MASK, 3, "COUNTn_RX_1");
+    assert_eq!(f.stat_rx(1), STAT_VALID, "STAT stays VALID from now on");
+    assert_eq!(f.ep(1) & EP_DTOG_RX, 0);
+    // DTOG_RX = 0 = SW_BUF: the application still holds buffer 0.
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 1, &[3]),
+        Completion::nak()
+    );
+    assert_eq!(
+        f.pma_read(0x100, 2),
+        vec![1, 1],
+        "nothing written on the NAK"
+    );
+    f.wr(4, (f.ep(1) & EP_RW) | EP_CTR_RX | EP_CTR_TX | EP_DTOG_TX);
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 1, &[3]),
+        Completion::ack(1)
+    );
+    assert_eq!(f.pma_read(0x100, 1), vec![3]);
+    // An explicit non-VALID status overrides the special flow control.
+    f.set_stat_rx(1, STAT_STALL);
+    assert_eq!(
+        f.bus.write(DeviceAddress::DEFAULT, 1, &[4]),
+        Completion::stall()
+    );
+}
+
+#[test]
+fn clearing_dbl_buf_rearms_the_first_transaction_rule() {
+    let f = fixture();
+    f.enumerate_ready();
+    two_buffers(&f, DBL_OUT | EP_DTOG_TX);
+    f.bus.write(DeviceAddress::DEFAULT, 1, &[1]);
+    assert_eq!(f.core().state.lock().dbl_live, 1 << 1);
+    // A guest write that drops DBL_BUF, then one that sets it again.
+    f.wr(4, f.ep(1) & EP_RW & !EP_KIND);
+    assert_eq!(f.core().state.lock().dbl_live, 0);
+    f.wr(4, (f.ep(1) & EP_RW) | EP_KIND);
+    f.set_stat_rx(1, STAT_VALID);
+    f.bus.write(DeviceAddress::DEFAULT, 1, &[1]);
+    assert_eq!(f.stat_rx(1), STAT_NAK, "a first transaction again");
+}
+
+#[test]
+fn a_double_buffered_in_sends_from_the_dtog_tx_buffer() {
+    let f = fixture();
+    f.enumerate_ready();
+    // TX only; DTOG_TX = 0 (USB on buffer 0), SW_BUF (bit 14) = 1.
+    two_buffers(&f, EP_KIND | (STAT_VALID << 4) | EP_DTOG_RX);
+    f.pma_write(0x100, &[0xa0, 0xa1]);
+    f.pma_write(0x0a, &2u16.to_le_bytes()); // COUNTn_TX_0
+    f.pma_write(0x140, &[0xb0, 0xb1, 0xb2]);
+    f.pma_write(0x0e, &3u16.to_le_bytes()); // COUNTn_TX_1
+    let mut buf = [0u8; 64];
+    let (c, pid) = f.bus.read_pid(DeviceAddress::DEFAULT, 1, &mut buf);
+    assert_eq!((c, pid), (Completion::ack(2), Some(DataPid::Data0)));
+    assert_eq!(&buf[..2], &[0xa0, 0xa1]);
+    assert_eq!(f.ep(1) & EP_CTR_TX, EP_CTR_TX);
+    assert_eq!(
+        f.stat_tx(1),
+        STAT_NAK,
+        "the first one ends the ordinary way"
+    );
+    f.set_stat_tx(1, STAT_VALID);
+    // DTOG_TX = 1, SW_BUF = 1: conflict.
+    assert_eq!(
+        f.bus.read(DeviceAddress::DEFAULT, 1, &mut buf),
+        Completion::nak()
+    );
+    f.wr(4, (f.ep(1) & EP_RW) | EP_CTR_RX | EP_DTOG_RX); // SW_BUF -> 0
+    let (c, pid) = f.bus.read_pid(DeviceAddress::DEFAULT, 1, &mut buf);
+    assert_eq!((c, pid), (Completion::ack(3), Some(DataPid::Data1)));
+    assert_eq!(&buf[..3], &[0xb0, 0xb1, 0xb2]);
+    assert_eq!(f.stat_tx(1), STAT_VALID);
+}
+
+#[test]
+fn an_isochronous_out_swaps_buffers_keeps_valid_and_takes_an_overrun() {
+    let f = fixture();
+    f.enumerate_ready();
+    two_buffers(&f, (TYPE_ISO << 9) | (STAT_VALID << 12));
+    f.pma_write(0x0e, &(1u16 << 10).to_le_bytes()); // RX_1: two bytes only
+    // No toggle sequencing: any PID is taken.
+    assert_eq!(
+        f.bus
+            .write_pid(DeviceAddress::DEFAULT, 1, &[1, 2, 3], DataPid::Data1),
+        Completion::ack(3)
+    );
+    assert_eq!(f.pma_read(0x100, 3), vec![1, 2, 3], "DTOG_RX 0: buffer 0");
+    assert_eq!(f.ep(1) & EP_CTR_RX, EP_CTR_RX);
+    assert_eq!(f.stat_rx(1), STAT_VALID, "STAT not affected");
+    f.core().state.lock().ep[1] &= !EP_CTR_RX;
+    f.pma_write(0x142, &[0x5a; 4]);
+    let c = f.bus.write(DeviceAddress::DEFAULT, 1, &[7, 7, 7, 7]);
+    assert_eq!(c, Completion::ack(4));
+    assert_eq!(f.pma_read(0x140, 2), vec![7, 7], "buffer 1, up to its end");
+    assert_eq!(f.pma_read(0x142, 4), vec![0x5a; 4], "nothing past it");
+    assert_eq!(f.ep(1) & EP_CTR_RX, EP_CTR_RX, "an overrun still completes");
+    assert_eq!(rd16(&f, 0x0e) & COUNT_MASK, 2);
+    assert_eq!(f.stat_rx(1), STAT_VALID);
+}
+
+#[test]
+fn an_isochronous_in_is_always_data0_and_keeps_valid() {
+    let f = fixture();
+    f.enumerate_ready();
+    two_buffers(&f, (TYPE_ISO << 9) | (STAT_VALID << 4) | EP_DTOG_TX);
+    f.pma_write(0x140, &[0xcc]);
+    f.pma_write(0x0e, &1u16.to_le_bytes()); // COUNTn_TX_1
+    let mut buf = [0u8; 8];
+    let (c, pid) = f.bus.read_pid(DeviceAddress::DEFAULT, 1, &mut buf);
+    assert_eq!((c, pid), (Completion::ack(1), Some(DataPid::Data0)));
+    assert_eq!(buf[0], 0xcc, "DTOG_TX 1: buffer 1");
+    assert_eq!(f.ep(1) & EP_DTOG_TX, 0, "toggled after the transmission");
+    assert_eq!(f.stat_tx(1), STAT_VALID);
+    assert_eq!(f.ep(1) & EP_CTR_TX, EP_CTR_TX);
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt priority and the high-priority line
+// ---------------------------------------------------------------------------
+
+/// Follows the level of one output pin.
+#[derive(Debug, Default)]
+struct Probe {
+    high: AtomicBool,
+}
+
+impl crate::core::wire::WireSink for Probe {
+    fn set_level(&self, _src: WireId, _line: u32, level: Level) {
+        self.high.store(level.is_high(), Ordering::Relaxed);
+    }
+}
+
+fn watch(f: &Fixture, port: &str) -> Arc<Probe> {
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let probe = Arc::new(Probe::default());
+    let wire = Wire::builder()
+        .source(id)
+        .sink(
+            Arc::clone(&probe) as Arc<dyn crate::core::wire::WireSink>,
+            0,
+        )
+        .build_shared();
+    Device::connect(&f.dev, port, WireSource::new(wire, id)).expect("an output pin");
+    probe
+}
+
+#[test]
+fn ep_id_names_an_iso_or_double_buffered_endpoint_before_the_others() {
+    let f = fixture();
+    {
+        let mut s = f.core().state.lock();
+        s.ep[0] = EP_CTR_RX | (TYPE_CONTROL << 9);
+        s.ep[3] = EP_CTR_TX | EP_KIND | 3; // bulk, DBL_BUF
+        s.ep[5] = EP_CTR_RX | (TYPE_ISO << 9) | 5;
+    }
+    let istr = f.rd(OFF_ISTR);
+    assert_eq!(istr & 0x000f, 3, "the lowest of the priority set");
+    assert_eq!(istr & ISTR_DIR, 0, "and it is a TX");
+    f.core().state.lock().ep[3] &= !EP_CTR_TX;
+    assert_eq!(f.rd(OFF_ISTR) & 0x001f, ISTR_DIR | 5);
+    f.core().state.lock().ep[5] &= !EP_CTR_RX;
+    assert_eq!(f.rd(OFF_ISTR) & 0x001f, ISTR_DIR, "then the others: EP0R");
+}
+
+#[test]
+fn the_high_priority_line_follows_iso_and_double_buffered_ctr_whatever_ctrm_says() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.wr(OFF_ISTR, 0); // the port reset's RESET flag, serviced
+    f.wr(OFF_CNTR, CNTR_RESETM); // CTRM off
+    let lp = watch(&f, pin::IRQ);
+    let hp = watch(&f, pin::IRQ_HP);
+    // An ordinary endpoint's CTR is not high-priority.
+    f.bus.write(DeviceAddress::DEFAULT, 0, &[1]);
+    assert!(!hp.high.load(Ordering::Relaxed));
+    assert!(
+        !lp.high.load(Ordering::Relaxed),
+        "CTRM masks the generic one"
+    );
+    // An isochronous one is, CTRM or not.
+    two_buffers(&f, (TYPE_ISO << 9) | (STAT_VALID << 12));
+    f.bus.write(DeviceAddress::DEFAULT, 1, &[1]);
+    assert!(hp.high.load(Ordering::Relaxed));
+    assert_eq!(f.core().irq_hp_level(), Level::High);
+    assert!(!lp.high.load(Ordering::Relaxed));
+    // It falls when software clears the endpoint's CTR_RX.
+    f.wr(4, (f.ep(1) & EP_RW) | EP_CTR_TX);
+    assert!(!hp.high.load(Ordering::Relaxed));
+    // With CTRM set the generic line carries it too.
+    f.wr(OFF_CNTR, CNTR_CTRM);
+    f.bus.write(DeviceAddress::DEFAULT, 1, &[1]);
+    assert!(hp.high.load(Ordering::Relaxed));
+    assert!(lp.high.load(Ordering::Relaxed));
+}
+
+#[test]
+fn only_the_two_interrupt_pins_connect() {
+    let f = fixture();
+    let ids = WireIdAllocator::new();
+    let id = ids.alloc();
+    let wire = Wire::builder().source(id).build_shared();
+    assert!(Device::connect(&f.dev, "irq_lp", WireSource::new(wire, id)).is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot, schema, registry
 // ---------------------------------------------------------------------------
 
@@ -437,6 +1007,10 @@ fn a_snapshot_round_trips() {
         .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18));
     let marker: Vec<u8> = (0..32u8).collect();
     f.pma_write(0x80, &marker);
+    // A double-buffered endpoint past its first transaction: hidden state.
+    two_buffers(&f, DBL_OUT | EP_DTOG_TX);
+    f.bus.write(DeviceAddress::DEFAULT, 1, &[1]);
+    assert_eq!(f.core().state.lock().dbl_live, 1 << 1);
 
     let mut shape = MachineShape::new();
     shape.add_device("usb", CLASS_NAME).unwrap();
@@ -458,6 +1032,12 @@ fn a_snapshot_round_trips() {
         assert_eq!(restored.rd(off), f.rd(off), "register {off:#x}");
     }
     assert_eq!(restored.pma_read(0x80, 32), marker);
+    assert_eq!(restored.ep(1), f.ep(1));
+    assert_eq!(
+        restored.core().state.lock().dbl_live,
+        1 << 1,
+        "the double-buffer latch"
+    );
     assert_eq!(
         restored.pma_read(0x40, 8),
         f.pma_read(0x40, 8),
@@ -709,4 +1289,27 @@ fn with_can_clocked_the_top_256_bytes_are_not_usbs() {
     assert_eq!(f.pma_read(0x300, 2), vec![0, 0], "the reset cleared them");
     f.pma_write(0x300, &[5, 6]);
     assert_eq!(f.pma_read(0x300, 2), vec![5, 6], "USB's again");
+}
+
+#[test]
+fn a_reception_buffer_running_into_the_can_share_writes_nothing_there() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.pma_write(0x04, &0x2fcu16.to_le_bytes()); // ADDR_RX four bytes below it
+    f.core().state.lock().pma[0x300..0x304].copy_from_slice(&[0xaa; 4]);
+    let pin = Device::sink(&f.dev, pin::CAN_ENABLE, &[WireId::new(7)]).expect("the pin");
+    pin.sink.set_level(WireId::new(7), 0, Level::High);
+    let c = f.bus.write(DeviceAddress::DEFAULT, 0, &[1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        c,
+        Completion::ack(6),
+        "the buffer's size is the descriptor's"
+    );
+    let s = f.core().state.lock();
+    assert_eq!(&s.pma[0x2fc..0x300], &[1, 2, 3, 4]);
+    assert_eq!(
+        &s.pma[0x300..0x304],
+        &[0xaa; 4],
+        "the CAN bytes are untouched"
+    );
 }

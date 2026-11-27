@@ -121,9 +121,11 @@
 //! [`gate`] describes; an unwired `enable` leaves the block clocked, so a board
 //! written before the gate existed does not change. `can-enable` is the
 //! F0x2's `RCC_APB1ENR.CANEN`; like the gate's levels it is wiring, not
-//! snapshot state — the RCC republishes it on load. One `irq` output carries
+//! snapshot state — the RCC republishes it on load. The `irq` output carries
 //! the low-priority USB interrupt — level, the OR of the enabled `ISTR` flags
-//! under `CNTR`'s mask — and the board wires it to its core's USB vector.
+//! under `CNTR`'s mask — and the board wires it to its core's USB vector;
+//! `irq_hp` carries the high-priority one (see [`pin::IRQ_HP`] for what feeds
+//! it and how each family wires it).
 //!
 //! # Sources
 //!
@@ -142,7 +144,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::bus::usb::{
-    Completion, DeviceAddress, SetupPacket, Speed, Status, UsbBus, UsbDevice, buses,
+    Completion, DataPid, DeviceAddress, SetupPacket, Speed, Status, UsbBus, UsbDevice, buses,
 };
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
@@ -161,7 +163,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 const CLASS_NAME: &str = "st.usbfs";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// How many endpoint registers the block has. Fixed on this peripheral.
 const ENDPOINTS: usize = 8;
@@ -198,6 +200,14 @@ const EP_CTR_TX: u16 = 1 << 7;
 const EP_DTOG_TX: u16 = 1 << 6;
 const EP_STAT_TX: u16 = 0b11 << 4;
 const EP_EA: u16 = 0x000f;
+/// `EP_TYPE` (10:9): Table 259, `00` bulk, `01` control, `10` iso, `11` interrupt.
+const EP_TYPE: u16 = 0b11 << 9;
+/// `EP_KIND` (8): `DBL_BUF` on a bulk endpoint, `STATUS_OUT` on a control one,
+/// unused on the other two (Table 260).
+const EP_KIND: u16 = 1 << 8;
+const TYPE_BULK: u16 = 0b00;
+const TYPE_CONTROL: u16 = 0b01;
+const TYPE_ISO: u16 = 0b10;
 /// The plain read/write bits: `EP_TYPE` (10:9), `EP_KIND` (8) and `EA` (3:0).
 const EP_RW: u16 = 0b0000_0111_0000_1111;
 
@@ -238,6 +248,9 @@ const BTABLE_WRITABLE: u16 = 0xfff8;
 /// `REMWAKE` (3) are `r`, written by the hardware from the last ACKed LPM
 /// token, and bit 2 is reserved.
 const LPMCSR_WRITABLE: u16 = 0x0003;
+/// `DADDR.EF` (7): "If this bit is at '0 no transactions are handled,
+/// irrespective of the settings of USB_EPnR registers." (RM0434 §40.6.1)
+const DADDR_EF: u16 = 1 << 7;
 const BCDR_DPPU: u16 = 1 << 15;
 const BCDR_PS2DET: u16 = 1 << 7;
 const BCDR_SDET: u16 = 1 << 6;
@@ -254,6 +267,92 @@ const BCDR_WRITABLE: u16 = BCDR_DPPU | BCDR_SDEN | BCDR_PDEN | BCDR_DCDEN | BCDR
 /// Low ten bits of a `COUNT_*` word: the byte count. The high bits are the RX
 /// buffer's allocated block size and are the application's, not ours.
 const COUNT_MASK: u16 = 0x03ff;
+/// `COUNTn_RX.BL_SIZE` (15): blocks of two bytes when clear, of 32 when set.
+const COUNT_BL_SIZE: u16 = 1 << 15;
+
+/// How a register's endpoint uses its buffer-descriptor entry.
+///
+/// The two special kinds are the ones RM0434 §40.5.3/§40.5.4 give "special
+/// handling of packet buffers": both descriptor slots serve the one enabled
+/// direction, and the direction's `DTOG` bit picks which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Control, interrupt, or bulk without `DBL_BUF`: slot 0 is the TX
+    /// buffer, slot 1 the RX buffer.
+    Single,
+    /// Bulk with `EP_KIND = DBL_BUF`: "Writing EP_TYPE bit field at '00 [...]
+    /// and Setting EP_KIND bit at '1 (DBL_BUF)" (§40.5.3).
+    DoubleBulk,
+    /// `EP_TYPE = 10`: "The Isochronous behavior for an endpoint is selected by
+    /// setting the EP_TYPE bits at '10" (§40.5.4).
+    Iso,
+}
+
+impl Kind {
+    fn of(reg: u16) -> Kind {
+        match (reg & EP_TYPE) >> 9 {
+            TYPE_ISO => Kind::Iso,
+            TYPE_BULK if reg & EP_KIND != 0 => Kind::DoubleBulk,
+            _ => Kind::Single,
+        }
+    }
+
+    /// Whether this endpoint is in the set the `ISTR.EP_ID` priority and the
+    /// high-priority line single out: "Isochronous and double-buffered bulk
+    /// endpoints are considered first" (§40.6.1, `EP_ID`).
+    fn is_priority(self) -> bool {
+        self != Kind::Single
+    }
+}
+
+fn is_control(reg: u16) -> bool {
+    (reg & EP_TYPE) >> 9 == TYPE_CONTROL
+}
+
+/// The allocated size of a reception buffer, from its `COUNTn_RX` word
+/// (RM0434 §40.6.2, `BL_SIZE`/`NUM_BLOCK` and Table 262).
+///
+/// "If BL_SIZE=0, the memory block is 2-byte large [...] If BL_SIZE=1, the
+/// memory block is 32-byte large". Table 262 counts `NUM_BLOCK` blocks when
+/// `BL_SIZE = 0` (1 → 2 bytes, 31 → 62) and `NUM_BLOCK + 1` when it is set
+/// (0 → 32 bytes, 14 → 480). `NUM_BLOCK = 0` with `BL_SIZE = 0` is "Not
+/// allowed"; it is taken as no room at all, so nothing is written. The table
+/// stops filling the `BL_SIZE = 1` column after 14 and marks 31 "N/A"; the text
+/// says the size "theoretically ranges from 32 to 1024 bytes", so the same
+/// `+ 1` rule is carried on — the packet memory's own end bounds it anyway.
+fn rx_capacity(count_rx: u16) -> usize {
+    let blocks = usize::from((count_rx >> 10) & 0x1f);
+    if count_rx & COUNT_BL_SIZE != 0 {
+        (blocks + 1) * 32
+    } else {
+        blocks * 2
+    }
+}
+
+/// The CRC16 a data packet carries (USB 2.0 §8.3.5.2: generator
+/// `x^16 + x^15 + x^2 + 1`, register seeded with ones, the remainder sent
+/// inverted, least-significant bit first).
+///
+/// The block writes it into the reception buffer behind the payload: buffer
+/// locations are written "for a number of bytes corresponding to the received
+/// data packet length, CRC included (i.e. data payload length + 2), or up to
+/// the last allocated memory location [...] whichever comes first" (RM0434
+/// §40.5.2). The two bytes land in wire order, which is the CRC's low byte
+/// first.
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xffff;
+    for &byte in data {
+        crc ^= u16::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xa001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -279,6 +378,14 @@ struct State {
     /// Not guest state: it follows the `can-enable` wire, and is re-derived
     /// from it whenever the state is rebuilt ([`Usbfs::set_state`]).
     usb_pma_len: usize,
+    /// Per endpoint register (bit `n`): a double-buffered bulk endpoint has
+    /// completed its first transaction since `DBL_BUF` was set, so its special
+    /// flow control is in force. "The end of the first transaction occurring
+    /// after having set DBL_BUF, triggers the special flow control of
+    /// double-buffered bulk endpoints, which is used for all other
+    /// transactions addressed to this endpoint until DBL_BUF remain set"
+    /// (RM0434 §40.5.3). Hidden hardware state, so it is in the snapshot.
+    dbl_live: u8,
 }
 
 impl State {
@@ -293,6 +400,7 @@ impl State {
             bcdr: 0,
             pma: vec![0; PMA_BYTES as usize],
             usb_pma_len: PMA_BYTES as usize,
+            dbl_live: 0,
         }
     }
 
@@ -354,15 +462,84 @@ impl State {
     fn btable_entry(&self, n: usize) -> u16 {
         self.btable.wrapping_add((n as u16) * 8)
     }
-    /// `(ADDR_TX, &COUNT_TX, ADDR_RX, &COUNT_RX)` for endpoint register `n`.
-    fn descr(&self, n: usize) -> (u16, u16, u16, u16) {
-        let e = self.btable_entry(n);
-        (
-            self.pma_u16(e),
-            e.wrapping_add(2),
-            self.pma_u16(e.wrapping_add(4)),
-            e.wrapping_add(6),
-        )
+    /// `(ADDR, &COUNT)` of descriptor slot `slot` (0 or 1) of register `n`.
+    ///
+    /// Slot 0 is the entry's first pair (`ADDRn_TX`/`COUNTn_TX`, or the
+    /// `_TX_0`/`_RX_0` buffer of a double-buffered or isochronous endpoint),
+    /// slot 1 its second (`ADDRn_RX`/`COUNTn_RX`, or `_TX_1`/`_RX_1`) —
+    /// §40.6.2's notes on each location.
+    fn slot(&self, n: usize, slot: usize) -> (u16, u16) {
+        let e = self.btable_entry(n).wrapping_add((slot as u16) * 4);
+        (self.pma_u16(e), e.wrapping_add(2))
+    }
+
+    /// Copy a received data packet into descriptor slot `slot` of register `n`
+    /// and say whether it fitted.
+    ///
+    /// "The USB peripheral will never change the contents of memory locations
+    /// adjacent to the allocated memory buffers; if a packet bigger than the
+    /// allocated buffer length is received (buffer overrun condition) the data
+    /// are copied to the memory only up to the last available location"
+    /// (RM0434 §40.5.2). What is written is the payload and its CRC, cut at
+    /// the allocated size; the overrun is "the length of the data packet
+    /// payload [...] greater than the allocated buffer". `COUNTn_RX` is not
+    /// touched here — on an overrun it must not be.
+    fn receive(&mut self, n: usize, slot: usize, data: &[u8]) -> bool {
+        let (addr, count) = self.slot(n, slot);
+        let capacity = rx_capacity(self.pma_u16(count));
+        let crc = crc16(data).to_le_bytes();
+        for (i, b) in data.iter().chain(crc.iter()).take(capacity).enumerate() {
+            if let Some(cell) = self.pma_slot(usize::from(addr) + i) {
+                *cell = *b;
+            }
+        }
+        data.len() <= capacity
+    }
+
+    /// Write the received byte count into slot `slot`'s `COUNT` word, keeping
+    /// `BL_SIZE`/`NUM_BLOCK`: "the internal COUNT register is copied back in
+    /// the COUNTn_RX location [...] leaving unaffected BL_SIZE and NUM_BLOCK
+    /// fields" (§40.5.2).
+    fn set_rx_count(&mut self, n: usize, slot: usize, len: usize) {
+        let (_, count) = self.slot(n, slot);
+        let old = self.pma_u16(count);
+        let len = len.min(usize::from(COUNT_MASK)) as u16;
+        self.set_pma_u16(count, (old & !COUNT_MASK) | len);
+    }
+
+    /// The `STAT` side of a completed double-buffered bulk transaction on
+    /// register `n` (`rx`: the reception direction).
+    ///
+    /// The first transaction after `DBL_BUF` is set ends the ordinary way —
+    /// "Unlike common transactions, and the first one after DBL_BUF setting,
+    /// STAT bit pair is not affected by the transaction termination and its
+    /// value remains '11 (Valid)" (RM0434 §40.5.3) — so it is forced to `NAK`,
+    /// and the special flow control takes over from the next one.
+    fn finish_double(&mut self, n: usize, rx: bool) {
+        if self.dbl_live & (1 << n) == 0 {
+            if rx {
+                self.set_stat_rx(n, STAT_NAK);
+            } else {
+                self.set_stat_tx(n, STAT_NAK);
+            }
+            self.dbl_live |= 1 << n;
+        }
+    }
+
+    /// Set `CTR_RX` on register `n` with the `SETUP` bit's rule: it "changes
+    /// its value only for control endpoints" and "is kept frozen while CTR_RX
+    /// bit is at 1" (§40.6.1, `SETUP`).
+    fn complete_rx(&mut self, n: usize, setup: bool) {
+        let reg = self.ep[n];
+        let mut new = reg | EP_CTR_RX;
+        if is_control(reg) && reg & EP_CTR_RX == 0 {
+            new = if setup {
+                new | EP_SETUP
+            } else {
+                new & !EP_SETUP
+            };
+        }
+        self.ep[n] = new;
     }
 
     /// The endpoint register whose `EA` matches `ea`, lowest index first.
@@ -376,17 +553,54 @@ impl State {
 
     /// `ISTR` as a read answers it: the latched flags, plus the computed
     /// `CTR`/`DIR`/`EP_ID` naming the highest-priority pending transfer.
+    ///
+    /// The priority is RM0434 §40.6.1's (`EP_ID`): "Two endpoint sets are
+    /// defined, in order of priority: Isochronous and double-buffered bulk
+    /// endpoints are considered first and then the other endpoints are
+    /// examined. If more than one endpoint from the same set is requesting an
+    /// interrupt, the EP_ID bits [...] are assigned according to the lowest
+    /// requesting endpoint register". `DIR` is 1 when "CTR_RX bit or both
+    /// CTR_TX/CTR_RX are set" on that register.
     fn istr_value(&self) -> u16 {
-        for n in 0..ENDPOINTS as u16 {
-            let ep = self.ep[n as usize];
-            if ep & EP_CTR_RX != 0 {
-                return self.istr | ISTR_CTR | ISTR_DIR | n;
-            }
-            if ep & EP_CTR_TX != 0 {
-                return self.istr | ISTR_CTR | n;
+        for priority in [true, false] {
+            for n in 0..ENDPOINTS as u16 {
+                let ep = self.ep[n as usize];
+                if Kind::of(ep).is_priority() != priority {
+                    continue;
+                }
+                if ep & EP_CTR_RX != 0 {
+                    return self.istr | ISTR_CTR | ISTR_DIR | n;
+                }
+                if ep & EP_CTR_TX != 0 {
+                    return self.istr | ISTR_CTR | n;
+                }
             }
         }
         self.istr & !ISTR_CTR
+    }
+
+    /// Whether the high-priority line stands: a pending `CTR_RX`/`CTR_TX` on
+    /// an isochronous or double-buffered bulk endpoint.
+    ///
+    /// The manual's grounds, quoted: "Endpoint transaction completion can be
+    /// handled in a different way to reduce interrupt response latency. [...]
+    /// An endpoint dedicated interrupt condition is activated independently
+    /// from the CTRM bit in the USB_CNTR register. Both interrupt conditions
+    /// remain active until software clears the pending bit in the
+    /// corresponding USB_EPnR register" (RM0434 §40.6.1, `USB_ISTR`), and the
+    /// vector table's "USB_HP — USB high priority interrupt" beside "USB_LP —
+    /// USB low priority interrupt (including USB wake-up)" (RM0434 Table 72,
+    /// the CPU1 vector table). So the line ignores `CTRM` and falls only when
+    /// `CTR_x` is cleared. **Which endpoints feed it is not stated in RM0434
+    /// or RM0091** — this is an assumption, not a quote: the set taken is the
+    /// one the same register description already singles out for latency,
+    /// "Isochronous and double-buffered bulk endpoints are considered first".
+    /// Evidence from silicon that says otherwise should change this function
+    /// and nothing else.
+    fn irq_hp_asserted(&self) -> bool {
+        self.ep
+            .iter()
+            .any(|&ep| Kind::of(ep).is_priority() && ep & (EP_CTR_RX | EP_CTR_TX) != 0)
     }
 
     /// Whether the interrupt line stands: an enabled `ISTR` flag under `CNTR`'s
@@ -521,8 +735,10 @@ fn bcd_status(bcdr: u16, port: PortType) -> u16 {
 pub struct Usbfs {
     state: Mutex<State>,
     gate: ClockGate,
-    /// The `irq` output, connected at realize time.
+    /// The `irq` output (`USB_LP`), connected at realize time.
     irq: Mutex<Option<WireSource>>,
+    /// The `irq_hp` output (`USB_HP`), connected at realize time.
+    irq_hp: Mutex<Option<WireSource>>,
     /// The bus this device plugs into when its pull-up is attached.
     bus: Arc<UsbBus>,
     /// Which port of [`bus`](Usbfs::bus) it plugs into.
@@ -568,6 +784,7 @@ impl Usbfs {
             state: Mutex::with_rank(LockRank::DEVICE, State::reset()),
             gate: ClockGate::new(),
             irq: Mutex::with_rank(LockRank::WIRE, None),
+            irq_hp: Mutex::with_rank(LockRank::WIRE, None),
             bus,
             port,
             attached: AtomicU32::new(0),
@@ -598,6 +815,12 @@ impl Usbfs {
     #[must_use]
     pub fn irq_level(&self) -> Level {
         Level::from_bool(self.state.lock().irq_asserted())
+    }
+
+    /// The level the high-priority interrupt output is being driven to.
+    #[must_use]
+    pub fn irq_hp_level(&self) -> Level {
+        Level::from_bool(self.state.lock().irq_hp_asserted())
     }
 
     /// `ISTR` as the guest would read it.
@@ -696,12 +919,25 @@ impl Usbfs {
         self.refresh_irq();
     }
 
-    /// Republish the interrupt line. Called with **no lock held**.
+    /// Connect the high-priority interrupt output.
+    pub fn connect_irq_hp(&self, source: WireSource) {
+        *self.irq_hp.lock() = Some(source);
+        self.refresh_irq();
+    }
+
+    /// Republish both interrupt lines. Called with **no lock held**.
     pub fn refresh_irq(&self) {
-        let asserted = self.state.lock().irq_asserted();
+        let (lp, hp) = {
+            let state = self.state.lock();
+            (state.irq_asserted(), state.irq_hp_asserted())
+        };
         let source = self.irq.lock().clone();
         if let Some(source) = source {
-            source.set(Level::from_bool(asserted));
+            source.set(Level::from_bool(lp));
+        }
+        let source = self.irq_hp.lock().clone();
+        if let Some(source) = source {
+            source.set(Level::from_bool(hp));
         }
     }
 
@@ -733,7 +969,15 @@ impl Usbfs {
     fn write_reg(&self, word: u64, value: u16) -> (bool, bool) {
         let mut state = self.state.lock();
         match word {
-            o if o < 0x20 => write_epnr(&mut state.ep[(o / 4) as usize], value),
+            o if o < 0x20 => {
+                let n = (o / 4) as usize;
+                write_epnr(&mut state.ep[n], value);
+                if Kind::of(state.ep[n]) != Kind::DoubleBulk {
+                    // `DBL_BUF` (or bulk) is gone: the next time it is set,
+                    // its first transaction is an ordinary one again.
+                    state.dbl_live &= !(1 << n);
+                }
+            }
             OFF_CNTR => state.cntr = value & CNTR_WRITABLE,
             OFF_ISTR => state.istr &= value & ISTR_FLAG_MASK,
             // Every bit is `r`; the write decodes and changes nothing.
@@ -755,80 +999,217 @@ impl Usbfs {
 
     // -- the transactions the gadget runs -------------------------------
 
+    /// A `SETUP` token and its eight-byte `DATA0` packet.
+    ///
+    /// RM0434 §40.5.2, "Control transfers", is the rule set:
+    ///
+    /// * "SETUP transactions are handled by control endpoints only" and "are
+    ///   ignored by endpoints of other kinds" (§40.6.1, `EP_TYPE`) — no
+    ///   handshake, which on this bus is [`Status::NoDevice`].
+    /// * "When the STAT_RX bits are set to '01 (STALL) or '10 (NAK) and a
+    ///   SETUP token is received, the USB accepts the data, performing the
+    ///   required data transfers and sends back an ACK handshake." The
+    ///   `EP_TYPE` description says the opposite for NAK ("the USB peripheral
+    ///   will not answer, simulating a receive error"); the control-transfer
+    ///   section is the detailed one, and USB 2.0 §8.5.3 requires a device to
+    ///   accept a `SETUP`, so this follows it.
+    /// * "If that endpoint has a previously issued CTR_RX request not yet
+    ///   acknowledged by the application [...] the USB discards the SETUP
+    ///   transaction and does not answer with any handshake packet regardless
+    ///   of its state, simulating a reception error" — [`Status::Error`], the
+    ///   host's cue to retry.
+    /// * `STAT_RX = DISABLED`: "all reception requests addressed to this
+    ///   endpoint are ignored" (Table 258).
+    /// * On success "the values of DTOG_TX and DTOG_RX bits of the addressed
+    ///   endpoint registers are set to 1 and 0 respectively [...] and both
+    ///   STAT_TX and STAT_RX are set to '10 (NAK)". `DTOG_RX`'s own
+    ///   description places the clear "at the reception of a SETUP PID", and
+    ///   the same register's rule — it toggles "when the ACK handshake is sent
+    ///   [...] following a data packet reception having a matching data PID
+    ///   value" — then applies to the `SETUP`'s `DATA0`, so it reads 1
+    ///   afterwards: the `DATA1` the first data stage carries. (Were it left
+    ///   at 0, an `OUT` data stage would be a toggle mismatch.)
     fn do_setup(&self, endpoint: u8, packet: &SetupPacket) -> Status {
         let mut state = self.state.lock();
+        if state.daddr & DADDR_EF == 0 {
+            return Status::NoDevice;
+        }
         let Some(n) = state.match_ea(u16::from(endpoint)) else {
-            return Status::Stall;
+            return Status::NoDevice;
         };
-        if state.stat_rx(n) == STAT_DISABLED {
-            // No reception armed on a control endpoint: nothing can take it.
+        let reg = state.ep[n];
+        if !is_control(reg) || state.stat_rx(n) == STAT_DISABLED {
+            return Status::NoDevice;
+        }
+        if reg & EP_CTR_RX != 0 {
+            return Status::Error;
+        }
+        // A control endpoint is single-buffered ("Endpoint 0 is always used
+        // for control transfer in single-buffer mode", §40.4.1): slot 1 is RX.
+        let bytes = packet.encode();
+        if !state.receive(n, 1, &bytes) {
+            // The overrun rule is stated for "OUT/SETUP" alike (§40.5.2).
             return Status::Stall;
         }
-        let (_, _, addr_rx, count_rx) = state.descr(n);
-        let bytes = packet.encode();
-        state.pma_write(addr_rx, &bytes);
-        let cr = state.pma_u16(count_rx);
-        state.set_pma_u16(count_rx, (cr & !COUNT_MASK) | SetupPacket::SIZE as u16);
-        state.ep[n] |= EP_CTR_RX | EP_SETUP;
-        // §30.5.3: a `SETUP` forces both directions to `NAK`, so a stale `VALID`
-        // from the previous transfer does not answer the new one's data stage
-        // before firmware has prepared it.
+        state.set_rx_count(n, 1, bytes.len());
+        state.complete_rx(n, true);
+        state.ep[n] |= EP_DTOG_RX | EP_DTOG_TX;
         state.set_stat_rx(n, STAT_NAK);
         state.set_stat_tx(n, STAT_NAK);
         Status::Ack
     }
 
-    fn do_out(&self, endpoint: u8, src: &[u8]) -> Completion {
+    /// An `OUT` token and its data packet. `pid` is the packet's data PID, or
+    /// `None` when the host did not say — taken as the one expected.
+    ///
+    /// The single-buffered path is RM0434 §40.5.2, "OUT and SETUP packets":
+    /// the addressed register's `STAT_RX` answers a non-`VALID` endpoint ("a
+    /// NAK or STALL handshake packet is sent instead of the ACK [...] and no
+    /// data is written in the reception memory buffers"), and on success
+    /// "DTOG_RX bit is toggled, the endpoint is made invalid by setting
+    /// STAT_RX = '10 (NAK) and bit CTR_RX is set". On an overrun "a STALL
+    /// handshake is sent instead of the usual ACK [...] no interrupt is
+    /// generated and the transaction is considered failed", and "none of the
+    /// previously listed actions take place".
+    fn do_out(&self, endpoint: u8, src: &[u8], pid: Option<DataPid>) -> Completion {
         let mut state = self.state.lock();
+        if state.daddr & DADDR_EF == 0 {
+            return Completion::absent();
+        }
         let Some(n) = state.match_ea(u16::from(endpoint)) else {
-            return Completion::stall();
+            return Completion::absent();
         };
+        let reg = state.ep[n];
+        let kind = Kind::of(reg);
+        let dtog = reg & EP_DTOG_RX != 0;
+        let live = state.dbl_live & (1 << n) != 0;
         match state.stat_rx(n) {
             STAT_VALID => {}
             STAT_NAK => return Completion::nak(),
-            _ => return Completion::stall(), // DISABLED or STALL
+            STAT_DISABLED => return Completion::absent(), // Table 258: ignored
+            _ => return Completion::stall(),
         }
-        let (_, _, addr_rx, count_rx) = state.descr(n);
-        state.pma_write(addr_rx, src);
-        let cr = state.pma_u16(count_rx);
-        state.set_pma_u16(
-            count_rx,
-            (cr & !COUNT_MASK) | (src.len() as u16 & COUNT_MASK),
-        );
-        state.ep[n] = (state.ep[n] | EP_CTR_RX) & !EP_SETUP;
-        state.set_stat_rx(n, STAT_NAK);
+        if kind == Kind::DoubleBulk && live && dtog == (reg & EP_DTOG_TX != 0) {
+            // "the actual endpoint status is masked as '10 (NAK) when a buffer
+            // conflict between the USB peripheral and the application software
+            // is detected (this condition is identified by DTOG and SW_BUF
+            // having the same value" (§40.5.3). SW_BUF of a reception
+            // endpoint is bit 6 (Table 254).
+            return Completion::nak();
+        }
+        if kind != Kind::Iso && pid.is_some_and(|pid| pid.toggle() != dtog) {
+            // A retransmission of a packet already taken. DTOG_RX toggles only
+            // "following a data packet reception having a matching data PID
+            // value", and CTR_RX is not set "as in the case of protocol errors
+            // or data toggle mismatches" (§40.6.1). The manual does not name
+            // the handshake; USB 2.0 §8.6.4 has the receiver ACK the duplicate
+            // and discard it, which is what the host needs to move on. Nothing
+            // is written: "no data is actually transferred".
+            return Completion::ack(src.len() as u64);
+        }
+        if kind == Kind::Single && is_control(reg) && reg & EP_KIND != 0 && !src.is_empty() {
+            // STATUS_OUT: "all OUT transactions containing more than zero data
+            // bytes are answered 'STALL' instead of 'ACK'" (§40.6.1,
+            // `EP_KIND`). The manual does not say whether the bytes reach the
+            // buffer; a refused transaction writes none here.
+            return Completion::stall();
+        }
+        let slot = match kind {
+            Kind::Single => 1,
+            // Tables 255/256: DTOG_RX = 0 → ADDRn_RX_0 (slot 0), 1 → RX_1.
+            Kind::DoubleBulk | Kind::Iso => usize::from(dtog),
+        };
+        let fitted = state.receive(n, slot, src);
+        if !fitted && kind != Kind::Iso {
+            return Completion::stall();
+        }
+        // Isochronous: "CRC errors or buffer-overrun conditions occurring
+        // during Isochronous OUT transfers are anyway considered as correct
+        // transactions and they always trigger an CTR_RX event" (§40.5.4).
+        // What COUNT then holds is not stated; the bytes that reached the
+        // buffer is what it is given.
+        let (_, count) = state.slot(n, slot);
+        let len = src.len().min(rx_capacity(state.pma_u16(count)));
+        state.set_rx_count(n, slot, len);
+        state.complete_rx(n, false);
+        state.ep[n] ^= EP_DTOG_RX;
+        match kind {
+            Kind::Single => state.set_stat_rx(n, STAT_NAK),
+            // "STAT bit pair is not affected by transaction completion; [...]
+            // the endpoint remains always '11 (Valid)" (§40.5.4).
+            Kind::Iso => {}
+            Kind::DoubleBulk => state.finish_double(n, true),
+        }
         Completion::ack(src.len() as u64)
     }
 
-    fn do_in(&self, endpoint: u8, dst: &mut [u8], commit: bool) -> Completion {
+    /// An `IN` token: the data packet the endpoint has staged, and the PID it
+    /// went out with. `commit` is false for the debug peek, which changes
+    /// nothing.
+    ///
+    /// RM0434 §40.5.2, "IN packets": the packet goes out "according to
+    /// USB_EPnR bit DTOG_TX"; "If the addressed endpoint is not valid, a NAK or
+    /// STALL handshake packet is sent instead of the data packet"; and on the
+    /// host's ACK "DTOG_TX bit is toggled, the endpoint is made invalid by
+    /// setting STAT_TX=10 (NAK) and bit CTR_TX is set". The double-buffered
+    /// and isochronous paths pick the buffer by `DTOG_TX` (Tables 255/256).
+    fn do_in(&self, endpoint: u8, dst: &mut [u8], commit: bool) -> (Completion, Option<DataPid>) {
         let mut state = self.state.lock();
+        if state.daddr & DADDR_EF == 0 {
+            return (Completion::absent(), None);
+        }
         let Some(n) = state.match_ea(u16::from(endpoint)) else {
-            return Completion::stall();
+            return (Completion::absent(), None);
         };
+        let reg = state.ep[n];
+        let kind = Kind::of(reg);
+        let dtog = reg & EP_DTOG_TX != 0;
+        let live = state.dbl_live & (1 << n) != 0;
         match state.stat_tx(n) {
             STAT_VALID => {}
-            STAT_NAK => return Completion::nak(),
-            _ => return Completion::stall(), // DISABLED or STALL
+            STAT_NAK => return (Completion::nak(), None),
+            STAT_DISABLED => return (Completion::absent(), None), // Table 261: ignored
+            _ => return (Completion::stall(), None),
         }
-        let (addr_tx, count_tx, _, _) = state.descr(n);
-        let len = (state.pma_u16(count_tx) & COUNT_MASK) as usize;
+        if kind == Kind::DoubleBulk && live && dtog == (reg & EP_DTOG_RX != 0) {
+            // The buffer conflict of §40.5.3; SW_BUF of a transmission endpoint
+            // is bit 14 (Table 254).
+            return (Completion::nak(), None);
+        }
+        let slot = match kind {
+            Kind::Single => 0,
+            Kind::DoubleBulk | Kind::Iso => usize::from(dtog),
+        };
+        let (addr, count) = state.slot(n, slot);
+        let len = (state.pma_u16(count) & COUNT_MASK) as usize;
         if len > dst.len() {
             // The device has more staged than the host will take in one packet:
             // a device sending past `wMaxPacketSize` (USB 2.0 §8.7.4).
-            return Completion {
-                status: Status::Babble,
-                len: 0,
-            };
+            return (
+                Completion {
+                    status: Status::Babble,
+                    len: 0,
+                },
+                None,
+            );
         }
-        let base = addr_tx as usize;
-        for (i, slot) in dst[..len].iter_mut().enumerate() {
-            *slot = state.pma_byte(base + i);
+        let base = addr as usize;
+        for (i, cell) in dst[..len].iter_mut().enumerate() {
+            *cell = state.pma_byte(base + i);
         }
+        // "Isochronous transfers do not support data toggle sequencing and
+        // always use DATA0 PID to start any data packet" (§40.5.4).
+        let pid = DataPid::from_toggle(kind != Kind::Iso && dtog);
         if commit {
             state.ep[n] |= EP_CTR_TX;
-            state.set_stat_tx(n, STAT_NAK);
+            state.ep[n] ^= EP_DTOG_TX;
+            match kind {
+                Kind::Single => state.set_stat_tx(n, STAT_NAK),
+                Kind::Iso => {}
+                Kind::DoubleBulk => state.finish_double(n, false),
+            }
         }
-        Completion::ack(len as u64)
+        (Completion::ack(len as u64), Some(pid))
     }
 
     fn do_bus_reset(&self) {
@@ -909,6 +1290,17 @@ impl fmt::Debug for Gadget {
     }
 }
 
+impl Gadget {
+    fn out(&self, endpoint: u8, src: &[u8], pid: Option<DataPid>) -> Completion {
+        let Some(core) = self.core.upgrade() else {
+            return Completion::absent();
+        };
+        let c = core.do_out(endpoint, src, pid);
+        core.refresh_irq();
+        c
+    }
+}
+
 impl UsbDevice for Gadget {
     fn speed(&self) -> Speed {
         Speed::Full
@@ -939,8 +1331,12 @@ impl UsbDevice for Gadget {
     }
 
     fn transfer_in(&self, endpoint: u8, dst: &mut [u8]) -> Completion {
+        self.transfer_in_pid(endpoint, dst).0
+    }
+
+    fn transfer_in_pid(&self, endpoint: u8, dst: &mut [u8]) -> (Completion, Option<DataPid>) {
         let Some(core) = self.core.upgrade() else {
-            return Completion::absent();
+            return (Completion::absent(), None);
         };
         let c = core.do_in(endpoint, dst, true);
         core.refresh_irq();
@@ -948,17 +1344,16 @@ impl UsbDevice for Gadget {
     }
 
     fn transfer_out(&self, endpoint: u8, src: &[u8]) -> Completion {
-        let Some(core) = self.core.upgrade() else {
-            return Completion::absent();
-        };
-        let c = core.do_out(endpoint, src);
-        core.refresh_irq();
-        c
+        self.out(endpoint, src, None)
+    }
+
+    fn transfer_out_pid(&self, endpoint: u8, src: &[u8], pid: DataPid) -> Completion {
+        self.out(endpoint, src, Some(pid))
     }
 
     fn peek_in(&self, endpoint: u8, dst: &mut [u8]) -> Completion {
         match self.core.upgrade() {
-            Some(core) => core.do_in(endpoint, dst, false),
+            Some(core) => core.do_in(endpoint, dst, false).0,
             None => Completion::absent(),
         }
     }
@@ -1120,13 +1515,23 @@ pub struct UsbfsPeripheral {
 
 /// The pin names a machine description wires.
 pub mod pin {
-    /// The low-priority USB interrupt. Level, the OR of the enabled `ISTR`
-    /// flags under `CNTR`'s mask.
+    /// The low-priority USB interrupt (`USB_LP`). Level, the OR of the
+    /// enabled `ISTR` flags under `CNTR`'s mask.
     pub const IRQ: &str = "irq";
     /// Input: the F0x2's `RCC_APB1ENR.CANEN`. High hands the top 256 bytes of
     /// packet memory to CAN (RM0091 Table 121, note 2). Unwired is low — the
     /// STM32WB, which has no CAN, and every board written before the pin.
     pub const CAN_ENABLE: &str = "can-enable";
+    /// The high-priority USB interrupt (`USB_HP`). Level, a pending
+    /// `CTR_RX`/`CTR_TX` on an isochronous or double-buffered bulk endpoint,
+    /// whatever `CNTR.CTRM` says. The STM32WB wires it to NVIC 19 (`USB_HP`)
+    /// and `irq` to 20 (`USB_LP`), RM0434 Table 72. The F0x2 has one vector
+    /// for the block — position 31, "USB global interrupt (combined with EXTI
+    /// line 18)", RM0091 Table 36 — so an F0x2 board wires `irq` to 31 and
+    /// leaves this pin unwired; RM0091 does not say whether the
+    /// endpoint-dedicated condition reaches that vector when `CTRM` is clear,
+    /// and this leaves it not reaching it.
+    pub const IRQ_HP: &str = "irq_hp";
 }
 
 impl UsbfsPeripheral {
@@ -1236,7 +1641,8 @@ impl Device for UsbfsPeripheral {
         w.write_u16(state.btable)?;
         w.write_u16(state.lpmcsr)?;
         w.write_u16(state.bcdr)?;
-        w.write_bytes(&state.pma)
+        w.write_bytes(&state.pma)?;
+        w.write_u8(state.dbl_live)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1259,6 +1665,7 @@ impl Device for UsbfsPeripheral {
             )));
         }
         state.pma.copy_from_slice(pma);
+        state.dbl_live = r.read_u8()?;
         self.core.set_state(state);
         Ok(())
     }
@@ -1288,16 +1695,20 @@ impl Device for UsbfsPeripheral {
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
-        if port != pin::IRQ {
-            return Err(Error::Config {
-                at: String::from(port),
-                message: format!(
-                    "a USB device peripheral drives `{}` and nothing else",
-                    pin::IRQ
-                ),
-            });
+        match port {
+            pin::IRQ => self.core.connect_irq(source),
+            pin::IRQ_HP => self.core.connect_irq_hp(source),
+            _ => {
+                return Err(Error::Config {
+                    at: String::from(port),
+                    message: format!(
+                        "a USB device peripheral drives `{}` and `{}` and nothing else",
+                        pin::IRQ,
+                        pin::IRQ_HP
+                    ),
+                });
+            }
         }
-        self.core.connect_irq(source);
         Ok(())
     }
 
@@ -1366,6 +1777,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("port-type", ValueKind::Str).values(&PortType::NAMES))
         .port(pin::IRQ, PortDir::Out)
         .port(pin::CAN_ENABLE, PortDir::In)
+        .port(pin::IRQ_HP, PortDir::Out)
         .region("")
         .region("regs")
         .region("pma")
