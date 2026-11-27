@@ -1218,3 +1218,34 @@ fn pins_that_are_on_a_net_are_freed_when_they_are_dropped() {
     // A net that outlives them delivers to nobody, and says nothing.
     cs.set(src, Level::High);
 }
+
+#[test]
+fn a_controller_whose_miso_is_on_a_net_is_freed_when_it_is_dropped() {
+    // The MISO sink is kept by the device, because a net holds it weakly.
+    // When it was kept inside the state it points at, a controller with MISO
+    // wired owned itself — and its bus, and every slave on that bus.
+    let bus = Arc::new(SpiBus::new());
+    let ctrl = transactional(&bus);
+    let src = WireId::new(1);
+    let pin = Device::sink(&ctrl, cpin::MISO, &[src]).expect("a MISO input");
+    // Weakly, as a machine's nets hold every sink (`core::device`).
+    let miso = Wire::builder()
+        .source(src)
+        .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+        .build();
+    drop(pin);
+
+    miso.set(src, Level::High);
+    miso.set(src, Level::Low);
+
+    // The controller's state owns the bus, so the bus going is the state
+    // going.
+    let weak_bus = Arc::downgrade(&bus);
+    drop((ctrl, bus));
+    assert_eq!(
+        weak_bus.strong_count(),
+        0,
+        "the controller's state outlived the controller, and kept its bus"
+    );
+    miso.set(src, Level::High);
+}
