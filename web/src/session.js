@@ -80,6 +80,8 @@ export class Session {
     /** Keysyms currently down, so losing focus can release every one. */
     this.keysDown = new Set();
     this.consoleText = "";
+    // Whether the pane's last byte was a CR: `decodeGuest`'s memory between reads.
+    this.consoleLine = { cr: false };
 
     // Loop bookkeeping. All plain numbers, none of it reactive.
     this.pending = 0;
@@ -151,6 +153,7 @@ export class Session {
     // start audio — so this is where the context is created, not on load.
     this.startSound();
     this.consoleText = "";
+    this.consoleLine = { cr: false };
     this.hooks.console("");
     this.held = 0;
     this.keysDown.clear();
@@ -201,6 +204,7 @@ export class Session {
     this.keysDown.clear();
     this.screenFocused = false;
     this.consoleText = "";
+    this.consoleLine = { cr: false };
     this.hooks.console("");
     this.pushStats();
   }
@@ -376,7 +380,7 @@ export class Session {
     if (!this.hasConsole) return;
     const bytes = this.emu.consoleRead();
     if (bytes.length > 0) {
-      this.consoleText += decodeGuest(bytes);
+      this.consoleText += decodeGuest(bytes, this.consoleLine);
       if (this.consoleText.length > CONSOLE_LIMIT) {
         this.consoleText = this.consoleText.slice(-CONSOLE_TRIM);
       }
@@ -582,18 +586,23 @@ export class Session {
  * **one** newline, which is why the previous byte is remembered; dropping LF
  * outright, which is what this did, would have printed a serial console as one
  * unbroken line the first time a board with a UART reached this page.
+ *
+ * It is remembered in `line`, which the caller keeps **across calls**: the pane
+ * is fed one `consoleRead` at a time, and a guest printing through a UART has
+ * its CR at the end of one read and its LF at the start of the next as often as
+ * not. Remembering it only for the length of one call made each of those a
+ * blank line. Omit `line` to decode one self-contained buffer.
  */
-export function decodeGuest(bytes) {
+export function decodeGuest(bytes, line = { cr: false }) {
   let out = "";
-  let wasCr = false;
   for (const byte of bytes) {
     const c = byte & 0x7f;
     if (c === 0x0d) out += "\n";
     else if (c === 0x0a) {
-      if (!wasCr) out += "\n";
+      if (!line.cr) out += "\n";
     } else if (c === 0x09) out += "\t";
     else if (c >= 0x20 && c < 0x7f) out += String.fromCharCode(c);
-    wasCr = c === 0x0d;
+    line.cr = c === 0x0d;
   }
   return out;
 }

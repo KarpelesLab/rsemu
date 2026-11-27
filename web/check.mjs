@@ -1010,6 +1010,15 @@ check(decodeGuest(guest("A\nB")) === "A\nB", "a bare LF is a newline (a 16550)")
 check(decodeGuest(guest("A\r\nB")) === "A\nB", "and CRLF is one newline, not two");
 check(decodeGuest(guest("a\x00b\x07c")) === "abc", "control bytes are dropped");
 check(decodeGuest(guest("\xc1\xc2")) === "AB", "and bit 7 is the keyboard's, not the text's");
+// The pane is fed one `consoleRead` at a time, and a guest printing through a
+// UART has its CR in one read and its LF in the next as often as not.
+{
+  const line = { cr: false };
+  const split = decodeGuest(guest("A\r"), line) + decodeGuest(guest("\nB"), line);
+  check(split === "A\nB", `a CRLF split across two reads is still one newline (${JSON.stringify(split)})`);
+  const apart = decodeGuest(guest("A\r"), line) + decodeGuest(guest("B\n"), line);
+  check(apart === "A\nB\n", "but only the LF immediately after the CR is its other half");
+}
 
 console.log(failures === 0 ? "\nall checks passed" : `\n${failures} check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);
