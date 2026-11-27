@@ -4311,6 +4311,47 @@ mod long_mode {
         pc
     }
 
+    /// A selector load into `FS` or `GS` moves the base a 64-bit access uses.
+    ///
+    /// *Intel SDM* volume 3A §3.4.4: "Normal segment loads (MOV to Sreg and
+    /// POP Sreg) into FS and GS load a standard 32-bit base value in the
+    /// hidden portion of the segment register", and "The hidden descriptor
+    /// register fields for FS.base and GS.base are physically mapped to
+    /// MSRs". The base a 64-bit access adds was kept beside the descriptor
+    /// cache and only `WRMSR` wrote it, so the load changed the selector and
+    /// nothing else.
+    #[test]
+    fn a_selector_load_into_fs_or_gs_moves_the_base_a_64_bit_access_uses() {
+        for (sreg_modrm, prefix, base_msr) in
+            [(0xe0u8, 0x64u8, msr::FS_BASE), (0xe8, 0x65, msr::GS_BASE)]
+        {
+            let pc = pc64();
+            // A data segment whose base is the scratch page.
+            pc.gdt(5, descriptor(la::MARK, 0xffff_ffff, rights::DATA32));
+            pc.write64(la::MARK + 0x10, 0x1122_3344_5566_7788);
+            let mut code = alloc::vec![
+                0x66, 0xb8, 0x28, 0x00, // mov ax, 0x28
+                0x8e, sreg_modrm, // mov fs|gs, ax
+                prefix, 0x48, 0x8b, 0x1c, 0x25, 0x10, 0x00, 0x00,
+                0x00, // mov rbx, fs|gs:[0x10]
+                0xb9, // mov ecx, IA32_FS_BASE | IA32_GS_BASE
+            ];
+            code.extend_from_slice(&base_msr.to_le_bytes());
+            code.extend_from_slice(&[0x0f, 0x32, 0xf4]); // rdmsr ; hlt
+            let pc = run64_on(pc, 0, &code);
+            let regs = pc.regs();
+            assert_eq!(
+                regs.rbx, 0x1122_3344_5566_7788,
+                "{prefix:#x}: the access went through the descriptor's base"
+            );
+            assert_eq!(
+                (regs.rdx << 32) | regs.rax,
+                la::MARK,
+                "and the base register reads it back"
+            );
+        }
+    }
+
     /// The x86-64-v2 extensions on top of the baseline.
     fn v2_features() -> Features {
         Features {

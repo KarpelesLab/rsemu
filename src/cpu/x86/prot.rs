@@ -1674,7 +1674,47 @@ impl Exec<'_> {
     ///
     /// `CS` never comes through here: the only way to change the code segment
     /// is a control transfer, which has its own checks and its own faults.
+    ///
+    /// # `FS`, `GS` and their base registers
+    ///
+    /// On a long-mode part the hidden base of `FS` and of `GS` *is*
+    /// `IA32_FS_BASE` and `IA32_GS_BASE` — one register with two ways in —
+    /// so a selector load moves the model-specific register too (*Intel SDM*
+    /// volume 3A §3.4.4, "Segment Loading Instructions in IA-32e Mode"):
+    /// "Normal segment loads (MOV to Sreg and POP Sreg) into FS and GS load a
+    /// standard 32-bit base value in the hidden portion of the segment
+    /// register. The base address bits above the standard 32 bits are cleared
+    /// to 0", and "The hidden descriptor register fields for FS.base and
+    /// GS.base are physically mapped to MSRs".
+    ///
+    /// [`Sys::fs_base`] and [`Sys::gs_base`] are what a 64-bit access adds, so
+    /// a load that left them alone gave `mov fs, ax` no effect at all in
+    /// 64-bit mode: the next `fs:` access still used whatever `WRMSR` had last
+    /// written. A **null** selector is the one load that leaves them — what
+    /// that does to the base differs between vendors, and keeping it is what
+    /// an operating system that zeroes the selector and *then* writes the
+    /// base register is unaffected by.
     pub(super) fn load_segment(&mut self, index: u8, selector: u16) -> Ex<()> {
+        self.load_segment_cache(index, selector)?;
+        if self.cfg.features.long && matches!(index, seg::FS | seg::GS) {
+            let loaded = self.state.sys.seg(index);
+            // In protected mode a null selector marks the register unusable
+            // and is skipped; in real and virtual-8086 mode zero is an
+            // ordinary segment value with a base of zero.
+            if loaded.present() || !self.protected() || self.v86() {
+                let base = loaded.base & 0xffff_ffff;
+                if index == seg::FS {
+                    self.state.sys.fs_base = base;
+                } else {
+                    self.state.sys.gs_base = base;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Exec::load_segment`] as far as the descriptor cache.
+    fn load_segment_cache(&mut self, index: u8, selector: u16) -> Ex<()> {
         if index >= seg::COUNT as u8 {
             return Err(Fault::bare(VEC_UD));
         }
