@@ -400,6 +400,39 @@ mod against_an_8520 {
     }
 
     #[test]
+    fn a_power_up_stream_with_many_keys_down_survives_a_snapshot() {
+        // The start-up stream is the two markers and "the key codes of all
+        // depressed keys" between them, however many that is: it is built in
+        // one go and is not held to the ten-code type-ahead buffer. A snapshot
+        // taken while it is still going out has to load.
+        let mut rig = Rig::new();
+        for key in 0..12u8 {
+            rig.keyboard().press(key, true);
+        }
+        rig.run(100);
+        rig.handshake();
+        let bytes = snapshot(&rig.device);
+
+        let other = Rig::new();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("kbd", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&other.device, &mut chunk.reader()).expect("its own snapshot");
+        assert_eq!(snapshot(&other.device), bytes);
+
+        // And the stream it was saved in the middle of is the whole stream.
+        let mut got = Vec::new();
+        while let Some(b) = rig.receive() {
+            got.push(b);
+            if b == code::END_POWER_UP_STREAM {
+                break;
+            }
+        }
+        assert_eq!(got.len(), 14, "two markers and twelve keys: {got:02x?}");
+    }
+
+    #[test]
     fn a_warm_reset_leaves_the_keyboard_alone_and_a_cold_one_restarts_it() {
         let mut rig = Rig::new();
         rig.synchronise();

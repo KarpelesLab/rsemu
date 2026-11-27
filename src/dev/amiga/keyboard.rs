@@ -1078,8 +1078,12 @@ impl Device for AmigaKeyboard {
         let lost = r.read_u16()?;
         st.lost = (lost & 0x100 != 0).then_some(lost as u8);
         let queue = r.read_bytes()?;
-        if queue.len() > TYPE_AHEAD + 2 {
-            return Err(bad("a type-ahead buffer longer than the keyboard's"));
+        // The longest the queue ever is: the start-up stream, which is both
+        // markers and every key that was down between them, built in one go
+        // and not held to `TYPE_AHEAD` (`Sending::Sync`). The type-ahead
+        // buffer's own limit is well inside that.
+        if queue.len() > KEY_COUNT + 2 {
+            return Err(bad("more codes queued than the keyboard has keys"));
         }
         st.queue = queue.iter().copied().collect();
         let held = r.read_bytes()?;
