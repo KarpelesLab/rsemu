@@ -2611,6 +2611,12 @@ impl Device for M68k {
             rt.flush();
         }
         drop(session);
+        // A request the `reset` pin latched before this load was owed by the
+        // machine being replaced. `save` folds the latch into
+        // `reset_pending`, so the snapshot already says whether the restored
+        // one owes a sequence; left standing, the stale latch would reset it
+        // on its first step.
+        self.lines.take_reset_request();
         self.lines.restore((ipl, vector, level_seven, resets));
         Ok(())
     }

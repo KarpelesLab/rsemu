@@ -548,6 +548,26 @@ fn a_snapshot_round_trips_to_an_identical_state() -> Result<()> {
 }
 
 #[test]
+fn a_load_forgets_a_reset_the_pin_asked_for_before_it() -> Result<()> {
+    // The `reset` pin's request is latched outside the state and folded in by
+    // the next step. A snapshot carries its own `reset_pending`, and a latch
+    // left over from before the load belongs to the machine that was replaced,
+    // not to the one restored.
+    let board = Board::new();
+    board.boot(&[0x7001, 0x7202, 0x4e71]);
+    board.cpu.step();
+    let bytes = snapshot(&board.cpu)?;
+
+    board.cpu.lines.request_reset_pin();
+    restore(&board.cpu, &bytes)?;
+    board.cpu.step();
+    let regs = board.cpu.regs();
+    assert_eq!(regs.d[1], 2, "the restored program's next instruction ran");
+    assert_eq!(regs.pc, 0x404, "and not the reset sequence");
+    Ok(())
+}
+
+#[test]
 fn a_status_register_with_impossible_bits_cannot_be_set() {
     let board = Board::new();
     board.boot(&[0x4e71]);
