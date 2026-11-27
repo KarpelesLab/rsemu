@@ -38,6 +38,10 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `riscv_lift`      | `cpu::riscv::lift` → `ir::verify` → `ir::Interp`, against `cpu::riscv`'s interpreter | the lifted block and the interpreter agree on registers, PC, ticks, memory and faults |
 | `record_log`      | `core::record::InputLog` — a recorded session, plus the replay path that reads it | never panics; canonical encoding; a replay cursor always advances |
 | `journal_log`     | `usermode::journal::Journal` — the second seam's recording, and the snapshot form that embeds it | never panics; canonical encoding; the two forms agree |
+| `machine_mmio`    | every non-RAM range of every address space of a whole board from `machine::catalog` (STM32 U5, PC/AT, riscv-virt, Mac Plus; STM32 F4/WB and the Amiga 500 behind `RSEMU_FUZZ_LEAKY_BOARDS`, until they stop leaking on drop), with the machine run between accesses | never panics; a debug read leaves the machine's snapshot byte-identical; save, load, save is a round trip; a dropped machine is freed |
+
+This table is not the list of targets — `cargo +nightly fuzz list` is, and
+`fuzz/Cargo.toml` says what each of the rest is for.
 
 ### `machine_parser`
 
@@ -300,6 +304,18 @@ Then, in order:
    *harness* that keeps the rest of the target running. A drift detector that
    is expected to be red detects nothing, which is exactly the trap this job
    fell into for a week.
+   One harness bug has its own shape and is worth recognising on sight,
+   because it is **intermittent**: an assertion about a *literal the harness
+   made up*. `state_decoder` asserted that no chunk was named
+   `/definitely/not/here`. libFuzzer traces comparison operands, `find`
+   compares that literal against every chunk path, and the `CMP` mutator
+   (`MS: 1 CMP- DE: "/definitely/not/here"-` in the log) pastes it into the
+   input — which then holds a well-formed chunk of exactly that name. Whether
+   a thirty-second smoke gets that far is luck, so the scheduled run was red
+   one day in three with identical code. A sentinel a harness asserts on has
+   to be *derived from the input* so that it cannot be in it; a constant is
+   only a matter of time. `corpus/state_decoder/sentinel-path.snap` is the
+   input that did it.
 2. **Turn it into a unit test** in the module that owns the code, beside the
    rest of its tests (`CLAUDE.md`, Testing). The fuzz corpus is not a
    regression suite; a `#[test]` is.
