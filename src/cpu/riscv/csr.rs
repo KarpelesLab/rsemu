@@ -421,6 +421,21 @@ pub fn csr_name(number: u32) -> Option<&'static str> {
 /// configuration for a hart with no firmware to program it.
 pub const PMP_ENTRIES: usize = 16;
 
+/// What a CSR write does to `mip`: the bits it owns, and their new values.
+///
+/// Volume II, "Machine Interrupt Registers": only some bits of `mip` are
+/// writable through the CSR — "MEIP is read-only in mip, and is set and
+/// cleared by a platform-specific interrupt controller", and likewise MTIP
+/// and MSIP — so a write is a mask and a value rather than a new register.
+/// [`Lines::write`] is what applies one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MipWrite {
+    /// Which bits the write replaces.
+    pub mask: u64,
+    /// Their new values. Bits outside `mask` are ignored.
+    pub bits: u64,
+}
+
 /// The interrupt and reset inputs, kept outside the execution lock.
 ///
 /// Atomics rather than fields under the mutex, for the reason `core::device`'s
@@ -453,8 +468,31 @@ impl Lines {
     }
 
     /// Replace the whole interrupt-pending register.
+    ///
+    /// For a reset and a snapshot restore, where nothing else is driving the
+    /// lines. A guest's own write to `mip` or `sip` is [`Lines::write`], which
+    /// touches only the bits that write owns.
     pub fn set_all_pending(&self, value: u64) {
         self.mip.store(value & irq::ALL, Ordering::Release);
+    }
+
+    /// Apply a guest write to `mip` or `sip`: replace the bits `write.mask`
+    /// names and leave every other bit exactly as it is *now*.
+    ///
+    /// An atomic set of the bits being raised and an atomic clear of the bits
+    /// being lowered, not a store of a whole register computed from an
+    /// earlier read. The two are separate operations and need not be one: no
+    /// bit is in both, and nothing reads a pair of these bits as a unit. The
+    /// machine bits are driven from other
+    /// threads — a sibling hart writing this hart's `msip` in the CLINT, the
+    /// PLIC raising `meip` — and a read-modify-write of the whole word would
+    /// put back the value it read, erasing an edge that arrived in between. A
+    /// CLINT drives its line on a *change* of `msip`, so an inter-processor
+    /// interrupt erased that way is never delivered again.
+    pub fn write(&self, write: MipWrite) {
+        let mask = write.mask & irq::ALL;
+        self.mip.fetch_or(write.bits & mask, Ordering::AcqRel);
+        self.mip.fetch_and(!(mask & !write.bits), Ordering::AcqRel);
     }
 
     /// Latch a reset request. Idempotent: two pulses are one reset.
@@ -1042,11 +1080,11 @@ impl Csrs {
 
     /// Write a CSR.
     ///
-    /// `None` means the access raises an illegal-instruction exception.
-    /// `pending` is the current `mip`; a `Some(new)` return value replaces it,
-    /// which is how a write to `mip` or `sip` reaches [`Lines`].
+    /// `None` means the access raises an illegal-instruction exception. A
+    /// `Some(Some(write))` is a write to `mip` or `sip`, which lives in
+    /// [`Lines`] rather than here: the caller hands it to [`Lines::write`].
     #[must_use]
-    pub fn write(&mut self, num: u32, value: u64, pending: u64) -> Option<Option<u64>> {
+    pub fn write(&mut self, num: u32, value: u64) -> Option<Option<MipWrite>> {
         if !self.accessible(num, true) {
             return None;
         }
@@ -1136,8 +1174,10 @@ impl Csrs {
                     return None;
                 }
                 // A supervisor may only clear its own software interrupt.
-                let m = self.mideleg & irq::SSI;
-                new_pending = Some((pending & !m) | (value & m));
+                new_pending = Some(MipWrite {
+                    mask: self.mideleg & irq::SSI,
+                    bits: value,
+                });
             }
             num::SATP => {
                 if !self.ext.s {
@@ -1208,8 +1248,10 @@ impl Csrs {
             num::MIP => {
                 // MSIP, MTIP and MEIP are driven by the platform, not by
                 // software; only the supervisor bits are writable here.
-                let m = irq::S_MASK;
-                new_pending = Some((pending & !m) | (value & m));
+                new_pending = Some(MipWrite {
+                    mask: irq::S_MASK,
+                    bits: value,
+                });
             }
 
             num::MCYCLE => self.mcycle = value,
@@ -1302,9 +1344,9 @@ mod tests {
     fn read_only_csrs_reject_writes() {
         let mut c = csrs();
         assert!(c.read(num::MHARTID, 0).is_some());
-        assert!(c.write(num::MHARTID, 1, 0).is_none());
+        assert!(c.write(num::MHARTID, 1).is_none());
         assert!(c.read(num::CYCLE, 0).is_some());
-        assert!(c.write(num::CYCLE, 1, 0).is_none());
+        assert!(c.write(num::CYCLE, 1).is_none());
     }
 
     #[test]
@@ -1312,7 +1354,7 @@ mod tests {
         let mut c = csrs();
         c.priv_mode = Priv::Supervisor;
         assert!(c.read(num::MSTATUS, 0).is_none());
-        assert!(c.write(num::MSTATUS, 0, 0).is_none());
+        assert!(c.write(num::MSTATUS, 0).is_none());
         assert!(c.read(num::SSTATUS, 0).is_some());
         c.priv_mode = Priv::User;
         assert!(c.read(num::SSTATUS, 0).is_none());
@@ -1321,14 +1363,14 @@ mod tests {
     #[test]
     fn sstatus_is_a_masked_view_of_mstatus() {
         let mut c = csrs();
-        c.write(num::MSTATUS, status::MIE | status::SIE | status::MPP, 0)
+        c.write(num::MSTATUS, status::MIE | status::SIE | status::MPP)
             .unwrap();
         let s = c.read(num::SSTATUS, 0).unwrap();
         assert_ne!(s & status::SIE, 0);
         assert_eq!(s & status::MIE, 0, "MIE is not visible in sstatus");
         assert_eq!(s & status::MPP, 0, "MPP is not visible in sstatus");
         // Writing sstatus must not disturb the machine-only fields.
-        c.write(num::SSTATUS, 0, 0).unwrap();
+        c.write(num::SSTATUS, 0).unwrap();
         assert_ne!(c.mstatus & status::MIE, 0);
         assert_eq!(c.mstatus & status::SIE, 0);
     }
@@ -1336,13 +1378,13 @@ mod tests {
     #[test]
     fn sie_and_sip_are_filtered_through_mideleg() {
         let mut c = csrs();
-        c.write(num::MIDELEG, irq::SSI | irq::STI, 0).unwrap();
-        c.write(num::MIE, irq::ALL, 0).unwrap();
+        c.write(num::MIDELEG, irq::SSI | irq::STI).unwrap();
+        c.write(num::MIE, irq::ALL).unwrap();
         let sie = c.read(num::SIE, 0).unwrap();
         assert_eq!(sie, irq::SSI | irq::STI);
         // A supervisor write can only reach the delegated bits.
         c.priv_mode = Priv::Supervisor;
-        c.write(num::SIE, 0, 0).unwrap();
+        c.write(num::SIE, 0).unwrap();
         assert_eq!(c.mie & (irq::SSI | irq::STI), 0);
         assert_ne!(c.mie & irq::MEI, 0, "the machine bits survive");
     }
@@ -1350,15 +1392,46 @@ mod tests {
     #[test]
     fn mip_writes_reach_the_lines_not_the_csr_file() {
         let mut c = csrs();
-        let out = c.write(num::MIP, irq::SSI | irq::MEI, 0).unwrap();
+        let out = c.write(num::MIP, irq::SSI | irq::MEI).unwrap().unwrap();
         // Only the supervisor bits are writable; MEIP belongs to the platform.
-        assert_eq!(out, Some(irq::SSI));
+        assert_eq!(out.mask, irq::S_MASK);
+        let lines = Lines::default();
+        lines.write(out);
+        assert_eq!(lines.pending(), irq::SSI);
+    }
+
+    #[test]
+    fn a_mip_write_keeps_a_machine_bit_raised_since_the_instruction_read_it() {
+        // The interleaving a parallel machine produces: this hart's `csrw sip`
+        // has read `mip` and decided what to write, and before it writes, a
+        // sibling's store to the CLINT raises this hart's MSIP. The write owns
+        // SSIP alone, so MSIP has to survive it.
+        let mut c = csrs();
+        c.write(num::MIDELEG, irq::S_MASK).unwrap();
+        c.priv_mode = Priv::Supervisor;
+        let lines = Lines::default();
+        lines.set_pending(irq::SSI, true);
+        let write = c.write(num::SIP, 0).unwrap().unwrap();
+        lines.set_pending(irq::MSI, true);
+        lines.set_pending(irq::SEI, true);
+        lines.write(write);
+        assert_eq!(
+            lines.pending(),
+            irq::MSI | irq::SEI,
+            "SSIP is cleared and nothing else is touched"
+        );
+        // And the machine register's own write owns the three supervisor bits.
+        c.priv_mode = Priv::Machine;
+        let write = c.write(num::MIP, irq::STI).unwrap().unwrap();
+        lines.set_pending(irq::MTI, true);
+        lines.write(write);
+        assert_eq!(lines.pending(), irq::MSI | irq::MTI | irq::STI);
     }
 
     #[test]
     fn medeleg_cannot_delegate_a_machine_ecall() {
         let mut c = csrs();
-        c.write(num::MEDELEG, u64::MAX, 0).unwrap();
+        c.write(num::MEDELEG, u64::MAX).unwrap();
         assert_eq!(c.medeleg & (1 << cause::ECALL_M), 0);
     }
 
@@ -1366,19 +1439,19 @@ mod tests {
     fn satp_rejects_a_mode_this_core_cannot_walk() {
         let mut c = csrs();
         // Sv48 is mode 9, which this core does not implement.
-        c.write(num::SATP, 9 << 60, 0).unwrap();
+        c.write(num::SATP, 9 << 60).unwrap();
         assert_eq!(c.satp, 0, "an unsupported mode leaves satp unchanged");
-        c.write(num::SATP, 8 << 60 | 0x1234, 0).unwrap();
+        c.write(num::SATP, 8 << 60 | 0x1234).unwrap();
         assert_eq!(c.satp >> 60, 8);
     }
 
     #[test]
     fn epc_is_forced_to_an_aligned_address() {
         let mut c = csrs();
-        c.write(num::MEPC, 0x1003, 0).unwrap();
+        c.write(num::MEPC, 0x1003).unwrap();
         assert_eq!(c.mepc, 0x1002, "C is present, so bit 1 survives");
         let mut c = Csrs::new(Xlen::Rv64, Extensions::I, 0, PMP_ENTRIES);
-        c.write(num::MEPC, 0x1003, 0).unwrap();
+        c.write(num::MEPC, 0x1003).unwrap();
         assert_eq!(c.mepc, 0x1000, "without C the low two bits are zero");
     }
 
@@ -1387,9 +1460,9 @@ mod tests {
         let mut c = csrs();
         assert_eq!(c.fs(), status::FS_OFF);
         assert!(c.read(num::FCSR, 0).is_none());
-        c.write(num::MSTATUS, 1 << status::FS_SHIFT, 0).unwrap();
+        c.write(num::MSTATUS, 1 << status::FS_SHIFT).unwrap();
         assert!(c.read(num::FCSR, 0).is_some());
-        c.write(num::FRM, 3, 0).unwrap();
+        c.write(num::FRM, 3).unwrap();
         assert_eq!(c.read(num::FRM, 0).unwrap(), 3);
         assert_eq!(c.read(num::FCSR, 0).unwrap(), 3 << 5);
         assert_eq!(c.fs(), status::FS_DIRTY, "an FP write dirties the state");
@@ -1403,7 +1476,7 @@ mod tests {
         c.priv_mode = Priv::Supervisor;
         assert!(c.read(num::CYCLE, 0).is_none());
         c.priv_mode = Priv::Machine;
-        c.write(num::MCOUNTEREN, 1, 0).unwrap();
+        c.write(num::MCOUNTEREN, 1).unwrap();
         c.priv_mode = Priv::Supervisor;
         assert!(c.read(num::CYCLE, 0).is_some());
         assert!(c.read(num::TIME, 0).is_none());
@@ -1412,16 +1485,16 @@ mod tests {
     #[test]
     fn pmp_configuration_packs_eight_entries_per_register_on_rv64() {
         let mut c = csrs();
-        c.write(num::PMPCFG0, 0x0f0f_0f0f_0f0f_0f0f, 0).unwrap();
+        c.write(num::PMPCFG0, 0x0f0f_0f0f_0f0f_0f0f).unwrap();
         assert_eq!(c.pmpcfg[0], 0x0f);
         assert_eq!(c.pmpcfg[7], 0x0f);
         assert_eq!(c.read(num::PMPCFG0, 0).unwrap(), 0x0f0f_0f0f_0f0f_0f0f);
         // The odd-numbered registers do not exist on RV64.
         assert!(c.read(num::PMPCFG0 + 1, 0).is_none());
         // A locked entry ignores further writes.
-        c.write(num::PMPCFG0 + 2, 0x8f, 0).unwrap();
+        c.write(num::PMPCFG0 + 2, 0x8f).unwrap();
         assert_eq!(c.pmpcfg[8], 0x8f);
-        c.write(num::PMPCFG0 + 2, 0x00, 0).unwrap();
+        c.write(num::PMPCFG0 + 2, 0x00).unwrap();
         assert_eq!(c.pmpcfg[8], 0x8f);
     }
 

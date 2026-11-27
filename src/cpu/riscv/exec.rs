@@ -2023,10 +2023,13 @@ impl<'a> Exec<'a> {
             let updated = self
                 .st
                 .csrs
-                .write(num, value, pending)
+                .write(num, value)
                 .ok_or(Trap::illegal(encoding))?;
-            if let Some(bits) = updated {
-                self.lines.set_all_pending(bits);
+            if let Some(write) = updated {
+                // Only the bits the write owns, and atomically: `pending`
+                // above is a read from before a sibling hart or an interrupt
+                // controller may have moved a machine bit (`Lines::write`).
+                self.lines.write(write);
             }
             if matches!(num, csr::num::MINSTRET | csr::num::MINSTRETH) {
                 self.wrote_instret = true;

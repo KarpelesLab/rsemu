@@ -1524,13 +1524,13 @@ mod tests {
         // under Sv39, 9 under Sv32. Software probes the width by writing ones
         // and reading back, so what sticks here is what a guest believes.
         let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
-        csrs.write(num::SATP, (8 << 60) | (0xffff << 44) | 0x81fcb, 0)
+        csrs.write(num::SATP, (8 << 60) | (0xffff << 44) | 0x81fcb)
             .unwrap();
         assert_eq!(asid(&csrs), 0xffff);
         assert_eq!(root(&csrs), 0x81fcb << 12);
 
         let mut csrs = Csrs::new(Xlen::Rv32, Extensions::GC, 0, PMP_ENTRIES);
-        csrs.write(num::SATP, (1 << 31) | (0x1ff << 22) | 0x123, 0)
+        csrs.write(num::SATP, (1 << 31) | (0x1ff << 22) | 0x123)
             .unwrap();
         assert_eq!(asid(&csrs), 0x1ff);
         assert_eq!(root(&csrs), 0x123 << 12);
@@ -1558,7 +1558,7 @@ mod tests {
     fn a_satp_write_invalidates_the_whole_tlb_by_generation() {
         let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
         let before = csrs.translation_gen;
-        csrs.write(num::SATP, 8 << 60, 0).unwrap();
+        csrs.write(num::SATP, 8 << 60).unwrap();
         assert_ne!(csrs.translation_gen, before);
     }
 
@@ -1640,7 +1640,7 @@ mod tests {
         assert!(tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Store, Priv::Supervisor));
         // Take the write bit away. Without the generation the memo would keep
         // answering yes, which is the whole hazard of caching a permission.
-        csrs.write(num::PMPCFG0, 0b0001_1001, 0).unwrap();
+        csrs.write(num::PMPCFG0, 0b0001_1001).unwrap();
         assert!(!tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Store, Priv::Supervisor));
         assert!(tlb.pmp_allows(&csrs, 0x8000_0000, 8, Access::Load, Priv::Supervisor));
     }
@@ -1649,12 +1649,12 @@ mod tests {
     fn a_pmpaddr_write_throws_the_memo_away() {
         let mut csrs = Csrs::new(Xlen::Rv64, Extensions::GC, 0, PMP_ENTRIES);
         // A 4 KiB NAPOT window at 0x1000, readable.
-        csrs.write(num::PMPADDR0, (0x1000 >> 2) | 0x1ff, 0).unwrap();
-        csrs.write(num::PMPCFG0, 0b0001_1001, 0).unwrap();
+        csrs.write(num::PMPADDR0, (0x1000 >> 2) | 0x1ff).unwrap();
+        csrs.write(num::PMPCFG0, 0b0001_1001).unwrap();
         let mut tlb = Tlb::new();
         assert!(tlb.pmp_allows(&csrs, 0x1000, 4, Access::Load, Priv::Supervisor));
         // Slide the window off the address the memo remembers.
-        csrs.write(num::PMPADDR0, (0x8000 >> 2) | 0x1ff, 0).unwrap();
+        csrs.write(num::PMPADDR0, (0x8000 >> 2) | 0x1ff).unwrap();
         assert!(!tlb.pmp_allows(&csrs, 0x1000, 4, Access::Load, Priv::Supervisor));
     }
 
