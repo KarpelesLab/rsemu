@@ -355,6 +355,14 @@ pub fn scan_track(mfm: &[u8]) -> Vec<Sector> {
         let mut body = at + 16;
         while cells.word(body) == SYNC {
             body += 16;
+            if body - at >= total {
+                // All the way round and still in the same run: the track is
+                // one sync word repeated, which a guest makes by writing a
+                // revolution of `$4489`. Every cell is part of that run, so
+                // no sector starts anywhere on it — and on a loop this is the
+                // only place the run can be seen to end.
+                return found;
+            }
         }
         let mut info = [0u8; 4];
         let mut label = [0u8; LABEL_BYTES];
@@ -551,6 +559,23 @@ mod tests {
         let decoded = decode_track(&rotated, 5);
         assert!(decoded.iter().all(Option::is_some));
         assert_eq!(decoded[6].as_deref(), Some(&data[6 * 512..7 * 512]));
+    }
+
+    #[test]
+    fn a_track_of_nothing_but_sync_words_holds_no_sector_and_the_scan_ends() {
+        // What a guest leaves behind by writing 6250 words of `$4489` over a
+        // whole revolution. The track is a loop, so "past every sync word in a
+        // row" has no end on it unless the scan knows it has been all the way
+        // round.
+        let mfm: Vec<u8> = SYNC.to_be_bytes().repeat(TRACK_BYTES / 2);
+        assert_eq!(mfm.len(), TRACK_BYTES);
+        assert!(scan_track(&mfm).is_empty());
+        assert!(decode_track(&mfm, 0).iter().all(Option::is_none));
+        // The same with the index falling in the middle of a word: a write
+        // starts wherever the disk happened to be.
+        let mut turned = mfm.clone();
+        turned.rotate_left(1);
+        assert!(decode_track(&turned, 0).iter().all(Option::is_none));
     }
 
     #[test]
