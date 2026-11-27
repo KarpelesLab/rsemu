@@ -3185,7 +3185,8 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                     && let Some((other, _)) = out.capture.iter().find(|(_, to)| to.is_none())
                 {
                     return Err(format!(
-                        "--capture {name} and --capture {other} both go to stdout; give one of                          them a file"
+                        "--capture {name} and --capture {other} both go to stdout; give one of \
+                         them a file"
                     ));
                 }
                 out.capture.push((name.to_string(), path));
@@ -3267,7 +3268,9 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         && out.capture.iter().any(|(name, _)| name == console)
     {
         return Err(format!(
-            "--console {console} and --capture {console} are two listeners on one port, and a              port gives each byte to whichever asks first; capture a different port, or drop              --console"
+            "--console {console} and --capture {console} are two listeners on one port, and a \
+             port gives each byte to whichever asks first; capture a different port, or drop \
+             --console"
         ));
     }
     // Three things that each own when the machine advances, and only one of

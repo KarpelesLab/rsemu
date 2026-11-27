@@ -106,6 +106,24 @@ fn machines_advertises_only_flags_that_run_takes() {
     }
 }
 
+/// Two refusals whose text had a hole in it.
+///
+/// Each message was a string literal continued over a line, and each lost its
+/// backslash, so the next line's indentation was printed as part of the
+/// sentence: `give one of                          them a file`.
+#[test]
+fn a_refusal_is_one_sentence_with_no_gaps_in_it() {
+    let (code, _, stderr) = run(&["run", "any", "--capture", "a", "--capture", "b"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("both go to stdout"), "{stderr}");
+    assert!(!stderr.contains("  "), "a gap in: {stderr:?}");
+
+    let (code, _, stderr) = run(&["run", "any", "--console", "tty", "--capture", "tty"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("two listeners on one port"), "{stderr}");
+    assert!(!stderr.contains("  "), "a gap in: {stderr:?}");
+}
+
 /// A class this build lacks is reported at the line that names it.
 ///
 /// It was the one front-end mistake with no location: `registry: unknown

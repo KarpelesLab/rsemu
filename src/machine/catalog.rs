@@ -729,7 +729,7 @@ pub static XHCI_MINI: CatalogEntry = CatalogEntry {
 #[cfg_attr(docsrs, doc(cfg(feature = "machine-xhci-pci-mini")))]
 pub static XHCI_PCI_MINI: CatalogEntry = CatalogEntry {
     name: "xhci-pci-mini",
-    summary: "a minimal PCI board with an xHCI function, a VGA and a USB mouse: RAM, a host               bridge, an 8259A",
+    summary: "a minimal PCI board with an xHCI function, a VGA and a USB mouse: RAM, a host bridge, an 8259A",
     media: &[],
     source: include_str!("../../machines/xhci-pci-mini.machine"),
 };
@@ -1941,6 +1941,21 @@ mod tests {
             );
         }
         assert!(reg.get("ram").is_some(), "the language's own class");
+    }
+
+    #[test]
+    fn no_summary_has_a_gap_in_it() {
+        // `rsemu machines` prints these verbatim. One of them was a string
+        // literal continued over a line without its backslash, so the next
+        // line's indentation was printed in the middle of the sentence.
+        for entry in machines() {
+            assert!(
+                !entry.summary.contains("  ") && entry.summary.trim() == entry.summary,
+                "{}: {:?}",
+                entry.name,
+                entry.summary
+            );
+        }
     }
 
     #[test]
