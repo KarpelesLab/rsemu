@@ -2201,3 +2201,76 @@ fn a_u5_snapshot_round_trips_to_identical_state() {
     let after = *restored.shared.regs.lock();
     assert_eq!(after, before);
 }
+
+/// A timer running with a prescaler of four, stopped two ticks into a
+/// division, as one chunk payload.
+fn mid_division_payload() -> Vec<u8> {
+    let saved = advanced();
+    poke(&saved, OFF_ARR, 19);
+    poke(&saved, OFF_PSC, 3);
+    poke(&saved, OFF_EGR, EGR_UG);
+    start(&saved);
+    saved.advance_by(46);
+    let mut shape = MachineShape::new();
+    shape.add_device("tim1", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("tim1", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(&saved, &mut chunk).unwrap();
+    }
+    let bytes = w.to_vec().unwrap();
+    let reader = StateReader::new(&bytes).unwrap();
+    reader.load_raw("tim1").unwrap().2.to_vec()
+}
+
+/// Load `payload` into a fresh timer and, if it is taken, run the counter.
+fn load_payload(payload: &[u8]) -> Result<()> {
+    let mut shape = MachineShape::new();
+    shape.add_device("tim1", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    w.raw_chunk("tim1", CLASS_NAME, STATE_VERSION, payload)
+        .unwrap();
+    let bytes = w.to_vec().unwrap();
+    let restored = advanced();
+    let reader = StateReader::new(&bytes).unwrap();
+    let chunk = reader
+        .load("tim1", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    Device::load(&restored, &mut chunk.reader())?;
+    // What a believed snapshot does next: the counter runs.
+    restored.advance_by(1);
+    restored.advance_by(100);
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_with_a_prescaler_phase_past_its_division_is_refused() {
+    // The chunk opens with twenty-four words; `CNT` is the twelfth, the
+    // prescaler's phase the thirteenth and `PSC`'s shadow the fifteenth.
+    const CNT: usize = 11 * 4;
+    const PSC_COUNT: usize = 12 * 4;
+    const PSC_SHADOW: usize = 14 * 4;
+    let good = mid_division_payload();
+    assert_eq!(good[PSC_SHADOW..PSC_SHADOW + 4], 3u32.to_le_bytes());
+    assert_eq!(good[PSC_COUNT..PSC_COUNT + 4], 2u32.to_le_bytes());
+    load_payload(&good).expect("the honest snapshot loads and runs");
+
+    // Nine ticks into a division of four. Believed, the first counter clock
+    // costs `4 - 9` ticks.
+    let mut bad = good.clone();
+    bad[PSC_COUNT..PSC_COUNT + 4].copy_from_slice(&9u32.to_le_bytes());
+    let e = load_payload(&bad).expect_err("a phase outside the division");
+    assert!(format!("{e}").contains("prescaler"), "{e}");
+
+    // The last phase a division of four has is three, and that one loads.
+    let mut edge = good.clone();
+    edge[PSC_COUNT..PSC_COUNT + 4].copy_from_slice(&3u32.to_le_bytes());
+    load_payload(&edge).expect("the last tick of a division");
+
+    // A sixteen-bit counter holding seventeen bits: the distance to its wrap
+    // is `0xffff - CNT + 1`.
+    let mut bad = good;
+    bad[CNT..CNT + 4].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    let e = load_payload(&bad).expect_err("a counter wider than the timer");
+    assert!(format!("{e}").contains("counter"), "{e}");
+}

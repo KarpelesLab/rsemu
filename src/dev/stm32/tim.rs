@@ -2584,6 +2584,26 @@ impl Device for Tim {
             }
         }
         let tick = r.read_u64()?;
+        // A snapshot is a file somebody can be handed, so the two fields the
+        // counter does unguarded arithmetic on are checked before they are
+        // believed. The prescaler's phase is always below its division
+        // (`psc_count <= psc_shadow`): `run_counter` charges the first counter
+        // clock `per - psc_count` ticks, which underflows otherwise. And the
+        // counter is inside its own width: the distance to the wrap is
+        // `mask - cnt + 1`.
+        if regs.psc_count > regs.psc_shadow {
+            return Err(Error::State(format!(
+                "snapshot has a timer prescaler {} ticks into a division of {}",
+                regs.psc_count,
+                u64::from(regs.psc_shadow) + 1
+            )));
+        }
+        if regs.cnt & !self.shared.cfg.mask != 0 {
+            return Err(Error::State(format!(
+                "snapshot has a timer counter of {:#x}, which is wider than this timer ({:#x})",
+                regs.cnt, self.shared.cfg.mask
+            )));
+        }
         {
             let mut slot = self.shared.regs.lock();
             *slot = regs;
