@@ -6579,6 +6579,66 @@ mod long_mode {
         assert_eq!(sys.gs_base, 0x2_3450, "and so does GS");
     }
 
+    /// A reserved bit written to `CR0[63:32]`, `CR4` or `IA32_EFER` is
+    /// `#GP(0)`, not a bit quietly dropped.
+    ///
+    /// *Intel SDM* volume 3A §2.5: "Attempting to set any reserved bits in
+    /// CR0[31:0] is ignored. Attempting to set any reserved bits in
+    /// CR0[63:32] results in a general-protection exception, #GP(0).
+    /// Attempting to set any reserved bits in CR4 results in a
+    /// general-protection exception, #GP(0)." Volume 2, `WRMSR`: "#GP(0) ...
+    /// If the value in EDX:EAX sets bits that are reserved in the MSR
+    /// specified by ECX." A guest probes for an extension exactly this way —
+    /// set the bit, see whether it faults — and one that was told "yes" by
+    /// silence then relies on a feature that is not there.
+    #[test]
+    fn a_reserved_bit_of_cr0_cr4_or_efer_is_general_protection() {
+        let features = Variant::X86_64.features();
+        // mov rax, cr0 ; bts rax, 32 ; mov cr0, rax
+        faults64(
+            features,
+            13,
+            &[
+                0x0f, 0x20, 0xc0, 0x48, 0x0f, 0xba, 0xe8, 0x20, 0x0f, 0x22, 0xc0,
+            ],
+        );
+        // mov rax, cr4 ; bts rax, n ; mov cr4, rax — bit 15 is reserved on
+        // every part, bit 20 is SMEP (which this one does not have) and bit
+        // 40 is above anything defined.
+        for bit in [15u8, 20, 40] {
+            faults64(
+                features,
+                13,
+                &[
+                    0x0f, 0x20, 0xe0, 0x48, 0x0f, 0xba, 0xe8, bit, 0x0f, 0x22, 0xe0,
+                ],
+            );
+        }
+        // mov ecx, EFER ; rdmsr ; bts eax|edx, n ; wrmsr — bit 9 sits between
+        // LME and LMA, and bit 32 is in the reserved upper half.
+        for (modrm, bit) in [(0xe8u8, 9u8), (0xea, 0)] {
+            let mut code = alloc::vec![0xb9];
+            code.extend_from_slice(&msr::EFER.to_le_bytes());
+            code.extend_from_slice(&[0x0f, 0x32, 0x0f, 0xba, modrm, bit, 0x0f, 0x30]);
+            faults64(features, 13, &code);
+        }
+        // The bits that exist are still writable: rewriting each register
+        // with what it holds is not a fault.
+        let mut code = alloc::vec![
+            0x0f, 0x20, 0xc0, 0x0f, 0x22, 0xc0, // mov rax, cr0 ; mov cr0, rax
+            0x0f, 0x20, 0xe0, 0x0f, 0x22, 0xe0, // mov rax, cr4 ; mov cr4, rax
+            0xb9,
+        ];
+        code.extend_from_slice(&msr::EFER.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x32, 0x0f, 0x30]); // rdmsr ; wrmsr
+        code.extend_from_slice(&[0xbb, 0x2a, 0x00, 0x00, 0x00, 0xf4]); // mov ebx, 42
+        let pc = pc64();
+        pc.idt64(13, 0x18, la::HANDLER);
+        pc.write(la::HANDLER, &[0xf4]);
+        let pc = run64_on(pc, 0, &code);
+        assert_eq!(pc.regs().rbx, 42, "the round trips ran to completion");
+    }
+
     #[test]
     fn swapgs_exchanges_the_gs_base_with_the_kernels() {
         // The one instruction a 64-bit kernel cannot do without: entered from

@@ -3428,6 +3428,14 @@ impl Exec<'_> {
                     cr0::VALID_386
                 };
                 let old = self.state.sys.cr0;
+                // The upper half exists only for a 64-bit `MOV`, and no bit
+                // of it does anything: *Intel SDM* volume 3A §2.5,
+                // "Attempting to set any reserved bits in CR0[31:0] is
+                // ignored. Attempting to set any reserved bits in CR0[63:32]
+                // results in a general-protection exception, #GP(0)."
+                if value >> 32 != 0 {
+                    return Err(Fault::gp(0));
+                }
                 let new = (value as u32) & valid;
                 // Paging without protection is impossible: the page tables are
                 // walked with linear addresses, and without segmentation there
@@ -3469,8 +3477,13 @@ impl Exec<'_> {
             }
             4 if self.cfg.features.cr4 => {
                 let old = self.state.sys.cr4;
-                // Only the bits this core models have storage. A guest that
-                // sets one we do not have reads back a zero and knows.
+                // Only the bits this core models have storage, and the rest
+                // are reserved on the part it presents — `CPUID` advertises
+                // none of the features behind them. *Intel SDM* volume 3A
+                // §2.5: "Attempting to set any reserved bits in CR4 results
+                // in a general-protection exception, #GP(0)." Dropping the
+                // bit instead told a guest probing for, say, `SMEP` that the
+                // write had worked.
                 let valid = cr4::VME
                     | cr4::PVI
                     | cr4::TSD
@@ -3490,7 +3503,10 @@ impl Exec<'_> {
                 if value & cr4::OSXSAVE != 0 && !self.cfg.features.xsave {
                     return Err(Fault::gp(0));
                 }
-                let new = value & valid;
+                if value & !valid != 0 {
+                    return Err(Fault::gp(0));
+                }
+                let new = value;
                 // `CR4.PAE` cannot be cleared while long mode is active: the
                 // page tables under the processor's feet would change shape.
                 if self.state.sys.long_mode() && new & cr4::PAE == 0 {
@@ -3687,13 +3703,24 @@ impl Exec<'_> {
                 // is defined only across a `CR0.PG` edge, and allowing it
                 // would leave `LMA` describing a walk that never happened.
                 let old = self.state.sys.efer;
-                let mut new = value & efer::WRITABLE;
+                // A bit with no feature behind it is reserved on this part,
+                // and *Intel SDM* volume 2, `WRMSR`: "#GP(0) ... If the
+                // value in EDX:EAX sets bits that are reserved in the MSR
+                // specified by ECX." `LMA` is the one exception: it is the
+                // processor's status bit, and a write of it is discarded
+                // below rather than refused, so that software can write back
+                // what it read.
+                let mut writable = efer::WRITABLE;
                 if !self.cfg.features.nx {
-                    new &= !efer::NXE;
+                    writable &= !efer::NXE;
                 }
                 if !self.cfg.features.syscall {
-                    new &= !efer::SCE;
+                    writable &= !efer::SCE;
                 }
+                if value & !(writable | efer::LMA) != 0 {
+                    return Err(Fault::gp(0));
+                }
+                let new = value & writable;
                 if (old ^ new) & efer::LME != 0 && self.state.sys.cr0 & cr0::PG != 0 {
                     return Err(Fault::gp(0));
                 }
