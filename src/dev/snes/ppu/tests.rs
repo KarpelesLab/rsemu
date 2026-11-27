@@ -897,6 +897,28 @@ fn mode7_identity_matrix_maps_the_screen_onto_the_map() {
 }
 
 #[test]
+fn mode7_truncates_the_line_products_as_well_as_the_origin_ones() {
+    // nocash, *fullsnes*, "SNES PPU Rotation/Scaling":
+    //   VRAM.X = VRAM.X + ((M7B*SCREEN.Y) AND NOT 3Fh) + (M7A*SCREEN.X)
+    //   VRAM.Y = VRAM.Y + ((M7D*SCREEN.Y) AND NOT 3Fh) + (M7C*SCREEN.X)
+    // "before summing up the multiply results, it DOES strip the lower 6bit".
+    // Only the per-pixel M7A/M7C terms keep all their bits.
+    let p = ppu();
+    display_on(&p);
+    mode7_scene(&p);
+    // On line 1, M7B * 1 = $20, which the strip removes. M7A * 8 = $7E0 is
+    // then map pixel 7, the last of tile 1; with the $20 left in it is $800,
+    // pixel 8, the first of tile 2.
+    p.with_engine(|e| {
+        e.r.m7[0] = 0x00FC;
+        e.r.m7[1] = 0x0020;
+    });
+    let line = draw(&p, 1);
+    assert_eq!(line[8], RED);
+    assert_eq!(line[9], GREEN, "and the next pixel is where tile 2 starts");
+}
+
+#[test]
 fn mode7_scaling_and_flip() {
     let p = ppu();
     display_on(&p);

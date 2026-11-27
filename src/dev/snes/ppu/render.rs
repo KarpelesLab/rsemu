@@ -493,8 +493,13 @@ impl Engine {
         }
         let ox = clip(hofs - cx);
         let oy = clip(vofs - cy);
-        let vx = ((a * ox) & !63) + ((b * oy) & !63) + b * y + (cx << 8);
-        let vy = ((c * ox) & !63) + ((d * oy) & !63) + d * y + (cy << 8);
+        // Every product summed into the line's start is stripped of its low
+        // six bits, the two against the screen line as much as the two against
+        // the origin: "VRAM.X = VRAM.X + ((M7B*SCREEN.Y) AND NOT 3Fh) +
+        // (M7A*SCREEN.X)" (fullsnes, "SNES PPU Rotation/Scaling"). Only the
+        // per-pixel `M7A`/`M7C` terms below keep theirs.
+        let vx = ((a * ox) & !63) + ((b * oy) & !63) + ((b * y) & !63) + (cx << 8);
+        let vy = ((c * ox) & !63) + ((d * oy) & !63) + ((d * y) & !63) + (cy << 8);
         let over = self.r.m7sel >> 6;
         let direct = self.r.cgwsel & 0x01 != 0;
         for sx in 0..256i32 {
