@@ -106,7 +106,7 @@ use crate::core::space::{
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Drive, Level, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
 
 pub use dmc::{DmaKind, DmaRequest};
@@ -488,11 +488,26 @@ impl ApuState {
     /// re-entrancy contract in [`crate::core::device`]: a sink is free to call
     /// back into anything, including this device.
     fn refresh_irq(&self) {
-        let level = self.irq_level();
-        let port = self.irq.lock().clone();
-        if let Some(port) = port {
-            port.set(level);
-        }
+        self.drive_irq(self.irq_level());
+    }
+
+    /// Drive the IRQ line to `level`, which the caller read off the flags.
+    ///
+    /// Asks the wire what this output is already presenting before touching
+    /// it. [`Apu::advance_to`] ends here once per CPU cycle, the level moves a
+    /// handful of times a frame, and cloning the port out of its lock to tell
+    /// the wire what it already knows was most of that call's cost. The wire
+    /// stays the authority, so a net whose record was restored behind this
+    /// device's back is still corrected on the next cycle.
+    fn drive_irq(&self, level: Level) {
+        let port = {
+            let port = self.irq.lock();
+            match port.as_ref() {
+                Some(p) if p.drive_state() != Drive::strong(level) => p.clone(),
+                _ => return,
+            }
+        };
+        port.set(level);
     }
 
     fn write(&self, index: u8, value: u8) {
@@ -706,14 +721,15 @@ impl Apu {
     /// it before dispatching an access so that a sampled register — `$4015`
     /// above all — is read at the cycle the CPU actually reads it.
     pub fn advance_to(&self, tick: u64) {
-        {
+        let asserted = {
             let mut core = self.state.core.lock();
             while core.ticks < tick {
                 core.tick();
             }
             self.state.publish(&core);
-        }
-        self.refresh_irq();
+            core.irq_asserted()
+        };
+        self.state.drive_irq(Level::from_bool(asserted));
     }
 
     /// Connect the catch-up handle the register windows sync through (§4.2).

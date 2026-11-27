@@ -159,7 +159,7 @@ use crate::core::space::{
 use crate::core::state::{ChunkReader, ChunkWriter};
 use crate::core::sync::{AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::Width;
-use crate::core::wire::{Level, WireSource};
+use crate::core::wire::{Drive, Level, WireSource};
 use crate::machine::realize::{BindCtx, Instance};
 
 pub use engine::{
@@ -306,14 +306,19 @@ impl Shared {
     }
 
     fn drive_nmi(&self, active: bool) {
-        // Cloned out so the link lock is not held across the wire's fan-out.
+        let level = Level::from_bool(active);
+        // Cloned out so the link lock is not held across the wire's fan-out —
+        // but only when there is something to tell it. This runs once per CPU
+        // cycle and the request moves twice a frame; the wire is asked what
+        // this output already presents, and stays the authority on it.
         let source = {
             let links = self.links.lock();
-            links.nmi.clone()
+            match links.nmi.as_ref() {
+                Some(s) if s.drive_state() != Drive::strong(level) => s.clone(),
+                _ => return,
+            }
         };
-        if let Some(source) = source {
-            source.set(Level::from_bool(active));
-        }
+        source.set(level);
     }
 
     /// Catch this chip up before an access is dispatched to it (§4.2).
