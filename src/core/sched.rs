@@ -914,8 +914,36 @@ struct World {
     /// Bumped by every request, so a stop is distinguishable from the one
     /// before it.
     generation: AtomicU64,
-    /// Whether a stop is outstanding right now.
-    stop: AtomicBool,
+    /// How many stops are outstanding right now.
+    ///
+    /// A count and not a flag, because stops overlap: a snapshot taken under
+    /// one [`StopGuard`] while a second holder — another guard, or a host
+    /// thread that asked through its own [`SafePoint`] — still needs the
+    /// world quiescent. With a flag, whichever let go first let the world run
+    /// under the other.
+    stops: AtomicU32,
+}
+
+impl World {
+    /// Replace the outstanding-stop count with `f` of it, atomically.
+    ///
+    /// A compare-exchange loop because both directions clamp — a request
+    /// saturates and a release stops at zero — and neither is a plain
+    /// `fetch_add`. Cold: it runs once per stop, never per block.
+    fn adjust_stops(&self, f: impl Fn(u32) -> u32) {
+        let mut seen = self.stops.load(AtomicOrdering::Acquire);
+        loop {
+            match self.stops.compare_exchange_weak(
+                seen,
+                f(seen),
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(now) => seen = now,
+            }
+        }
+    }
 }
 
 impl SafePoint {
@@ -927,29 +955,36 @@ impl SafePoint {
 
     /// Ask every runnable to unwind at its next block boundary.
     ///
-    /// Returns the generation this request carries. Idempotent: a second
-    /// request while one is outstanding still bumps the generation, because a
-    /// second reason to stop is a second reason to invalidate.
+    /// Returns the generation this request carries. A second request while one
+    /// is outstanding still bumps the generation, because a second reason to
+    /// stop is a second reason to invalidate — and it is a second *hold*: the
+    /// world runs again when every request has been matched by a
+    /// [`SafePoint::release`], not at the first.
     pub fn request(&self) -> u64 {
         let generation = self
             .world
             .generation
             .fetch_add(1, AtomicOrdering::AcqRel)
             .wrapping_add(1);
-        self.world.stop.store(true, AtomicOrdering::Release);
+        // Saturating rather than wrapping: a holder that asks four billion
+        // times without ever letting go must not find the world running.
+        self.world.adjust_stops(|n| n.saturating_add(1));
         generation
     }
 
-    /// Let the world run again.
+    /// Withdraw one request. The world runs again once none is outstanding.
+    ///
+    /// A release with nothing outstanding does nothing; it cannot bank a
+    /// credit against a later request.
     pub fn release(&self) {
-        self.world.stop.store(false, AtomicOrdering::Release);
+        self.world.adjust_stops(|n| n.saturating_sub(1));
     }
 
     /// Whether a stop is outstanding.
     #[inline]
     #[must_use]
     pub fn stop_requested(&self) -> bool {
-        self.world.stop.load(AtomicOrdering::Acquire)
+        self.world.stops.load(AtomicOrdering::Acquire) != 0
     }
 
     /// The generation of the most recent request.
@@ -1004,7 +1039,8 @@ impl ExitFlag {
     #[inline]
     #[must_use]
     pub fn raised(&self) -> bool {
-        self.world.stop.load(AtomicOrdering::Relaxed) || self.mine.load(AtomicOrdering::Relaxed)
+        self.world.stops.load(AtomicOrdering::Relaxed) != 0
+            || self.mine.load(AtomicOrdering::Relaxed)
     }
 
     /// Ask this one runnable to unwind, leaving the rest running.
@@ -6144,6 +6180,46 @@ mod tests {
         // stale even though the flag has been raised and lowered since.
         assert_eq!(sched.safe_point().generation(), 1);
         assert_eq!(sched.stop_the_world().generation(), 2);
+    }
+
+    #[test]
+    fn overlapping_stops_hold_the_world_until_the_last_one_lets_go() {
+        // A snapshot under one guard while a second holder still needs the
+        // machine quiescent: whichever is dropped first must not release the
+        // world under the other.
+        let (mut sched, cpu, _ppu) = nes_scheduler_in(ThreadingMode::Parallel, 0);
+        stoppable(&mut sched, cpu, None);
+        let first = sched.stop_the_world();
+        let second = sched.stop_the_world();
+        assert_eq!((first.generation(), second.generation()), (1, 2));
+        drop(first);
+        assert!(
+            sched.safe_point().stop_requested(),
+            "the second guard is still alive"
+        );
+        let report = sched.run_quantum().unwrap();
+        assert_eq!(report.consumed[0].1, 1, "and still holds the world");
+        drop(second);
+        assert!(!sched.safe_point().stop_requested());
+
+        // The same for a request made through a cloned `SafePoint`, which is
+        // how a host thread asks: a guard coming and going leaves it standing.
+        let host = sched.safe_point();
+        host.request();
+        drop(sched.stop_the_world());
+        assert!(
+            host.stop_requested(),
+            "the host's request outlives the guard"
+        );
+        host.release();
+        assert!(!host.stop_requested());
+        // A stray release banks nothing against the next request.
+        host.release();
+        host.request();
+        assert!(host.stop_requested());
+        host.release();
+        assert!(!host.stop_requested());
+        assert!(sched.run_quantum().unwrap().consumed[0].1 > 1);
     }
 
     #[test]
