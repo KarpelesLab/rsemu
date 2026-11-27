@@ -445,15 +445,42 @@ pub struct MipWrite {
 /// interrupt this core can take is one of its bits.
 #[derive(Debug, Default)]
 pub struct Lines {
-    /// Machine interrupt pending, driven by wires and by M-mode CSR writes.
+    /// Machine interrupt pending, driven by wires and by M-mode CSR writes —
+    /// plus, at [`Lines::SEIP_LINE`], the external interrupt controller's
+    /// supervisor line, which is *not* the `SEIP` bit software writes.
     mip: AtomicU64,
     /// A reset assertion nobody has acted on yet.
     reset_req: AtomicBool,
 }
 
 impl Lines {
-    /// Set or clear one interrupt-pending bit.
+    /// How far above `SEIP` the controller's supervisor line is kept.
+    const SEIP_LINE_SHIFT: u32 = 16;
+
+    /// Where the external interrupt controller's supervisor line lives in
+    /// the word: a bit of its own, well clear of the architectural ones.
+    ///
+    /// `SEIP` is the one pending bit with two owners. Volume II, "Machine
+    /// Interrupt Registers (mip and mie)": "SEIP is writable in mip, and may
+    /// be written by M-mode software to indicate to S-mode that an external
+    /// interrupt is pending. Additionally, the platform-level interrupt
+    /// controller may generate supervisor-level external interrupts.
+    /// Supervisor-level external interrupts are made pending based on the
+    /// logical-OR of the software-writable SEIP bit and the signal from the
+    /// external interrupt controller." Kept as one bit, a CSR write lowered a
+    /// line the controller was still asserting, and the controller lowering
+    /// its line erased what software had written.
+    ///
+    /// It shares the word rather than having an atomic of its own so that
+    /// [`Lines::pending`], which every step reads, stays one load.
+    const SEIP_LINE: u64 = irq::SEI << Self::SEIP_LINE_SHIFT;
+
+    /// Drive one interrupt pin: set or clear what a *wire* owns.
+    ///
+    /// For `SEI` that is the controller's line, not the software-writable
+    /// bit; for every other bit the two are the same thing.
     pub fn set_pending(&self, mask: u64, asserted: bool) {
+        let mask = (mask & !irq::SEI) | ((mask & irq::SEI) << Self::SEIP_LINE_SHIFT);
         if asserted {
             self.mip.fetch_or(mask, Ordering::AcqRel);
         } else {
@@ -461,19 +488,39 @@ impl Lines {
         }
     }
 
-    /// The whole interrupt-pending register.
+    /// The whole interrupt-pending register, as a read of `mip` returns it:
+    /// `SEIP` is the OR of the software bit and the controller's line.
+    #[inline]
     #[must_use]
     pub fn pending(&self) -> u64 {
+        let raw = self.mip.load(Ordering::Acquire);
+        (raw | (raw >> Self::SEIP_LINE_SHIFT)) & irq::ALL
+    }
+
+    /// The register without the controller's line: what a `CSRRS` or `CSRRC`
+    /// of `mip` modifies. "Only the software-writable SEIP bit participates
+    /// in the read-modify-write sequence of a CSRRS or CSRRC instruction."
+    #[must_use]
+    pub fn software(&self) -> u64 {
+        self.mip.load(Ordering::Acquire) & irq::ALL
+    }
+
+    /// The stored word, controller's line and all, for a snapshot.
+    #[must_use]
+    pub fn raw(&self) -> u64 {
         self.mip.load(Ordering::Acquire)
     }
 
-    /// Replace the whole interrupt-pending register.
+    /// Replace the whole stored word — what [`Lines::raw`] returned.
     ///
     /// For a reset and a snapshot restore, where nothing else is driving the
     /// lines. A guest's own write to `mip` or `sip` is [`Lines::write`], which
-    /// touches only the bits that write owns.
+    /// touches only the bits that write owns. A snapshot from before the
+    /// controller's line had a bit of its own carries the OR in `SEIP`, and
+    /// restores as it always did.
     pub fn set_all_pending(&self, value: u64) {
-        self.mip.store(value & irq::ALL, Ordering::Release);
+        self.mip
+            .store(value & (irq::ALL | Self::SEIP_LINE), Ordering::Release);
     }
 
     /// Apply a guest write to `mip` or `sip`: replace the bits `write.mask`
@@ -1483,6 +1530,30 @@ mod tests {
         assert_eq!(lines.pending(), irq::SSI);
     }
 
+    /// The controller's supervisor line and the software `SEIP` bit are two
+    /// pieces of state, and a snapshot carries both — as does one taken
+    /// before they were told apart, whose single bit restores as the
+    /// software half.
+    #[test]
+    fn the_seip_line_and_the_software_bit_survive_a_snapshot_separately() {
+        let lines = Lines::default();
+        lines.set_pending(irq::SEI | irq::MTI, true);
+        assert_eq!(lines.pending(), irq::SEI | irq::MTI);
+        assert_eq!(lines.software(), irq::MTI, "the line is not software's");
+        let restored = Lines::default();
+        restored.set_all_pending(lines.raw());
+        assert_eq!(restored.raw(), lines.raw());
+        // The line can still be lowered by whoever drives it.
+        restored.set_pending(irq::SEI, false);
+        assert_eq!(restored.pending(), irq::MTI);
+
+        // The old encoding: `SEIP` itself, with nothing above it.
+        let old = Lines::default();
+        old.set_all_pending(irq::SEI);
+        assert_eq!(old.pending(), irq::SEI);
+        assert_eq!(old.software(), irq::SEI);
+    }
+
     #[test]
     fn a_mip_write_keeps_a_machine_bit_raised_since_the_instruction_read_it() {
         // The interleaving a parallel machine produces: this hart's `csrw sip`
@@ -1508,7 +1579,11 @@ mod tests {
         let write = c.write(num::MIP, irq::STI).unwrap().unwrap();
         lines.set_pending(irq::MTI, true);
         lines.write(write);
-        assert_eq!(lines.pending(), irq::MSI | irq::MTI | irq::STI);
+        // `SEIP` was raised by `set_pending`, which is the controller's
+        // line: the write cleared the software half of that bit, which was
+        // already clear, and the line is not a CSR write's to lower.
+        assert_eq!(lines.pending(), irq::MSI | irq::MTI | irq::STI | irq::SEI);
+        assert_eq!(lines.software(), irq::MSI | irq::MTI | irq::STI);
     }
 
     #[test]

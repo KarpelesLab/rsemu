@@ -2074,7 +2074,16 @@ impl<'a> Exec<'a> {
             None
         };
         if will_write {
-            let current = old.unwrap_or_else(|| self.st.csrs.read(num, pending).unwrap_or(0));
+            let mut current = old.unwrap_or_else(|| self.st.csrs.read(num, pending).unwrap_or(0));
+            if num == csr::num::MIP {
+                // What was *read* has the controller's line ORed into SEIP;
+                // what is modified does not. Volume II: "the signal from the
+                // interrupt controller is not used to calculate the value
+                // written to SEIP. Only the software-writable SEIP bit
+                // participates in the read-modify-write sequence of a CSRRS
+                // or CSRRC instruction."
+                current = (current & !irq::SEI) | (self.lines.software() & irq::SEI);
+            }
             let value = match op {
                 Op::Csrrw | Op::Csrrwi => source,
                 Op::Csrrs | Op::Csrrsi => current | source,

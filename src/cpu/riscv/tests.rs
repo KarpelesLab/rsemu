@@ -308,6 +308,80 @@ fn rv32_split_accesses_wrap_at_the_top_of_the_address_space() {
     assert_eq!(bottom.read_u8(1).unwrap(), 0);
 }
 
+/// `mip.SEIP` is two things ORed together: a bit M-mode software writes and
+/// the interrupt controller's line. Neither may overwrite the other.
+///
+/// Volume II (20240411), "Machine Interrupt Registers (mip and mie)":
+/// "Supervisor-level external interrupts are made pending based on the
+/// logical-OR of the software-writable SEIP bit and the signal from the
+/// external interrupt controller. When mip is read with a CSR instruction,
+/// the value of the SEIP bit returned in the rd destination register is the
+/// logical-OR of the software-writable bit and the interrupt signal from the
+/// interrupt controller, but the signal from the interrupt controller is not
+/// used to calculate the value written to SEIP. Only the software-writable
+/// SEIP bit participates in the read-modify-write sequence of a CSRRS or
+/// CSRRC instruction."
+///
+/// There was one bit for both. An M-mode `csrw mip` cleared an interrupt the
+/// PLIC was still asserting — and a level-triggered line is not driven again
+/// until it changes, so that interrupt was gone — and a `csrs mip` of some
+/// other bit copied the line into the software bit, where it stayed pending
+/// after the PLIC dropped it.
+#[test]
+fn seip_is_the_or_of_a_software_bit_and_the_controllers_line() {
+    let mip = num::MIP;
+    let h = Harness::rv64gc(&[
+        csrrw(10, mip, 0),  // csrrw a0, mip, x0: write zero
+        csrrs(11, mip, 0),  // csrr a1, mip
+        addi(5, 0, 1 << 1), // t0 = SSIP
+        csrrs(12, mip, 5),  // csrrs a2, mip, t0: set another bit
+        csrrs(13, mip, 0),  // csrr a3, mip      (line dropped first)
+        addi(6, 0, 1 << 9), // t1 = SEIP
+        csrrs(0, mip, 6),   // csrs mip, t1: software raises it
+        csrrs(14, mip, 0),  // csrr a4, mip      (line raised, dropped)
+    ]);
+    // The controller asserts the line.
+    h.hart.set_interrupt(irq::SEI, true);
+    h.steps(2);
+    assert_eq!(
+        h.hart.x(10) & irq::SEI,
+        irq::SEI,
+        "the line reads as pending"
+    );
+    assert_eq!(
+        h.hart.x(11) & irq::SEI,
+        irq::SEI,
+        "and a write of zero does not lower it: it is not software's bit"
+    );
+    // A set of some other bit reads the OR and must not store it.
+    h.steps(2);
+    assert_eq!(h.hart.x(12) & irq::SEI, irq::SEI);
+    h.hart.set_interrupt(irq::SEI, false);
+    h.steps(1);
+    assert_eq!(
+        h.hart.x(13) & irq::SEI,
+        0,
+        "the line was not copied into the software bit by the CSRRS"
+    );
+    assert_eq!(
+        h.hart.x(13) & irq::SSI,
+        irq::SSI,
+        "the bit it did set is there"
+    );
+    // And the software bit is the line's equal: the line going up and down
+    // again leaves what software wrote.
+    h.steps(2);
+    h.hart.set_interrupt(irq::SEI, true);
+    h.hart.set_interrupt(irq::SEI, false);
+    h.steps(1);
+    assert_eq!(
+        h.hart.x(14) & irq::SEI,
+        irq::SEI,
+        "software's SEIP survives"
+    );
+    assert_eq!(h.hart.interrupts() & irq::SEI, irq::SEI);
+}
+
 #[test]
 fn logical_right_shift_respects_rv32() {
     // -1 >> 1 must be 0x7fff_ffff on RV32, not 0x7fff_ffff_ffff_ffff.

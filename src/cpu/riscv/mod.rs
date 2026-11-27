@@ -1627,8 +1627,10 @@ impl Device for Hart {
             w.write_u64(addr)?;
         }
         // The interrupt lines are architectural: a restored machine whose
-        // timer was already firing must still see it.
-        w.write_u64(self.lines.pending())?;
+        // timer was already firing must still see it. The raw word, so that
+        // the controller's supervisor line and the software `SEIP` bit come
+        // back as the two things they are.
+        w.write_u64(self.lines.raw())?;
         Ok(())
     }
 
