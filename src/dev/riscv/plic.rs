@@ -303,19 +303,45 @@ impl Registers {
             .collect()
     }
 
-    /// Drive the external lines. Never called with the state lock held.
-    fn drive(&self, levels: &[bool]) {
+    /// Bring every context's external line level with the registers. Never
+    /// called with the state lock held.
+    ///
+    /// # Why this reads the state instead of being told the levels
+    ///
+    /// The state changes under its lock and the wires are driven after the
+    /// lock is released (`ROADMAP.md` §4.7), so two accesses from two harts
+    /// can drive in the opposite order to the one they changed the state in.
+    /// Handed the levels its own change produced, the later *drive* won and
+    /// the later *change* lost: a line left low with a source pending and
+    /// enabled, which nothing delivers until some unrelated access recomputes
+    /// it. The specification's "Interrupt Notifications" promises the
+    /// opposite: "The PLIC is guaranteed to eventually deliver all state
+    /// changes in EIP to all targets, provided there is no intervening
+    /// activity in the PLIC core."
+    ///
+    /// So each caller drives what the state says *now* and then looks again.
+    /// A drive made stale by a concurrent change is seen to be stale by the
+    /// thread that made it, which goes round; the last drive to finish is
+    /// therefore always one that was checked against the final state.
+    /// `tests/riscv_plic_line_race.rs` is the instrument.
+    fn notify(&self) {
         let sources: Vec<Option<WireSource>> = self.outs.lock().clone();
-        for (source, on) in sources.iter().zip(levels) {
-            if let Some(source) = source {
-                source.set(Level::from_bool(*on));
+        loop {
+            let levels = Self::evaluate(&self.state.lock());
+            for (source, on) in sources.iter().zip(&levels) {
+                if let Some(source) = source {
+                    source.set(Level::from_bool(*on));
+                }
+            }
+            if Self::evaluate(&self.state.lock()) == levels {
+                return;
             }
         }
     }
 
     /// A source's input line moved.
     fn set_level(&self, source: u32, level: bool) {
-        let levels = {
+        {
             let mut state = self.state.lock();
             let Some(slot) = state.level.get_mut(source as usize) else {
                 return;
@@ -333,14 +359,13 @@ impl Registers {
                 // A deassertion does *not* clear a request that has already
                 // been forwarded: the PLIC has promised it to a hart.
             }
-            Self::evaluate(&state)
-        };
-        self.drive(&levels);
+        }
+        self.notify();
     }
 
     /// Claim the highest-priority interrupt for `context`, or 0 for none.
     fn claim(&self, context: usize) -> u32 {
-        let (source, levels) = {
+        let source = {
             let mut state = self.state.lock();
             // Not masked by the threshold: a hart that has raised it to stop
             // being notified may still poll with a claim.
@@ -349,16 +374,15 @@ impl Registers {
                 state.pending[source as usize] = false;
                 state.claimed[source as usize] = true;
             }
-            let levels = Self::evaluate(&state);
-            (source, levels)
+            source
         };
-        self.drive(&levels);
+        self.notify();
         source
     }
 
     /// Complete `source` for `context`.
     fn complete(&self, context: usize, source: u32) {
-        let levels = {
+        {
             let mut state = self.state.lock();
             let index = source as usize;
             if index == 0 || index >= state.claimed.len() || !state.enable[context][index] {
@@ -372,9 +396,8 @@ impl Registers {
                 // Still asserted, so the gateway forwards again immediately.
                 state.pending[index] = true;
             }
-            Self::evaluate(&state)
-        };
-        self.drive(&levels);
+        }
+        self.notify();
     }
 
     /// Pack the pending array into the word at `index`, as the read-only
@@ -486,18 +509,14 @@ impl MemOps for Registers {
                     // read-only zero (§3).
                     return Ok(());
                 }
-                let levels = {
-                    let mut state = self.state.lock();
-                    state.priority[source] = value & PRIORITY_MASK;
-                    Registers::evaluate(&state)
-                };
-                self.drive(&levels);
+                self.state.lock().priority[source] = value & PRIORITY_MASK;
+                self.notify();
             }
             // The pending array is read-only: a source becomes pending because
             // its gateway said so, never because software said so.
             Reg::Pending(_) | Reg::None => {}
             Reg::Enable(context, word) => {
-                let levels = {
+                {
                     let mut state = self.state.lock();
                     for bit in 0..32 {
                         let source = word * 32 + bit;
@@ -506,17 +525,12 @@ impl MemOps for Registers {
                         }
                         state.enable[context][source] = value & (1 << bit) != 0;
                     }
-                    Registers::evaluate(&state)
-                };
-                self.drive(&levels);
+                }
+                self.notify();
             }
             Reg::Threshold(context) => {
-                let levels = {
-                    let mut state = self.state.lock();
-                    state.threshold[context] = value & PRIORITY_MASK;
-                    Registers::evaluate(&state)
-                };
-                self.drive(&levels);
+                self.state.lock().threshold[context] = value & PRIORITY_MASK;
+                self.notify();
             }
             Reg::Claim(context) => self.complete(context, value),
         }
@@ -629,12 +643,8 @@ impl Device for Plic {
     }
 
     fn reset(&self, _kind: ResetKind) {
-        let levels = {
-            let mut state = self.regs.state.lock();
-            *state = State::new(self.regs.sources, self.regs.contexts);
-            Registers::evaluate(&state)
-        };
-        self.regs.drive(&levels);
+        *self.regs.state.lock() = State::new(self.regs.sources, self.regs.contexts);
+        self.regs.notify();
     }
 
     fn region(&self, name: &str) -> Option<RegionRef> {
@@ -739,12 +749,8 @@ impl Device for Plic {
                 *slot = r.read_bool()?;
             }
         }
-        let levels = {
-            let mut live = self.regs.state.lock();
-            *live = state;
-            Registers::evaluate(&live)
-        };
-        self.regs.drive(&levels);
+        *self.regs.state.lock() = state;
+        self.regs.notify();
         Ok(())
     }
 }
