@@ -1954,6 +1954,15 @@ fn monitor_command(args: &[String]) -> ExitCode {
 /// as it comes, which also makes `printf 'devices\nquit\n' | rsemu monitor …` a
 /// session — which is how `tests/cli_monitor.rs` drives one, with no TTY
 /// anywhere.
+/// Whether a shutdown signal has arrived, and nothing else.
+///
+/// [`interrupted`] without the machine, for the one place that cannot lend it:
+/// the monitor's `step <n>` asks from inside a command that holds the machine.
+#[cfg(feature = "monitor")]
+fn signal_caught() -> bool {
+    rsemu::host::signal::caught().is_some()
+}
+
 #[cfg(feature = "monitor")]
 fn monitor_session(
     machine: &mut Machine,
@@ -2018,6 +2027,10 @@ fn monitor_session(
         timeline: timeline.as_mut(),
         deadline,
         input,
+        // Asked between the instructions of a `step <n>`. Only the flag: the
+        // machine is borrowed by the command while it runs, and the loop below
+        // makes the safe-point request once the command has handed it back.
+        interrupted: Some(&signal_caught),
     };
 
     if !args.quiet {

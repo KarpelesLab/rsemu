@@ -99,6 +99,7 @@ fn script(machine: &mut Machine, hosts: &HostObjects, lines: &[&str]) -> String 
         deadline: Some(GlobalTime::from_nanos(1_000_000)),
         timeline: None,
         input: None,
+        interrupted: None,
     };
     let mut out = String::new();
     for line in lines {
@@ -326,6 +327,7 @@ fn quit_and_its_spellings_end_the_session() {
         timeline: None,
         deadline: None,
         input: None,
+        interrupted: None,
     };
     for spelling in ["quit", "q", "exit"] {
         let response = monitor.execute(&mut target, &mut env, spelling);
@@ -529,6 +531,7 @@ fn step_moves_the_program_counter_and_status_admits_it() {
         timeline: None,
         deadline: None,
         input: None,
+        interrupted: None,
     };
     let quiet = monitor.execute(&mut target, &mut env, "status");
     assert!(
@@ -560,6 +563,53 @@ fn a_step_count_that_is_not_a_count_is_refused() {
         let out = script(&mut machine, &hosts, &[bad]);
         assert!(out.contains("not a step count"), "`{bad}` said:\n{out}");
     }
+}
+
+/// A `step <n>` that is asked to stop, stops — and says how far it got.
+///
+/// The loop ran `n` times with no way out. `step 4000000000` at the prompt
+/// left Ctrl-C nothing to do: the first one set a flag nobody read until the
+/// loop was over, and the second killed the process with the handler disarmed.
+#[cfg(feature = "machine-apple1")]
+#[test]
+fn a_long_step_can_be_interrupted() {
+    let (mut machine, hosts) = apple1();
+    let mut monitor = Monitor::new();
+    let mut target = MachineTarget::new(&mut machine);
+    // "Ctrl-C" arrives while the fourth instruction is being asked about.
+    let asked = core::cell::Cell::new(0u32);
+    let stop = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 3
+    };
+    let mut env = Env {
+        hosts: Some(&hosts),
+        timeline: None,
+        deadline: None,
+        input: None,
+        interrupted: Some(&stop),
+    };
+    let out = monitor
+        .execute(&mut target, &mut env, "step 4000000000")
+        .text;
+    assert!(
+        out.contains("interrupted after 3 of 4000000000 instructions"),
+        "step said:\n{out}"
+    );
+    assert!(out.contains("stepped 3 instructions"), "step said:\n{out}");
+    assert!(monitor.has_stepped());
+
+    // Asked before the first instruction too: a signal that is already
+    // pending steps nothing, and the session is not marked as having stepped.
+    let mut monitor = Monitor::new();
+    let already = || true;
+    env.interrupted = Some(&already);
+    let out = monitor.execute(&mut target, &mut env, "step 10").text;
+    assert!(
+        out.contains("interrupted after 0 of 10"),
+        "step said:\n{out}"
+    );
+    assert!(!monitor.has_stepped());
 }
 
 #[cfg(feature = "machine-apple1")]
@@ -691,6 +741,7 @@ fn rewind_puts_the_machine_back_where_it_was() {
         timeline: Some(&mut timeline),
         deadline: None,
         input: None,
+        interrupted: None,
     };
 
     // Two virtual seconds, so the default one-second cadence has taken
@@ -745,6 +796,7 @@ fn a_deadline_bounds_a_cont_that_named_no_span() {
         timeline: None,
         deadline: Some(GlobalTime::from_nanos(120_000_000)),
         input: None,
+        interrupted: None,
     };
     let response = monitor.execute(&mut target, &mut env, "cont");
     assert_eq!(response.flow, Flow::Advance(None));
@@ -769,6 +821,7 @@ fn an_advance_stops_when_the_session_says_to() {
         timeline: None,
         deadline: None,
         input: None,
+        interrupted: None,
     };
     let mut slices = 0;
     monitor.advance(

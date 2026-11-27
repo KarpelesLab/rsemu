@@ -130,7 +130,7 @@ impl Response {
 /// and a call site with `None, None, Some(x), None` in it reads as nothing at
 /// all. Each field is `None` in a session that has no such thing, and the
 /// command that wanted it says which flag would have provided it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Env<'a> {
     /// The build's host-object table, which is where the trace collector finds
     /// the per-CPU counters.
@@ -149,6 +149,29 @@ pub struct Env<'a> {
         alloc::sync::Arc<crate::core::record::Recorder>,
         crate::core::record::Channel,
     )>,
+    /// Whether the session has been asked to stop — a caught signal, in the
+    /// CLI.
+    ///
+    /// Asked between the instructions of a `step <n>`, which is the one
+    /// command that loops inside [`Monitor::execute`] rather than handing the
+    /// loop back as a [`Flow`]: `step 4000000000` could not otherwise be
+    /// stopped short of killing the process. `None` is a session nothing can
+    /// interrupt, which is every test and every script.
+    pub interrupted: Option<&'a dyn Fn() -> bool>,
+}
+
+impl core::fmt::Debug for Env<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // By hand because a closure has no `Debug`; what it is said to be is
+        // whether there is one.
+        f.debug_struct("Env")
+            .field("hosts", &self.hosts)
+            .field("timeline", &self.timeline)
+            .field("deadline", &self.deadline)
+            .field("input", &self.input)
+            .field("interrupted", &self.interrupted.map(|_| "…"))
+            .finish()
+    }
 }
 
 /// The console's own state: which processor commands act on, and whether the
@@ -265,7 +288,7 @@ impl Monitor {
                     Err(e) => Response::stay(e),
                 },
             },
-            "step" => Response::stay(self.step(target, args.first().copied())),
+            "step" => Response::stay(self.step(target, env, args.first().copied())),
             "cpu" => Response::stay(self.select(target, args.first().copied())),
             "cpus" => Response::stay(self.cpus(target)),
             "regs" => Response::stay(self.regs(target, args.first().copied())),
@@ -397,7 +420,12 @@ impl Monitor {
     }
 
     /// `step [n]` — the debugger's stepper, on the selected processor.
-    fn step(&mut self, target: &mut MachineTarget<'_>, count: Option<&str>) -> String {
+    fn step(
+        &mut self,
+        target: &mut MachineTarget<'_>,
+        env: &Env<'_>,
+        count: Option<&str>,
+    ) -> String {
         let count: u64 = match count {
             None => 1,
             Some(text) => match text.parse() {
@@ -409,7 +437,17 @@ impl Monitor {
             return String::from("this machine has no processor a debugger can step\n");
         }
         let mut out = String::new();
-        for _ in 0..count {
+        let mut done: u64 = 0;
+        while done < count {
+            // Asked before every instruction, the first included: the count is
+            // the user's, `step 4000000000` is one they can type, and a loop
+            // that only ended when it was finished left Ctrl-C with nothing to
+            // do but be pressed again — which kills the process, and with it
+            // whatever a drive had not yet flushed.
+            if env.interrupted.is_some_and(|asked| asked()) {
+                let _ = writeln!(out, "interrupted after {done} of {count} instructions");
+                break;
+            }
             match target.step(self.cpu) {
                 Ok(stop) => {
                     self.stepped = true;
@@ -420,11 +458,12 @@ impl Monitor {
                     return out;
                 }
             }
+            done += 1;
         }
         let _ = writeln!(
             out,
-            "stepped {count} instruction{} on cpu {}",
-            if count == 1 { "" } else { "s" },
+            "stepped {done} instruction{} on cpu {}",
+            if done == 1 { "" } else { "s" },
             self.cpu
         );
         out.push_str(&self.where_is(target, self.cpu));
