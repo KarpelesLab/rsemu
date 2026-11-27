@@ -506,13 +506,20 @@ pub const TLB_ENTRIES: usize = 256;
 /// One cached translation.
 #[derive(Debug, Clone, Copy, Default)]
 struct Entry {
-    /// Virtual page number, ASID, exception level and generation, hashed so a
-    /// stale entry can never be mistaken for a hit.
-    tag: u64,
+    /// The virtual page number, whole.
+    vpn: u64,
+    /// The translation generation the entry was made in.
+    generation: u64,
+    /// The ASID and the exception level, with [`Entry::VALID`] set — see
+    /// [`Tlb::context`]. Zero in an empty slot, which no lookup asks for.
+    context: u64,
     /// The physical address of the page's base.
     base: u64,
-    /// Whether this slot holds anything.
-    valid: bool,
+}
+
+impl Entry {
+    /// Set in the `context` of every slot that holds something.
+    const VALID: u64 = 1 << 63;
 }
 
 /// The per-core software TLB.
@@ -674,12 +681,23 @@ impl Tlb {
         (self.hits, self.misses)
     }
 
-    /// The tag for a page.
+    /// The ASID and exception level of an entry, as one word.
+    ///
+    /// The fields are **kept**, not hashed: a hit has to mean the same page
+    /// in the same address space at the same level in the same generation,
+    /// and a false one is a silent wrong translation. The old tag XORed a
+    /// multiplied page number with `generation << 40`, which let a page and
+    /// a generation trade off against each other (see the test) and made
+    /// generations 2^24 apart the same generation. Three compares against
+    /// three stored words cost less than the multiply did: two million
+    /// lookups, half of them hits, are 35.0 million instructions under
+    /// callgrind where the hashed tag took 47.0 million. The entry is
+    /// thirty-two bytes, so the slot index is a shift.
     #[inline]
-    fn tag(vpn: u64, asid: u64, el: El, generation: u64) -> u64 {
-        // The generation goes in the high bits so a bump invalidates every
-        // entry at once without touching them.
-        (generation << 40) ^ vpn.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (asid << 2) ^ el.bits()
+    fn context(asid: u64, el: El) -> u64 {
+        // An ASID is sixteen bits of a `TTBR`, so nothing reaches the top
+        // bit; the mask says so rather than assuming it.
+        Entry::VALID | ((asid & 0xffff) << 2) | el.bits()
     }
 
     /// Look a page up.
@@ -692,9 +710,9 @@ impl Tlb {
         el: El,
         generation: u64,
     ) -> Option<u64> {
-        let tag = Self::tag(vpn, asid, el, generation);
+        let context = Self::context(asid, el);
         let slot = &self.slots[kind.slot()][(vpn as usize) & (TLB_ENTRIES - 1)];
-        if slot.valid && slot.tag == tag {
+        if slot.vpn == vpn && slot.generation == generation && slot.context == context {
             self.hits += 1;
             Some(slot.base)
         } else {
@@ -715,9 +733,10 @@ impl Tlb {
         base: u64,
     ) {
         self.slots[kind.slot()][(vpn as usize) & (TLB_ENTRIES - 1)] = Entry {
-            tag: Self::tag(vpn, asid, el, generation),
+            vpn,
+            generation,
+            context: Self::context(asid, el),
             base,
-            valid: true,
         };
     }
 }
@@ -1012,6 +1031,44 @@ mod tests {
             translate_debug(&regs, &mut ram, 0xdead_beef),
             Some(0xdead_beef)
         );
+    }
+
+    /// A hit is a hit on the page, the address space, the exception level and
+    /// the generation — all four, compared, not hashed together.
+    ///
+    /// The tag used to be `(generation << 40) ^ vpn * K ^ (asid << 2) ^ el`.
+    /// A product fills all sixty-four bits, so the generation was not "in
+    /// the high bits" of anything: two pages whose numbers agree in their low
+    /// forty bits have products that differ only above bit 40, and a
+    /// generation that differs by exactly that amount cancels it. The pair
+    /// below is a user page and the kernel page with the same low bits —
+    /// `0x0000_0000_0123_4000` and `0xffff_0000_0123_4000` — which share a
+    /// slot, and the old tag answered the second with the first's frame.
+    #[test]
+    fn a_lookup_compares_every_field_of_the_tag() {
+        let mut tlb = Tlb::new();
+        let user = 0x1234u64;
+        let kernel = user | (0xfff << 40);
+        // `(0xfff << 40) * K`, shifted back down: the generation distance at
+        // which the old hash made the two indistinguishable.
+        let distance = (0xfffu64.wrapping_mul(0x9e37_79b9_7f4a_7c15)) & 0xff_ffff;
+        tlb.insert(Access::Load, user, 0, El::El1, 0, 0x4000);
+        assert_eq!(tlb.lookup(Access::Load, user, 0, El::El1, 0), Some(0x4000));
+        assert_eq!(
+            tlb.lookup(Access::Load, kernel, 0, El::El1, distance),
+            None,
+            "another page, in another generation"
+        );
+        // Generations 2^24 apart were the same generation, too.
+        assert_eq!(tlb.lookup(Access::Load, user, 0, El::El1, 1 << 24), None);
+        // And each field on its own still separates.
+        assert_eq!(tlb.lookup(Access::Load, user, 1, El::El1, 0), None);
+        assert_eq!(tlb.lookup(Access::Load, user, 0, El::El0, 0), None);
+        assert_eq!(
+            tlb.lookup(Access::Load, user | (1 << 8), 0, El::El1, 0),
+            None
+        );
+        assert_eq!(tlb.lookup(Access::Store, user, 0, El::El1, 0), None);
     }
 
     #[test]
