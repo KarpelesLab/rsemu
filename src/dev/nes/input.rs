@@ -381,6 +381,14 @@ impl Shared {
     /// not clock the controller (`ROADMAP.md` §15, invariant 5).
     fn read_port(&self, port: usize, bus: u8, advance: bool) -> u8 {
         let mut regs = self.regs.lock();
+        if regs.strobe && !advance {
+            // A monitor looking at a transparent register sees through it to
+            // the pad, the same bit a guest read would return — but the reload
+            // is the guest's to do. Storing it here would make a debug read
+            // change the snapshot, and change what the guest later shifts out
+            // if it drops the strobe where the falling edge does not latch.
+            return (bus & OPEN_BUS_BITS) | (self.pad.get(port) >> 7);
+        }
         if regs.strobe {
             // Latched continuously while the line is high, so every read is the
             // A button and nothing shifts.
@@ -840,6 +848,33 @@ mod tests {
         }
         // And the guest's own first read still gets the first bit.
         assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 1);
+    }
+
+    #[test]
+    fn a_debug_read_with_the_strobe_high_leaves_the_shift_registers_alone() {
+        // While the latch line is high the registers are transparent, and the
+        // read path models that by reloading them from the pads. A monitor
+        // read went through the same reload, so looking at `$4016` wrote the
+        // host's live buttons into device state: the snapshot changed, and a
+        // guest that then dropped the strobe in the window where the falling
+        // edge does not latch read the monitor's sample rather than its own.
+        let p = ports("test-debug-strobe");
+        p.pad().set(0, 0);
+        p.shared.write_strobe(1, 10);
+        assert_eq!(p.shared.read_port(0, 0x40, true) & 1, 0, "nothing held");
+        let before = p.shared.regs.lock().shift;
+
+        p.pad().set(0, buttons::A);
+        assert_eq!(
+            p.shared.read_port(0, 0x40, false),
+            0x40 | 1,
+            "the monitor sees what a guest read would return right now"
+        );
+        assert_eq!(
+            p.shared.regs.lock().shift,
+            before,
+            "and has not touched the registers to see it"
+        );
     }
 
     #[test]
