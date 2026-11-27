@@ -1112,6 +1112,8 @@ impl Chip {
         };
         let was = target.phase();
         let mut moved = 0u32;
+        // One staging buffer for the whole transfer, not one per burst.
+        let mut buf = alloc::vec![0u8; (count as usize).min(BURST)];
         while moved < count {
             // §7.5.6: the transfer ends where the phase does, and the bytes of
             // the next phase are not this transfer's to take.
@@ -1119,15 +1121,15 @@ impl Chip {
                 break;
             }
             let want = (count - moved).min(BURST as u32) as usize;
-            let mut buf = alloc::vec![0u8; want];
+            let buf = &mut buf[..want];
             let n = if input {
-                let got = target.read(&mut buf);
+                let got = target.read(buf);
                 if got == 0 {
                     break;
                 }
                 port.store(&buf[..got])
             } else {
-                let got = port.fetch(&mut buf);
+                let got = port.fetch(buf);
                 if got == 0 {
                     break;
                 }
