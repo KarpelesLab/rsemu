@@ -821,7 +821,7 @@ impl UserMemory {
         name: &str,
         src: Option<(Arc<RamStore>, u64)>,
     ) -> Result<()> {
-        let store = Arc::new(RamStore::new(len));
+        let store = new_store(len)?;
         if let Some((from, offset)) = src {
             // Copying rather than sharing: a *split* of a shared range would
             // need each half to alias a window of one store, and the halves
@@ -892,7 +892,7 @@ impl UserMemory {
         if !vma.shared {
             return Ok(());
         }
-        let private = Arc::new(RamStore::new(vma.len));
+        let private = new_store(vma.len)?;
         copy_between(&vma.store, 0, &private, 0, vma.len)?;
         vma.store = private;
         vma.shared = false;
@@ -1047,6 +1047,33 @@ impl UserMemory {
         }
         Ok(())
     }
+}
+
+/// A zeroed store of `len` bytes, or an error if this host cannot hold one.
+///
+/// `len` is, at one remove, a number a guest put in a register, and
+/// [`RamStore::new`] is infallible: it panics on a length a `Vec` cannot
+/// describe and aborts the process on one the allocator refuses. Neither is an
+/// answer a consumer can turn into `ENOMEM`. So the allocation is *asked for*
+/// first, fallibly, and released again — a reservation that touches no page —
+/// and only a length the host has just agreed to is handed on. The window
+/// between the two is a race against the rest of the process, not against the
+/// guest, which is the party this is here for.
+fn new_store(len: u64) -> Result<Arc<RamStore>> {
+    let refused = || {
+        config(alloc::format!(
+            "the host cannot back a mapping of {len:#x} bytes"
+        ))
+    };
+    // The page of slack is `RamStore`'s own, for aligning its first byte.
+    let bytes = usize::try_from(len)
+        .ok()
+        .and_then(|n| n.checked_add(PAGE_SIZE as usize))
+        .ok_or_else(refused)?;
+    let mut probe: Vec<u8> = Vec::new();
+    probe.try_reserve_exact(bytes).map_err(|_| refused())?;
+    drop(probe);
+    Ok(Arc::new(RamStore::new(len)))
 }
 
 /// Copy `len` bytes between two stores, a chunk at a time.

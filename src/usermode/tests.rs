@@ -361,6 +361,23 @@ fn a_zero_length_request_changes_nothing() {
 }
 
 #[test]
+fn a_mapping_the_host_cannot_back_is_an_error_not_a_panic() {
+    // The length of an anonymous mapping is whatever the guest put in a
+    // register. One that no host allocation can hold has to come back as a
+    // refusal the consumer can turn into `ENOMEM` — 2^63 bytes is past what a
+    // `Vec` can describe on any host, so this is not a test of how much
+    // memory the machine running it has.
+    let mem = UserMemory::new(64);
+    let huge = 1u64 << 63;
+    assert!(mem.map(huge, Prot::RW, "huge").is_err());
+    assert!(mem.map_at(0x1000, huge, Prot::NONE, "huge").is_err());
+    assert!(mem.mappings().is_empty(), "and nothing was left half made");
+    // The map is still usable afterwards.
+    let base = mem.map(0x1000, Prot::RW, "small").unwrap();
+    mem.write_u64(base, 7).unwrap();
+}
+
+#[test]
 fn an_unaligned_range_is_refused() {
     let mem = UserMemory::new(48);
     assert!(mem.map_at(0x1001, 0x1000, Prot::RW, "x").is_err());
