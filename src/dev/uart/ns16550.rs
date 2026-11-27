@@ -420,11 +420,17 @@ impl Registers {
             }
             // No modem is attached. In loopback the modem control outputs
             // appear as the status inputs, which is what a driver's loopback
-            // test checks: RTS→CTS, DTR→DSR, OUT1→RI, OUT2→DCD.
+            // test checks. The pairing is the data sheet's (PC16550D §8.6.8)
+            // and it is not bit-for-bit: "Bit 4: This bit is the complement of
+            // the Clear to Send (CTS) input. If bit 4 (loop) of the MCR is set
+            // to a 1, this bit is equivalent to RTS in the MCR. Bit 5: [...]
+            // equivalent to DTR in the MCR. Bit 6: [...] equivalent to OUT 1
+            // in the MCR. Bit 7: [...] equivalent to OUT 2 in the MCR." RTS is
+            // MCR bit 1 and DTR is MCR bit 0, so the low pair crosses over.
             6 => {
                 if state.mcr & MCR_LOOP != 0 {
                     let mcr = state.mcr;
-                    (mcr & 0x01) << 4 | (mcr & 0x02) << 4 | (mcr & 0x04) << 4 | (mcr & 0x08) << 4
+                    (mcr & 0x02) << 3 | (mcr & 0x01) << 5 | (mcr & 0x04) << 4 | (mcr & 0x08) << 4
                 } else {
                     0
                 }
@@ -913,9 +919,28 @@ mod tests {
         assert!(port.drain().is_empty(), "nothing reaches the host");
         assert_eq!(peek(&uart, 5) & LSR_DR, LSR_DR);
         assert_eq!(peek(&uart, 0), b'L');
-        // The modem status inputs mirror the control outputs.
-        poke(&uart, 4, MCR_LOOP | 0x01);
-        assert_eq!(peek(&uart, 6) & 0x10, 0x10, "RTS appears as CTS");
+    }
+
+    #[test]
+    fn loopback_crosses_the_modem_outputs_onto_the_inputs_the_data_sheet_names() {
+        // PC16550D §8.6.8: in loopback MSR bit 4 (CTS) "is equivalent to RTS
+        // in the MCR" (bit 1), bit 5 (DSR) to DTR (bit 0), bit 6 (RI) to
+        // OUT 1 (bit 2) and bit 7 (DCD) to OUT 2 (bit 3).
+        let (uart, _port) = wired();
+        for (mcr, msr, what) in [
+            (0x01, 0x20, "DTR appears as DSR"),
+            (0x02, 0x10, "RTS appears as CTS"),
+            (0x04, 0x40, "OUT1 appears as RI"),
+            (0x08, 0x80, "OUT2 appears as DCD"),
+            // What a driver's presence test writes — OUT2 and RTS — and the
+            // DCD and CTS it expects back.
+            (0x0a, 0x90, "OUT2|RTS appears as DCD|CTS"),
+        ] {
+            poke(&uart, 4, MCR_LOOP | mcr);
+            assert_eq!(peek(&uart, 6) & 0xf0, msr, "{what}");
+        }
+        poke(&uart, 4, 0x0f);
+        assert_eq!(peek(&uart, 6), 0, "out of loopback nothing is attached");
     }
 
     #[test]
