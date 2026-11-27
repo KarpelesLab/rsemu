@@ -1267,6 +1267,16 @@ impl Cpu {
         // anyway.
         session.monitor = MonitorSlot::new(Arc::clone(&space), RESERVATION_SHIFT);
         session.space = Some(space);
+        // Everything derived from the old space is now about the wrong one:
+        // the translations, the pages the interpreter resolved to its stores,
+        // the shadow that carries host addresses out of it, and every block
+        // lifted through it. Two spaces' topology generations are not
+        // comparable, so none of them would notice on its own.
+        session.tlb = Tlb::new();
+        #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
+        if let Some(jit) = session.jit.as_mut() {
+            jit.flush();
+        }
     }
 
     /// The address space this core executes from, if one is attached.

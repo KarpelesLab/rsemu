@@ -1021,7 +1021,7 @@ impl<'a> Exec<'a> {
             Access::Fetch => self.attrs.with_purpose(AccessPurpose::FETCH),
             _ => self.attrs,
         };
-        match self.space.read(pa, width, attrs) {
+        match self.tlb.read_phys(self.space, pa, width, attrs) {
             Ok(v) => Ok(v),
             Err(_) => {
                 self.st.faults = self.st.faults.wrapping_add(1);

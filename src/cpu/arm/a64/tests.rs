@@ -5710,3 +5710,107 @@ fn a_quadword_destination_has_no_shll() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The read cache (`mmu::Tlb::read_phys`)
+// ---------------------------------------------------------------------------
+
+/// The same program on two cores whose RAM is the same store mapped two ways:
+/// plainly, which is a page the read cache serves, and through an alias, which
+/// it must refuse — an alias can slide without the topology generation moving
+/// — so every read takes `AddressSpace::read`. A guest cannot tell them apart,
+/// and neither may anything this core counts.
+fn cached_and_uncached(program: &[u32], data: &[(u64, u64)]) -> (Cpu, Cpu) {
+    let build = |direct: bool| {
+        let ram = Arc::new(RamStore::new(RAM));
+        for (n, word) in program.iter().enumerate() {
+            for (k, byte) in word.to_le_bytes().iter().enumerate() {
+                ram.write_u8(4 * n as u64 + k as u64, *byte).unwrap();
+            }
+        }
+        for (at, value) in data {
+            for (k, byte) in value.to_le_bytes().iter().enumerate() {
+                ram.write_u8(*at + k as u64, *byte).unwrap();
+            }
+        }
+        let space = AddressSpace::new("mem", 64);
+        let region: crate::core::space::RegionRef = Region::ram("ram", ram).into();
+        if direct {
+            space.topology().map(region, 0).unwrap();
+        } else {
+            let window = Region::alias("window", region, 0, RAM).unwrap();
+            space.topology().map(window, 0).unwrap();
+        }
+        let cpu = Cpu::new(Config::cortex_a53());
+        cpu.attach_space(Arc::new(space));
+        cpu
+    };
+    (build(true), build(false))
+}
+
+/// Everything a read can leave behind.
+fn observed(cpu: &Cpu) -> ([u64; 31], u64, u64, u64) {
+    let mut x = [0u64; 31];
+    for (n, slot) in x.iter_mut().enumerate() {
+        *slot = cpu.x(n as u32);
+    }
+    (x, cpu.pc(), cpu.cycles(), cpu.bus_faults())
+}
+
+#[test]
+fn a_read_served_from_the_cache_is_the_read_the_space_makes() {
+    // A loop that loads eight bytes of instructions out of its data, stores
+    // them over the two instructions ahead of it, executes those, and loads a
+    // doubleword back -- so the page being fetched from is also being written
+    // and the fetch has to see the store.
+    let patch = u64::from(add_imm(1, 10, 10, 5)) | (u64::from(add_imm(1, 10, 10, 7)) << 32);
+    let program = [
+        movz(1, 5, 0x200, 0),  // 00: x5 = 0x200
+        ldr_x(7, 5, 0),        // 04: x7 = the patch
+        str_x(7, 6, 0),        // 08: over the instructions at 10 and 14
+        add_imm(1, 10, 10, 1), // 0c
+        add_imm(1, 10, 10, 1), // 10: becomes `add x10, x10, #5`
+        add_imm(1, 10, 10, 1), // 14: becomes `add x10, x10, #7`
+        ldr_x(11, 5, 8),       // 18
+        add_imm(1, 12, 12, 3), // 1c
+        b(-0x1c),              // 20: back to 04
+    ];
+    let (fast, slow) = cached_and_uncached(&program, &[(0x200, patch), (0x208, 0x1122_3344)]);
+    for cpu in [&fast, &slow] {
+        // The store goes through x6, which names the instruction at 10.
+        cpu.set_x(6, 0x10);
+    }
+    for step in 0..64 {
+        assert_eq!(fast.step(), slow.step(), "accesses charged by step {step}");
+        assert_eq!(observed(&fast), observed(&slow), "after step {step}");
+    }
+    // Eight passes reached the patched pair, and each fetched it as patched.
+    assert_eq!(fast.x(10), 8 * (1 + 5 + 7));
+    assert_eq!(fast.x(11), 0x1122_3344);
+    assert_eq!(fast.x(12), 8 * 3);
+}
+
+#[test]
+fn a_core_moved_to_another_space_reads_that_space() {
+    // Two spaces built the same way stand at the same topology generation, so
+    // the generation alone cannot tell a cache it has been moved.
+    let build = |imm: u32| {
+        let ram = Arc::new(RamStore::new(RAM));
+        for (k, byte) in movz(1, 3, imm, 0).to_le_bytes().iter().enumerate() {
+            ram.write_u8(k as u64, *byte).unwrap();
+        }
+        let space = AddressSpace::new("mem", 64);
+        space.topology().map(Region::ram("ram", ram), 0).unwrap();
+        Arc::new(space)
+    };
+    let (first, second) = (build(0x11), build(0x22));
+    assert_eq!(first.generation(), second.generation());
+    let cpu = Cpu::new(Config::cortex_a53());
+    cpu.attach_space(first);
+    cpu.step();
+    assert_eq!(cpu.x(3), 0x11);
+    cpu.attach_space(second);
+    cpu.set_pc(0);
+    cpu.step();
+    assert_eq!(cpu.x(3), 0x22);
+}
