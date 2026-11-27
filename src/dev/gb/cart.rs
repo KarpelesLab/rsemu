@@ -159,6 +159,18 @@ impl CartKind {
         }
     }
 
+    /// Whether the `$A000` window answers without being asked to.
+    ///
+    /// Every controller gates its RAM behind an enable register. A board with
+    /// no controller has no register at all: "Optionally up to 8 KiB of RAM
+    /// could be connected at $A000-BFFF, using a discrete logic decoder in
+    /// place of a full MBC chip" (Pan Docs, *No MBC*), and a decoder is always
+    /// decoding.
+    #[must_use]
+    pub const fn ram_always_enabled(&self) -> bool {
+        matches!(self.mapper, Mapper::None)
+    }
+
     /// Decode the cartridge-type byte at `$0147`.
     #[must_use]
     pub const fn from_byte(byte: u8) -> Option<CartKind> {
@@ -650,6 +662,7 @@ impl GbCart {
     pub fn new(cart: Cartridge) -> GbCart {
         let rom = Arc::new(RomStore::new(cart.bytes.to_vec()));
         let ram = (cart.ram_len > 0).then(|| Arc::new(RamStore::new(cart.ram_len)));
+        let ram_enabled = cart.kind.ram_always_enabled();
         let shared = Arc::new(Shared {
             cart,
             rom,
@@ -658,7 +671,7 @@ impl GbCart {
             rom0_base: AtomicU64::new(0),
             rom1_base: AtomicU64::new(ROM_BANK),
             ram_base: AtomicU64::new(0),
-            ram_enabled: AtomicBool::new(false),
+            ram_enabled: AtomicBool::new(ram_enabled),
             lazy: Mutex::new(None),
             tick: AtomicU64::new(0),
         });
@@ -996,7 +1009,10 @@ impl Device for GbCart {
             banks.rtc = rtc;
             banks.rtc_latched = rtc;
         }
-        self.shared.ram_enabled.store(false, Ordering::Relaxed);
+        self.shared.ram_enabled.store(
+            self.shared.cart.kind.ram_always_enabled(),
+            Ordering::Relaxed,
+        );
         self.shared.republish(&banks);
         drop(banks);
         if kind == ResetKind::Cold
@@ -1075,9 +1091,12 @@ impl Device for GbCart {
             ram.write_at(0, bytes)
                 .map_err(|e| Error::State(alloc::format!("cartridge RAM: {e}")))?;
         }
-        self.shared
-            .ram_enabled
-            .store(ram_enabled, Ordering::Relaxed);
+        // A board with no controller has no enable to have been saved clear;
+        // a snapshot from before that was understood says so anyway.
+        self.shared.ram_enabled.store(
+            ram_enabled || self.shared.cart.kind.ram_always_enabled(),
+            Ordering::Relaxed,
+        );
         self.shared.tick.store(tick, Ordering::Relaxed);
         self.shared.republish(&banks);
         *self.shared.banks.lock() = banks;

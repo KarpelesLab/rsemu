@@ -215,6 +215,36 @@ fn cartridge_ram_answers_only_while_it_is_enabled() {
 }
 
 #[test]
+fn a_cartridge_with_ram_and_no_controller_has_nothing_to_enable_it_with() {
+    // Pan Docs, *No MBC*: "Optionally up to 8 KiB of RAM could be connected at
+    // $A000-BFFF, using a discrete logic decoder in place of a full MBC chip."
+    // There is no register on such a board, so its RAM cannot be waiting for
+    // one to be written: types $08 and $09 were unusable.
+    let cart = banked_cart(2, 0x09, 0x02); // ROM+RAM+battery, 8 KiB
+    let region = Device::region(&cart, super::cart::RAM_REGION).expect("the RAM window");
+    let ops = io(&region);
+    let mut byte = [0u8; 1];
+    ops.write(0x123, &[0x42], MemAttrs::DEFAULT)
+        .expect("accepts");
+    ops.read(0x123, &mut byte, MemAttrs::DEFAULT)
+        .expect("answers");
+    assert_eq!(byte[0], 0x42);
+
+    // A write into the ROM window is not a register and changes nothing.
+    rom_write(&cart, 0x0000, 0x00);
+    ops.read(0x123, &mut byte, MemAttrs::DEFAULT)
+        .expect("answers");
+    assert_eq!(byte[0], 0x42);
+
+    // Nor does a reset take it away: the RAM is battery-backed and still
+    // decoded afterwards.
+    Device::reset(&cart, ResetKind::Warm);
+    ops.read(0x123, &mut byte, MemAttrs::DEFAULT)
+        .expect("answers");
+    assert_eq!(byte[0], 0x42);
+}
+
+#[test]
 fn the_mbc3_clock_counts_its_own_crystals_ticks() {
     // $10 is MBC3 with RAM, a battery and the timer.
     let cart = banked_cart(4, 0x10, 0x02);
