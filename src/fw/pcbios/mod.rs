@@ -389,6 +389,12 @@ const EBDA_CD_TRIES: u16 = EBDA_CD_SENSE + 18;
 /// with the same code. POST clears it.
 const EBDA_KB_PREFIX: u16 = EBDA_CD_TRIES + 1;
 
+/// Fixed-disk scratch: how many sectors of the last transfer did **not** move
+/// (word). The whole count before a transfer starts, zero when it finishes,
+/// and what is left when it stops short — which is what lets `INT 13h AH=42h`
+/// and `AH=43h` report how far they got.
+const EBDA_HD_LEFT: u16 = EBDA_KB_PREFIX + 1;
+
 /// Where the El Torito bootstrap stages a 2048-byte logical block.
 ///
 /// The same address POST's `IDENTIFY DEVICE` buffer uses, and deliberately:

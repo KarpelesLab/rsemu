@@ -36,9 +36,9 @@
 use super::{
     EBDA_CD_DRIVE, EBDA_CD_FLAGS, EBDA_COMMAND, EBDA_FD_CMD, EBDA_FD_COUNT, EBDA_FD_CYLINDER,
     EBDA_FD_DONE, EBDA_FD_HEAD, EBDA_FD_LENGTH, EBDA_FD_RESULT, EBDA_FD_SECTOR, EBDA_FD_SPT,
-    EBDA_HD_CAPACITY, EBDA_HD_CYLINDERS, EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS,
-    EBDA_LBA_HIGH, EBDA_LBA_LOW, F_AX, F_BX, F_CX, F_DS, F_DX, F_ES, F_SI, Labels, clear_cf,
-    ds_ebda, enter, leave, set_cf,
+    EBDA_HD_CAPACITY, EBDA_HD_CYLINDERS, EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_LEFT,
+    EBDA_HD_SECTORS, EBDA_LBA_HIGH, EBDA_LBA_LOW, F_AX, F_BX, F_CX, F_DS, F_DX, F_ES, F_SI, Labels,
+    clear_cf, ds_ebda, enter, leave, set_cf,
 };
 use crate::fw::asm16::{
     AH, AL, AX, Alu, Asm, BH, BL, BX, CH, CL, CS, CX, Cc, DH, DI, DL, DS, DX, ES, Mem, SI, Shift,
@@ -521,10 +521,12 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.mov(SI, AX);
     a.pop(AX);
     a.pops(DS);
+    let refused = a.label();
+    let short = a.label();
     a.alui(Alu::CMP, SI, 0);
-    a.jcc(Cc::NE, l.disk_fail);
+    a.jcc(Cc::NE, refused);
     a.testi(DX, 0xf000);
-    a.jcc(Cc::NE, l.disk_fail);
+    a.jcc(Cc::NE, refused);
     a.movto(Mem::abs(EBDA_LBA_LOW), BX);
     a.movto(Mem::abs(EBDA_LBA_HIGH), DX);
     a.movsr(ES, AX);
@@ -532,11 +534,26 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.alui(Alu::CMP, CX, 0);
     a.jcc(Cc::E, l.disk_ok);
     a.alui(Alu::CMP, CX, 0x7f);
-    a.jcc(Cc::A, l.disk_fail);
+    a.jcc(Cc::A, refused);
     a.mov8(AL, Mem::abs(EBDA_COMMAND));
     a.call(l.ata_read);
-    a.jcc(Cc::B, l.disk_fail);
-    a.jmp(l.disk_ok);
+    a.jcc(Cc::AE, l.disk_ok);
+    // The transfer stopped short, and the caller is owed how short. Ralf
+    // Brown's Interrupt List, INT 13h AH=42h: "CF set on error ... disk
+    // address packet's block count field set to number of blocks successfully
+    // transferred". A caller that reads a run of blocks and gets carry back
+    // uses that field to know which of them it has; left at the count it
+    // asked for, the field said "all of them".
+    a.alu(Alu::SUB, CX, Mem::abs(EBDA_HD_LEFT));
+    a.jmp(short);
+    // Refused before a sector moved: none were transferred.
+    a.bind(refused);
+    a.movi(CX, 0);
+    a.bind(short);
+    a.movsr(ES, Mem::bp(F_DS));
+    a.mov(DI, Mem::bp(F_SI));
+    a.movto(Mem::di(2).seg(ES), CX);
+    a.jmp(l.disk_fail);
 
     // AH=48h, get drive parameters, into the caller's buffer at DS:SI. The
     // buffer's first word is its size on the way in; EDD 1.1's result is
@@ -640,7 +657,8 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     //
     // AL is the command byte, CX the sector count, ES:BX the buffer, and the
     // LBA is in the EBDA. Carry comes back set if the drive refused or never
-    // answered. `REP INSW` is the transfer: 256 words is one sector, and the
+    // answered, and either way `EBDA_HD_LEFT` holds how many of the sectors
+    // were not transferred. `REP INSW` is the transfer: 256 words is one sector, and the
     // instruction exists precisely for this. A write is the same loop with
     // `REP OUTSW`, which reads `DS:SI` — the one place this handler has to
     // leave the EBDA, and it puts it back.
@@ -654,6 +672,8 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     let finish = a.label();
     let sector = a.label();
     a.movto8(Mem::abs(EBDA_COMMAND), AL);
+    // Nothing has moved yet, so the whole count is what is left.
+    a.movto(Mem::abs(EBDA_HD_LEFT), CX);
     a.call(l.ata_wait_ready);
     a.jcc(Cc::B, fail);
 
@@ -724,9 +744,24 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.in_al_dx();
     a.testi8(AL, 0x21); // ERR | DF
     a.jcc(Cc::NE, fail);
+    a.movmi(Mem::abs(EBDA_HD_LEFT), 0);
     a.clc();
     a.jmp(finish);
     a.bind(fail);
+    // How many sectors did not make it, for a caller that reports how many
+    // did. `CX` is the sectors the loop had not reached. On a read that is
+    // the answer: the block that failed was never handed over. On a write the
+    // drive reports a sector only after it has been given, so the one that
+    // failed is the one just sent, and it is counted back in — unless `CX` is
+    // still the whole count, which means nothing had been sent at all.
+    let counted = a.label();
+    a.alui8(Alu::CMP, Mem::abs(EBDA_COMMAND), 0x30);
+    a.jcc(Cc::NE, counted);
+    a.alu(Alu::CMP, CX, Mem::abs(EBDA_HD_LEFT));
+    a.jcc(Cc::E, counted);
+    a.inc(CX);
+    a.bind(counted);
+    a.movto(Mem::abs(EBDA_HD_LEFT), CX);
     a.stc();
     a.bind(finish);
     a.pop(DI);

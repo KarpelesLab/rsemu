@@ -793,3 +793,49 @@ fn a_write_whose_last_sector_the_drive_refuses_is_reported_as_a_failure() {
     }
     assert_eq!(medium.holds(303), vec![0u8; 512], "the sector that failed");
 }
+
+#[test]
+fn a_short_extended_transfer_says_how_many_blocks_it_moved() {
+    // Ralf Brown's Interrupt List, INT 13h AH=42h: on error, the "disk address
+    // packet's block count field [is] set to number of blocks successfully
+    // transferred". A caller reading a run of blocks uses that to know which
+    // of them it has; left alone, the field says "all of them" about a
+    // transfer that stopped part way.
+    let (m, medium) = short_transfers();
+    let filled = XFER_FILL.to_le_bytes().repeat(256);
+
+    // Four sectors to 300..=303 with 303 refused: three made it.
+    assert!(answer(&m, 0).1);
+    assert_eq!(answer(&m, 0).2, 3, "a write refused on its last sector");
+
+    // Eight to 200..=207 with 203 refused: three made it, and the medium
+    // agrees — the sector the drive refused and everything after it are
+    // untouched.
+    let (ah, carry, count) = answer(&m, 1);
+    assert!(carry && ah != 0, "a write refused in the middle");
+    assert_eq!(count, 3);
+    for lba in 200..203 {
+        assert_eq!(medium.holds(lba), filled, "sector {lba}");
+    }
+    for lba in 203..208 {
+        assert_eq!(medium.holds(lba), vec![0u8; 512], "sector {lba}");
+    }
+
+    // Eight from 100..=107 with 103 unreadable: three arrived.
+    let (ah, carry, count) = answer(&m, 2);
+    assert!(carry && ah != 0, "a read refused in the middle");
+    assert_eq!(count, 3);
+
+    // A transfer that works leaves the count it was given.
+    assert_eq!(answer(&m, 3), (0, false, 4));
+
+    // Off the end of the drive, which the drive refuses before a sector
+    // moves, and a block number the command cannot carry, which the firmware
+    // refuses before the drive hears of it: nothing was transferred.
+    let (_, carry, count) = answer(&m, 4);
+    assert!(carry, "a read past the last sector");
+    assert_eq!(count, 0);
+    let (_, carry, count) = answer(&m, 5);
+    assert!(carry, "a block number above 28 bits");
+    assert_eq!(count, 0);
+}

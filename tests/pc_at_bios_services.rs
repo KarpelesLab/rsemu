@@ -174,6 +174,8 @@ fn an_extended_transfer_beyond_28_bits_is_refused_rather_than_wrapped() {
     const WRITE_BUF: u16 = 0x0e00;
     /// Where block 0 is read back to at the end.
     const CHECK_BUF: u16 = 0x1000;
+    /// Where the block count each refused call left in the packet is kept.
+    const COUNTS: u16 = R + 16;
 
     let (m, _hosts) = run("edd range", |a| {
         for (buffer, fill) in [(READ_BUF, 0x1111u16), (WRITE_BUF, 0xeeee)] {
@@ -197,16 +199,24 @@ fn an_extended_transfer_beyond_28_bits_is_refused_rather_than_wrapped() {
         a.movi(SI, PACKET);
         a.int(0x13);
         record(a, R);
+        a.mov(AX, Mem::abs(PACKET + 2));
+        a.movto(Mem::abs(COUNTS), AX);
 
-        // The same block, written.
+        // The same block, written. The block count is set again before every
+        // call, as a caller has to: a call that fails writes back how many
+        // blocks it transferred, and for a refusal that is none.
+        a.movmi(Mem::abs(PACKET + 2), 1);
         a.movmi(Mem::abs(PACKET + 4), WRITE_BUF);
         a.movi(AX, 0x4300);
         a.movi(DX, 0x0080);
         a.movi(SI, PACKET);
         a.int(0x13);
         record(a, R + 4);
+        a.mov(AX, Mem::abs(PACKET + 2));
+        a.movto(Mem::abs(COUNTS + 2), AX);
 
         // Block 1_0000_0000h: only the high double word is non-zero.
+        a.movmi(Mem::abs(PACKET + 2), 1);
         a.movmi(Mem::abs(PACKET + 4), READ_BUF);
         a.movmi32(Mem::abs(PACKET + 8), 0);
         a.movmi32(Mem::abs(PACKET + 12), 1);
@@ -215,8 +225,11 @@ fn an_extended_transfer_beyond_28_bits_is_refused_rather_than_wrapped() {
         a.movi(SI, PACKET);
         a.int(0x13);
         record(a, R + 8);
+        a.mov(AX, Mem::abs(PACKET + 2));
+        a.movto(Mem::abs(COUNTS + 4), AX);
 
         // And block 0 itself, which must still be what the disk came with.
+        a.movmi(Mem::abs(PACKET + 2), 1);
         a.movmi(Mem::abs(PACKET + 4), CHECK_BUF);
         a.movmi32(Mem::abs(PACKET + 12), 0);
         a.movi(AX, 0x4200);
@@ -235,6 +248,19 @@ fn an_extended_transfer_beyond_28_bits_is_refused_rather_than_wrapped() {
     );
     assert_eq!(peek16(&m, R + 6), 1, "a write to that block succeeded");
     assert_eq!(peek16(&m, R + 10), 1, "block 1_0000_0000h was read");
+    // RBIL, INT 13h AH=42h: on error the "disk address packet's block count
+    // field [is] set to number of blocks successfully transferred" — and a
+    // call refused before it reached the drive transferred none.
+    for (i, what) in ["the read", "the write", "the high-dword read"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            peek16(&m, COUNTS + 2 * i as u16),
+            0,
+            "{what} was refused, and its packet still claims a block"
+        );
+    }
     assert_eq!(peek16(&m, R + 14), 0, "block 0 itself must read");
     assert_eq!(peek16(&m, R + 12) >> 8, 0);
     assert_eq!(
