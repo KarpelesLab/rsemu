@@ -37,10 +37,10 @@ on:
     - cron: '23 5 * * *'
   workflow_dispatch:
     inputs:
-      seconds:
-        description: 'Guest seconds to compare on arm64-virt (default 120)'
+      millis:
+        description: 'Guest milliseconds to compare on arm64-virt and riscv-virt (default 1200)'
         required: false
-        default: '120'
+        default: '1200'
       x86_millis:
         description: 'Guest milliseconds to compare on pc64 (default 200000)'
         required: false
@@ -105,7 +105,16 @@ jobs:
       - name: interpreter against jit and jit-host
         env:
           RSEMU_LONGRUN_REQUIRED: 1
-          RSEMU_LONGRUN_SECONDS: ${{ github.event.inputs.seconds || '120' }}
+          # **Milliseconds, and `_MS`.** This was `RSEMU_LONGRUN_SECONDS` fed
+          # from a `seconds` input defaulting to 120, and it did nothing at
+          # all: `scripts/check.sh long` reads `RSEMU_LONGRUN_MS`, defaults it
+          # to 1200 and hands that to every leg, and `tests/longrun`'s
+          # `budget_millis` lets `_MS` win when both are set. So the dispatch
+          # knob was dead and every run, scheduled or by hand, took the
+          # script's default — the defect the x86 knob below had, one line up
+          # from where it was fixed. The default here is the script's own, so
+          # the nightly runs exactly what it has been running.
+          RSEMU_LONGRUN_MS: ${{ github.event.inputs.millis || '1200' }}
           # `pc64`'s own budget, and it is **milliseconds**: that board measures
           # guest time differently from `arm64-virt` and `scripts/check.sh` says
           # why at length. This used to read `RSEMU_X86_LONGRUN_SECONDS`, which
@@ -181,6 +190,11 @@ jobs:
       - name: install and boot
         env:
           RSEMU_FREEDOS_DIR: testdata/freedos
+          # The test returns early, and passes, when it cannot read the set.
+          # That is right on a pull request and here it would be a sixteen-
+          # minute gate reporting green in a second; this turns it into a
+          # failure, as RSEMU_LONGRUN_REQUIRED does one job up.
+          RSEMU_FREEDOS_REQUIRED: 1
         run: |
           set -uo pipefail
           rc=0
