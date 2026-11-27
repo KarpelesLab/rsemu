@@ -157,6 +157,21 @@ impl State {
             last_fault: 0,
         }
     }
+
+    /// The state a pulse on the reset pin leaves: [`State::new`], with the
+    /// clock still running.
+    ///
+    /// `cycles` is published to the scheduler as this core's free-running
+    /// position in its clock domain, and `debt` is cycles of that domain
+    /// already spent; neither belongs to the program the reset restarts, and
+    /// the domain is not rewound by one.
+    pub(super) fn warm_reset(&self) -> State {
+        State {
+            cycles: self.cycles,
+            debt: self.debt,
+            ..State::new()
+        }
+    }
 }
 
 /// One step's worth of execution, borrowing everything it needs.

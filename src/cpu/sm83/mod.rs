@@ -845,7 +845,7 @@ impl Sm83 {
         let cfg = self.effective_config();
         let mut session = self.session.lock();
         if self.lines.take_reset_request() {
-            session.state = State::new();
+            session.state = session.state.warm_reset();
             if cfg.post_boot {
                 session.state.regs = Regs::post_boot_dmg();
             }
@@ -1125,7 +1125,11 @@ impl Device for Sm83 {
 
     fn reset(&self, kind: ResetKind) {
         let mut session = self.session.lock();
-        session.state = State::new();
+        session.state = if kind == ResetKind::Cold {
+            State::new()
+        } else {
+            session.state.warm_reset()
+        };
         if self.cfg.post_boot {
             session.state.regs = Regs::post_boot_dmg();
         }

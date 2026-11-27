@@ -945,6 +945,43 @@ fn a_line_held_high_across_a_snapshot_requests_nothing_on_restore() {
     assert_eq!(restored.interrupt_flags() & (1 << interrupt::STAT), 0x02);
 }
 
+/// A warm reset restarts the program, not the cycle counter.
+///
+/// `State::cycles` is what the core publishes to its `TickCursor`, and the
+/// scheduler reads that as "monotonic and free-running — the core's
+/// ticks-since-power-on" (`core::sched`), measuring each quantum's progress
+/// as the cursor minus the clock domain's own tick. `Machine::reset` does not
+/// rewind the domain, so a core that zeroed its counter on a warm reset — or
+/// on a pulse of its reset pin — reported no progress inside a quantum until
+/// it had re-run as many cycles as the machine had been up, and every
+/// lazily-advanced device was a whole quantum stale for that long. The 6502
+/// and the Z80 keep theirs across a warm reset; this core did not.
+#[test]
+fn a_warm_reset_keeps_the_cycle_counter_running() {
+    let (cpu, _ram) = cpu_with(&[0x18, 0xfe]); // JR -2
+    for _ in 0..100 {
+        step(&cpu);
+    }
+    let before = cpu.cycles();
+    assert!(before >= 300);
+
+    Device::reset(cpu.as_ref(), ResetKind::Warm);
+    assert_eq!(cpu.cycles(), before, "the reset itself costs nothing");
+    assert_eq!(cpu.regs().pc, 0x0100, "but it did reset");
+    let used = step(&cpu);
+    assert_eq!(cpu.cycles(), before + used);
+
+    // The reset pin is the same event arriving by wire.
+    let before = cpu.cycles();
+    cpu.lines.request_reset();
+    let used = step(&cpu);
+    assert_eq!(
+        cpu.cycles(),
+        before + used,
+        "the pin does not rewind it either"
+    );
+}
+
 #[test]
 fn the_class_constructs_from_properties() {
     let cpu = Sm83::from_props(&Props::new().with("post-boot", false)).expect("valid");
