@@ -321,7 +321,17 @@ impl Blitter {
         if remaining == 0 {
             return 0;
         }
-        remaining * self.cost() as u64 - self.credit as u64
+        // The word in progress lands when its credit reaches the cost, and on
+        // the next count if it already has — `BLTCON0` and `BLTCON1` are
+        // writable while a blit runs, and a rewrite that drops a source makes
+        // the word cheaper than what it has already been charged. Saturating,
+        // deliberately: that case is "overdue", not a wrap.
+        let cost = self.cost() as u64;
+        let first = match cost.saturating_sub(self.credit as u64) {
+            0 => 1,
+            n => n,
+        };
+        first + (remaining - 1) * cost
     }
 
     /// Spend one count. Returns `true` if this count finished the blit.
@@ -665,6 +675,46 @@ mod tests {
         assert_eq!(b.cost(), 4, "B, C and D: eight");
         b.con1 = LINE;
         assert_eq!(b.cost(), 4, "a line pixel: eight");
+    }
+
+    #[test]
+    fn a_cheaper_bltcon0_written_mid_word_does_not_run_the_countdown_below_zero() {
+        // A B+C+D blit is four counts a word. Three counts into its last word
+        // the processor rewrites `BLTCON0` to an A+D blit, two counts a word:
+        // the word is now overdue, and it lands on the very next count.
+        let mut ram = Ram::default();
+        let mut b = Blitter::new();
+        b.con0 = USEB | USEC | USED | 0xcc;
+        b.start_bltsize((1 << 6) | 1);
+        for _ in 0..3 {
+            assert!(!b.tick(&mut ram));
+        }
+        assert_eq!(b.ticks_to_finish(), 1);
+        b.con0 = USEA | USED | 0xf0;
+        assert_eq!(
+            b.ticks_to_finish(),
+            1,
+            "overdue is the next count, not a wrap"
+        );
+        assert!(b.tick(&mut ram), "and the next count does finish it");
+
+        // The same rewrite with words still to come: the overdue word on the
+        // next count, the rest at the new rate.
+        let mut b = Blitter::new();
+        b.con0 = USEB | USEC | USED | 0xcc;
+        b.start_bltsize((1 << 6) | 3);
+        for _ in 0..3 {
+            b.tick(&mut ram);
+        }
+        b.con0 = USEA | USED | 0xf0;
+        let expect = b.ticks_to_finish();
+        assert_eq!(expect, 1 + 2 * 2);
+        let mut n = 0;
+        while b.busy {
+            b.tick(&mut ram);
+            n += 1;
+        }
+        assert_eq!(n, expect, "the forecast is the count it finishes on");
     }
 
     #[test]
