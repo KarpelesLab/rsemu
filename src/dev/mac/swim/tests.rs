@@ -562,3 +562,18 @@ fn a_field_the_chip_writes_reads_back_with_its_crc_clear() {
         .count();
     assert_eq!(others, 0, "the write reached {others} other blocks");
 }
+
+/// The same refusal as the IWM's, and the same one readable sentence.
+#[test]
+fn a_disk_for_a_drive_that_is_not_there_is_refused_in_one_sentence() {
+    use crate::core::props::{Media, Props};
+    let props = Props::new().with("drives", Value::Uint(1)).with(
+        "image2",
+        Value::Media(Media::new("fd1", alloc::vec![0u8; 16])),
+    );
+    let err = Swim::new(&props)
+        .expect_err("one mechanism, and a disk for the second")
+        .to_string();
+    assert!(err.contains("`drives` is 1; a cable"), "{err}");
+    assert!(!err.contains("  "), "no run of spaces: {err}");
+}

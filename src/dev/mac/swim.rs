@@ -335,7 +335,8 @@ impl Swim {
         if let Some(bytes) = image2.filter(|b| !b.is_empty()) {
             if drives < 2 {
                 return Err(Error::Property(alloc::format!(
-                    "property `image2`: there is a disk for the second drive and `drives` is                      {drives}; a cable with one mechanism on it has nowhere to put it"
+                    "property `image2`: there is a disk for the second drive and `drives` is \
+                     {drives}; a cable with one mechanism on it has nowhere to put it"
                 )));
             }
             swim.insert(1, Disk::from_image_for(&bytes, Reader::Swim)?);

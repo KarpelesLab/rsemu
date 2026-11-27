@@ -819,3 +819,20 @@ fn a_write_protected_disk_keeps_its_bytes() {
     let after = iwm.disk(0).expect("a disk");
     assert!(!after.written(), "nothing reached the medium");
 }
+
+/// A disk for a drive the cable does not have is refused in one readable
+/// sentence. (The message once carried a line continuation that had lost its
+/// backslash, and with it twenty-two spaces in the middle.)
+#[test]
+fn a_disk_for_a_drive_that_is_not_there_is_refused_in_one_sentence() {
+    use crate::core::props::Media;
+    let props = Props::new().with("drives", Value::Uint(1)).with(
+        "image2",
+        Value::Media(Media::new("fd1", alloc::vec![0u8; 16])),
+    );
+    let err = Iwm::new(&props)
+        .expect_err("one mechanism, and a disk for the second")
+        .to_string();
+    assert!(err.contains("`drives` is 1; a cable"), "{err}");
+    assert!(!err.contains("  "), "no run of spaces: {err}");
+}
