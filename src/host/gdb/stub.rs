@@ -116,7 +116,9 @@ pub struct Stub {
     query_thread: usize,
     /// The thread `c` and `s` apply to when the packet does not say.
     cont_thread: ThreadSel,
-    /// Ctrl-C arrived while the target was running.
+    /// Ctrl-C arrived and has not been answered yet: either the target is
+    /// running and the next [`Stub::drive`] stops it, or it was stopped and
+    /// the interrupt is queued for the next resume.
     interrupt_pending: bool,
     /// Whether the client said `swbreak+` in its `qSupported`.
     ///
@@ -251,16 +253,18 @@ impl Stub {
                 Outcome::Continue
             }
             Event::Interrupt => {
-                if self.running {
-                    self.interrupt_pending = true;
-                } else {
-                    // Already stopped: GDB still wants to hear about it.
-                    self.last_stop = Stop {
-                        cpu: self.query_thread,
-                        kind: StopKind::Interrupt,
-                    };
-                    self.send_stop(out);
-                }
+                // Running or not, the interrupt is only *noted* here. While
+                // the target runs, `drive` turns it into a stop reply at the
+                // next slice. While it is stopped there is nothing to send:
+                // the client is not waiting for a stop reply, so one sent now
+                // would be read as the answer to whatever it asks next and
+                // every reply after it would be one packet out of step. That
+                // is not a contrived case — it is what happens when the user
+                // presses Ctrl-C in the instant a breakpoint is being
+                // reported. The GDB manual, "Interrupts": "Interrupts received
+                // while the program is stopped are queued and the program will
+                // be interrupted when it is resumed next time."
+                self.interrupt_pending = true;
                 Outcome::Continue
             }
             Event::Packet(payload) => {
@@ -659,8 +663,9 @@ impl Stub {
             return Outcome::Continue;
         }
         target.begin_resume();
+        // `interrupt_pending` is deliberately left alone: one queued while
+        // the target was stopped is owed to this resume, and `drive` pays it.
         self.running = true;
-        self.interrupt_pending = false;
         // No reply: the next thing this connection sends is a stop reply.
         Outcome::Continue
     }
@@ -684,6 +689,18 @@ impl Stub {
     }
 
     fn do_step(&mut self, cpu: usize, target: &mut dyn DebugTarget, out: &mut Vec<u8>) {
+        // A step is a resume, so a queued interrupt is owed to it exactly as
+        // it is to a continue: the stop is reported and nothing runs.
+        if self.interrupt_pending {
+            self.interrupt_pending = false;
+            self.running = false;
+            self.last_stop = Stop {
+                cpu,
+                kind: StopKind::Interrupt,
+            };
+            self.send_stop(out);
+            return;
+        }
         match target.step(cpu) {
             Ok(stop) => {
                 self.running = false;
@@ -758,7 +775,6 @@ impl Stub {
                 self.cont_thread = sel;
                 target.begin_resume();
                 self.running = true;
-                self.interrupt_pending = false;
             }
             Some((b't', _)) => {
                 self.running = false;
@@ -1779,6 +1795,51 @@ mod tests {
         stub.drive(&mut target, &mut out);
         assert_eq!(payload(&String::from_utf8_lossy(&out)), "T02thread:1;");
         assert!(!stub.is_running());
+    }
+
+    /// The GDB manual, "Interrupts": "Interrupts received while the program
+    /// is stopped are queued and the program will be interrupted when it is
+    /// resumed next time."
+    ///
+    /// The stub used to answer one with a stop reply on the spot. The client
+    /// was not waiting for one, so it took it for the answer to its next
+    /// packet — here a `g` — and every reply after that was one out of step.
+    #[test]
+    fn ctrl_c_while_stopped_is_queued_rather_than_answered() {
+        let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
+        let mut out = Vec::new();
+        stub.on_event(Event::Interrupt, &mut target, &mut out);
+        assert!(out.is_empty(), "nobody asked: {out:?}");
+        // The next request gets its own reply and nothing else.
+        assert_eq!(ask(&mut stub, &mut target, b"g"), "+$112200c0#b9");
+
+        // And the interrupt is owed to the next resume: no slice runs.
+        assert_eq!(ask(&mut stub, &mut target, b"c"), "+");
+        assert!(stub.is_running());
+        let mut out = Vec::new();
+        stub.drive(&mut target, &mut out);
+        assert_eq!(payload(&String::from_utf8_lossy(&out)), "T02thread:1;");
+        assert!(!stub.is_running());
+        assert_eq!(target.resumed, 0, "interrupted before it ran");
+
+        // Paid once. The continue after that runs.
+        assert_eq!(ask(&mut stub, &mut target, b"c"), "+");
+        let mut out = Vec::new();
+        stub.drive(&mut target, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(target.resumed, 1);
+    }
+
+    #[test]
+    fn a_queued_ctrl_c_interrupts_a_step_too() {
+        let (mut stub, mut target) = (Stub::new(), FakeTarget::new());
+        let mut out = Vec::new();
+        stub.on_event(Event::Interrupt, &mut target, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(payload(&ask(&mut stub, &mut target, b"s")), "T02thread:1;");
+        assert_eq!(target.steps, 0, "a step is a resume");
+        assert_eq!(payload(&ask(&mut stub, &mut target, b"s")), "T05thread:1;");
+        assert_eq!(target.steps, 1);
     }
 
     #[test]
