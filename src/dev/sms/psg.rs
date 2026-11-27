@@ -229,6 +229,16 @@ impl Engine {
     /// One internal step: every counter, and the flip-flops they drive.
     fn step(&mut self) {
         for channel in 0..3 {
+            // "If the register value is zero or one then the output is a
+            // constant value of +1. This is often used for sample playback on
+            // the SN76489" (SMS Power, *SN76489*, "Tone channels"). The
+            // counter is left at zero, so a real period written later starts
+            // on the next step.
+            if self.tone[channel] & 0x3ff <= 1 {
+                self.output[channel] = true;
+                self.counter[channel] = 0;
+                continue;
+            }
             if self.counter[channel] == 0 {
                 self.counter[channel] = self.period(channel);
                 self.output[channel] = !self.output[channel];

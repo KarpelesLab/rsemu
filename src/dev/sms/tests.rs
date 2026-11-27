@@ -537,6 +537,31 @@ fn the_noise_register_shifts_once_for_every_two_counter_reloads() {
 }
 
 #[test]
+fn a_tone_period_of_zero_or_one_holds_the_output_high() {
+    // SMS Power, *SN76489*, "Tone channels": "If the register value is zero or
+    // one then the output is a constant value of +1. This is often used for
+    // sample playback on the SN76489." A driver doing that modulates the
+    // volume register over a flat output; a flip-flop toggling on every
+    // internal step turned its samples into alternating signs.
+    for period in [0u8, 1] {
+        let psg = SmsPsg::new();
+        psg.set_recording(true);
+        psg.write(0x80 | period); // channel 0 tone, low nibble
+        psg.write(0x00); // high bits zero
+        psg.write(0x90); // channel 0 at full volume
+        psg.advance_by(SAMPLE_DIVISOR * 64);
+        let samples = psg.take_samples();
+        assert_eq!(samples.len(), 64);
+        let first = samples[0].0;
+        assert!(first > 0, "period {period}: the level is +1, got {first}");
+        assert!(
+            samples.iter().all(|&(l, r)| l == first && r == first),
+            "period {period}: and it does not move"
+        );
+    }
+}
+
+#[test]
 fn a_silent_chip_produces_a_flat_line_and_a_loud_one_does_not() {
     let psg = SmsPsg::new();
     psg.set_recording(true);
