@@ -623,6 +623,83 @@ fn the_harness_reads_the_register_file_and_the_frame_counter() {
     );
 }
 
+/// A ROM that measures the distance from the mode-0 `STAT` interrupt of line
+/// `$41` to the `LY` increment, the way Gekkio's `ppu/hblank_ly_scx_timing`
+/// does: take the interrupt out of `HALT`, wait `nops` machine cycles in the
+/// handler, read `LY` into `B`, and mark the end with `C = $99`.
+fn hblank_to_ly_rom(scx: u8, nops: usize) -> Vec<u8> {
+    let program: &[u8] = &[
+        0xf3, // DI
+        0x31, 0xfe, 0xff, // LD SP,$fffe
+        0x3e, scx, 0xe0, 0x43, // LD A,scx ; LDH (SCX),A
+        0x3e, 0x08, 0xe0, 0x41, // LD A,$08 ; LDH (STAT),A   mode-0 interrupt
+        0x3e, 0x02, 0xe0, 0xff, // LD A,$02 ; LDH (IE),A     STAT only
+        0x21, 0x44, 0xff, // LD HL,$ff44
+        0xf0, 0x44, 0xfe, 0x41, 0x20, 0xfa, // wait: LDH A,(LY) ; CP $41 ; JR NZ,wait
+        0xaf, 0xe0, 0x0f, // XOR A ; LDH (IF),A
+        0xfb, // EI
+        0x76, // HALT
+        0x00, // NOP
+        0x18, 0xfe, // JR -2
+    ];
+    let mut rom = super::cart::synthetic_image(2, 0x00, 0x00, program);
+    // The STAT vector, $0048: the NOPs, then the read.
+    let at = 0x48 + nops;
+    rom[at..at + 6].copy_from_slice(&[
+        0x7e, // LD A,(HL)
+        0x47, // LD B,A
+        0x0e, 0x99, // LD C,$99
+        0x18, 0xfe, // JR -2
+    ]);
+    rom
+}
+
+#[test]
+fn the_mode_0_interrupt_reaches_the_cpu_on_the_machine_cycle_it_rises_in() {
+    // Pan Docs, *Rendering*, "Mode 3 length": "Background scrolling: At the
+    // very beginning of Mode 3, rendering is paused for SCX % 8 dots while the
+    // same number of pixels are discarded from the leftmost tile." So mode 0,
+    // and the STAT interrupt with it, begins `SCX % 8` dots later, and `LY`
+    // increments that much sooner after it.
+    //
+    // The CPU can only see that in whole machine cycles, and Gekkio's
+    // `ppu/hblank_ly_scx_timing-GS` (MIT; "Verified results: pass: DMG, MGB,
+    // SGB, SGB2") tabulates what it sees: "(SCX mod 8) = 0 => LY increments 51
+    // cycles after STAT interrupt; 1-4 => 50 cycles; 5-7 => 49 cycles". Its
+    // handler reads `LY` 47+N cycles after the interrupt, and the read first
+    // shows the new line at N = 3, 2 and 1 respectively. The ROM above is the
+    // same measurement with the handler's fixed delay written as 41 NOPs.
+    //
+    // 1-4 and 5-7 are the interrupt rising part-way through a machine cycle
+    // and being taken at the end of it. It was being taken at the *start*: a
+    // round that ends on the PPU's event delivers the event with the CPU still
+    // standing on the cycle boundary before it, up to three dots in the past,
+    // so every `SCX % 8` but 0 and 4 came out a cycle early.
+    for scx in 0..=8u8 {
+        let first_new = match scx & 7 {
+            0 => 3,
+            1..=4 => 2,
+            _ => 1,
+        };
+        for (n, want) in [(first_new - 1, 0x41u8), (first_new, 0x42)] {
+            let rom = hblank_to_ly_rom(scx, 41 + n);
+            let mut machine = machine_for(&rom).expect("the shipped machine builds");
+            machine.reset(crate::core::device::ResetKind::Cold);
+            let done = run(&mut machine, 8, |m| {
+                verdict_registers(m).is_some_and(|r| r[1] == 0x99)
+            });
+            assert!(done, "SCX={scx} N={n}: the handler never ran");
+            let ly = verdict_registers(&machine).expect("the register file")[0];
+            assert_eq!(
+                ly,
+                want,
+                "SCX={scx}: LY read {} cycles after the interrupt",
+                47 + n
+            );
+        }
+    }
+}
+
 #[test]
 fn only_the_dmg_variants_of_the_suite_are_selected() {
     assert!(targets_dmg("acceptance/timer/tim00.gb"));

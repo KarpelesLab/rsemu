@@ -1113,10 +1113,31 @@ impl fmt::Debug for Shared {
 }
 
 impl Shared {
+    /// Republish the tick and the next event for the lock-free lazy surface.
+    ///
+    /// The event is reported on the **machine-cycle grid**: the first multiple
+    /// of four dots at or after the boundary, not the boundary itself. Nearly
+    /// every boundary is on the grid already; the end of mode 3 is the one
+    /// that is not, because `SCX & 7` and the object penalties move it by
+    /// single dots.
+    ///
+    /// The only thing that can observe this chip is the CPU, and it looks once
+    /// per machine cycle, so between two grid points nothing is observable and
+    /// the grid point is where the change *becomes* so. Reporting the dot
+    /// itself is not merely early by nothing: a scheduling round that ends on
+    /// a device's event delivers it there (`Scheduler::sync_lazy_devices`,
+    /// "The event a round ended on"), with the CPU still standing on the cycle
+    /// boundary before it. The `STAT` line then rose up to three dots in the
+    /// CPU's future and the CPU took the interrupt a whole cycle early —
+    /// which is exactly the table Gekkio's `ppu/hblank_ly_scx_timing`
+    /// measures, and every `SCX & 7` but 0 and 4 failed it.
+    ///
+    /// The dot pipeline itself is untouched: the chip still passes through the
+    /// boundary on its own dot, on the way to the grid point.
     fn publish(&self, engine: &Engine) {
         self.dots.store(engine.dots, Ordering::Relaxed);
         let event = match engine.next_boundary() {
-            Some(delta) => engine.dots + delta,
+            Some(delta) => (engine.dots + delta).next_multiple_of(CLOCKS_PER_MCYCLE),
             None => u64::MAX,
         };
         self.next_event.store(event, Ordering::Relaxed);
