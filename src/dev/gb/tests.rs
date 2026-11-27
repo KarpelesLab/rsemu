@@ -1181,6 +1181,37 @@ fn a_dmg_keeps_its_length_timers_through_a_power_down() {
 }
 
 #[test]
+fn a_channel_whose_dac_is_off_adds_nothing_to_the_mix() {
+    // Pan Docs, *Audio details*, "DACs": "If a DAC is disabled, it fades to an
+    // analog value of 0, which corresponds to 'digital 7.5'." A silent channel
+    // behind a *live* DAC is something else — "a disabled channel outputs 0,
+    // which an enabled DAC will dutifully convert into 'analog 1'" — and the
+    // mixer treated the two alike, so a unit with every DAC off sat at
+    // negative full scale instead of at rest.
+    let apu = GbApu::new();
+    apu.set_recording(true);
+    apu.write_register(0x16, 0x80); // power
+    apu.write_register(0x14, 0x77); // NR50: both sides at full volume
+    apu.write_register(0x15, 0xff); // NR51: every channel to both sides
+    apu.advance_to(super::apu::SAMPLE_DIVISOR * 4);
+    assert!(
+        apu.take_samples().iter().all(|&frame| frame == (0, 0)),
+        "four DACs that are off are four analogue zeroes"
+    );
+
+    // One DAC on, its channel not triggered: a steady, non-zero level.
+    apu.write_register(0x07, 0xf0); // NR22
+    apu.advance_to(super::apu::SAMPLE_DIVISOR * 8);
+    let frames = apu.take_samples();
+    assert!(frames.iter().all(|&frame| frame == frames[0]));
+    assert_ne!(
+        frames[0],
+        (0, 0),
+        "an enabled DAC converts digital 0 as well"
+    );
+}
+
+#[test]
 fn powering_down_zeroes_everything_except_the_wave_ram() {
     let apu = GbApu::new();
     apu.write_register(0x16, 0x80);

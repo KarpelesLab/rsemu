@@ -551,15 +551,23 @@ impl Engine {
         if !self.powered {
             return (0, 0);
         }
+        // Each channel's digital output, or `None` where its DAC is off.
+        // The two are not the same silence: "If a DAC is disabled, it fades to
+        // an analog value of 0", whereas "a disabled channel outputs 0, which
+        // an enabled DAC will dutifully convert" to one end of its range
+        // (Pan Docs, *Audio details*, "DACs").
         let outs = [
-            self.ch1.output(),
-            self.ch2.output(),
-            self.ch3.output(),
-            self.ch4.output(),
+            self.ch1.envelope.dac_on().then(|| self.ch1.output()),
+            self.ch2.envelope.dac_on().then(|| self.ch2.output()),
+            self.ch3.dac.then(|| self.ch3.output()),
+            self.ch4.envelope.dac_on().then(|| self.ch4.output()),
         ];
         let mut right = 0i32;
         let mut left = 0i32;
         for (i, out) in outs.iter().enumerate() {
+            let Some(out) = out else {
+                continue;
+            };
             // A digital 0-15 becomes -15..+15 around the DAC's midpoint.
             let signed = i32::from(*out) * 2 - 15;
             if self.nr51 & (1 << i) != 0 {
