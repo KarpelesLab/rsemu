@@ -1567,8 +1567,35 @@ impl<'a> Exec<'a> {
             // register — so it retires rather than stalling, which is always
             // an architecturally legal wake-up and cannot deadlock a guest
             // whose `SEV` would come from a core that does not exist here.
+            //
+            // Which is also why `SCTLR_EL1.nTWE` has nothing to trap: the
+            // control applies "if the instruction would otherwise have caused
+            // the PE to enter a low-power state" (DDI 0487C.a D10.2.100), and
+            // this one never does — "the traps on WFE of WFI are not
+            // guaranteed to be taken ... The only guarantee is that if the
+            // instruction does not complete in finite time in the absence of
+            // a Wakeup event, the trap will be taken."
             Op::Wfe => {}
-            Op::Wfi => self.st.wfi = true,
+            // `WFI` does wait, so EL0's is EL1's to allow. DDI 0487C.a C6.2:
+            // "if !InterruptPending() then if PSTATE.EL == EL0 then
+            // AArch64.CheckForWFxTrap(EL1, FALSE); ... WaitForInterrupt();",
+            // where the trap is taken when "SCTLR[].nTWI == '0'". The
+            // syndrome is `AArch64.WFxTrap`'s: "exception.syndrome<24:20> =
+            // ConditionSyndrome(); exception.syndrome<0> = if is_wfe then '1'
+            // else '0';" — `CV` set and `COND` 0b1110 from AArch64 — and the
+            // preferred return is the `WFI` itself.
+            Op::Wfi => {
+                let pending = self.lines.pending() != 0 || self.timer_irq();
+                if !pending && self.st.sys.el == El::El0 && self.st.sys.sctlr & sctlr::NTWI == 0 {
+                    return Err(Trap {
+                        ec: ec::WF,
+                        iss: (1 << 24) | (0b1110 << 20),
+                        far: None,
+                        advance: false,
+                    });
+                }
+                self.st.wfi = true;
+            }
             // A barrier is the guest asking for ordering **stronger than its
             // own baseline**, so "this core completes every access before the
             // next" does not answer it. It answers the emulator's half: the

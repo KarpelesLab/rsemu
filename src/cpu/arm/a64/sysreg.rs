@@ -94,8 +94,7 @@ pub mod daif {
 pub mod ec {
     /// Unknown reason — an `UNDEFINED` instruction, among others.
     pub const UNKNOWN: u64 = 0x00;
-    /// A trapped `WFI` or `WFE`. Not raised here; named because the bit
-    /// pattern is easy to confuse with `UNKNOWN`.
+    /// A trapped `WFI` or `WFE`: an EL0 `WFI` with `SCTLR_EL1.nTWI` clear.
     pub const WF: u64 = 0x01;
     /// An access to SIMD or floating-point functionality that `CPACR_EL1.FPEN`
     /// traps.
@@ -579,6 +578,9 @@ pub mod sctlr {
     pub const I: u64 = 1 << 12;
     /// `UCT`: EL0 may read `CTR_EL0`. Clear, the read traps to EL1.
     pub const UCT: u64 = 1 << 15;
+    /// `nTWI`: EL0 may execute `WFI`. Clear, a `WFI` that would have waited
+    /// traps to EL1.
+    pub const NTWI: u64 = 1 << 16;
     /// `UCI`: EL0 may execute the cache maintenance instructions `DC CVAU`,
     /// `DC CVAC`, `DC CIVAC` and `IC IVAU`. Clear, they trap to EL1.
     pub const UCI: u64 = 1 << 26;

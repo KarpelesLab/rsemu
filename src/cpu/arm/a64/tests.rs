@@ -3940,6 +3940,56 @@ fn at_el0_with_sctlr(word: u32, sctlr_value: u64) -> (u64, u64) {
     (h.cpu.pc(), h.cpu.sysregs().esr_el1)
 }
 
+/// `WFI` at EL0 traps to EL1 unless `SCTLR_EL1.nTWI` lets it through.
+///
+/// DDI 0487C.a D10.2.100, `SCTLR_EL1.nTWI`: "0 Any attempt to execute a WFI
+/// instruction at EL0 is trapped EL1, if the instruction would otherwise have
+/// caused the PE to enter a low-power state. 1 This control does not cause
+/// any instructions to be trapped." C6.2 `WFI`: "if !InterruptPending() then
+/// if PSTATE.EL == EL0 then AArch64.CheckForWFxTrap(EL1, FALSE); ...
+/// WaitForInterrupt();", and `AArch64.WFxTrap`: "exception.syndrome<24:20> =
+/// ConditionSyndrome(); exception.syndrome<0> = if is_wfe then '1' else '0';"
+/// with a preferred return of `ThisInstrAddr()`.
+///
+/// The bit was not looked at, so a kernel that clears it — to keep a user
+/// program from parking the processor, or to see it try — got neither.
+#[test]
+fn el0_wfi_follows_sctlr_ntwi() {
+    use super::sysreg::sctlr;
+    const WFI: u32 = 0xd503_207f;
+    let run = |sctlr_value: u64, el: El| {
+        let h = Harness::a53(&[WFI]);
+        let mut regs = h.cpu.sysregs();
+        regs.vbar_el1 = 0x4000;
+        regs.el = el;
+        regs.spsel = el != El::El0;
+        regs.sctlr = sctlr_value;
+        h.cpu.set_sysregs(regs);
+        h.steps(1);
+        (h.cpu.pc(), h.cpu.sysregs(), h.cpu.is_waiting())
+    };
+    // Clear: trapped, with the trapped instruction as the return address.
+    let (pc, regs, waiting) = run(0, El::El0);
+    assert_eq!(pc, 0x4400, "a synchronous exception from a lower level");
+    assert!(!waiting, "and the core did not go to sleep");
+    assert_eq!(regs.esr_el1 >> 26, ec::WF);
+    assert_eq!((regs.esr_el1 >> 25) & 1, 1, "IL: a 32-bit instruction");
+    assert_eq!(
+        regs.esr_el1 & 0x01ff_ffff,
+        (1 << 24) | (0b1110 << 20),
+        "CV set, COND 0b1110, TI 0 for WFI"
+    );
+    assert_eq!(regs.elr_el1, 0, "the WFI itself");
+    // Set: an ordinary WFI, which stalls.
+    let (pc, _, waiting) = run(sctlr::NTWI, El::El0);
+    assert_eq!(pc, 4);
+    assert!(waiting);
+    // The control is EL0's: EL1 waits whatever the bit says.
+    let (pc, _, waiting) = run(0, El::El1);
+    assert_eq!(pc, 4);
+    assert!(waiting);
+}
+
 /// DDI 0487C.a C5.1.4, table C5-1: `IC IVAU` and `DC CVAU`/`CVAC`/`CIVAC` are,
 /// "When SCTLR_EL1.UCI == 1, accessible from EL0 or higher". D1.15.2: with
 /// `UCI` clear, "any attempt to execute a cache maintenance instruction at EL0
