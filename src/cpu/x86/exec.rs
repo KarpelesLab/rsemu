@@ -2548,7 +2548,11 @@ impl<'a> Exec<'a> {
 
     /// Read one operand at `size` bytes.
     pub(super) fn read_arg(&mut self, f: &Fields, arg: Arg, size: u8) -> Ex<u64> {
-        let regs = self.state.regs;
+        // Borrowed, not copied: the register file is a couple of hundred
+        // bytes and this is called for every operand of every instruction.
+        // The arms that go on to touch memory take `&mut self` and read no
+        // register afterwards, so the borrow has ended by then.
+        let regs = &self.state.regs;
         let rex = f.has_rex();
         let value = match arg {
             // `Ey` is `Ev` with its width taken from `REX.W` rather than from

@@ -2443,8 +2443,10 @@ impl Lines {
         if !self.has_intc.load(Ordering::Relaxed) {
             return None;
         }
-        let peer = self.intc.lock().clone();
-        peer.and_then(|weak| weak.upgrade())
+        // Upgraded under the lock rather than from a clone of the `Weak`: the
+        // upgrade is a reference count and calls nothing, and this runs once
+        // per guest instruction on every machine with a local APIC.
+        self.intc.lock().as_ref().and_then(Weak::upgrade)
     }
 
     /// Ask this core's controller what it has, and fold it into the latches.
@@ -3412,11 +3414,14 @@ impl X86 {
         // becomes execution state, and it happens before the step so a pulse is
         // honoured at the very next instruction boundary.
         state.reset_pending |= reset;
-        let Some(memory) = memory.clone() else {
+        // Borrowed out of the session, not cloned: the lock is held for the
+        // whole step, so neither space can be detached underneath it, and a
+        // clone here was two reference-count round trips -- four locked
+        // read-modify-writes -- per guest instruction.
+        let Some(memory) = memory.as_deref() else {
             return (0, None);
         };
-        let io = io.clone();
-        let mut exec = Exec::new(state, &memory, io.as_deref(), &cfg, &self.lines)
+        let mut exec = Exec::new(state, memory, io.as_deref(), &cfg, &self.lines)
             .with_position(position.as_ref())
             .with_host(host);
         let used = exec.step();
