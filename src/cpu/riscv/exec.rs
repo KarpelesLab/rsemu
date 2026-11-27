@@ -170,6 +170,9 @@ pub(super) struct Exec<'a> {
     /// The cost on the load path is a null test against a niche-packed
     /// reference, ahead of the watch's own disarmed test.
     spin: Option<&'a mut Watch>,
+    /// The hart's decode memo, when the borrow was lent one
+    /// ([`Exec::with_decode`]).
+    decode: Option<&'a mut isa::DecodeCache>,
     /// This hart's slot in the space's global exclusive monitor, if it has
     /// one.
     ///
@@ -286,7 +289,17 @@ impl<'a> Exec<'a> {
             wrote_n: 0,
             wrote_instret: false,
             timing: &NOTHING_SCHEDULED,
+            decode: None,
         }
+    }
+
+    /// Lend this borrow the hart's decode memo ([`isa::DecodeCache`]).
+    ///
+    /// A builder for the reason [`Exec::with_spin`] is one. A borrow without
+    /// it decodes from the tables every time, which is the same answer.
+    pub(super) fn with_decode(mut self, decode: &'a mut isa::DecodeCache) -> Exec<'a> {
+        self.decode = Some(decode);
+        self
     }
 
     /// Lend this borrow the scheduler's wiring: the cursor this hart
@@ -1142,7 +1155,11 @@ impl<'a> Exec<'a> {
             if !self.cfg.ext.c {
                 return Err(Trap::illegal(u64::from(low)));
             }
-            let word = isa::expand(low, self.cfg.xlen).ok_or(Trap::illegal(u64::from(low)))?;
+            let expanded = match self.decode.as_deref_mut() {
+                Some(memo) => memo.expand(low, self.cfg.xlen),
+                None => isa::expand(low, self.cfg.xlen),
+            };
+            let word = expanded.ok_or(Trap::illegal(u64::from(low)))?;
             return Ok((word, u64::from(low), 2));
         }
         let high = self.read_once(pc.wrapping_add(2), Width::U16, Access::Fetch)? as u16;
@@ -1390,7 +1407,11 @@ impl<'a> Exec<'a> {
         let (word, encoding, len) = self.fetch()?;
         self.next_pc = self.this_pc.wrapping_add(len);
 
-        let insn = isa::decode(word, self.cfg.xlen).ok_or(Trap::illegal(encoding))?;
+        let insn = match self.decode.as_deref_mut() {
+            Some(memo) => memo.decode(word, self.cfg.xlen),
+            None => isa::decode(word, self.cfg.xlen),
+        }
+        .ok_or(Trap::illegal(encoding))?;
         if !self.has(insn.ext) {
             return Err(Trap::illegal(encoding));
         }

@@ -41,6 +41,7 @@
 //! `SFENCE.VMA`. Field positions and immediate scrambles are transcribed from
 //! the instruction-format figures in Volume I.
 
+use alloc::vec::Vec;
 use core::fmt;
 
 /// The register width a core is configured for.
@@ -550,6 +551,130 @@ pub fn decode(word: u32, xlen: Xlen) -> Option<&'static Insn> {
         i += 1;
     }
     None
+}
+
+/// Which question a [`Decoded`] slot holds the answer to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// The slot is empty.
+    Nothing,
+    /// [`decode`], of a 32-bit word.
+    Word,
+    /// [`expand`], of a halfword.
+    Half,
+}
+
+/// One remembered answer of a [`DecodeCache`].
+#[derive(Debug, Clone, Copy)]
+struct Decoded {
+    /// The encoding asked about: a 32-bit word, or a halfword in the low
+    /// sixteen bits.
+    raw: u32,
+    /// Which of the two questions this slot answers, or [`Asked::Nothing`].
+    ///
+    /// Part of the key. An interpreter only ever asks [`expand`] about a
+    /// halfword whose low two bits are not `11` and [`decode`] about a word
+    /// whose low two bits are, so its two kinds of key never coincide — but
+    /// nothing stops another caller asking about `0x3073` as a halfword and
+    /// then as `csrrc`, and the second answer must not be the first's.
+    asked: Asked,
+    /// For a halfword, what [`expand`] made of it; `None` is "reserved".
+    word: Option<u32>,
+    /// For a word, the row [`decode`] found; `None` is "not an instruction".
+    insn: Option<&'static Insn>,
+}
+
+/// A memo of [`decode`] and [`expand`], for an interpreter that asks both of
+/// them about the same few hundred encodings millions of times.
+///
+/// Both are **pure functions** of the encoding and the register width: a scan
+/// of [`TABLE`] within an opcode's rows, and for a compressed instruction a
+/// scan of [`CTABLE`], an immediate unscrambled out of it, and then the first
+/// scan again on the result. So the answer for an encoding can be remembered
+/// against the encoding itself — not against an address, which is what makes
+/// this indifferent to self-modifying code, to paging, and to everything else
+/// that can change what is *at* a program counter. A guest that rewrites an
+/// instruction fetches different bits, and different bits are a different key.
+///
+/// Direct-mapped, [`DecodeCache::SLOTS`] entries, allocated on first use.
+/// Derived state: never serialized, and safe to drop at any moment.
+#[derive(Debug, Default)]
+pub struct DecodeCache {
+    slots: Vec<Decoded>,
+    /// The width the remembered answers were computed for.
+    xlen: Option<Xlen>,
+}
+
+impl DecodeCache {
+    /// How many encodings are remembered. A power of two, because the index
+    /// is a mask.
+    pub const SLOTS: usize = 1024;
+
+    /// An empty memo.
+    #[must_use]
+    pub const fn new() -> DecodeCache {
+        DecodeCache {
+            slots: Vec::new(),
+            xlen: None,
+        }
+    }
+
+    /// The slot an encoding lives in, with the memo made ready for `xlen`.
+    #[inline]
+    fn slot(&mut self, raw: u32, xlen: Xlen) -> &mut Decoded {
+        if self.xlen != Some(xlen) || self.slots.is_empty() {
+            self.reset(xlen);
+        }
+        // A multiplicative hash, so that the opcode and the register fields —
+        // the bits that vary least and most — both reach the index.
+        let index = (raw.wrapping_mul(0x9e37_79b9) >> 22) as usize & (Self::SLOTS - 1);
+        &mut self.slots[index]
+    }
+
+    fn reset(&mut self, xlen: Xlen) {
+        self.slots.clear();
+        self.slots.resize(
+            Self::SLOTS,
+            Decoded {
+                raw: 0,
+                asked: Asked::Nothing,
+                word: None,
+                insn: None,
+            },
+        );
+        self.xlen = Some(xlen);
+    }
+
+    /// [`decode`], remembered.
+    #[inline]
+    pub fn decode(&mut self, word: u32, xlen: Xlen) -> Option<&'static Insn> {
+        let slot = self.slot(word, xlen);
+        if !(slot.asked == Asked::Word && slot.raw == word) {
+            *slot = Decoded {
+                raw: word,
+                asked: Asked::Word,
+                word: None,
+                insn: decode(word, xlen),
+            };
+        }
+        slot.insn
+    }
+
+    /// [`expand`], remembered.
+    #[inline]
+    pub fn expand(&mut self, half: u16, xlen: Xlen) -> Option<u32> {
+        let raw = u32::from(half);
+        let slot = self.slot(raw, xlen);
+        if !(slot.asked == Asked::Half && slot.raw == raw) {
+            *slot = Decoded {
+                raw,
+                asked: Asked::Half,
+                word: expand(half, xlen),
+                insn: None,
+            };
+        }
+        slot.word
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,5 +1423,64 @@ mod tests {
         assert!(is_32bit(0x0033));
         assert!(!is_32bit(0x0001));
         assert!(!is_32bit(0x4000));
+    }
+
+    /// The same row, compared by identity rather than by value.
+    fn same(a: Option<&'static Insn>, b: Option<&'static Insn>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => core::ptr::eq(a, b),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn the_memo_expands_every_halfword_as_the_table_does() {
+        // All 65 536 of them, on both widths, in one memo — sixty-four times
+        // its size, so every slot is evicted over and over — and each asked
+        // twice, so both the fill and the hit are checked.
+        let mut memo = DecodeCache::new();
+        for xlen in [Xlen::Rv64, Xlen::Rv32, Xlen::Rv64] {
+            for half in 0..=u16::MAX {
+                assert_eq!(memo.expand(half, xlen), expand(half, xlen), "{half:#06x}");
+                assert_eq!(memo.expand(half, xlen), expand(half, xlen), "{half:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_memo_decodes_words_as_the_table_does() {
+        // Every row's own encoding with its free bits walked, every expansion
+        // of a compressed instruction, and a run of words that are nothing —
+        // interleaved with halfwords, which share the slots.
+        let mut memo = DecodeCache::new();
+        let mut words: Vec<u32> = Vec::new();
+        for insn in TABLE {
+            for free in [0u32, 0x5555_5555, 0xaaaa_aaaa, u32::MAX, 0x0123_4567] {
+                words.push(insn.bits | (free & !insn.mask));
+            }
+        }
+        for half in (0..=u16::MAX).step_by(7) {
+            if let Some(word) = expand(half, Xlen::Rv64) {
+                words.push(word);
+            }
+        }
+        for n in 0..4096u32 {
+            words.push(n.wrapping_mul(0x9e37_79b9) | 3);
+        }
+        for xlen in [Xlen::Rv64, Xlen::Rv32] {
+            for (n, word) in words.iter().copied().enumerate() {
+                assert!(
+                    same(memo.decode(word, xlen), decode(word, xlen)),
+                    "{word:#010x} on {xlen:?}"
+                );
+                let half = (n as u16).wrapping_mul(0x9e37);
+                assert_eq!(memo.expand(half, xlen), expand(half, xlen));
+                assert!(
+                    same(memo.decode(word, xlen), decode(word, xlen)),
+                    "{word:#010x} on {xlen:?}, asked again"
+                );
+            }
+        }
     }
 }

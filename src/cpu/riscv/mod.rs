@@ -456,6 +456,11 @@ struct Session {
     /// and a snapshot restore replaces it again, and neither must unplug a
     /// detector the machine attached.
     spin: spin::Watch,
+    /// What the interpreter has decoded lately, keyed on the encoding
+    /// ([`isa::DecodeCache`]). Derived state, and unlike the TLB it is about
+    /// no address space and no guest state at all, so nothing ever has to
+    /// flush it.
+    decode: isa::DecodeCache,
     /// The translation runtime, on a hart configured for it.
     ///
     /// Built on the first run rather than in `new`, because `new` performs no
@@ -549,6 +554,7 @@ impl Hart {
                     space: None,
                     monitor: None,
                     time_src: None,
+                    decode: isa::DecodeCache::new(),
                     timing: Timing::default(),
                     spin: spin::Watch::new(cfg.requester),
                     #[cfg(all(feature = "cpu-riscv-lift", feature = "jit"))]
@@ -984,6 +990,7 @@ impl Hart {
             time_src,
             timing,
             spin,
+            decode,
             ..
         } = &mut *session;
         if let Some(timer) = time_src {
@@ -1004,7 +1011,8 @@ impl Hart {
             monitor.as_ref(),
         )
         .with_timing(timing)
-        .with_spin(spin);
+        .with_spin(spin)
+        .with_decode(decode);
         let used = exec.step();
         (used, exec.take_exit())
     }
@@ -1055,6 +1063,7 @@ impl Hart {
                 timing,
                 spin,
                 jit,
+                ..
             } = &mut *session;
             if let Some(timer) = time_src {
                 state.csrs.mtime = timer.load(Ordering::Relaxed);
