@@ -325,6 +325,11 @@ impl<'a> Exec<'a> {
         self.used += 1;
         self.state.cycles = self.state.cycles.wrapping_add(1);
         self.publish();
+        // The clock has not stopped, so the `/NMI` edge detector is still
+        // being clocked — and it has to be, because NMI is one of the three
+        // things that end a `WAI`, and a wired NMI is a level on the pin until
+        // this turns it into a request for `wake` to find.
+        self.lines.sample_nmi();
     }
 
     /// Whether an interrupt line has released a `WAI`, latching what to do next.

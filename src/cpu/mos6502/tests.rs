@@ -2201,6 +2201,35 @@ fn properties_name_the_part_and_default_its_adder() {
 }
 
 #[test]
+fn wai_is_released_by_the_nmi_pin_and_not_only_by_a_pulse() {
+    // Bruce Clark, *65C02 Opcodes* (6502.org), "Additional WDC 65C02
+    // instructions": "WAI puts the 65C02 into a low power sleep state until a
+    // hardware interrupt occurs, i.e. an IRQ, NMI, or RESET."
+    //
+    // A wired NMI arrives as a level on the pin, and the edge detector that
+    // turns it into a request is clocked once per cycle. The stall cycle did
+    // not clock it, so a waiting core never saw the edge: `pulse_nmi` samples
+    // by itself, which is the only reason any test ever woke one this way.
+    let h = cmos(&[0xcb, 0xe8]);
+    h.bus.poke(0xfffa, &[0x00, 0xd0]);
+    h.step();
+    assert!(h.cpu.is_waiting());
+    h.step();
+    h.cpu.set_nmi(true);
+    for _ in 0..3 {
+        if !h.cpu.is_waiting() {
+            break;
+        }
+        h.step();
+    }
+    assert!(!h.cpu.is_waiting(), "the line going low wakes it");
+    assert_eq!(h.regs().pc, 0xd000, "into the handler");
+    // The return address is the instruction after the WAI.
+    assert_eq!(h.bus.peek(0x01fd), 0xc0);
+    assert_eq!(h.bus.peek(0x01fc), 0x01);
+}
+
+#[test]
 fn a_wai_survives_a_snapshot() -> Result<()> {
     let h = cmos(&[0xcb]);
     h.step();
