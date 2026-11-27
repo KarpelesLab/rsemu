@@ -233,9 +233,13 @@ enum FetchOp {
 /// has to resume drawing the same pixels.
 pub struct Engine {
     // -- position -----------------------------------------------------------
-    /// Total dots executed since the last cold reset. The lazily-advanced
-    /// device's clock (`ROADMAP.md` §4.2).
+    /// Total dots executed since power-on. The lazily-advanced device's clock
+    /// (`ROADMAP.md` §4.2) — the position of its clock domain, which a reset
+    /// does not rewind, so no reset writes it.
     pub(crate) dots: u64,
+    /// [`Engine::dots`] as it stood at the last reset, cold or warm: what the
+    /// write lockout is counted from.
+    pub(crate) reset_dot: u64,
     /// Frames completed. Its parity chooses the odd-frame skip.
     pub(crate) frame: u64,
     /// The scanline about to be executed, 0 to
@@ -491,6 +495,7 @@ impl Engine {
     pub fn new(region: Region, warmup: bool, decay_dots: u64) -> Engine {
         let mut engine = Engine {
             dots: 0,
+            reset_dot: 0,
             frame: 0,
             scanline: 0,
             dot: 0,
@@ -583,7 +588,7 @@ impl Engine {
     pub fn reset_cold(&mut self) {
         let warmup = self.warmup;
         let ttl = self.latch.ttl();
-        self.dots = 0;
+        self.reset_dot = self.dots;
         self.frame = 0;
         self.scanline = 0;
         self.dot = 0;
@@ -613,7 +618,7 @@ impl Engine {
     /// and the frame buffer keep their contents, because nothing discharges
     /// them.
     pub fn reset_warm(&mut self) {
-        self.dots = 0;
+        self.reset_dot = self.dots;
         self.frame = 0;
         self.scanline = 0;
         self.dot = 0;
@@ -734,7 +739,10 @@ impl Engine {
     /// Whether `$2000`/`$2001`/`$2005`/`$2006` writes are accepted yet.
     #[inline]
     fn warm(&self) -> bool {
-        !self.warmup || self.dots >= self.geom.warmup_dots
+        // `dots` only ever grows and `reset_dot` is a copy of it, so the
+        // difference cannot underflow; saturating says so without a panic path
+        // for a snapshot that claims otherwise.
+        !self.warmup || self.dots.saturating_sub(self.reset_dot) >= self.geom.warmup_dots
     }
 
     /// Read one byte from the PPU bus, or the bus latch if nothing answers.
@@ -2141,6 +2149,8 @@ impl Engine {
         for pixel in self.fb.iter() {
             w.write_u16(pixel.0)?;
         }
+        // v5: where the write lockout is counted from.
+        w.write_u64(self.reset_dot)?;
         Ok(())
     }
 
@@ -2228,6 +2238,7 @@ impl Engine {
         for pixel in self.fb.iter_mut() {
             *pixel = Pixel(r.read_u16()?);
         }
+        self.reset_dot = r.read_u64()?;
         Ok(())
     }
 }

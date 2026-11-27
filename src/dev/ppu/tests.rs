@@ -1377,8 +1377,44 @@ fn a_cold_reset_returns_every_register_to_its_documented_value() {
         assert_eq!(e.status, 0);
         assert_eq!(e.v, 0);
         assert_eq!(e.t, 0);
-        assert_eq!(e.dots, 0);
     });
+}
+
+/// A reset restarts the frame; it does not rewind the device's clock.
+///
+/// `Engine::dots` is the lazily-advanced tick the scheduler reads, and
+/// `Machine::reset` does not rewind clock domains. Zeroing it left the PPU
+/// claiming dot 0 while the forest stood wherever it stood, so the next
+/// catch-up walked every dot since power-on in one call — a stall that grows
+/// with uptime, ending at whatever beam position that many dots happens to
+/// reach, with the write lockout already expired. NESdev, *PPU power up
+/// state*: "The PPU comes out of power and reset at the top of the picture",
+/// and "Writes to the following registers are ignored if earlier than ~29658
+/// CPU clocks after reset: PPUCTRL, PPUMASK, PPUSCROLL, PPUADDR."
+#[test]
+fn a_reset_restarts_the_frame_without_rewinding_the_clock() {
+    for kind in [ResetKind::Cold, ResetKind::Warm] {
+        let ppu = NesPpu::new(&Props::new()).unwrap();
+        ppu.attach_bus(Arc::new(AddressSpace::new("ppu", 14)));
+        ppu.advance_to(1_000_000);
+        ppu.write_register(PPUCTRL, CTRL_NMI);
+        assert_eq!(ppu.with_engine(|e| e.ctrl), CTRL_NMI, "long since warm");
+
+        ppu.reset(kind);
+        assert_eq!(
+            Device::current_tick(&ppu),
+            1_000_000,
+            "{kind:?}: the tick is the clock domain's position, not ours to zero"
+        );
+        ppu.advance_to(1_000_003);
+        assert_eq!(ppu.position(), (0, 3), "{kind:?}: top of the picture");
+
+        ppu.write_register(PPUCTRL, CTRL_NMI);
+        assert_eq!(ppu.with_engine(|e| e.ctrl), 0, "{kind:?}: locked out again");
+        ppu.advance_by(WARMUP_DOTS);
+        ppu.write_register(PPUCTRL, CTRL_NMI);
+        assert_eq!(ppu.with_engine(|e| e.ctrl), CTRL_NMI, "{kind:?}");
+    }
 }
 
 /// A cheap order-sensitive hash, so a round trip is compared by value rather
@@ -2008,10 +2044,12 @@ fn the_lock_free_position_tracks_the_engine() {
     ppu.write_register(regs::PPUCTRL, CTRL_NMI);
     assert_eq!(device.current_tick(), ppu.dots());
 
-    // And a reset puts both back where a cold machine's are.
+    // A reset restarts the frame and republishes the next event with it. The
+    // tick stays: it is the clock domain's position, which no reset rewinds.
     Device::reset(&ppu, ResetKind::Cold);
-    assert_eq!(device.current_tick(), 0);
+    assert_eq!(device.current_tick(), 1000);
     assert_eq!(device.current_tick(), ppu.dots());
+    assert_eq!(device.next_event_tick(), Some(ppu.next_event_dot()));
 }
 
 #[test]

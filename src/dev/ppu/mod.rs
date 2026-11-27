@@ -638,8 +638,10 @@ pub static NES_PPU_CLASS: DeviceClass = DeviceClass {
     // v4 sprite evaluation's step-3a read counter, whether the last even dot
     // wrote secondary OAM or read it, and whether the pipeline ran on the dot
     // before — which is what gates the shift registers' load pulse — and the
-    // first stage of the two-dot `/NMI` output register.
-    version: 4,
+    // first stage of the two-dot `/NMI` output register. v5 appended the dot
+    // of the last reset, which the write lockout is counted from now that a
+    // reset no longer rewinds the tick; see [`migrations`].
+    version: 5,
     summary: "NES / Famicom picture processing unit (RP2C02 / RP2C07 / UA6538)",
     properties: PPU_PROPERTIES,
     construct: |props| Ok(Box::new(NesPpu::new(props)?) as Box<dyn Device>),
@@ -653,6 +655,24 @@ pub static NES_PPU_CLASS: DeviceClass = DeviceClass {
 /// features collided.
 pub fn register(registry: &mut crate::core::Registry) -> Result<()> {
     registry.add(&NES_PPU_CLASS)
+}
+
+/// Carry a v4 `nes.ppu` chunk forward.
+///
+/// v5 appends `Engine::reset_dot`. A v4 engine zeroed its
+/// tick on every reset, so in a v4 chunk the tick *is* the count since the
+/// last reset and zero is the exact value, not a guess.
+///
+/// # Errors
+///
+/// If the step is already registered.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    use crate::core::state::{Sink, Source};
+    migrations.register(NES_PPU_CLASS.name, 4, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_u64(0)
+    })
 }
 
 impl Device for NesPpu {

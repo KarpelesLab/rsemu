@@ -105,6 +105,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::dev::stm32::octospi::migrations(&mut migrations)?;
     #[cfg(feature = "dev-nes-apu")]
     crate::dev::apu::migrations(&mut migrations)?;
+    #[cfg(feature = "dev-nes-ppu")]
+    crate::dev::ppu::migrations(&mut migrations)?;
     #[cfg(feature = "dev-rcar")]
     crate::dev::rcar::scif::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-arm-aprofile")]
@@ -144,6 +146,8 @@ mod tests {
         crate::dev::amiga::akiko::CLASS_NAME,
         #[cfg(feature = "cpu-sm83")]
         "cpu.sm83",
+        #[cfg(feature = "dev-nes-ppu")]
+        "nes.ppu",
     ];
 
     #[test]
