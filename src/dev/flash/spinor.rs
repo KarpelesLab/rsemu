@@ -1256,7 +1256,7 @@ impl SpiNor {
             )));
         }
 
-        let array = Arc::new(RamStore::new(size));
+        let array = Arc::new(RamStore::try_new(size)?);
         // Erased, not zeroed: an unwritten part reads all ones, and firmware
         // that finds zeroes concludes the whole array has been programmed.
         array

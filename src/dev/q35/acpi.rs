@@ -1297,15 +1297,18 @@ impl AcpiTables {
         // Acquiring a host object *is* allocation (`core::hosts`), so it
         // belongs in `new` beside the rest of it; nothing is announced.
         let bus = buses::attach(props, &bus_name)?;
-        Ok(AcpiTables::with_config(len, cfg, iospace).on_bus(bus))
+        Ok(AcpiTables::with_config(len, cfg, iospace)?.on_bus(bus))
     }
 
     /// The same device, built from a configuration a test already has.
-    #[must_use]
-    pub fn with_config(len: u64, cfg: TableConfig, iospace: String) -> AcpiTables {
-        let store = Arc::new(RamStore::new(len));
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Property`] if this host cannot allocate `len` bytes.
+    pub fn with_config(len: u64, cfg: TableConfig, iospace: String) -> Result<AcpiTables> {
+        let store = Arc::new(RamStore::try_new(len)?);
         let region: RegionRef = Arc::new(Region::ram(TABLES_REGION, Arc::clone(&store)));
-        AcpiTables {
+        Ok(AcpiTables {
             store,
             region,
             len,
@@ -1314,7 +1317,7 @@ impl AcpiTables {
             bus: None,
             spaces: Mutex::with_rank(LockRank::LEAF, None),
             facts: Mutex::with_rank(LockRank::LEAF, MachineFacts::default()),
-        }
+        })
     }
 
     /// The fabric whose functions `_PRT` describes.

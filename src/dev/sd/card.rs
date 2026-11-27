@@ -775,7 +775,7 @@ impl SdCard {
                 id.capacity
             )));
         }
-        let media = Backing::Ram(Arc::new(RamStore::new(id.capacity)));
+        let media = Backing::Ram(Arc::new(RamStore::try_new(id.capacity)?));
         Ok(SdCard {
             id,
             mode,

@@ -662,7 +662,7 @@ impl Array {
                 geom.size()
             )));
         }
-        let array = Arc::new(RamStore::new(geom.size()));
+        let array = Arc::new(RamStore::try_new(geom.size())?);
         // Erased, not zeroed: an unwritten part reads all ones, and firmware
         // that finds zeroes concludes the whole array has been programmed.
         array.fill(0, geom.size(), 0xff).map_err(|_| {

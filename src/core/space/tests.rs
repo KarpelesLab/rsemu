@@ -2943,3 +2943,40 @@ fn a_debug_burst_reaches_no_hook_on_either_side() {
     assert_eq!(observer.hits.load(Ordering::Relaxed), 0);
     assert!(space.monitor().holds(id), "a debugger is not an observer");
 }
+
+/// A length this host cannot back is an error, from the constructor itself.
+///
+/// `RamStore` had only the infallible form, whose `n + pad` overflowed `usize`
+/// for a length near the top of the address space and whose allocation aborted
+/// the process for one the allocator refuses: `rsemu run pc-at -p
+/// hd0size=1024G` died with `memory allocation of 1099511631871 bytes failed`.
+/// Each caller that took a size from a user had to probe for itself, and most
+/// did not.
+#[test]
+fn a_store_the_host_cannot_back_is_an_error_not_an_abort() {
+    use crate::core::error::Error;
+    // Every one of these is a number a property can carry. The first two do
+    // not fit `usize` once the alignment slack is added; the third fits and is
+    // refused by the allocator (it is past `isize::MAX`, which no allocation
+    // may exceed).
+    for len in [u64::MAX, u64::MAX - 4094, (isize::MAX as u64) + 1] {
+        match RamStore::try_new(len) {
+            Err(Error::Property(message)) => {
+                assert!(
+                    message.contains(&alloc::format!("{len}")),
+                    "the refusal names the length: {message}"
+                );
+            }
+            other => panic!("{len:#x}: expected a refusal, got {other:?}"),
+        }
+    }
+    // And the ordinary case is unchanged: zeroed, aligned, the length asked,
+    // nothing dirty.
+    let ram = RamStore::try_new(0x3000).expect("three pages");
+    assert_eq!(ram.len(), 0x3000);
+    assert_eq!(ram.host_addr() % HOST_PAGE, 0);
+    let mut buf = vec![0xffu8; 0x3000];
+    ram.read_at(0, &mut buf).expect("in range");
+    assert!(buf.iter().all(|&b| b == 0));
+    assert_eq!(ram.dirty_page_count(), 0);
+}

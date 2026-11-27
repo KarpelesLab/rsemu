@@ -624,7 +624,7 @@ impl AtapiDrive {
             // no disc in the drive" without the machine description needing an
             // `if`.
             (None, Some(bytes)) if !bytes.is_empty() => {
-                let store = RamStore::new(bytes.len() as u64);
+                let store = RamStore::try_new(bytes.len() as u64)?;
                 store.write_at(0, &bytes).map_err(|e| {
                     config(format!("the disc image does not fit in host memory: {e:?}"))
                 })?;

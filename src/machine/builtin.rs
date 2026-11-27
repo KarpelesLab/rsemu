@@ -47,10 +47,6 @@ const ROM_CLASS_NAME: &str = "rom";
 /// And the one for a bare node in the clock forest.
 const CLOCK_CLASS_NAME: &str = "clock";
 
-/// What [`RamStore`] allocates beyond the bytes it was asked for: enough to
-/// place guest byte zero on a host page boundary.
-const HOST_PAGE_SLACK: usize = crate::core::space::HOST_PAGE as usize - 1;
-
 /// Read/write memory: `size` bytes, mapped wherever a `map` statement puts it.
 ///
 /// Not a device model — there is no chip called "RAM" — but it is a device as
@@ -78,25 +74,11 @@ impl Ram {
                 "property `size`: a ram object with no bytes in it cannot be mapped",
             )));
         }
-        // `RamStore::new` allocates infallibly, so a size the host cannot
-        // back is an *abort* — "memory allocation of 1099511631871 bytes
-        // failed" and a core dump, from `-p ram=1024G` or one digit too many
-        // in a machine file. Ask the allocator first, with a reservation that
-        // touches no page and is given straight back, and turn its refusal
-        // into the error a mistyped property deserves. The padding is the
-        // store's own: it over-allocates by a host page to align guest byte
-        // zero. `checked_add` because `size` is the user's number and
-        // `u64::MAX` is one they can type.
-        let fits = usize::try_from(size)
-            .ok()
-            .and_then(|n| n.checked_add(HOST_PAGE_SLACK))
-            .is_some_and(|n| Vec::<u8>::new().try_reserve_exact(n).is_ok());
-        if !fits {
-            return Err(Error::Property(alloc::format!(
-                "property `size`: this host cannot allocate {size} bytes ({size:#x}) of guest RAM"
-            )));
-        }
-        let store = Arc::new(RamStore::new(size));
+        // Fallibly: `size` is the user's number, and one digit too many in a
+        // machine file is a mistyped property, not a reason to abort.
+        let store = RamStore::try_new(size)
+            .map_err(|e| Error::Property(alloc::format!("property `size`: {e}")))?;
+        let store = Arc::new(store);
         let region = Arc::new(Region::ram("ram", Arc::clone(&store)));
         Ok(Ram { store, region })
     }

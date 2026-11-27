@@ -207,7 +207,7 @@ pub fn blk_from_props(props: &Props) -> Result<VirtioMmio> {
             // front end bound to it, and a short tail there is a ramdisk
             // image's rather than a misconfiguration.
             let bytes = bytes.next_multiple_of(blk::SECTOR_SIZE);
-            let store = RamStore::new(bytes);
+            let store = RamStore::try_new(bytes)?;
             if let Some(image) = image {
                 RamStore::write_at(&store, 0, &image).map_err(|e| crate::core::Error::Config {
                     at: String::from(BLK_CLASS_NAME),

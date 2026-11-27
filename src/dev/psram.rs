@@ -836,7 +836,7 @@ impl Psram {
             )));
         };
 
-        let array = Arc::new(RamStore::new(size));
+        let array = Arc::new(RamStore::try_new(size)?);
         array
             .fill(0, size, fill as u8)
             .map_err(|_| config(String::from("the array could not be filled")))?;

@@ -305,8 +305,9 @@
 //! state hash target-dependent.
 
 use super::attrs::MemResult;
-use crate::core::error::BusError;
+use crate::core::error::{BusError, Error, Result};
 use crate::core::value::{Endian, Width};
+use alloc::format;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -410,6 +411,36 @@ pub struct RamStore {
     pages: u64,
 }
 
+/// `n` zeroed atomics, or `None` if the allocator will not hand them over.
+///
+/// Two things the obvious `resize_with(n, || Atomic::new(0))` got wrong.
+///
+/// **It could not fail.** A length the allocator refuses was an *abort* —
+/// `memory allocation of 1099511631871 bytes failed` and a core dump, from one
+/// digit too many in a machine file. So the request is put to the allocator
+/// first, fallibly, as a reservation that touches no page and is given
+/// straight back. The window between that and the allocation below is a race
+/// against the rest of this process, not against whoever chose `n`; closing
+/// it needs `alloc_zeroed` called by hand, which is an `unsafe` this file has
+/// so far done without.
+///
+/// **It wrote every byte.** A gigabyte of guest RAM was a gigabyte of resident
+/// host memory before the guest had run an instruction, and a board that maps
+/// far more than it touches paid for all of it. `vec![0; n]` asks the
+/// allocator for *zeroed* memory instead, which for anything large is fresh
+/// pages from the kernel that cost nothing until they are written. The `map`
+/// that follows turns integers into atomics of the same layout in the same
+/// allocation — `Vec`'s in-place `collect` — and storing back the value just
+/// loaded is a loop the optimiser deletes. If either of those ever stops
+/// being true the result is the old cost, never a wrong answer: the contents
+/// are zero either way.
+fn zeroed<T: Clone + Default, A>(n: usize, wrap: fn(T) -> A) -> Option<Vec<A>> {
+    let mut probe: Vec<T> = Vec::new();
+    probe.try_reserve_exact(n).ok()?;
+    drop(probe);
+    Some(alloc::vec![T::default(); n].into_iter().map(wrap).collect())
+}
+
 impl fmt::Debug for RamStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RamStore")
@@ -423,9 +454,14 @@ impl fmt::Debug for RamStore {
 impl RamStore {
     /// Allocate `len` zeroed bytes with the default dirty-page granularity.
     ///
+    /// For a length the *program* chose — a console's work RAM, a test's
+    /// scratch page. A length that came from a property, a file or a guest
+    /// register goes through [`try_new`](RamStore::try_new) instead, which
+    /// answers a number the host cannot back with an error.
+    ///
     /// # Panics
     ///
-    /// If `len` does not fit in a host `usize` — a 4 GiB guest cannot be
+    /// If this host cannot allocate `len` bytes — a 4 GiB guest cannot be
     /// backed by a 32-bit host allocation, and pretending otherwise only moves
     /// the failure somewhere less obvious.
     #[must_use]
@@ -433,39 +469,78 @@ impl RamStore {
         Self::with_page_bits(len, DEFAULT_PAGE_BITS)
     }
 
+    /// Allocate `len` zeroed bytes with the default dirty-page granularity, or
+    /// say that this host cannot.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Property`] if `len` does not fit this host's address space or
+    /// its allocator refuses the request. The sentence names the length and
+    /// not a property, because the store does not know which one it came
+    /// from; a caller that does can prefix it.
+    pub fn try_new(len: u64) -> Result<Self> {
+        Self::try_with_page_bits(len, DEFAULT_PAGE_BITS)
+    }
+
     /// Allocate `len` zeroed bytes, tracking dirtiness at `1 << page_bits`
     /// granularity.
     ///
     /// # Panics
     ///
-    /// If `len` does not fit in a host `usize`, or `page_bits` is 0 or >= 64.
+    /// If this host cannot allocate `len` bytes, or `page_bits` is 0 or >= 64.
     #[must_use]
     pub fn with_page_bits(len: u64, page_bits: u32) -> Self {
+        match Self::try_with_page_bits(len, page_bits) {
+            Ok(store) => store,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Allocate `len` zeroed bytes, tracking dirtiness at `1 << page_bits`
+    /// granularity, or say that this host cannot.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_new`](RamStore::try_new).
+    ///
+    /// # Panics
+    ///
+    /// If `page_bits` is 0 or >= 64, which is a caller's constant rather than
+    /// anybody's input.
+    pub fn try_with_page_bits(len: u64, page_bits: u32) -> Result<Self> {
         assert!(page_bits > 0 && page_bits < 64, "implausible page size");
-        let n = usize::try_from(len).expect("guest RAM larger than the host address space");
+        let refused = || {
+            Error::Property(format!(
+                "this host cannot allocate {len} bytes ({len:#x}) of guest memory"
+            ))
+        };
         let pages = len.div_ceil(1u64 << page_bits);
-        let words = usize::try_from(pages.div_ceil(64)).expect("dirty bitmap too large");
         // The slack that buys a page-aligned `host_addr`. A zero-length store
         // has no bytes to align, and allocating a page for it to say so would
         // be worse than admitting it has no address.
-        let pad = if n == 0 { 0 } else { HOST_PAGE as usize - 1 };
-        let mut cells = Vec::new();
-        cells.resize_with(n + pad, || AtomicU8::new(0));
-        let base = if n == 0 {
+        let pad = if len == 0 { 0 } else { HOST_PAGE as usize - 1 };
+        // `checked_add`: `len` is very often a number somebody typed, and
+        // `u64::MAX` is one they can type.
+        let total = usize::try_from(len)
+            .ok()
+            .and_then(|n| n.checked_add(pad))
+            .ok_or_else(refused)?;
+        let words = usize::try_from(pages.div_ceil(64)).map_err(|_| refused())?;
+        let cells = zeroed(total, AtomicU8::new).ok_or_else(refused)?;
+        let dirty = zeroed(words, AtomicU64::new).ok_or_else(refused)?;
+        let base = if len == 0 {
             0
         } else {
             align_gap(cells.as_ptr() as usize)
         };
-        let mut dirty = Vec::new();
-        dirty.resize_with(words, || AtomicU64::new(0));
-        RamStore {
+        Ok(RamStore {
             cells,
             base,
             dirty,
             page_bits,
             len,
             pages,
-        }
+        })
     }
 
     /// The host address of guest byte zero, as an integer.

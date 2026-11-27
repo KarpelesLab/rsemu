@@ -963,7 +963,7 @@ impl AtaDisk {
                 "a drive of {bytes} byte(s) is larger than this host's address space"
             )));
         }
-        AtaDisk::with_medium(id, position, Arc::new(RamStore::new(bytes)))
+        AtaDisk::with_medium(id, position, Arc::new(RamStore::try_new(bytes)?))
     }
 
     /// Build a drive on a medium the caller already has.

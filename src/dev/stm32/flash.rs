@@ -3492,7 +3492,7 @@ impl Flash {
             )));
         }
 
-        let array_store = Arc::new(RamStore::new(size));
+        let array_store = Arc::new(RamStore::try_new(size)?);
         // Erased, not zeroed: an unwritten part reads all ones, and firmware
         // that finds zeroes concludes the array has already been programmed.
         array_store

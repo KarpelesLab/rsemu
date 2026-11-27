@@ -1594,7 +1594,7 @@ impl UsbStorage {
         let media: Arc<dyn Medium> = match supplied {
             Some(medium) => medium,
             None => {
-                let store = RamStore::new(bytes);
+                let store = RamStore::try_new(bytes)?;
                 if let Some(image) = image {
                     if image.len() as u64 > bytes {
                         return Err(Error::Config {

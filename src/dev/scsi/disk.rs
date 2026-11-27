@@ -1264,7 +1264,7 @@ impl DiskDevice {
 
         let media: Arc<dyn Medium> = match supplied {
             Some(m) => m,
-            None => Arc::new(RamStore::new(bytes)),
+            None => Arc::new(RamStore::try_new(bytes)?),
         };
         let mut disk = ScsiDisk::with_medium(media)?;
         disk.read_only = read_only || disk.read_only;

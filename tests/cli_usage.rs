@@ -323,3 +323,29 @@ fn debug_without_the_stub_names_the_feature() {
     assert!(stderr.contains("`gdb` feature"), "{stderr}");
     assert!(!stderr.contains("unknown command"), "{stderr}");
 }
+
+/// A disk the host cannot hold is a refused property, not a core dump.
+///
+/// `-p hd0size=1024G` — one letter from the `1024M` somebody meant — aborted
+/// the process with `memory allocation of 1099511631871 bytes failed`: the
+/// drive sized a `RamStore` from the number and the store could only allocate
+/// infallibly. No exit code, no message of rsemu's own, and a core file.
+#[cfg(feature = "machine-pc-at")]
+#[test]
+fn a_disk_larger_than_the_host_is_refused_not_aborted() {
+    let (code, _, stderr) = run(&[
+        "run",
+        "pc-at",
+        "--headless",
+        "--for",
+        "1ms",
+        "-p",
+        "hd0size=1024G",
+    ]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot allocate 1099511627776 bytes"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("memory allocation of"), "{stderr}");
+}
