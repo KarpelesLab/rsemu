@@ -1,32 +1,56 @@
-//! The STM32 **USB full-speed device** peripheral — the `USB_FS` block of the
-//! F0x2/F1/F3/L0 families, not the dwc2 OTG core.
+//! The STM32 **USB full-speed device** peripheral — the `USB` block of the
+//! STM32F0x2 and the STM32WB, not the dwc2 OTG core.
 //!
-//! One class, `st.usbfs`. This is the device-only controller ST has carried
-//! since the F1: eight endpoint registers, a packet-buffer memory the endpoints
-//! draw their buffers from, and a buffer-descriptor table that says where each
+//! One class, `st.usbfs`. This is ST's device-only controller: eight endpoint
+//! registers, a 1 KiB packet-buffer memory the endpoints draw their buffers
+//! from, and a buffer-descriptor table in that memory that says where each
 //! buffer is. It is a **peripheral, never a host** — there is no `HPRT`, no
-//! channel list, nothing that drives a bus — so it plugs into
-//! [`UsbBus`] as a [`UsbDevice`]
-//! and a modelled host enumerates it, exactly the way the [`dwc2`](super::super::usb::dwc2)
-//! gadget does. That is the whole reason it belongs here rather than being
-//! faked: the firmware under test is a USB device stack, and the thing it talks
-//! to is the register file below.
+//! channel list, nothing that drives a bus — so it plugs into [`UsbBus`] as a
+//! [`UsbDevice`] and a modelled host enumerates it, exactly the way the
+//! [`dwc2`](super::super::usb::dwc2) gadget does. That is the whole reason it
+//! belongs here rather than being faked: the firmware under test is a USB
+//! device stack, and the thing it talks to is the register file below.
+//!
+//! # One class, two families
+//!
+//! RM0091 §30 (STM32F04x/F072/F078) and RM0434 §40 (STM32WB) describe the same
+//! block in the same words — the register descriptions and the register map
+//! are identical, the packet memory is 1 KiB "structured as 512 half-words of
+//! 16 bits" with the linear (one byte per byte address) layout in both. Two
+//! things differ, and neither is a register:
+//!
+//! * The F0 places the block on "APB", the WB on "APB1". Nothing here sees the
+//!   difference.
+//! * The F0x2's packet memory is shared with its CAN: "When the CAN peripheral
+//!   clock is enabled in the RCC_APB1ENR register, only the first 768 Bytes are
+//!   available to USB while the last 256 Bytes are used by CAN" (RM0091 Table
+//!   121, note 2). That is the `can-enable` input; the WB has no CAN and leaves
+//!   it unwired, which is the whole 1 KiB.
 //!
 //! # The register file
 //!
-//! Register window (RM0091 §30.6, offsets from the block base), each a sixteen-
-//! bit register in the low half of a thirty-two-bit word:
+//! Register map (RM0434 §40.6.3 Table 263, RM0091 §30.6.3), offsets from the
+//! block base. Each register is sixteen bits in the low half of a thirty-two-
+//! bit word, and "can be accessed by half-words (16-bit) or words (32-bit)";
+//! the high half and the gap at `0x20`…`0x3c` are reserved. The block's
+//! boundary-address slot is 1 KiB; the window this model decodes ends after
+//! `BCDR`.
 //!
-//! | Offset | Register | |
-//! | --- | --- | --- |
-//! | `0x00`…`0x1c` | `EP0R`…`EP7R` | the eight endpoint registers |
-//! | `0x40` | `CNTR` | control: the interrupt-enable mask, and `PDWN`/`FRES` power |
-//! | `0x44` | `ISTR` | interrupt status |
-//! | `0x48` | `FNR` | frame number (read-only; this model answers zero) |
-//! | `0x4c` | `DADDR` | the device address and the function-enable bit |
-//! | `0x50` | `BTABLE` | where the buffer-descriptor table sits in packet memory |
-//! | `0x54` | `LPMCSR` | the LPM control/status (storage) |
-//! | `0x58` | `BCDR` | battery-charging detection; `DPPU` is the pull-up |
+//! | Offset | Register | Reset | Implemented bits |
+//! | --- | --- | --- | --- |
+//! | `0x00`…`0x1c` | `EP0R`…`EP7R` | `0x0000` | all sixteen (rules below) |
+//! | `0x40` | `CNTR` | `0x0003` | the eight interrupt masks `CTRM`…`L1REQM` (15:7), `L1RESUME`, `RESUME`, `FSUSP`, `LP_MODE`, `PDWN`, `FRES`; bit 6 reserved |
+//! | `0x44` | `ISTR` | `0x0000` | `CTR` (r), the `rc_w0` flags `PMAOVR`…`L1REQ` (14:7), `DIR` and `EP_ID[3:0]` (r); 6:5 reserved |
+//! | `0x48` | `FNR` | `0x0XXX` | `RXDP`, `RXDM`, `LCK`, `LSOF[1:0]`, `FN[10:0]`, all read-only |
+//! | `0x4c` | `DADDR` | `0x0000` | `EF` (7), `ADD[6:0]`; 15:8 reserved |
+//! | `0x50` | `BTABLE` | `0x0000` | `BTABLE[15:3]`; 2:0 "forced by hardware to 0" |
+//! | `0x54` | `LPMCSR` | `0x0000` | `BESL[3:0]`, `REMWAKE` (r), `LPMACK`, `LPMEN` (rw); bit 2 and 15:8 reserved |
+//! | `0x58` | `BCDR` | `0x0000` | `DPPU` (15), `SDEN`/`PDEN`/`DCDEN`/`BCDEN` (3:0) rw; `PS2DET`/`SDET`/`PDET`/`DCDET` (7:4) r; 14:8 reserved |
+//!
+//! A write never sets a reserved or read-only bit; each register's mask is
+//! named beside its offset below. A word write is the register in its low half
+//! and a dropped high half. An offset outside the table is a bus fault here;
+//! the manual says only "Reserved".
 //!
 //! The endpoint register is the one with the access rules a driver is written
 //! around, and getting them wrong is a stack that hangs rather than a value
@@ -37,56 +61,77 @@
 //!   it. Writing one leaves it as it was — which is what lets a driver clear
 //!   one direction's flag without touching the other's in a single store.
 //! * `DTOG_RX` (14), `STAT_RX` (13:12), `DTOG_TX` (6) and `STAT_TX` (5:4) are
-//!   **toggle**: a written one flips the bit, a written zero leaves it. A
+//!   **toggle** (`t`): a written one flips the bit, a written zero leaves it. A
 //!   driver that wants `STAT_RX = VALID` writes the exclusive-or of where it is
 //!   and where it wants to be, and the hardware does the rest.
 //! * `SETUP` (11) is **read-only** — hardware sets it on a `SETUP` packet.
 //! * `EP_TYPE` (10:9), `EP_KIND` (8) and `EA` (3:0) are plain read/write.
 //!
 //! `ISTR`'s flag bits are `rc_w0` as a group (a write ANDs), while `CTR`, `DIR`
-//! and `EP_ID` are read-only and **computed**: `CTR` is the OR of every
-//! endpoint's pending `CTR_RX`/`CTR_TX`, and `DIR`/`EP_ID` name the endpoint the
-//! highest-priority one of those is on. That is how a driver's interrupt
-//! handler finds the endpoint to service without scanning all eight.
+//! and `EP_ID` are read-only and **computed** from the endpoint registers'
+//! pending `CTR_RX`/`CTR_TX`. That is how a driver's interrupt handler finds
+//! the endpoint to service without scanning all eight.
+//!
+//! What the controller does on the wire — the transaction path, data toggles,
+//! double-buffered and isochronous endpoints, and the bus events (`RESET`,
+//! `SOF`/`ESOF`, suspend and resume, LPM) — is the code below, and its comments
+//! cite the manual section by section.
+//!
+//! # Battery charging detection (`BCDR`)
+//!
+//! The detector's results are a property of what the cable is plugged into,
+//! not of the chip, so they come from the `port-type` property: `sdp` (the
+//! default — a standard host port, which is what every board written before
+//! the property assumed), `cdp`, `dcp`, `ps2` or `none`. RM0434 §40.6.1 gives
+//! the bits and no sequence beyond them; [`bcd_status`] has the table and the
+//! line conditions from USB Battery Charging 1.2 that decide each result.
+//! While `BCDEN` is set the block is off the bus: "the USB PHY is fully
+//! controlled by BCD and cannot be used for normal communication".
 //!
 //! # The packet memory
 //!
-//! A separate region — the block's SRAM — mapped at its own base. On this
-//! family it is **linear**: a flat run of bytes (1 KiB here), addressed the way
-//! any other memory is, which is the "1 × 16 bit / word" organisation of the
-//! F0x2 rather than the F1's doubled, gap-ridden one. The buffer-descriptor
-//! table lives at `BTABLE` and holds, per endpoint register, four sixteen-bit
-//! words — `ADDR_TX`, `COUNT_TX`, `ADDR_RX`, `COUNT_RX` — and the data buffers
-//! sit at those `ADDR_*` byte offsets. `COUNT_RX`'s high bits are the allocated
-//! block size and are left alone; hardware writes only the low ten bits, the
-//! received byte count.
+//! A separate region — the block's SRAM — mapped at its own base: a flat run of
+//! 1024 bytes, addressed the way any other memory is. "The packet memory
+//! should be accessed only by byte (8-bit) or half-word (16-bit) accesses.
+//! Word (32-bit) accesses are not allowed" (RM0434 §40.6.2), so the region's
+//! constraints refuse a word. The buffer-descriptor table lives at `BTABLE`
+//! and holds, per endpoint register, four sixteen-bit words — `ADDR_TX`,
+//! `COUNT_TX`, `ADDR_RX`, `COUNT_RX` — and the data buffers sit at those
+//! `ADDR_*` byte offsets. `COUNT_RX`'s high bits are the allocated block size
+//! and are left alone; hardware writes only the low ten bits, the received
+//! byte count.
+//!
+//! With `can-enable` high (F0x2 only) the top 256 bytes are CAN's. RM0091 does
+//! not say what a USB or CPU access there does; this model reads zero and
+//! drops the write, for the controller and the CPU alike, and leaves the bytes
+//! USB had there as they were.
 //!
 //! # On the bus
 //!
-//! A [`UsbDevice`]. The host's `SETUP`, `IN` and
-//! `OUT` transactions are matched to an endpoint register by its `EA` field —
-//! not by the register's position — exactly as the token's address field is
-//! matched on silicon, and the matched register's `STAT` decides the handshake:
-//! `VALID` proceeds, `NAK` asks the host to retry, `STALL` refuses, `DISABLED`
-//! is no endpoint at all. A completed transaction sets the direction's `CTR`,
-//! forces its `STAT` back to `NAK` (so firmware must re-arm — the hardware's
-//! anti-overrun), and raises the interrupt. The device signals **full speed**
-//! and answers at `DADDR`'s address.
+//! A [`UsbDevice`]. The host's `SETUP`, `IN` and `OUT` transactions are
+//! matched to an endpoint register by its `EA` field — not by the register's
+//! position — exactly as the token's address field is matched on silicon. The
+//! device signals **full speed** and answers at `DADDR`'s address. It is on the
+//! bus while it is clocked, out of `PDWN` and `FRES`, its `DPPU` pull-up is
+//! set and `BCDEN` is clear.
 //!
-//! # The clock, the interrupt
+//! # The clock, the interrupt, the inputs
 //!
 //! `enable` and `reset` arrive from the reset and clock controller, as
-//! [`gate`] describes; an unwired `enable` leaves the block
-//! clocked, so a board written before the gate existed does not change. One
-//! `irq` output carries the low-priority USB interrupt — level, the OR of the
-//! enabled `ISTR` flags under `CNTR`'s mask — and the board wires it to its
-//! core's USB vector.
+//! [`gate`] describes; an unwired `enable` leaves the block clocked, so a board
+//! written before the gate existed does not change. `can-enable` is the
+//! F0x2's `RCC_APB1ENR.CANEN`; like the gate's levels it is wiring, not
+//! snapshot state — the RCC republishes it on load. One `irq` output carries
+//! the low-priority USB interrupt — level, the OR of the enabled `ISTR` flags
+//! under `CNTR`'s mask — and the board wires it to its core's USB vector.
 //!
 //! # Sources
 //!
-//! ST **RM0091** rev 9 §30 "Universal serial bus full-speed device interface
-//! (USB)", for the STM32F0x2 line. No emulator source of any licence was
-//! consulted (`ROADMAP.md` §1).
+//! ST **RM0091** rev 10 §30 "Universal serial bus full-speed device interface
+//! (USB)" (STM32F0x2), and ST **RM0434** rev 16 §40 of the same title
+//! (STM32WB). USB Battery Charging Specification revision 1.2 for what each
+//! kind of port does to the data lines during detection. No emulator source of
+//! any licence was consulted (`ROADMAP.md` §1).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -104,9 +149,10 @@ use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
+use crate::core::sync::AtomicBool;
 use crate::core::sync::{AtomicU32, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
-use crate::core::wire::{Level, WireId, WireSource};
+use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::dev::stm32::gate::{self, ClockGate, Gated};
 use crate::machine::Instance;
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
@@ -123,8 +169,16 @@ const ENDPOINTS: usize = 8;
 /// Register-window size, through `BCDR`.
 pub const REGISTER_BYTES: u64 = 0x60;
 
-/// Packet-buffer memory size: 1 KiB on the F0x2.
+/// Packet-buffer memory size: 1 KiB on both families — "The size of the Packet
+/// Memory is 1024 bytes, structured as 512 half-words of 16 bits" (RM0434
+/// §40.4.1; RM0091 §30.4.1 says "up to").
 pub const PMA_BYTES: u64 = 0x400;
+
+/// How much of the packet memory is USB's while the F0x2's CAN clock runs:
+/// "When the CAN peripheral clock is enabled in the RCC_APB1ENR register, only
+/// the first 768 Bytes are available to USB while the last 256 Bytes are used
+/// by CAN" (RM0091 Table 121, note 2).
+pub const PMA_BYTES_WITH_CAN: u64 = 0x300;
 
 // Register word offsets (each register is the low half of its 32-bit word).
 const OFF_CNTR: u64 = 0x40;
@@ -158,6 +212,9 @@ const STAT_VALID: u16 = 0b11;
 /// The interrupt-enable bits that line up with the `ISTR` flags, `CTRM` (15)
 /// down through `L1REQM` (7) — each gates the interrupt its `ISTR` flag raises.
 const CNTR_IRQ_MASK: u16 = 0xff80;
+/// `CNTR`'s implemented bits: all but bit 6, "Reserved, must be kept at reset
+/// value" (RM0434 §40.6.1).
+const CNTR_WRITABLE: u16 = 0xffbf;
 const CNTR_PDWN: u16 = 1 << 1;
 const CNTR_FRES: u16 = 1 << 0;
 /// `CNTR`'s reset value: powered down and held in reset (RM0091 §30.6.1).
@@ -171,9 +228,28 @@ const ISTR_DIR: u16 = 1 << 4;
 /// `CTR`, `DIR` and `EP_ID` are read-only and computed.
 const ISTR_FLAG_MASK: u16 = 0x7f80;
 
-// --- DADDR / BCDR ---
+// --- DADDR / BTABLE / LPMCSR / BCDR ---
 const DADDR_ADD: u16 = 0x007f;
+/// `EF` (7) and `ADD[6:0]`; bits 15:8 are "Reserved".
+const DADDR_WRITABLE: u16 = 0x00ff;
+/// `BTABLE[15:3]`; bits 2:0 are "Reserved, forced by hardware to 0".
+const BTABLE_WRITABLE: u16 = 0xfff8;
+/// `LPMACK` (1) and `LPMEN` (0) are the only `rw` bits; `BESL[3:0]` (7:4) and
+/// `REMWAKE` (3) are `r`, written by the hardware from the last ACKed LPM
+/// token, and bit 2 is reserved.
+const LPMCSR_WRITABLE: u16 = 0x0003;
 const BCDR_DPPU: u16 = 1 << 15;
+const BCDR_PS2DET: u16 = 1 << 7;
+const BCDR_SDET: u16 = 1 << 6;
+const BCDR_PDET: u16 = 1 << 5;
+const BCDR_DCDET: u16 = 1 << 4;
+const BCDR_SDEN: u16 = 1 << 3;
+const BCDR_PDEN: u16 = 1 << 2;
+const BCDR_DCDEN: u16 = 1 << 1;
+const BCDR_BCDEN: u16 = 1 << 0;
+/// The `rw` bits of `BCDR`: `DPPU` and the four enables. The detection
+/// results (7:4) are `r` and computed ([`bcd_status`]); 14:8 are reserved.
+const BCDR_WRITABLE: u16 = BCDR_DPPU | BCDR_SDEN | BCDR_PDEN | BCDR_DCDEN | BCDR_BCDEN;
 
 /// Low ten bits of a `COUNT_*` word: the byte count. The high bits are the RX
 /// buffer's allocated block size and are the application's, not ours.
@@ -197,6 +273,12 @@ struct State {
     bcdr: u16,
     /// The packet-buffer memory.
     pma: Vec<u8>,
+    /// How many bytes of [`pma`](State::pma), from the bottom, are USB's:
+    /// all of it, or [`PMA_BYTES_WITH_CAN`] while the F0x2's CAN clock runs.
+    ///
+    /// Not guest state: it follows the `can-enable` wire, and is re-derived
+    /// from it whenever the state is rebuilt ([`Usbfs::set_state`]).
+    usb_pma_len: usize,
 }
 
 impl State {
@@ -210,6 +292,7 @@ impl State {
             lpmcsr: 0,
             bcdr: 0,
             pma: vec![0; PMA_BYTES as usize],
+            usb_pma_len: PMA_BYTES as usize,
         }
     }
 
@@ -228,21 +311,40 @@ impl State {
         self.ep[n] = (self.ep[n] & !EP_STAT_TX) | ((v & 0b11) << 4);
     }
 
+    /// The packet-memory byte at `off` as the controller sees it — zero past
+    /// the end, and zero in the part CAN holds (see [`pma_slot`](State::pma_slot)).
+    ///
+    /// Every controller-side access to the packet memory goes through this or
+    /// [`pma_slot`](State::pma_slot), so the CAN share is honoured in one place.
+    fn pma_byte(&self, off: usize) -> u8 {
+        if off < self.usb_pma_len {
+            self.pma.get(off).copied().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+    /// The packet-memory byte at `off` for writing, or `None` past the end or
+    /// in the part CAN holds: RM0091 says only that those 256 bytes "are used
+    /// by CAN", not what a USB access there does, so the conservative reading
+    /// is that it reaches nothing — a read gets zero, a write is lost, and the
+    /// bytes USB had there are left as they were.
+    fn pma_slot(&mut self, off: usize) -> Option<&mut u8> {
+        if off < self.usb_pma_len {
+            self.pma.get_mut(off)
+        } else {
+            None
+        }
+    }
     fn pma_u16(&self, off: u16) -> u16 {
         let o = off as usize;
-        self.pma
-            .get(o..o + 2)
-            .map_or(0, |s| u16::from_le_bytes([s[0], s[1]]))
+        u16::from_le_bytes([self.pma_byte(o), self.pma_byte(o + 1)])
     }
     fn set_pma_u16(&mut self, off: u16, v: u16) {
-        let o = off as usize;
-        if let Some(s) = self.pma.get_mut(o..o + 2) {
-            s.copy_from_slice(&v.to_le_bytes());
-        }
+        self.pma_write(off, &v.to_le_bytes());
     }
     fn pma_write(&mut self, addr: u16, data: &[u8]) {
         for (i, b) in data.iter().enumerate() {
-            if let Some(slot) = self.pma.get_mut(addr as usize + i) {
+            if let Some(slot) = self.pma_slot(addr as usize + i) {
                 *slot = *b;
             }
         }
@@ -295,6 +397,122 @@ impl State {
 }
 
 // ---------------------------------------------------------------------------
+// Battery charging detection
+// ---------------------------------------------------------------------------
+
+/// What the cable is plugged into, as the USB Battery Charging specification
+/// 1.2 classifies the far end — the one thing `BCDR`'s detection results
+/// depend on, and a fact about the attachment rather than the chip.
+///
+/// A closed set on purpose: [`bcd_status`] matches it exhaustively, and a new
+/// kind of port is a new row of that table, not a value a board can invent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PortType {
+    /// A Standard Downstream Port: an ordinary host or hub port. The default,
+    /// and what every board written before this property existed plugs into.
+    #[default]
+    Sdp,
+    /// A Charging Downstream Port: a host port that also supplies charging
+    /// current, and answers primary detection.
+    Cdp,
+    /// A Dedicated Charging Port: a wall charger, `D+` shorted to `D-`, no host.
+    Dcp,
+    /// A port that pulls **both** data lines up — a PS/2 port, or a proprietary
+    /// charger that does not follow BC 1.2 (RM0434 §40.6.1, `PS2DET`).
+    Ps2,
+    /// Nothing: the data lines float.
+    Unplugged,
+}
+
+impl PortType {
+    /// The values the `port-type` property takes, in [`PortType`] order.
+    pub const NAMES: [&'static str; 5] = ["sdp", "cdp", "dcp", "ps2", "none"];
+
+    /// Parse a `port-type` property value.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<PortType> {
+        Some(match name {
+            "sdp" => PortType::Sdp,
+            "cdp" => PortType::Cdp,
+            "dcp" => PortType::Dcp,
+            "ps2" => PortType::Ps2,
+            "none" => PortType::Unplugged,
+            _ => return None,
+        })
+    }
+
+    /// Data contact detection: with the device sourcing a small current into
+    /// `D+` (BC 1.2 `IDP_SRC`) and pulling `D-` down (`RDM_DWN`), does `D+`
+    /// read low? A host port's own `D+` pull-down does that for an SDP or CDP;
+    /// a DCP's `D+`–`D-` short hands `D+` to the device's own `D-` pull-down. A
+    /// port that pulls `D+` up, or no port at all, leaves `D+` high.
+    fn data_contact(self) -> bool {
+        matches!(self, PortType::Sdp | PortType::Cdp | PortType::Dcp)
+    }
+
+    /// Primary detection: with the device driving `VDP_SRC` onto `D+`, is `D-`
+    /// above `VDAT_REF`? A CDP drives `D-` back, a DCP's short carries `D+`
+    /// across, and a pull-up holds it high; an SDP's `D-` pull-down keeps it
+    /// low, and so does the device's own sink current when nothing is there.
+    fn primary(self) -> bool {
+        matches!(self, PortType::Cdp | PortType::Dcp | PortType::Ps2)
+    }
+
+    /// Secondary detection, the mirror of primary: `VDM_SRC` onto `D-`, is `D+`
+    /// above `VDAT_REF`? Only a port that joins the lines (DCP) or pulls `D+`
+    /// up says yes; a CDP does not drive `D+` back, which is the distinction.
+    fn secondary(self) -> bool {
+        matches!(self, PortType::Dcp | PortType::Ps2)
+    }
+
+    /// The `PS2DET` comparator during primary detection: `D-` above `VLGC`,
+    /// i.e. pulled up from outside rather than merely carrying `VDP_SRC`.
+    fn dm_pulled_up(self) -> bool {
+        matches!(self, PortType::Ps2)
+    }
+}
+
+/// `BCDR`'s read-only result bits for a register holding `bcdr`, on a cable
+/// into `port`.
+///
+/// RM0434 §40.6.1 (RM0091 §30.6.1 is word-for-word the same) gives the bits and
+/// no sequence beyond them, so the table is the bit descriptions:
+///
+/// | Bit | Mode | 0 | 1 |
+/// | --- | --- | --- | --- |
+/// | `DCDET` (4) | `DCDEN` | "data lines contact not detected" | "data lines contact detected" |
+/// | `PDET` (5) | `PDEN` | "no BCD support detected (connected to SDP or proprietary device)" | "BCD support detected (connected to ACA, CDP or DCP)" |
+/// | `PS2DET` (7) | `PDEN` | "Normal port detected (connected to SDP, ACA, CDP or DCP)" | "PS2 port or proprietary charger detected" |
+/// | `SDET` (6) | `SDEN` | "CDP detected" | "DCP detected" |
+///
+/// What decides each result is the line condition BC 1.2's detection steps
+/// (data contact detect, primary detection, secondary detection) sense; the
+/// [`PortType`] methods say which port meets which. Three rules are this
+/// model's reading where the manual is silent:
+///
+/// * Nothing reads back unless `BCDEN` is set — the detector is off — and a
+///   result shows only while its own mode is selected (the manual says this
+///   outright for `PS2DET`: "active only during PD").
+/// * "Only one detection mode (DCD, PD, SD or OFF) should be selected to work
+///   correctly." With two or more selected every result reads zero, rather
+///   than inventing which mode wins.
+/// * The comparators are modelled as settled: the result is there on the
+///   first read after the mode is selected. Firmware that waits out BC 1.2's
+///   timings first sees the same answer it would on silicon.
+fn bcd_status(bcdr: u16, port: PortType) -> u16 {
+    if bcdr & BCDR_BCDEN == 0 {
+        return 0;
+    }
+    let bit = |cond: bool, b: u16| if cond { b } else { 0 };
+    match bcdr & (BCDR_DCDEN | BCDR_PDEN | BCDR_SDEN) {
+        BCDR_DCDEN => bit(port.data_contact(), BCDR_DCDET),
+        BCDR_PDEN => bit(port.primary(), BCDR_PDET) | bit(port.dm_pulled_up(), BCDR_PS2DET),
+        BCDR_SDEN => bit(port.secondary(), BCDR_SDET),
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
 
@@ -313,6 +531,14 @@ pub struct Usbfs {
     attached: AtomicU32,
     /// This block seen from the bus. Holds a [`Weak`] back here.
     gadget: Mutex<Option<Arc<Gadget>>>,
+    /// What the cable is plugged into — configuration, fixed at construction.
+    port_type: PortType,
+    /// The F0x2's `RCC_APB1ENR.CANEN`, as the `can-enable` wire last
+    /// delivered it. Low (and so all 1 KiB USB's) when nothing drives it.
+    can: AtomicBool,
+    /// The `can-enable` pins built for this block. A net holds its sinks
+    /// weakly, so the strong reference lives here.
+    can_pins: Mutex<Vec<Arc<CanPin>>>,
 }
 
 impl fmt::Debug for Usbfs {
@@ -320,14 +546,24 @@ impl fmt::Debug for Usbfs {
         f.debug_struct("Usbfs")
             .field("port", &self.port)
             .field("attached", &(self.attached.load(Ordering::Relaxed) != 0))
+            .field("port_type", &self.port_type)
+            .field("can", &self.can.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
 impl Usbfs {
-    /// Build the engine on `bus`, its device half plugging into `port`.
+    /// Build the engine on `bus`, its device half plugging into `port`, on a
+    /// cable into a standard host port.
     #[must_use]
     pub fn new(bus: Arc<UsbBus>, port: u8) -> Arc<Usbfs> {
+        Usbfs::with_port_type(bus, port, PortType::Sdp)
+    }
+
+    /// The same, with the cable plugged into `port_type` — what `BCDR`'s
+    /// battery-charging detection finds.
+    #[must_use]
+    pub fn with_port_type(bus: Arc<UsbBus>, port: u8, port_type: PortType) -> Arc<Usbfs> {
         let me = Arc::new(Usbfs {
             state: Mutex::with_rank(LockRank::DEVICE, State::reset()),
             gate: ClockGate::new(),
@@ -336,6 +572,9 @@ impl Usbfs {
             port,
             attached: AtomicU32::new(0),
             gadget: Mutex::with_rank(LockRank::WIRE, None),
+            port_type,
+            can: AtomicBool::new(false),
+            can_pins: Mutex::with_rank(LockRank::WIRE, Vec::new()),
         });
         *me.gadget.lock() = Some(Arc::new(Gadget {
             core: Arc::downgrade(&me),
@@ -367,11 +606,48 @@ impl Usbfs {
         self.state.lock().istr_value()
     }
 
+    /// What the cable is plugged into.
+    #[must_use]
+    pub fn port_type(&self) -> PortType {
+        self.port_type
+    }
+
+    /// Whether the F0x2's CAN currently holds the top 256 bytes of packet
+    /// memory.
+    #[must_use]
+    pub fn can_holds_pma(&self) -> bool {
+        self.can.load(Ordering::Relaxed)
+    }
+
+    /// Drive the `can-enable` input directly — the route a test takes.
+    pub fn set_can_enable(&self, high: bool) {
+        self.can.store(high, Ordering::Relaxed);
+        self.state.lock().usb_pma_len = Usbfs::usb_pma_len(high);
+    }
+
+    fn usb_pma_len(can: bool) -> usize {
+        if can {
+            PMA_BYTES_WITH_CAN as usize
+        } else {
+            PMA_BYTES as usize
+        }
+    }
+
+    /// Replace the state wholesale (reset, snapshot load), keeping the one
+    /// field that follows a wire rather than the guest.
+    fn set_state(&self, mut state: State) {
+        state.usb_pma_len = Usbfs::usb_pma_len(self.can.load(Ordering::Relaxed));
+        *self.state.lock() = state;
+    }
+
     /// Whether the device is electrically on the bus: clocked, powered, out of
-    /// reset, and its `DPPU` pull-up attached.
+    /// reset, its `DPPU` pull-up attached, and the PHY not lent to the charger
+    /// detector — "When enabled, the USB PHY is fully controlled by BCD and
+    /// cannot be used for normal communication" (`BCDR.BCDEN`, RM0434 §40.6.1).
     fn connected(state: &State, gate: &ClockGate) -> bool {
         gate.live()
             && state.bcdr & BCDR_DPPU != 0
+            && state.bcdr & BCDR_BCDEN == 0
             && state.cntr & CNTR_PDWN == 0
             && state.cntr & CNTR_FRES == 0
     }
@@ -430,7 +706,7 @@ impl Usbfs {
     }
 
     fn do_reset(&self) {
-        *self.state.lock() = State::reset();
+        self.set_state(State::reset());
     }
 
     // -- register file --------------------------------------------------
@@ -447,7 +723,7 @@ impl Usbfs {
             OFF_DADDR => state.daddr,
             OFF_BTABLE => state.btable,
             OFF_LPMCSR => state.lpmcsr,
-            OFF_BCDR => state.bcdr,
+            OFF_BCDR => state.bcdr | bcd_status(state.bcdr, self.port_type),
             _ => return None,
         })
     }
@@ -458,16 +734,21 @@ impl Usbfs {
         let mut state = self.state.lock();
         match word {
             o if o < 0x20 => write_epnr(&mut state.ep[(o / 4) as usize], value),
-            OFF_CNTR => state.cntr = value,
+            OFF_CNTR => state.cntr = value & CNTR_WRITABLE,
             OFF_ISTR => state.istr &= value & ISTR_FLAG_MASK,
-            OFF_DADDR => state.daddr = value,
-            OFF_BTABLE => state.btable = value,
-            OFF_LPMCSR => state.lpmcsr = value,
-            OFF_BCDR => state.bcdr = value,
+            // Every bit is `r`; the write decodes and changes nothing.
+            OFF_FNR => {}
+            OFF_DADDR => state.daddr = value & DADDR_WRITABLE,
+            OFF_BTABLE => state.btable = value & BTABLE_WRITABLE,
+            OFF_LPMCSR => {
+                state.lpmcsr = (state.lpmcsr & !LPMCSR_WRITABLE) | (value & LPMCSR_WRITABLE);
+            }
+            // The result bits are computed on read and never stored.
+            OFF_BCDR => state.bcdr = value & BCDR_WRITABLE,
             _ => return (false, false),
         }
-        // `CNTR.PDWN`/`FRES` and `BCDR.DPPU` decide whether the device is on the
-        // bus; a write to either may have flipped that.
+        // `CNTR.PDWN`/`FRES` and `BCDR.DPPU`/`BCDEN` decide whether the device
+        // is on the bus; a write to either may have flipped that.
         let settle = matches!(word, OFF_CNTR | OFF_BCDR);
         (true, settle)
     }
@@ -541,7 +822,7 @@ impl Usbfs {
         }
         let base = addr_tx as usize;
         for (i, slot) in dst[..len].iter_mut().enumerate() {
-            *slot = state.pma.get(base + i).copied().unwrap_or(0);
+            *slot = state.pma_byte(base + i);
         }
         if commit {
             state.ep[n] |= EP_CTR_TX;
@@ -565,6 +846,26 @@ impl Gated for Usbfs {
     }
     fn gate_reset(&self) {
         self.do_reset();
+    }
+}
+
+/// The `can-enable` input, as something a wire can drive.
+///
+/// Holds its device **weakly** (the device owns the pin), exactly as
+/// [`gate::GatePin`] does and for the same reason.
+#[derive(Debug)]
+struct CanPin {
+    owner: Weak<Usbfs>,
+    inputs: FanIn,
+}
+
+impl WireSink for CanPin {
+    fn set_level(&self, src: WireId, _line: u32, level: Level) {
+        self.inputs.set(src, level);
+        let high = self.inputs.resolve(Resolve::Or).is_high();
+        if let Some(owner) = self.owner.upgrade() {
+            owner.set_can_enable(high);
+        }
     }
 }
 
@@ -769,8 +1070,11 @@ impl MemOps for Pma {
             dst.fill(0);
             return Ok(());
         }
+        // The CPU sees the share CAN holds the way the controller does: RM0091
+        // is silent on it, and reading zero is the answer that cannot leak a
+        // stale USB buffer as if it were live.
         for (i, b) in dst.iter_mut().enumerate() {
-            *b = state.pma.get(offset as usize + i).copied().unwrap_or(0);
+            *b = state.pma_byte(offset as usize + i);
         }
         Ok(())
     }
@@ -786,7 +1090,7 @@ impl MemOps for Pma {
             return Ok(());
         }
         for (i, b) in src.iter().enumerate() {
-            if let Some(slot) = state.pma.get_mut(offset as usize + i) {
+            if let Some(slot) = state.pma_slot(offset as usize + i) {
                 *slot = *b;
             }
         }
@@ -794,7 +1098,11 @@ impl MemOps for Pma {
     }
 
     fn constraints(&self) -> AccessConstraints {
-        AccessConstraints::word(Width::U32, Endian::Little).with_widths(Width::U8, Width::U32)
+        // "The packet memory should be accessed only by byte (8-bit) or
+        // half-word (16-bit) accesses. Word (32-bit) accesses are not allowed"
+        // (RM0434 §40.6.2, RM0091 §30.6.2). What a word access does on silicon
+        // is not stated; refusing it is the answer that tells the firmware.
+        AccessConstraints::word(Width::U16, Endian::Little).with_widths(Width::U8, Width::U16)
     }
 }
 
@@ -815,6 +1123,10 @@ pub mod pin {
     /// The low-priority USB interrupt. Level, the OR of the enabled `ISTR`
     /// flags under `CNTR`'s mask.
     pub const IRQ: &str = "irq";
+    /// Input: the F0x2's `RCC_APB1ENR.CANEN`. High hands the top 256 bytes of
+    /// packet memory to CAN (RM0091 Table 121, note 2). Unwired is low — the
+    /// STM32WB, which has no CAN, and every board written before the pin.
+    pub const CAN_ENABLE: &str = "can-enable";
 }
 
 impl UsbfsPeripheral {
@@ -824,17 +1136,34 @@ impl UsbfsPeripheral {
     ///
     /// * `bus` — the named [`UsbBus`] this device plugs into. Required.
     /// * `port` — which port of `bus` it occupies. Defaults to 0.
+    /// * `port-type` — what the cable is plugged into, for `BCDR`'s battery
+    ///   charging detection: `sdp` (a standard host port, the default), `cdp`,
+    ///   `dcp`, `ps2` or `none`. See [`PortType`].
     ///
     /// # Errors
     ///
-    /// [`Error::Property`] for an unknown or missing property.
+    /// [`Error::Property`] for an unknown or missing property, and
+    /// [`Error::Config`] for a `port-type` that is not one of those.
     pub fn new(props: &Props) -> Result<UsbfsPeripheral> {
         let mut r = props.reader();
         let bus_name = String::from(r.require_str("bus")?);
         let port = r.or_range("port", 0u64, 0..=u64::from(u8::MAX))?;
+        let port_type_name = r.or_str("port-type", "sdp")?;
         r.finish()?;
+        let Some(port_type) = PortType::from_name(port_type_name) else {
+            return Err(Error::Config {
+                at: String::from("port-type"),
+                message: format!(
+                    "`port-type` is {port_type_name:?}; the BC 1.2 port kinds this model \
+                     detects are {:?}",
+                    PortType::NAMES
+                ),
+            });
+        };
         let bus = buses::attach(props, &bus_name, (port as u8).saturating_add(1))?;
-        Ok(UsbfsPeripheral::with_bus_at(bus, port as u8))
+        Ok(UsbfsPeripheral::with_bus_port_type(
+            bus, port as u8, port_type,
+        ))
     }
 
     /// A peripheral on a bus the caller already holds, on port zero of it.
@@ -846,7 +1175,13 @@ impl UsbfsPeripheral {
     /// The same, on a named port.
     #[must_use]
     pub fn with_bus_at(bus: Arc<UsbBus>, port: u8) -> UsbfsPeripheral {
-        let core = Usbfs::new(bus, port);
+        UsbfsPeripheral::with_bus_port_type(bus, port, PortType::Sdp)
+    }
+
+    /// The same, with the cable plugged into `port_type`.
+    #[must_use]
+    pub fn with_bus_port_type(bus: Arc<UsbBus>, port: u8, port_type: PortType) -> UsbfsPeripheral {
+        let core = Usbfs::with_port_type(bus, port, port_type);
         let regs = Arc::new(Region::io(
             "usbfs",
             REGISTER_BYTES,
@@ -924,7 +1259,7 @@ impl Device for UsbfsPeripheral {
             )));
         }
         state.pma.copy_from_slice(pma);
-        *self.core.state.lock() = state;
+        self.core.set_state(state);
         Ok(())
     }
 
@@ -937,8 +1272,19 @@ impl Device for UsbfsPeripheral {
     }
 
     fn sink(&self, port: &str, sources: &[WireId]) -> Option<SinkPin> {
-        // The clock gate's `enable` and `reset`, and nothing else inward.
-        gate::sink(&self.core, port, sources)
+        // The clock gate's `enable` and `reset`, and the F0x2's CAN share.
+        if let Some(pin) = gate::sink(&self.core, port, sources) {
+            return Some(pin);
+        }
+        if port != pin::CAN_ENABLE {
+            return None;
+        }
+        let pin = Arc::new(CanPin {
+            owner: Arc::downgrade(&self.core),
+            inputs: FanIn::new(sources),
+        });
+        self.core.can_pins.lock().push(Arc::clone(&pin));
+        Some(SinkPin { sink: pin, line: 0 })
     }
 
     fn connect(&self, port: &str, source: WireSource) -> Result<()> {
@@ -966,7 +1312,7 @@ impl Instance for UsbfsPeripheral {}
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
     version: STATE_VERSION,
-    summary: "STM32 USB full-speed device peripheral (the F0x2/F1/F3/L0 USB_FS block)",
+    summary: "STM32 USB full-speed device peripheral (the F0x2 and STM32WB USB block)",
     properties: &[
         PropertySpec {
             name: "bus",
@@ -979,6 +1325,13 @@ pub static CLASS: DeviceClass = DeviceClass {
             kind: ValueKind::Uint,
             required: false,
             summary: "which port of the bus it occupies (default 0)",
+        },
+        PropertySpec {
+            name: "port-type",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "what the cable is plugged into, for battery charging detection: \
+                      sdp (default), cdp, dcp, ps2 or none",
         },
     ],
     construct: |props| Ok(Box::new(UsbfsPeripheral::new(props)?)),
@@ -1010,7 +1363,9 @@ pub fn schema() -> ClassSchema {
     let schema = ClassSchema::new(CLASS_NAME)
         .prop(PropSchema::new("bus", ValueKind::Str).required())
         .prop(PropSchema::new("port", ValueKind::Uint).range(0, u64::from(u8::MAX)))
+        .prop(PropSchema::new("port-type", ValueKind::Str).values(&PortType::NAMES))
         .port(pin::IRQ, PortDir::Out)
+        .port(pin::CAN_ENABLE, PortDir::In)
         .region("")
         .region("regs")
         .region("pma")

@@ -494,3 +494,219 @@ fn the_schema_and_the_device_agree_about_regions_and_pins() {
     assert!(schema.port_named(gate::ENABLE_PIN).is_some());
     assert!(schema.port_named(gate::RESET_PIN).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// The register map (RM0434 §40.6.1/§40.6.3, RM0091 §30.6.1/§30.6.3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_register_comes_out_of_reset_at_the_tables_value() {
+    // The register map tables: `CNTR` resets to 0x0003, every other register
+    // to zero (`FNR`'s undefined bits read zero here before any SOF).
+    let f = fixture();
+    assert_eq!(f.rd(OFF_CNTR), 0x0003, "PDWN and FRES");
+    for off in [OFF_ISTR, OFF_DADDR, OFF_BTABLE, OFF_LPMCSR, OFF_BCDR] {
+        assert_eq!(f.rd(off), 0, "register {off:#x}");
+    }
+    for n in 0..8 {
+        assert_eq!(f.ep(n), 0, "EP{n}R");
+    }
+}
+
+#[test]
+fn reserved_and_read_only_bits_do_not_take_a_write() {
+    let f = fixture();
+    // CNTR bit 6: "Reserved, must be kept at reset value".
+    f.wr(OFF_CNTR, 0xffff);
+    assert_eq!(f.rd(OFF_CNTR), 0xffbf);
+    // DADDR 15:8 reserved; EF and ADD[6:0] are rw.
+    f.wr(OFF_DADDR, 0xffff);
+    assert_eq!(f.rd(OFF_DADDR), 0x00ff);
+    // BTABLE 2:0: "Reserved, forced by hardware to 0".
+    f.wr(OFF_BTABLE, 0xffff);
+    assert_eq!(f.rd(OFF_BTABLE), 0xfff8);
+    // LPMCSR: only LPMACK/LPMEN are rw; BESL and REMWAKE are the hardware's.
+    f.core().state.lock().lpmcsr = 0x00f8;
+    f.wr(OFF_LPMCSR, 0x0000);
+    assert_eq!(
+        f.rd(OFF_LPMCSR),
+        0x00f8,
+        "a write leaves BESL/REMWAKE alone"
+    );
+    f.wr(OFF_LPMCSR, 0xffff);
+    assert_eq!(f.rd(OFF_LPMCSR), 0x00fb, "and sets only bits 1:0");
+    // BCDR: DPPU and the four enables; the results are `r`. With every mode
+    // selected at once no result is defined, so none reads back.
+    f.wr(OFF_BCDR, 0xffff);
+    assert_eq!(f.rd(OFF_BCDR), 0x800f);
+    assert_eq!(
+        f.core().state.lock().bcdr,
+        0x800f,
+        "no result bit is stored"
+    );
+    // FNR is read-only throughout: the write decodes and changes nothing.
+    f.regs
+        .write(OFF_FNR, &0xffffu16.to_le_bytes(), MemAttrs::DEFAULT)
+        .expect("a write to a read-only register is not a bus fault");
+    assert_eq!(f.rd(OFF_FNR), 0);
+}
+
+#[test]
+fn the_packet_memory_takes_bytes_and_half_words_but_not_words() {
+    // "The packet memory should be accessed only by byte (8-bit) or half-word
+    // (16-bit) accesses. Word (32-bit) accesses are not allowed."
+    let f = fixture();
+    let c = f.pma.constraints();
+    let at = MemAttrs::DEFAULT;
+    assert!(c.check(0x10, Width::U8, at).is_ok());
+    assert!(c.check(0x11, Width::U8, at).is_ok());
+    assert!(c.check(0x10, Width::U16, at).is_ok());
+    assert!(c.check(0x11, Width::U16, at).is_err(), "half-word aligned");
+    assert!(c.check(0x10, Width::U32, at).is_err(), "no word access");
+    // The register file is the other way round: "can be accessed by
+    // half-words (16-bit) or words (32-bit)".
+    let r = f.regs.constraints();
+    assert!(r.check(OFF_CNTR, Width::U16, at).is_ok());
+    assert!(r.check(OFF_CNTR, Width::U32, at).is_ok());
+    assert!(r.check(OFF_CNTR, Width::U8, at).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Battery charging detection
+// ---------------------------------------------------------------------------
+
+fn fixture_on(port_type: PortType) -> Fixture {
+    let bus = Arc::new(UsbBus::new(1));
+    let dev = UsbfsPeripheral::with_bus_port_type(Arc::clone(&bus), 0, port_type);
+    let regs = io(&Device::region(&dev, "regs").expect("the register block"));
+    let pma = io(&Device::region(&dev, "pma").expect("the packet memory"));
+    Fixture {
+        dev,
+        bus,
+        regs,
+        pma,
+    }
+}
+
+/// `BCDR`'s result bits (7:4) with the detector on and `mode` selected.
+fn detect(f: &Fixture, mode: u16) -> u16 {
+    f.wr(OFF_BCDR, BCDR_BCDEN | mode);
+    f.rd(OFF_BCDR) & 0x00f0
+}
+
+#[test]
+fn each_port_type_answers_the_detection_it_should() {
+    // (port, DCDET, PDET, PS2DET, SDET). The bit meanings are RM0434
+    // §40.6.1's: PDET "0: ... SDP ... 1: ... ACA, CDP or DCP", SDET "0: CDP
+    // detected. 1: DCP detected.", PS2DET "1: PS2 port or proprietary
+    // charger detected."
+    let table = [
+        (PortType::Sdp, true, false, false, false),
+        (PortType::Cdp, true, true, false, false),
+        (PortType::Dcp, true, true, false, true),
+        (PortType::Ps2, false, true, true, true),
+        (PortType::Unplugged, false, false, false, false),
+    ];
+    for (port, dcd, pd, ps2, sd) in table {
+        let f = fixture_on(port);
+        let b = |set: bool, bit: u16| if set { bit } else { 0 };
+        assert_eq!(detect(&f, BCDR_DCDEN), b(dcd, BCDR_DCDET), "{port:?} DCD");
+        assert_eq!(
+            detect(&f, BCDR_PDEN),
+            b(pd, BCDR_PDET) | b(ps2, BCDR_PS2DET),
+            "{port:?} PD"
+        );
+        assert_eq!(detect(&f, BCDR_SDEN), b(sd, BCDR_SDET), "{port:?} SD");
+        assert_eq!(detect(&f, 0), 0, "{port:?}: no mode, no result");
+        f.wr(OFF_BCDR, BCDR_PDEN);
+        assert_eq!(
+            f.rd(OFF_BCDR),
+            BCDR_PDEN,
+            "{port:?}: BCDEN clear, no result"
+        );
+    }
+}
+
+#[test]
+fn the_detector_holds_the_phy_off_the_bus() {
+    // "When enabled, the USB PHY is fully controlled by BCD and cannot be
+    // used for normal communication."
+    let f = fixture();
+    f.enumerate_ready();
+    assert!(f.core().is_attached());
+    f.wr(OFF_BCDR, BCDR_DPPU | BCDR_BCDEN | BCDR_PDEN);
+    assert!(!f.core().is_attached(), "the detector has the lines");
+    assert_eq!(
+        f.rd(OFF_BCDR) & BCDR_PDET,
+        0,
+        "and an SDP answers PD with 0"
+    );
+    f.wr(OFF_BCDR, BCDR_DPPU);
+    assert!(f.core().is_attached(), "OFF mode hands them back");
+}
+
+#[test]
+fn port_type_is_a_property_with_sdp_the_default() {
+    let mut reg = Registry::new();
+    register(&mut reg).unwrap();
+    let props = Props::new()
+        .with("bus", Value::from("usb-bcd"))
+        .with("port-type", Value::from("dcp"));
+    assert!(reg.create(CLASS_NAME, &props).is_ok());
+    let bad = Props::new()
+        .with("bus", Value::from("usb-bcd2"))
+        .with("port-type", Value::from("aca"));
+    assert!(
+        reg.create(CLASS_NAME, &bad).is_err(),
+        "not a port kind we model"
+    );
+    assert_eq!(fixture().core().port_type(), PortType::Sdp);
+    assert!(schema().port_named(pin::CAN_ENABLE).is_some());
+}
+
+// ---------------------------------------------------------------------------
+// The F0x2's CAN share of the packet memory
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unwired_can_enable_leaves_all_of_the_packet_memory_usbs() {
+    let f = fixture();
+    assert!(!f.core().can_holds_pma());
+    f.pma_write(0x3fe, &[0xa5, 0x5a]);
+    assert_eq!(f.pma_read(0x3fe, 2), vec![0xa5, 0x5a]);
+}
+
+#[test]
+fn with_can_clocked_the_top_256_bytes_are_not_usbs() {
+    let f = fixture();
+    f.pma_write(0x2fe, &[1, 2]);
+    f.pma_write(0x300, &[3, 4]);
+    // Drive the pin the way RCC would, through the sink a board's wire gets.
+    let pin = Device::sink(&f.dev, pin::CAN_ENABLE, &[WireId::new(7)]).expect("the pin");
+    pin.sink.set_level(WireId::new(7), 0, Level::High);
+    assert!(f.core().can_holds_pma());
+    assert_eq!(
+        f.pma_read(0x2fe, 2),
+        vec![1, 2],
+        "the first 768 bytes stay USB's"
+    );
+    assert_eq!(
+        f.pma_read(0x300, 2),
+        vec![0, 0],
+        "the last 256 read nothing"
+    );
+    f.pma_write(0x300, &[9, 9]);
+    {
+        let s = f.core().state.lock();
+        assert_eq!(s.pma_u16(0x300), 0, "nor does the controller see them");
+        assert_eq!(&s.pma[0x300..0x302], &[3, 4], "and the write was lost");
+    }
+    // A reset of the block does not forget a level its RCC still drives.
+    Device::reset(&f.dev, ResetKind::Cold);
+    assert_eq!(f.core().state.lock().usb_pma_len, 0x300);
+    pin.sink.set_level(WireId::new(7), 0, Level::Low);
+    assert!(!f.core().can_holds_pma());
+    assert_eq!(f.pma_read(0x300, 2), vec![0, 0], "the reset cleared them");
+    f.pma_write(0x300, &[5, 6]);
+    assert_eq!(f.pma_read(0x300, 2), vec![5, 6], "USB's again");
+}

@@ -24,7 +24,7 @@
 //! | [`firewall`] | `st.firewall` | the L0/L4 Firewall: three fenced segments, one call gate, and a reset for anything else |
 //! | [`flash`] | `st.flash` | the embedded flash interface: wait states, the unlock keys, and a programmable array |
 //! | [`crc`] | `st.crc` | the CRC calculation unit, fixed on an F4 and programmable from the F0/F3/F7/L4 on |
-//! | [`usbfs`] | `st.usbfs` | the USB full-speed **device** peripheral (the F0x2/F1/F3/L0 `USB_FS` block), on the USB bus |
+//! | [`usbfs`] | `st.usbfs` | the USB full-speed **device** peripheral (the STM32F0x2 and STM32WB `USB` block), on the USB bus |
 //! | [`hash`] | `st.hash` | the hash processor: SHA-1/MD5 (plus SHA-224/256 on `v2`), HMAC, and the `CSR` context swap |
 //! | [`iwdg`] | `st.iwdg` | the independent watchdog: a down-counter on the LSI that resets the board |
 //! | [`wwdg`] | `st.wwdg` | the window watchdog, which also resets the board when a kick comes *early* |
