@@ -706,7 +706,8 @@ impl Engine {
         for x in 0..SCREEN_WIDTH {
             let index = if !bg_on {
                 // On a DMG, LCDC bit 0 clear blanks the background *and* the
-                // window; objects still draw over the blank.
+                // window; objects still draw over the blank. Index 0, so that
+                // an object behind the background is not hidden by it.
                 0
             } else if window_here && (x as i16) >= i16::from(self.wx) - 7 {
                 window_drawn = true;
@@ -731,7 +732,14 @@ impl Engine {
                 self.tile_pixel(self.tile_address(tile), bx as u8, by as u8)
             };
             bg_index[x] = index;
-            self.fb[row + x] = Engine::shade(self.bgp, index);
+            // The blank is white, not `BGP`'s idea of colour 0: "When Bit 0
+            // is cleared, both background and window become blank (white)"
+            // (Pan Docs, *LCDC*, LCDC.0, Non-CGB Mode).
+            self.fb[row + x] = if bg_on {
+                Engine::shade(self.bgp, index)
+            } else {
+                0
+            };
         }
 
         if window_drawn {

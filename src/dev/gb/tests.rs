@@ -1703,3 +1703,46 @@ fn an_lcd_snapshot_with_the_beam_off_the_raster_or_too_much_dma_is_refused() {
     assert!(try_load(&|p| p[dma_remaining_at] = 161).is_err());
     assert!(try_load(&|p| p[dma_remaining_at + 7] = 0xff).is_err());
 }
+
+#[test]
+fn a_disabled_background_is_white_whatever_bgp_says() {
+    // Pan Docs, *LCDC*, "LCDC.0 — BG and Window enable/priority", Non-CGB
+    // Mode: "When Bit 0 is cleared, both background and window become blank
+    // (white), and the Window Display Bit is ignored in that case. Only
+    // objects may still be displayed (if enabled in Bit 1)."
+    //
+    // White, not "colour 0": the blank pixels used to go through `BGP`, so a
+    // program that had mapped colour 0 to black got a black screen out of a
+    // background it had switched off.
+    let ppu = lcd(0);
+    ppu.write_register(0x07, 0b00_00_00_11); // BGP: colour 0 is the darkest shade
+    ppu.write_register(0x00, lcdc::LCD_ENABLE);
+    ppu.advance_by(ppu::DOTS_PER_LINE);
+    assert_eq!(ppu.pixel(0, 0), Some(0));
+    assert_eq!(ppu.pixel(159, 0), Some(0));
+
+    // And with it on, the same palette paints colour 0 black, so the test is
+    // looking at what it thinks it is.
+    let ppu = lcd(0);
+    ppu.write_register(0x07, 0b00_00_00_11);
+    ppu.write_register(0x00, lcdc::LCD_ENABLE | lcdc::BG_ENABLE | lcdc::TILE_DATA);
+    ppu.advance_by(ppu::DOTS_PER_LINE);
+    assert_eq!(ppu.pixel(0, 0), Some(3));
+
+    // An object still draws over the blank, through its own palette.
+    let ppu = lcd(0);
+    for row in 0..8u64 {
+        ppu.poke_vram(16 + row * 2, 0xff);
+        ppu.poke_vram(16 + row * 2 + 1, 0x00);
+    }
+    ppu.poke_oam(0, 16);
+    ppu.poke_oam(1, 8);
+    ppu.poke_oam(2, 1);
+    ppu.poke_oam(3, 0);
+    ppu.write_register(0x07, 0b00_00_00_11);
+    ppu.write_register(0x08, 0b00_00_10_00); // OBP0: colour 1 is shade 2
+    ppu.write_register(0x00, lcdc::LCD_ENABLE | lcdc::OBJ_ENABLE);
+    ppu.advance_by(ppu::DOTS_PER_LINE);
+    assert_eq!(ppu.pixel(0, 0), Some(2), "the object");
+    assert_eq!(ppu.pixel(8, 0), Some(0), "the blank beside it");
+}
