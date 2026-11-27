@@ -612,10 +612,10 @@ impl Default for Env {
 /// The arithmetic parameters of a format, with no encoding attached.
 ///
 /// IEEE 754-2019 §3.3 describes a binary format by its radix, precision `p`
-/// and maximum exponent `emax`. The third field is what makes x87's precision
-/// control expressible: setting `PC` to 53 changes `precision` and leaves the
-/// exponent range — and therefore `min_ulp`, the exponent of the smallest
-/// subnormal's last bit — where the 80-bit register has it.
+/// and maximum exponent `emax`. The third field is the subnormal grid, kept
+/// separate because not every rounding precision implies it: x87's precision
+/// control moves it with the precision ([`x87::Precision::spec`]), while a
+/// 68881 `FSGLMUL` rounds to 24 bits on the extended format's own grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Spec {
     /// `p`: how many significand bits the result keeps, counting the leading
@@ -648,8 +648,8 @@ impl Spec {
         1 - self.emax
     }
 
-    /// The same exponent range at a shorter precision, which is what x87's
-    /// precision control does (SDM Volume 1, §8.1.5.2).
+    /// The same exponent range **and the same subnormal grid** at a shorter
+    /// precision. Not x87's precision control, which coarsens the grid too.
     #[must_use]
     #[inline]
     pub const fn with_precision(self, precision: u32) -> Spec {

@@ -1430,12 +1430,78 @@ fn the_precision_control_encoding_is_intels() {
     for pc in [0, 2, 3] {
         assert_eq!(Precision::from_pc(pc).unwrap().pc(), pc);
     }
-    // Precision control never touches the exponent range.
+    // Precision control never touches the exponent range, and it rounds a
+    // denormal at the same bit of the register as it rounds a normal.
     for p in [Precision::Single, Precision::Double, Precision::Extended] {
         assert_eq!(p.spec().emax, 16383);
-        assert_eq!(p.spec().min_ulp, -16445);
+        assert_eq!(p.spec().emin(), -16382);
+        assert_eq!(p.spec().min_ulp, -16382 - (p.bits() as i32 - 1));
         assert_eq!(p.spec().precision, p.bits());
     }
+}
+
+#[test]
+fn precision_control_rounds_a_denormal_result_at_the_same_bit_position() {
+    // Each row is one instruction executed on an x86 host (AMD Zen 5) with
+    // the control word shown, and the result and status word it left.
+    let all = Flags::DENORMAL | Flags::UNDERFLOW | Flags::INEXACT;
+    let env = |rc: u32| Env::X87.round(Round::from_x86_rc(rc));
+    // 027F: -0 + the smallest denormal, at 53 bits, is below half of the
+    // smallest denormal that precision can hold.
+    assert_eq!(
+        x87::add(
+            F80::new(0x8000, 0),
+            F80::new(0, 1),
+            Precision::Double,
+            env(0)
+        ),
+        (F80::ZERO, all)
+    );
+    // 0A7F: round up, 53 bits. The low eleven bits of the denormal are zero.
+    assert_eq!(
+        x87::add(
+            F80::new(1, 0x8900_2657_6600_7168),
+            F80::new(0x8000, 0x7fff_ffff_ffff_fffe),
+            Precision::Double,
+            env(2)
+        ),
+        (F80::new(0, 0x0900_2657_6600_7800), all)
+    );
+    // 007F: nearest, 24 bits. Neither operand is a denormal.
+    assert_eq!(
+        x87::add(
+            F80::new(1, 0x8337_49ad_8df1_ed68),
+            F80::new(0x8001, 0x8000_0000_0000_0001),
+            Precision::Single,
+            env(0)
+        ),
+        (
+            F80::new(0, 0x0337_4a00_0000_0000),
+            Flags::UNDERFLOW | Flags::INEXACT
+        )
+    );
+    // 067F: round down, 53 bits. A negative product far below the grid
+    // becomes the smallest denormal the precision has, which is 2^11 ulps of
+    // the register.
+    assert_eq!(
+        x87::mul(
+            F80::new(0xb453, 0x9407_1701_7fdc_d674),
+            F80::new(0, 0x12b2_3b4e_3d3e_663d),
+            Precision::Double,
+            env(1)
+        ),
+        (F80::new(0x8000, 0x800), all)
+    );
+    // At full precision the grid is the register's own.
+    assert_eq!(
+        x87::add(
+            F80::new(0x8000, 0),
+            F80::new(0, 1),
+            Precision::Extended,
+            env(0)
+        ),
+        (F80::new(0, 1), Flags::DENORMAL)
+    );
 }
 
 // ---------------------------------------------------------------------------

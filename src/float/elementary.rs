@@ -230,6 +230,19 @@ fn decide(enc: &Enclosure, spec: Spec, env: Env) -> Option<(Outcome, Flags, bool
     (a == b).then_some(a)
 }
 
+/// The parameters a transcendental rounds to at a given [`Precision`]: that
+/// many significand bits on the 80-bit format's **own** subnormal grid.
+///
+/// Deliberately not [`Precision::spec`], which is what `FADD`/`FSUB`/`FMUL`/
+/// `FDIV`/`FSQRT` do under precision control and coarsens the grid with the
+/// precision. No x87 transcendental honours precision control at all — the
+/// only caller passes [`Precision::Extended`], where the two agree — so the
+/// reduced precisions here are this module's own generality, and the vectors
+/// in `elementary/tests.rs` were computed for this definition of it.
+fn rounding_spec(pc: Precision) -> Spec {
+    F80::SPEC.with_precision(pc.bits())
+}
+
 /// Ziv's loop: evaluate at increasing precision until the enclosure decides.
 fn ziv(
     pc: Precision,
@@ -237,7 +250,7 @@ fn ziv(
     extra: Flags,
     mut eval: impl FnMut(u32) -> Option<Enclosure>,
 ) -> Elementary {
-    let spec = pc.spec();
+    let spec = rounding_spec(pc);
     let mut w = W0;
     loop {
         let enc = eval(w);
@@ -297,7 +310,7 @@ fn beside(
     } else {
         base.sub(&Big::from_u64(1))
     };
-    let (out, flags, up) = round_point(neg, &rep, e - i64::from(GAP) - 1, pc.spec(), env);
+    let (out, flags, up) = round_point(neg, &rep, e - i64::from(GAP) - 1, rounding_spec(pc), env);
     finish(out, flags | extra, up, env)
 }
 
@@ -313,7 +326,7 @@ fn exact_value(
     if sig.is_zero() {
         return special(Outcome::Num(neg, Rounded::Zero), extra, env);
     }
-    let (out, flags, up) = round_point(neg, sig, exp, pc.spec(), env);
+    let (out, flags, up) = round_point(neg, sig, exp, rounding_spec(pc), env);
     finish(out, flags | extra, up, env)
 }
 

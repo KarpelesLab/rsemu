@@ -22,8 +22,8 @@
 //! * **Precision control** (§8.1.5.2): `FADD`, `FSUB`, `FMUL`, `FDIV` and
 //!   `FSQRT` round their significand to 24 or 53 bits when the control word
 //!   says so, while keeping the 15-bit exponent range. That is a [`Spec`] with
-//!   a shortened precision and an unchanged subnormal grid, which is why
-//!   [`super::Spec`] carries `min_ulp` separately from `precision`.
+//!   a shortened precision, the extended `emax`, and the subnormal grid that
+//!   follows from the two — see [`Precision::spec`].
 //!
 //! Nothing here is wired into a CPU core: this module is the format and its
 //! arithmetic, tested standalone.
@@ -184,9 +184,24 @@ impl Precision {
     /// Precision control shortens the significand and **not** the exponent
     /// range, which is exactly why a `PC = 53` result is not the same as a
     /// binary64 result near the ends of the range.
+    ///
+    /// What it rounds at is a fixed *bit position* of the 64-bit significand
+    /// — bit 11 for 53 bits, bit 40 for 24 — and a tiny result is
+    /// denormalised to the register's smallest exponent first and rounded at
+    /// that same position afterwards. So the subnormal grid under precision
+    /// control is `emin - (p - 1)`, coarser than the register's own, and the
+    /// low bits of a denormal result are zero just as a normal one's are.
+    /// Read back from an x86 host (AMD Zen 5), one instruction each:
+    ///
+    /// | control word | operation | result |
+    /// | --- | --- | --- |
+    /// | `027F` (53, nearest) | `FADD` `-0`, `0000:0000000000000001` | `+0`, `DE UE PE` |
+    /// | `0A7F` (53, up) | `FADD` `0001:8900265766007168`, `8000:7FFFFFFFFFFFFFFE` | `0000:0900265766007800`, `DE UE PE` |
+    /// | `007F` (24, nearest) | `FADD` `0001:833749AD8DF1ED68`, `8001:8000000000000001` | `0000:03374A0000000000`, `UE PE` |
+    /// | `067F` (53, down) | `FMUL` `B453:940717017FDCD674`, `0000:12B23B4E3D3E663D` | `8000:0000000000000800`, `DE UE PE` |
     #[must_use]
     pub const fn spec(self) -> Spec {
-        F80::SPEC.with_precision(self.bits())
+        Spec::interchange(self.bits(), EMAX)
     }
 }
 
