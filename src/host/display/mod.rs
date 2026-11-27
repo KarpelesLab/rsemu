@@ -193,7 +193,7 @@ impl PixelFormat {
     /// goes through it, so adding a format is one arm here and one in
     /// [`bytes_per_pixel`](PixelFormat::bytes_per_pixel).
     #[inline]
-    const fn channel_offsets(self) -> [usize; 3] {
+    pub(crate) const fn channel_offsets(self) -> [usize; 3] {
         match self {
             PixelFormat::BGRA8888 => [2, 1, 0],
             // RGBA8888, RGB888 and anything unknown: R, G, B in order. An

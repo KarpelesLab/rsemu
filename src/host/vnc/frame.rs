@@ -29,6 +29,7 @@
 //! silently sending rectangles outside the framebuffer the client allocated is
 //! how a viewer segfaults.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::host::display::{PixelFormat as SurfaceFormat, Surface};
@@ -49,6 +50,30 @@ pub struct FrameEncoder {
     last: Vec<u8>,
     /// The shape `last` is in.
     last_shape: (SurfaceFormat, u32, u32),
+    /// [`PixelFormat::pack`], tabulated: for each of red, green and blue, the
+    /// channel's 256 possible values already scaled to the client's maximum
+    /// and shifted into place. Derived from `format` and rebuilt whenever it
+    /// changes. See [`pack_table`].
+    table: Box<[[u32; 256]; 3]>,
+}
+
+/// One client pixel format's packing, as three lookups and two ORs.
+///
+/// `pack` scales each channel with a multiply and a divide by 255, which is
+/// the rounding the RFC implies and is the right thing to compute once. A
+/// frame computes it 921 600 times at VGA size for a client whose format is
+/// not the server's own — and there are only 256 inputs per channel, so the
+/// whole function is 768 words. The entries are `pack`'s own results, one
+/// channel at a time, which is why a test can and does compare every one.
+fn pack_table(format: PixelFormat) -> Box<[[u32; 256]; 3]> {
+    let mut table = Box::new([[0u32; 256]; 3]);
+    for value in 0..=255u8 {
+        let at = usize::from(value);
+        table[0][at] = format.pack([value, 0, 0]);
+        table[1][at] = format.pack([0, value, 0]);
+        table[2][at] = format.pack([0, 0, value]);
+    }
+    table
 }
 
 impl FrameEncoder {
@@ -62,6 +87,7 @@ impl FrameEncoder {
             resizable: false,
             last: Vec::new(),
             last_shape: (SurfaceFormat::RGBA8888, 0, 0),
+            table: pack_table(format),
         }
     }
 
@@ -77,6 +103,7 @@ impl FrameEncoder {
     /// is a whole frame whatever it asks for.
     pub fn set_format(&mut self, format: PixelFormat) {
         self.format = format;
+        self.table = pack_table(format);
         self.invalidate();
     }
 
@@ -137,8 +164,12 @@ impl FrameEncoder {
             return Some(out);
         }
 
-        let mut rects: Vec<Vec<u8>> = Vec::new();
+        // One buffer for the whole message, written in place. Each rectangle
+        // used to be built in a `Vec` of its own and then copied into the
+        // update — a second pass over every pixel of every frame.
         let (aw, ah) = self.announced;
+        let mut out = update_header(0).to_vec();
+        let mut count = 0usize;
         if comparable {
             for (top, bottom) in self.damaged_bands(surface) {
                 // The bands are rows of the *surface*; the rectangles are rows
@@ -152,23 +183,24 @@ impl FrameEncoder {
                 if top >= bottom {
                     continue;
                 }
-                rects.push(self.raw_rect(surface, 0, fits(top), aw, fits(bottom - top)));
+                self.raw_rect(&mut out, surface, fits(top), aw, fits(bottom - top));
+                count += 1;
             }
-            if rects.is_empty() {
+            if count == 0 {
                 return None;
             }
         } else {
-            rects.push(self.raw_rect(surface, 0, 0, aw, ah));
+            self.raw_rect(&mut out, surface, 0, aw, ah);
+            count = 1;
         }
 
         self.remember(surface);
 
+        // At most one band per two rows of a sixteen-bit height, so this
+        // always fits; the clamp is for the reader, not for the arithmetic.
         #[allow(clippy::cast_possible_truncation)]
-        let count = rects.len().min(usize::from(u16::MAX)) as u16;
-        let mut out = update_header(count).to_vec();
-        for rect in rects {
-            out.extend_from_slice(&rect);
-        }
+        let count = count.min(usize::from(u16::MAX)) as u16;
+        out[..4].copy_from_slice(&update_header(count));
         Some(out)
     }
 
@@ -200,14 +232,16 @@ impl FrameEncoder {
         bands
     }
 
-    /// One Raw-encoded rectangle (§7.7.1), header included.
+    /// Append one Raw-encoded rectangle (§7.7.1), header included, to `out`:
+    /// `height` full rows of the announced `width`, starting at row `y`.
     ///
     /// Pixels outside the surface are black rather than absent: the client was
     /// promised a rectangle of this size and has allocated for it.
-    fn raw_rect(&self, surface: &Surface, x: u16, y: u16, width: u16, height: u16) -> Vec<u8> {
+    fn raw_rect(&self, out: &mut Vec<u8>, surface: &Surface, y: u16, width: u16, height: u16) {
         let bpp = self.format.bytes_per_pixel();
-        let mut out = rect_header(x, y, width, height, encoding::RAW).to_vec();
-        out.reserve(usize::from(width) * usize::from(height) * bpp);
+        let row_bytes = usize::from(width) * bpp;
+        out.reserve(12 + row_bytes * usize::from(height));
+        out.extend_from_slice(&rect_header(0, y, width, height, encoding::RAW));
 
         // The common case by construction: the session allocates its surface in
         // BGRA8888, and BGRA8888 is byte for byte what the default RFB pixel
@@ -215,21 +249,47 @@ impl FrameEncoder {
         // the difference between one memcpy and 288 000 shifts on a VGA frame.
         let direct = surface.format() == SurfaceFormat::BGRA8888
             && self.format == PixelFormat::DEFAULT
-            && x == 0
             && u32::from(width) == surface.width();
 
+        // Everything else is a repack, a row at a time: the surface's own
+        // bytes walked once, each channel looked up rather than rescaled.
+        let step = surface.format().bytes_per_pixel() as usize;
+        let [r, g, b] = surface.format().channel_offsets();
+        // How many of the rectangle's columns the surface actually has.
+        let have = usize::from(width).min(surface.width() as usize);
+
         for row in 0..u32::from(height) {
-            let sy = u32::from(y) + row;
-            if direct && let Some(bytes) = surface.row(sy) {
+            let Some(bytes) = surface.row(u32::from(y) + row) else {
+                // Below the surface: black, which packs to zero in every
+                // format because every channel scales zero to zero.
+                out.resize(out.len() + row_bytes, 0);
+                continue;
+            };
+            if direct {
                 out.extend_from_slice(bytes);
                 continue;
             }
-            for column in 0..u32::from(width) {
-                let rgb = surface.get(u32::from(x) + column, sy).unwrap_or([0, 0, 0]);
-                self.format.put(self.format.pack(rgb), &mut out);
+            let pixels = bytes.chunks_exact(step).take(have);
+            let packed = pixels.map(|px| {
+                self.table[0][usize::from(px[r])]
+                    | self.table[1][usize::from(px[g])]
+                    | self.table[2][usize::from(px[b])]
+            });
+            // The width and byte order are the format's, so they are decided
+            // once a row rather than once a pixel. Each arm is `PixelFormat::
+            // put` for that width.
+            match (self.format.bits_per_pixel, self.format.big_endian) {
+                (8, _) => out.extend(packed.map(|v| v as u8)),
+                (16, false) => {
+                    packed.for_each(|v| out.extend_from_slice(&(v as u16).to_le_bytes()))
+                }
+                (16, true) => packed.for_each(|v| out.extend_from_slice(&(v as u16).to_be_bytes())),
+                (_, false) => packed.for_each(|v| out.extend_from_slice(&v.to_le_bytes())),
+                (_, true) => packed.for_each(|v| out.extend_from_slice(&v.to_be_bytes())),
             }
+            // To the right of the surface: black again.
+            out.resize(out.len() + (usize::from(width) - have) * bpp, 0);
         }
-        out
     }
 
     /// Keep a copy of what the client now has.
@@ -422,6 +482,111 @@ mod tests {
         // Row 1 does not exist in the surface, so it is black.
         let row1 = 16 + 4 * 4;
         assert_eq!(&update[row1..row1 + 4], [0, 0, 0, 0]);
+    }
+
+    /// What the encoder did before it had a table: one pixel at a time,
+    /// through the two functions `proto` defines the format with. The repack
+    /// in `raw_rect` has to produce exactly these bytes.
+    fn reference(format: PixelFormat, s: &Surface, y: u16, width: u16, height: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in 0..u32::from(height) {
+            for column in 0..u32::from(width) {
+                let rgb = s.get(column, u32::from(y) + row).unwrap_or([0, 0, 0]);
+                format.put(format.pack(rgb), &mut out);
+            }
+        }
+        out
+    }
+
+    /// Every pixel format shape the wire can ask for, against every surface
+    /// layout a scanout can hand over, at a geometry that crops on the right,
+    /// pads on the right and pads below — so the table, the row walk and the
+    /// black fill are all compared with the per-pixel definition.
+    #[test]
+    fn a_repacked_rectangle_is_byte_for_byte_the_per_pixel_definition() {
+        let mut formats = Vec::new();
+        for (bits, max, shifts) in [
+            (32u8, [255u16, 255, 255], [16u8, 8, 0]),
+            (32, [255, 255, 255], [0, 8, 16]),
+            (32, [1023, 1023, 1023], [20, 10, 0]),
+            (16, [31, 63, 31], [11, 5, 0]),
+            (16, [31, 31, 31], [0, 5, 10]),
+            (8, [7, 7, 3], [0, 3, 6]),
+        ] {
+            for big_endian in [false, true] {
+                formats.push(PixelFormat {
+                    bits_per_pixel: bits,
+                    depth: bits,
+                    big_endian,
+                    true_colour: true,
+                    red_max: max[0],
+                    green_max: max[1],
+                    blue_max: max[2],
+                    red_shift: shifts[0],
+                    green_shift: shifts[1],
+                    blue_shift: shifts[2],
+                });
+            }
+        }
+        for layout in [
+            SurfaceFormat::BGRA8888,
+            SurfaceFormat::RGBA8888,
+            SurfaceFormat::RGB888,
+        ] {
+            let mut s = Surface::new(layout, 5, 4);
+            for y in 0..4u32 {
+                for x in 0..5u32 {
+                    let v = (x * 53 + y * 101) as u8;
+                    s.put(x, y, [v, v.wrapping_mul(7), !v]);
+                }
+            }
+            for format in &formats {
+                assert!(format.is_well_formed(), "{format:?}");
+                // Narrower than the surface, exactly it, and wider and taller.
+                for (width, height) in [(3u16, 2u16), (5, 4), (7, 6)] {
+                    let mut enc = FrameEncoder::new(*format, width, height);
+                    let update = enc.update(&s, false).expect("a frame");
+                    assert_eq!(&update[..4], update_header(1));
+                    assert_eq!(
+                        &update[4..16],
+                        rect_header(0, 0, width, height, encoding::RAW)
+                    );
+                    assert_eq!(
+                        &update[16..],
+                        reference(*format, &s, 0, width, height),
+                        "{layout} as {format:?} at {width}x{height}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The table is `pack`, and `set_format` rebuilds it: every channel value
+    /// of every channel, after a format change, through the encoder.
+    #[test]
+    fn the_packing_table_is_the_packing_function() {
+        let rgb565 = PixelFormat {
+            bits_per_pixel: 16,
+            depth: 16,
+            big_endian: false,
+            true_colour: true,
+            red_max: 31,
+            green_max: 63,
+            blue_max: 31,
+            red_shift: 11,
+            green_shift: 5,
+            blue_shift: 0,
+        };
+        let mut enc = FrameEncoder::new(PixelFormat::DEFAULT, 1, 1);
+        enc.set_format(rgb565);
+        for value in 0..=255u8 {
+            for rgb in [[value, 0, 0], [0, value, 0], [0, 0, value], [value; 3]] {
+                let packed = enc.table[0][usize::from(rgb[0])]
+                    | enc.table[1][usize::from(rgb[1])]
+                    | enc.table[2][usize::from(rgb[2])];
+                assert_eq!(packed, rgb565.pack(rgb), "{rgb:?}");
+            }
+        }
     }
 
     #[test]
