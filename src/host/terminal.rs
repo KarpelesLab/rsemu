@@ -26,8 +26,22 @@
 //! time. That is degraded, not broken, and [`Terminal::is_raw`] says which one
 //! you got so a caller can tell the user.
 //!
-//! Raw mode is restored by [`Terminal`]'s `Drop`. A hard kill (`SIGKILL`)
-//! skips that, as it would with any program; `stty sane` fixes it.
+//! Raw mode is restored by [`Terminal`]'s `Drop`, and by [`restore`] on the two
+//! ways out that never reach a `Drop`:
+//!
+//! * **A second shutdown signal.** [`signal`](super::signal) hands the first
+//!   one to the run loop and, by design, lets the second kill the process. A
+//!   run loop therefore calls [`restore`] as soon as it sees the first, before
+//!   it starts flushing — so the kill, if it comes, leaves a cooked terminal.
+//!   What is left is the instant between the signal and the loop noticing it
+//!   (a slice of virtual time at most): closing that would mean changing
+//!   terminal settings from inside a signal handler.
+//! * **A panic.** Entering raw mode installs a panic hook that restores the
+//!   terminal *before* the message is printed, so the message is not
+//!   stair-stepped down a raw screen and the shell that follows is usable.
+//!
+//! A hard kill (`SIGKILL`) skips all of it, as it would with any program;
+//! `stty sane` fixes it.
 //!
 //! # Why a thread
 //!
@@ -42,9 +56,9 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::{Mutex, Once, OnceLock};
 
 use super::chardev::{CharDevice, CharPort};
 
@@ -55,6 +69,57 @@ use super::chardev::{CharDevice, CharPort};
 /// forwarded, and shows up as [`Terminal::interrupted`].
 const INTERRUPT: u8 = 0x03;
 
+/// The `stty -g` string that undoes raw mode: the settings the terminal had
+/// the first time this process made it raw.
+///
+/// Process-wide rather than a field of [`Terminal`], because the two callers
+/// that most need it have no `Terminal` to hand: a panic hook, and a run loop
+/// that has just been told a signal arrived. There is one controlling terminal
+/// per process, so there is one of these.
+///
+/// Written once and never locked. The first entry into raw mode is the one
+/// that saw what the shell left; a later one, made while the terminal is
+/// already raw, would only record raw settings as the thing to go back to.
+/// And a reader that cannot block is what a panic hook needs — a lock here
+/// would be one more thing to be holding when the panic happened.
+static COOKED: OnceLock<String> = OnceLock::new();
+
+/// Whether the terminal is raw and [`COOKED`] is owed to it.
+///
+/// Whoever swaps this to `false` does the restoring, so two callers racing —
+/// a panic hook and a `Drop`, say — run `stty` once between them.
+static RAW: AtomicBool = AtomicBool::new(false);
+
+/// Put the terminal back the way [`Terminal::open`] found it, now.
+///
+/// Does nothing if it was never made raw or has already been restored, so it
+/// is safe to call from every path that might be the last one: the first
+/// sight of a shutdown signal, a panic hook, and `Drop`. A [`Terminal`] that
+/// is still alive keeps working afterwards, as a cooked one.
+pub fn restore() {
+    if RAW.swap(false, Ordering::SeqCst)
+        && let Some(saved) = COOKED.get()
+    {
+        let _ = stty(&[saved]);
+    }
+}
+
+/// Restore the terminal before a panic message is printed.
+///
+/// Chained in front of whatever hook was there, once per process, and only
+/// once raw mode has actually been entered — a process that never touched the
+/// terminal keeps the hook it had.
+fn restore_on_panic() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore();
+            previous(info);
+        }));
+    });
+}
+
 /// The process's controlling terminal, as a character stream.
 ///
 /// One per process, in practice: two of these would fight over `stty` and over
@@ -64,8 +129,8 @@ const INTERRUPT: u8 = 0x03;
 pub struct Terminal {
     /// Bytes from the reader thread, and whatever a short read left over.
     input: Mutex<Input>,
-    /// The `stty -g` string to restore on the way out, if raw mode was entered.
-    saved: Option<String>,
+    /// Whether this terminal entered raw mode. What undoes it is in [`COOKED`].
+    raw: bool,
     /// Set when the user pressed Ctrl-C in raw mode.
     interrupted: AtomicBool,
     /// Whether the last byte written was a carriage return, so that a line
@@ -91,7 +156,7 @@ impl Terminal {
     /// [`is_raw`](Terminal::is_raw) to find out which.
     #[must_use]
     pub fn open() -> Terminal {
-        let saved = enter_raw_mode();
+        let raw = enter_raw_mode();
         let (tx, rx) = channel();
         // Detached on purpose: it is blocked in `read` for the life of the
         // process and there is no portable way to interrupt that. Process exit
@@ -119,7 +184,7 @@ impl Terminal {
                 pending: VecDeque::new(),
                 closed: false,
             }),
-            saved,
+            raw,
             interrupted: AtomicBool::new(false),
             after_cr: AtomicBool::new(false),
         }
@@ -131,7 +196,7 @@ impl Terminal {
     /// whole line at a time and each line appears twice. Worth telling the user.
     #[must_use]
     pub fn is_raw(&self) -> bool {
-        self.saved.is_some()
+        self.raw
     }
 
     /// Whether the user has pressed Ctrl-C.
@@ -237,7 +302,7 @@ impl CharDevice for Terminal {
             let Some(byte) = input.pending.pop_front() else {
                 break;
             };
-            if byte == INTERRUPT && self.saved.is_some() {
+            if byte == INTERRUPT && self.raw {
                 self.interrupted.store(true, Ordering::Relaxed);
                 continue;
             }
@@ -269,8 +334,8 @@ impl CharDevice for Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let Some(saved) = self.saved.take() {
-            let _ = stty(&[&saved]);
+        if self.raw {
+            restore();
         }
     }
 }
@@ -304,20 +369,34 @@ fn expand_line_breaks(src: &[u8], after_cr: &mut bool, out: &mut Vec<u8>) {
     }
 }
 
-/// Put the controlling terminal into raw mode, returning what to restore.
+/// Put the controlling terminal into raw mode, leaving what undoes it in
+/// [`COOKED`].
 ///
-/// `None` when there is nothing to restore, which covers every failure: no
+/// `false` when there is nothing to restore, which covers every failure: no
 /// `stty`, stdin is not a terminal, or the settings string came back empty.
-fn enter_raw_mode() -> Option<String> {
-    let saved = stty(&["-g"])?;
+fn enter_raw_mode() -> bool {
+    let Some(saved) = stty(&["-g"]) else {
+        return false;
+    };
     let saved = saved.trim().to_string();
     if saved.is_empty() {
-        return None;
+        return false;
     }
+    // The way back is recorded, and the panic hook armed, *before* the
+    // terminal changes: there is no instant at which it is raw and nothing
+    // knows how to undo that.
+    // An earlier entry's settings stand: see `COOKED`.
+    let _ = COOKED.set(saved);
+    restore_on_panic();
+    RAW.store(true, Ordering::SeqCst);
     // `raw` alone leaves output post-processing on some hosts and off on
     // others; `-echo` is the half that matters, since the guest echoes.
-    stty(&["raw", "-echo"])?;
-    Some(saved)
+    if stty(&["raw", "-echo"]).is_none() {
+        // Nothing changed, so there is nothing to put back.
+        RAW.store(false, Ordering::SeqCst);
+        return false;
+    }
+    true
 }
 
 /// Run `stty` against this process's terminal, returning its stdout.

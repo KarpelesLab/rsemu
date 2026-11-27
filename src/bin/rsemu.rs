@@ -1356,6 +1356,13 @@ fn interrupted(machine: &Machine) -> bool {
     // predicate is a predicate and one that printed per call would be noise.
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // The terminal first, before anything slow. The handler is one-shot by
+        // design (`host::signal`): a second signal of the same kind kills the
+        // process outright, no `Drop` runs, and a console session used to
+        // leave the shell behind it in raw mode — no echo, no line editing —
+        // if somebody pressed twice while a drive was flushing. Restored
+        // here, the kill leaves a terminal that works.
+        rsemu::host::terminal::restore();
         // A leading return in case a raw-mode console left the cursor mid-line.
         eprintln!("\rrsemu: {signal} — stopping, and flushing what the guest wrote");
     }
