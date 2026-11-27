@@ -1040,7 +1040,13 @@ struct Shared {
     /// The chip-RAM channels, shared with Paula and Denise.
     dma: Arc<ChipDma>,
     /// The custom-chip bus the copper writes through. `None` until bind.
-    bus: Mutex<Option<Arc<CustomBus>>>,
+    ///
+    /// Held **weakly**, as Denise holds it: the bus owns this chip's register
+    /// block, which owns this, so a strong reference back would be a cycle
+    /// that frees neither — and Agnus owns chip RAM. `amiga.custom` is what
+    /// keeps the bus alive; with that gone there is no register space for a
+    /// copper `MOVE` to land in, and the write goes nowhere.
+    bus: Mutex<Option<Weak<CustomBus>>>,
     /// The video chip lines are pushed into, if one is attached.
     video: Mutex<Option<Arc<Video>>>,
     /// Paula, if attached.
@@ -1222,7 +1228,7 @@ impl Shared {
             .iter()
             .any(|a| matches!(a, Outward::Write { .. } | Outward::SpriteData { .. }))
         {
-            let bus = self.bus.lock().clone();
+            let bus = self.bus.lock().as_ref().and_then(Weak::upgrade);
             let video = self.video.lock().clone();
             // In outbox order, because a wide sprite fetch and the
             // `SPRxPOS`/`SPRxCTL` writes of the same slot are one sequence:
@@ -1483,7 +1489,7 @@ impl Agnus {
         // answers a read of a write-only register: hand the register space the
         // bus this chip's DMA cycles leave their words on (`dma::ChipDataBus`).
         bus.attach_data_bus(self.shared.dma.data_bus());
-        *self.shared.bus.lock() = Some(Arc::clone(bus));
+        *self.shared.bus.lock() = Some(Arc::downgrade(bus));
         Ok(())
     }
 

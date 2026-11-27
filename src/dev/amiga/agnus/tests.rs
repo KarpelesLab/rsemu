@@ -1911,3 +1911,32 @@ fn an_alice_snapshot_round_trips_with_fmode_and_eight_pointers() {
     restored.run(2 * PAL_FIELD);
     assert_eq!(snapshot(&restored.agnus), snapshot(&saved.agnus));
 }
+
+#[test]
+fn a_dropped_agnus_and_its_custom_bus_are_freed() {
+    // Agnus's register block sits on the custom bus and Agnus writes through
+    // that bus (a copper `MOVE`, a sprite word). When each owned the other
+    // neither was ever freed, and Agnus owns chip RAM: megabytes per machine,
+    // for the life of the process.
+    let agnus = Agnus::bare(Standard::Pal);
+    let custom = Custom::new(&Props::new()).unwrap();
+    agnus.attach_bus(custom.bus()).unwrap();
+    let store = Arc::new(RamStore::new(CHIP));
+    let region: RegionRef = Arc::new(Region::ram("chip", Arc::clone(&store)));
+    agnus.attach_ram(&region).unwrap();
+
+    let shared = Arc::downgrade(&agnus.shared);
+    let bus = Arc::downgrade(custom.bus());
+    let ram = Arc::downgrade(&store);
+    drop(store);
+    drop(region);
+    drop(agnus);
+    drop(custom);
+    assert_eq!(shared.strong_count(), 0, "Agnus's state outlived Agnus");
+    assert_eq!(
+        bus.strong_count(),
+        0,
+        "the custom bus outlived `amiga.custom`"
+    );
+    assert_eq!(ram.strong_count(), 0, "and chip RAM outlived them both");
+}
