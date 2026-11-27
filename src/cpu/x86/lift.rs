@@ -3151,13 +3151,27 @@ impl<'a> Lifter<'a> {
                 // nothing. The destination is a register in every encoding, so
                 // selecting the old value is the same thing and needs no
                 // conditional store.
-                let Some(old) = self.read_arg(f, insn.dst, size) else {
-                    return Flow::Rejected;
-                };
-                let v = self.b.emit(Opcode::MOVCOND, Type::I64, &[zf, old, index]);
-                if !self.write_arg(f, insn.dst, size, v) {
+                //
+                // The selection is over the whole **slot**, for the reason
+                // `Lifter::shift` gives for a `CL` count of zero: writing the
+                // operand's own old value back is the same thing at sixteen
+                // bits, where a write preserves what is above it, and is not
+                // at a 32-bit operand in long mode, where a doubleword write
+                // zero-extends. `bsf eax, ecx` with `ECX` zero cleared the
+                // upper half of a `RAX` that `Exec::bit_scan` never touches.
+                if !matches!(insn.dst, Arg::Gv) {
                     return Flow::Rejected;
                 }
+                let dst_slot = f.reg_num();
+                let slot_before = self.read_r(dst_slot);
+                if !self.write_arg(f, insn.dst, size, index) {
+                    return Flow::Rejected;
+                }
+                let slot_after = self.read_r(dst_slot);
+                let chosen =
+                    self.b
+                        .emit(Opcode::MOVCOND, Type::I64, &[zf, slot_before, slot_after]);
+                self.write_r(dst_slot, chosen);
                 Self::flow(next_eip, mem, false)
             }
             Plan::SetCc(cc) => {

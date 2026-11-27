@@ -3161,13 +3161,16 @@ pub fn synthesize64(form: u32, fields: u32) -> Vec<u8> {
             out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
             out
         }
+        // At either width: a scan that finds nothing writes nothing, and at
+        // thirty-two bits "nothing" includes the upper half a doubleword
+        // write would have zeroed.
         39 => {
-            let mut out = vec![rex(true, reg, rm), 0x0f, 0xbc]; // bsf
+            let mut out = vec![rex(wide, reg, rm), 0x0f, 0xbc]; // bsf
             out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
             out
         }
         40 => {
-            let mut out = vec![rex(true, reg, rm), 0x0f, 0xbd]; // bsr
+            let mut out = vec![rex(wide, reg, rm), 0x0f, 0xbd]; // bsr
             out.push(0xc0 | ((reg & 7) << 3) | (rm & 7));
             out
         }
@@ -3691,6 +3694,43 @@ mod tests {
                 match compare(&case) {
                     Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 1, .. }), "{v:?}"),
                     Err(e) => panic!("{a:#x} * {b:#x} ({op:#x}): {e}"),
+                }
+            }
+        }
+    }
+
+    /// A bit scan that finds nothing writes nothing — and in long mode
+    /// "nothing" is the whole register, not the operand.
+    ///
+    /// `Exec::bit_scan` returns without touching the destination when the
+    /// source is zero. The frontend used to select the destination's old
+    /// *operand* and write that back, which is the same thing at sixteen bits
+    /// and clears the upper half of the register at thirty-two, where a
+    /// doubleword write zero-extends. [`synthesize64`] only ever scanned with
+    /// `REX.W`, and a random source is almost never zero, so nothing
+    /// generated reached it.
+    #[test]
+    fn a_bit_scan_of_zero_leaves_the_whole_register_alone() {
+        let wide = 0x1234_5678_9abc_def0u64;
+        for scan in [0xbcu8, 0xbd] {
+            for source in [0u64, 0x0000_0100_0000_0000, 0x8000_0010, 1 << 63] {
+                // bsf/bsr eax, ecx ; hlt — then at sixteen bits, at
+                // sixty-four, and into a register only `REX.R` can name.
+                for program in [
+                    vec![0x0f, scan, 0xc1, 0xf4],
+                    vec![0x66, 0x0f, scan, 0xc1, 0xf4],
+                    vec![0x48, 0x0f, scan, 0xc1, 0xf4],
+                    vec![0x44, 0x0f, scan, 0xf9, 0xf4],
+                ] {
+                    let case = Case::new(program.clone())
+                        .with_reg(0, wide)
+                        .with_reg(15, wide)
+                        .with_reg(1, source)
+                        .long();
+                    match compare(&case) {
+                        Ok(v) => assert!(matches!(v, Verdict::Agreed { insns: 1, .. }), "{v:?}"),
+                        Err(e) => panic!("{program:02x?} with a source of {source:#x}: {e}"),
+                    }
                 }
             }
         }
