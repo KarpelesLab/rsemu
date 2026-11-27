@@ -3925,6 +3925,106 @@ fn el0_cannot_read_the_counter_until_cntkctl_says_so() {
     assert_eq!(h.cpu.x(7), h.cpu.counter());
 }
 
+/// Run one instruction at EL0 with the given `SCTLR_EL1`, and report where it
+/// went and what `ESR_EL1` says.
+fn at_el0_with_sctlr(word: u32, sctlr_value: u64) -> (u64, u64) {
+    let h = Harness::a53(&[word]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    regs.el = El::El0;
+    regs.spsel = false;
+    regs.sctlr = sctlr_value;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_x(3, 0x100);
+    h.steps(1);
+    (h.cpu.pc(), h.cpu.sysregs().esr_el1)
+}
+
+/// DDI 0487C.a C5.1.4, table C5-1: `IC IVAU` and `DC CVAU`/`CVAC`/`CIVAC` are,
+/// "When SCTLR_EL1.UCI == 1, accessible from EL0 or higher". D1.15.2: with
+/// `UCI` clear, "any attempt to execute a cache maintenance instruction at EL0
+/// is trapped to EL1", reported "using EC value 0x18".
+///
+/// Both halves used to be UNDEFINED, which is a `SIGILL` for every user-space
+/// program that writes code and then flushes the instruction cache.
+#[test]
+fn el0_cache_maintenance_follows_sctlr_uci() {
+    use super::sysreg::sctlr;
+    // `SYS #3, C7, C<m>, #1, X3`.
+    let cache_op = |crm: u32| 0xd50b_7023 | (crm << 8);
+    for crm in [5, 10, 11, 14] {
+        let (pc, esr) = at_el0_with_sctlr(cache_op(crm), sctlr::UCI);
+        assert_eq!((pc, esr), (4, 0), "CRm {crm} with UCI set is a no-op");
+
+        let (pc, esr) = at_el0_with_sctlr(cache_op(crm), 0);
+        assert_eq!(pc, 0x4400, "CRm {crm} with UCI clear traps");
+        assert_eq!(esr >> 26, ec::SYSREG);
+        let iss = esr & 0x01ff_ffff;
+        assert_eq!((iss >> 20) & 3, 1, "Op0");
+        assert_eq!((iss >> 17) & 7, 1, "Op2");
+        assert_eq!((iss >> 14) & 7, 3, "Op1");
+        assert_eq!((iss >> 10) & 0xf, 7, "CRn");
+        assert_eq!((iss >> 5) & 0x1f, 3, "Rt");
+        assert_eq!((iss >> 1) & 0xf, u64::from(crm), "CRm");
+        assert_eq!(iss & 1, 0, "a write");
+    }
+    // The set-and-way and TLB operations are EL1's whatever `UCI` says:
+    // `DC ISW, X3` and `TLBI VMALLE1`.
+    for word in [0xd508_7643, 0xd508_871f] {
+        let (pc, esr) = at_el0_with_sctlr(word, sctlr::UCI);
+        assert_eq!(pc, 0x4400);
+        assert_eq!(esr >> 26, ec::UNKNOWN);
+    }
+}
+
+/// DDI 0487C.a D1.15.2: "SCTLR_EL1.UMA traps EL0 execution of MSR and MRS
+/// instructions that access the PSTATE.{D, A, I, F} masks to EL1", and
+/// C6.2.174's decode: "if op1 == '011' && PSTATE.EL == EL0 && (IsInHost() ||
+/// SCTLR_EL1.UMA == '0') then AArch64.SystemRegisterTrap(EL1, '00', op2, op1,
+/// '0100', '11111', CRm, '0')". All three forms, both ways: the register
+/// forms used to go through at EL0 unconditionally, and the immediate form
+/// was UNDEFINED unconditionally.
+#[test]
+fn el0_access_to_the_interrupt_masks_follows_sctlr_uma() {
+    use super::sysreg::sctlr;
+    let daifset = 0xd503_40df | (0xf << 8); // `MSR DAIFSet, #15`
+    for (word, rt, read) in [
+        (mrs(key(SysReg::DaifReg), 3), 3, 1),
+        (msr(key(SysReg::DaifReg), 3), 3, 0),
+        (daifset, 31, 0),
+    ] {
+        let (pc, esr) = at_el0_with_sctlr(word, 0);
+        assert_eq!(pc, 0x4400, "{word:#x} traps with UMA clear");
+        assert_eq!(esr >> 26, ec::SYSREG, "{word:#x}");
+        assert_eq!((esr >> 5) & 0x1f, rt, "{word:#x}: Rt");
+        assert_eq!(esr & 1, read, "{word:#x}: direction");
+        assert_eq!((esr >> 14) & 7, 3, "{word:#x}: Op1");
+        assert_eq!((esr >> 10) & 0xf, 4, "{word:#x}: CRn");
+
+        let (pc, esr) = at_el0_with_sctlr(word, sctlr::UMA);
+        assert_eq!((pc, esr), (4, 0), "{word:#x} goes through with UMA set");
+    }
+    // `SPSel` is never EL0's: `MSR SPSel, #1` stays UNDEFINED.
+    let (pc, esr) = at_el0_with_sctlr(0xd500_41bf, sctlr::UMA);
+    assert_eq!(pc, 0x4400);
+    assert_eq!(esr >> 26, ec::UNKNOWN);
+}
+
+/// DDI 0487C.a D1.15.2: "SCTLR_EL1.UCT traps EL0 accesses to the CTR_EL0 to
+/// EL1: 1: EL0 accesses to the CTR_EL0 are not trapped to EL1. 0: EL0 accesses
+/// to the CTR_EL0 are trapped to EL1."
+#[test]
+fn el0_reads_ctr_el0_only_with_sctlr_uct() {
+    use super::sysreg::sctlr;
+    let word = mrs(key(SysReg::Ctr), 3);
+    let (pc, esr) = at_el0_with_sctlr(word, 0);
+    assert_eq!(pc, 0x4400);
+    assert_eq!(esr >> 26, ec::SYSREG);
+    assert_eq!(esr & 1, 1, "a read");
+    let (pc, esr) = at_el0_with_sctlr(word, sctlr::UCT);
+    assert_eq!((pc, esr), (4, 0));
+}
+
 /// EL1 is never gated by `CNTKCTL_EL1` — the level that owns the gate is not
 /// subject to it.
 #[test]

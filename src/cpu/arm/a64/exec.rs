@@ -1602,7 +1602,12 @@ impl<'a> Exec<'a> {
                 self.st.sys.spsel = isa::field(word, 11, 8) & 1 != 0;
             }
             Op::MsrDaifset | Op::MsrDaifclr => {
-                self.require_el1()?;
+                // DDI 0487C.a C6.2.174 (`MSR` immediate): "if op1 == '011' &&
+                // PSTATE.EL == EL0 && (IsInHost() || SCTLR_EL1.UMA == '0')
+                // then AArch64.SystemRegisterTrap(EL1, '00', op2, op1, '0100',
+                // '11111', CRm, '0')" — a trap, not UNDEFINED, and no trap at
+                // all once the kernel has set `UMA`.
+                self.check_el0_gate(sctlr::UMA, word, false)?;
                 // The immediate's four bits are D, A, I, F in that order, and
                 // `DAIF` holds them at bits 9:6.
                 let bits = u64::from(isa::field(word, 11, 8)) << 6;
@@ -1969,6 +1974,7 @@ impl<'a> Exec<'a> {
         }
         self.check_fp_sysreg(spec.reg)?;
         self.check_cnt_gate(spec, word, true)?;
+        self.check_sctlr_gate(spec.reg, word, true)?;
         // Read before the borrow below, because it needs `self.cfg` too.
         let count = self.counter();
         let s = &self.st.sys;
@@ -2071,6 +2077,7 @@ impl<'a> Exec<'a> {
         }
         self.check_fp_sysreg(spec.reg)?;
         self.check_cnt_gate(spec, word, false)?;
+        self.check_sctlr_gate(spec.reg, word, false)?;
         let count = self.counter();
         // Anything that changes the translation regime invalidates every
         // cached translation. Bumping the generation is the whole
@@ -2188,9 +2195,23 @@ impl<'a> Exec<'a> {
         if self.st.sys.cnt_gate_open(spec) {
             return Ok(());
         }
+        Err(Self::sysreg_trap(word, read))
+    }
+
+    /// The `EC 0x18` trap for the `MRS`, `MSR` or `SYS` instruction `word`.
+    ///
+    /// DDI 0487C.a D10.2.36 (`ESR_EL1`), "ISS encoding for an exception from MSR,
+    /// MRS, or System instruction execution in AArch64 state": `Op0` at bits
+    /// 21:20,
+    /// `Op2` at 19:17, `Op1` at 16:14, `CRn` at 13:10, `Rt` at 9:5, `CRm` at
+    /// 4:1 and the direction at bit 0, "1: Read access, including MRS
+    /// instructions". Every one of those is a field of the instruction, so
+    /// the instruction is all this needs — which also makes it right for the
+    /// forms that name no register in the table: `MSR DAIFSet` and `DC CVAU`.
+    fn sysreg_trap(word: u32, read: bool) -> Trap {
         // The ISS field order is the architecture's and is not the order the
         // instruction spells them in, which is exactly why it is written out.
-        let key = u64::from(spec.enc);
+        let key = u64::from(isa::field(word, 20, 5));
         let op0 = (key >> 14) & 3;
         let op1 = (key >> 11) & 7;
         let crn = (key >> 7) & 0xf;
@@ -2204,7 +2225,7 @@ impl<'a> Exec<'a> {
             | (rt << 5)
             | (crm << 1)
             | u64::from(read);
-        Err(Trap {
+        Trap {
             ec: ec::SYSREG,
             iss,
             far: None,
@@ -2213,12 +2234,59 @@ impl<'a> Exec<'a> {
             // when it is done, and one that does not wants the guest to fault
             // on the same instruction rather than to skip it.
             advance: false,
-        })
+        }
+    }
+
+    /// Trap an EL0 access that an `SCTLR_EL1` enable bit does not permit.
+    ///
+    /// DDI 0487C.a D1.15.2 ("EL1 configurable controls") gives EL1 four of these — `UCI` for the cache
+    /// maintenance instructions, `UCT` for `CTR_EL0`, `DZE` for `DC ZVA` and
+    /// `UMA` for the interrupt masks — and all of them read the same way:
+    /// with the bit set the EL0 access "is not trapped to EL1", and with it
+    /// clear it "is trapped to EL1", reported as "Trapped AArch64 MSR, MRS,
+    /// or system instruction, using EC value 0x18". Neither half is
+    /// UNDEFINED, and a kernel relies on both: on the first so that a JIT in
+    /// user space can flush the instruction cache, on the second so that it
+    /// can emulate the access for a process it has taken the enable away
+    /// from.
+    fn check_el0_gate(&self, enable: u64, word: u32, read: bool) -> Result<(), Trap> {
+        if self.st.sys.el == El::El0 && self.st.sys.sctlr & enable == 0 {
+            return Err(Self::sysreg_trap(word, read));
+        }
+        Ok(())
+    }
+
+    /// The two registers [`Exec::check_el0_gate`] guards: `DAIF` behind `UMA`
+    /// and `CTR_EL0` behind `UCT`.
+    fn check_sctlr_gate(&self, reg: SysReg, word: u32, read: bool) -> Result<(), Trap> {
+        match reg {
+            SysReg::DaifReg => self.check_el0_gate(sctlr::UMA, word, read),
+            SysReg::Ctr => self.check_el0_gate(sctlr::UCT, word, read),
+            _ => Ok(()),
+        }
     }
 
     /// `SYS` and `SYSL`: the `TLBI`, `DC` and `IC` aliases.
     fn system_op(&mut self, word: u32) -> Result<(), Trap> {
-        self.require_el1()?;
+        if self.st.sys.el == El::El0 {
+            // DDI 0487C.a C5.1.4, table C5-1: `IC IVAU` (`op1` 3, `CRn` 7,
+            // `CRm` 5, `op2` 1) and `DC CVAC`, `DC CVAU`, `DC CIVAC` (`CRm`
+            // 10, 11, 14) are, "When SCTLR_EL1.UCI == 1, accessible from EL0
+            // or higher. Otherwise, accessible from EL1 or higher." They are
+            // what a user-space JIT executes after
+            // writing code, so refusing them as UNDEFINED kills every such
+            // process. Everything else in the `SYS` space stays EL1's.
+            let user_cache_op = isa::field(word, 21, 21) == 0
+                && isa::field(word, 18, 16) == 3
+                && isa::field(word, 15, 12) == 7
+                && matches!(isa::field(word, 11, 8), 5 | 10 | 11 | 14)
+                && isa::field(word, 7, 5) == 1;
+            if !user_cache_op {
+                return Err(Trap::undefined());
+            }
+            // No cache, so the operation itself is nothing — once permitted.
+            return self.check_el0_gate(sctlr::UCI, word, false);
+        }
         let crn = isa::field(word, 15, 12);
         match crn {
             // TLB maintenance. Every variant invalidates at least what this

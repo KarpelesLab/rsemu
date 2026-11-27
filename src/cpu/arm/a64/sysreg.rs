@@ -572,8 +572,16 @@ pub mod sctlr {
     pub const SA: u64 = 1 << 3;
     /// Stack alignment check at EL0.
     pub const SA0: u64 = 1 << 4;
+    /// `UMA`: EL0 may read and write `PSTATE.{D, A, I, F}`. Clear, those
+    /// accesses trap to EL1.
+    pub const UMA: u64 = 1 << 9;
     /// Instruction cache enable. Modelled as storage.
     pub const I: u64 = 1 << 12;
+    /// `UCT`: EL0 may read `CTR_EL0`. Clear, the read traps to EL1.
+    pub const UCT: u64 = 1 << 15;
+    /// `UCI`: EL0 may execute the cache maintenance instructions `DC CVAU`,
+    /// `DC CVAC`, `DC CIVAC` and `IC IVAU`. Clear, they trap to EL1.
+    pub const UCI: u64 = 1 << 26;
     /// Write permission implies execute-never.
     pub const WXN: u64 = 1 << 19;
     /// Exception endianness. Big-endian is not implemented.
