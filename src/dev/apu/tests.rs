@@ -1491,3 +1491,31 @@ fn a_restore_does_not_inherit_the_previous_stop() {
         early.advance(1);
     }
 }
+
+/// Silencing a DMC that is not playing stops nothing, so it aborts nothing.
+///
+/// NESdev, *DMA*: "When sample playback is stopped during the APU cycle before
+/// a reload DMA would schedule [...], the DMA starts, but is aborted after a
+/// single cycle." Both halves of that need playback: something to stop, and a
+/// reload that was about to be scheduled. A `$4015` write with bit 4 clear on
+/// an idle channel — which is every such write most sound engines ever make —
+/// recorded a stop all the same, and if the idle output unit happened to end
+/// an output cycle within two CPU cycles of it, the channel asked the CPU for
+/// a one-cycle halt that no hardware takes.
+#[test]
+fn silencing_an_idle_dmc_never_schedules_an_aborted_dma() {
+    // One whole output cycle at the slowest rate: eight bits of 428 cycles.
+    for offset in 0..(8 * 428 + 8) {
+        let apu = apu();
+        apu.advance(offset);
+        apu.write(0x15, 0x0F);
+        for after in 0..4 {
+            assert_eq!(
+                apu.dma_request(),
+                None,
+                "written at cycle {offset}, {after} cycles on"
+            );
+            apu.advance(1);
+        }
+    }
+}

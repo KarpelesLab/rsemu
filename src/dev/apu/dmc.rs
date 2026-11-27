@@ -333,8 +333,18 @@ impl Dmc {
             // Playback stops, but a fetch that is already scheduled still
             // happens: the CPU has been told to halt and the DMA runs its full
             // length. What the byte is used for afterwards is another matter.
+            //
+            // The stop is only on record if there was playback to stop. The
+            // aborted DMA is what happens "when sample playback is stopped
+            // during the APU cycle before a reload DMA would schedule"
+            // (NESdev, "DMA"); with no bytes remaining no reload was coming,
+            // and a channel that is merely being told to stay off — or one
+            // whose sample has just ended and already recorded *that* stop —
+            // has nothing new to abort.
+            if self.bytes_remaining > 0 {
+                self.stopped_at = Some(now);
+            }
             self.bytes_remaining = 0;
-            self.stopped_at = Some(now);
         }
     }
 
