@@ -124,8 +124,29 @@ fuzz_target!(|data: &[u8]| {
     // Paths that are not in the snapshot: the "not found" path builds an error
     // message out of the paths that *are* there, which is more string handling
     // over untrusted bytes.
-    assert!(reader.find("/definitely/not/here").is_none());
-    let _ = reader.load_raw("/definitely/not/here");
+    //
+    // The absent path is *derived from the input*, never a literal. A literal
+    // is compared against every chunk path inside `find`, libFuzzer's
+    // comparison tracing sees the operand, and its `CMP` mutator then pastes
+    // it into the input as a chunk path — at which point "this path is not in
+    // the snapshot" is simply false and the assertion fires on a perfectly
+    // well-formed file. That is what the scheduled run of 2026-11-26 reported:
+    // `MS: 1 CMP- DE: "/definitely/not/here"-`. Whether a thirty-second run
+    // gets that far is luck, which is why the days either side were green.
+    // Appending to the candidate until no chunk has it terminates within
+    // `chunks.len() + 1` steps, since each step rules out at least one chunk.
+    let mut absent = String::from("/definitely/not/here");
+    while chunks.iter().any(|info| info.path == absent) {
+        absent.push('!');
+    }
+    assert!(
+        reader.find(&absent).is_none(),
+        "find returned a chunk for `{absent}`, which no listed chunk is named"
+    );
+    assert!(
+        reader.load_raw(&absent).is_err(),
+        "load_raw produced a chunk for `{absent}`, which no listed chunk is named"
+    );
 
     // Canonical form. Re-encoding what was decoded must reproduce the input
     // byte for byte.
