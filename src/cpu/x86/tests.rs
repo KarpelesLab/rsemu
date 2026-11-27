@@ -6325,6 +6325,38 @@ mod long_mode {
         }
     }
 
+    /// `SYSCALL`'s `SS` is eight past the `STAR` field as written, not past
+    /// the `CS` it was masked into.
+    ///
+    /// *Intel SDM* volume 2, `SYSCALL`, "Operation": "CS.Selector :=
+    /// IA32_STAR[47:32] AND FFFCH (* Operating system provides CS; RPL
+    /// forced to 0 *)" and "SS.Selector := IA32_STAR[47:32] + 8; (* SS just
+    /// above CS *) ... SS.DPL := 0;". The low two bits of the field reach
+    /// `SS`; the descriptor's privilege level is 0 regardless.
+    #[test]
+    fn syscall_derives_ss_from_the_star_field_before_the_rpl_mask() {
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        let mut sys = pc.cpu.sys();
+        sys.efer |= efer::SCE;
+        sys.star = 0x001bu64 << 32;
+        sys.lstar = la::HANDLER;
+        pc.cpu.set_sys(sys);
+        // mov ebx, cs ; mov edx, ss ; hlt
+        pc.write(la::HANDLER, &[0x8c, 0xcb, 0x8c, 0xd2, 0xf4]);
+        pc.write(la::CODE64, &[0x0f, 0x05]);
+        let steps = pc.run(80);
+        assert!(steps < 80, "the kernel side halted");
+        let regs = pc.regs();
+        assert_eq!(regs.rbx, 0x18, "CS: the field with RPL forced to 0");
+        assert_eq!(regs.rdx, 0x23, "SS: the field plus eight, bits and all");
+        let sys = pc.cpu.sys();
+        assert_eq!(sys.seg(isa::seg::SS).dpl(), 0, "SS.DPL := 0");
+        assert_eq!(sys.seg(isa::seg::CS).dpl(), 0, "CS.DPL := 0");
+    }
+
     #[test]
     fn swapgs_exchanges_the_gs_base_with_the_kernels() {
         // The one instruction a 64-bit kernel cannot do without: entered from

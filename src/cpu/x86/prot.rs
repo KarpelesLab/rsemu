@@ -3754,7 +3754,7 @@ impl Exec<'_> {
     /// GDT is a system call that touches memory — and it is also why an
     /// operating system has to lay its GDT out in the order `STAR` assumes
     /// rather than the other way round.
-    fn syscall_seg(selector: u16, code: bool, long: bool) -> SegReg {
+    fn syscall_seg(selector: u16, dpl: u8, code: bool, long: bool) -> SegReg {
         let mut ar = ar::PRESENT | ar::S | ar::RW | ar::ACCESSED | ar::GRANULAR;
         if code {
             ar |= ar::CODE;
@@ -3767,11 +3767,12 @@ impl Exec<'_> {
             ar |= ar::DB;
         }
         // The `DPL` the architecture fixes is the level the instruction lands
-        // at, which the selector already carries: `SYSCALL` forces `RPL` 0 and
-        // `SYSRET` forces 3, and *Intel SDM* Vol 2B gives each synthesised
-        // descriptor the matching `DPL`. `Exec::cpl` reads it back out of
-        // here, so the two cannot be written separately and drift.
-        ar |= ((selector & 3) as u32) << ar::DPL_SHIFT;
+        // at — 0 for `SYSCALL`, 3 for `SYSRET` (*Intel SDM* Vol 2B: "CS.DPL
+        // := 0; ... SS.DPL := 0;" and "CS.DPL := 3; ... SS.DPL := 3;") — and
+        // `Exec::cpl` reads it back out of the code segment built here. It
+        // is the caller's to state rather than the selector's low bits:
+        // `SYSCALL` does not clear them in the `SS` it loads.
+        ar |= u32::from(dpl & 3) << ar::DPL_SHIFT;
         SegReg {
             selector,
             base: 0,
@@ -3801,16 +3802,25 @@ impl Exec<'_> {
         let sys = self.state.sys;
         // `STAR[47:32]` is the kernel's `CS`; `SS` is that plus eight, which
         // is why the GDT has to hold them adjacently.
-        let cs_sel = ((sys.star >> 32) as u16) & 0xfffc;
+        let field = (sys.star >> 32) as u16;
+        let cs_sel = field & 0xfffc;
+        // Eight past the *field*, not past the `CS` it was masked into:
+        // *Intel SDM* volume 2, `SYSCALL`, "Operation": "CS.Selector :=
+        // IA32_STAR[47:32] AND FFFCH (* Operating system provides CS; RPL
+        // forced to 0 *)" but "SS.Selector := IA32_STAR[47:32] + 8; (* SS
+        // just above CS *)" — the low two bits survive into `SS`, which is
+        // what a guest reads back with `mov ax, ss` or finds on an interrupt
+        // frame.
+        //
         // A selector is sixteen bits and the sum is the guest's: `STAR` is
         // whatever ring 0 wrote, so this wraps rather than trusting the
         // build profile to (CLAUDE.md, "Arithmetic").
-        let ss_sel = cs_sel.wrapping_add(8);
+        let ss_sel = field.wrapping_add(8);
         self.state.regs.rcx = self.state.regs.rip;
         self.state.regs.r[3] = u64::from(self.state.regs.eflags);
         self.state.regs.rip = sys.lstar;
-        *self.state.sys.seg_mut(seg::CS) = Self::syscall_seg(cs_sel, true, true);
-        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(ss_sel, false, true);
+        *self.state.sys.seg_mut(seg::CS) = Self::syscall_seg(cs_sel, 0, true, true);
+        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(ss_sel, 0, false, true);
         self.state.regs.cs = cs_sel;
         self.state.regs.ss = ss_sel;
         let masked = self.state.regs.eflags & !(sys.sfmask as u32) & !flags::RF;
@@ -3847,8 +3857,8 @@ impl Exec<'_> {
         if wide && !canonical(target) {
             return Err(Fault::gp(0));
         }
-        *self.state.sys.seg_mut(seg::CS) = Self::syscall_seg(cs_sel, true, wide);
-        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(ss_sel, false, false);
+        *self.state.sys.seg_mut(seg::CS) = Self::syscall_seg(cs_sel, 3, true, wide);
+        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(ss_sel, 3, false, false);
         self.state.regs.cs = cs_sel;
         self.state.regs.ss = ss_sel;
         self.state.regs.rip = if wide { target } else { target & 0xffff_ffff };
