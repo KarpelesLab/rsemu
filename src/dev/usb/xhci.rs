@@ -2258,11 +2258,11 @@ impl Xhci {
         if icc[1] & 0x3 != 0x3 {
             return code::PARAMETER_ERROR;
         }
-        let Some(slot_ctx) = self.read_context(space, input + CONTEXT_BYTES) else {
+        let Some(slot_ctx) = self.read_context(space, input.wrapping_add(CONTEXT_BYTES)) else {
             self.host_system_error();
             return code::TRB_ERROR;
         };
-        let Some(mut ep0) = self.read_context(space, input + 2 * CONTEXT_BYTES) else {
+        let Some(mut ep0) = self.read_context(space, input.wrapping_add(2 * CONTEXT_BYTES)) else {
             self.host_system_error();
             return code::TRB_ERROR;
         };
@@ -2312,7 +2312,7 @@ impl Xhci {
 
         if self.write_context(space, output, &out_slot).is_none()
             || self
-                .write_context(space, output + CONTEXT_BYTES, &ep0)
+                .write_context(space, output.wrapping_add(CONTEXT_BYTES), &ep0)
                 .is_none()
         {
             self.host_system_error();
@@ -2362,7 +2362,11 @@ impl Xhci {
             for dci in 2..=MAX_DCI {
                 let zero = [0u32; CONTEXT_DWORDS];
                 if self
-                    .write_context(space, output + u64::from(dci) * CONTEXT_BYTES, &zero)
+                    .write_context(
+                        space,
+                        output.wrapping_add(u64::from(dci) * CONTEXT_BYTES),
+                        &zero,
+                    )
                     .is_none()
                 {
                     self.host_system_error();
@@ -2389,7 +2393,7 @@ impl Xhci {
 
         for dci in 2..=MAX_DCI {
             let bit = 1u32 << dci;
-            let out_addr = output + u64::from(dci) * CONTEXT_BYTES;
+            let out_addr = output.wrapping_add(u64::from(dci) * CONTEXT_BYTES);
             if drop & bit != 0 {
                 let zero = [0u32; CONTEXT_DWORDS];
                 if self.write_context(space, out_addr, &zero).is_none() {
@@ -2398,9 +2402,10 @@ impl Xhci {
                 }
             }
             if add & bit != 0 {
-                let Some(mut ep) =
-                    self.read_context(space, input + u64::from(dci + 1) * CONTEXT_BYTES)
-                else {
+                let Some(mut ep) = self.read_context(
+                    space,
+                    input.wrapping_add(u64::from(dci + 1) * CONTEXT_BYTES),
+                ) else {
                     self.host_system_error();
                     return code::TRB_ERROR;
                 };
@@ -2420,7 +2425,7 @@ impl Xhci {
         }
 
         if add & 1 != 0 {
-            let Some(in_slot) = self.read_context(space, input + CONTEXT_BYTES) else {
+            let Some(in_slot) = self.read_context(space, input.wrapping_add(CONTEXT_BYTES)) else {
                 self.host_system_error();
                 return code::TRB_ERROR;
             };
@@ -2456,7 +2461,7 @@ impl Xhci {
         let add = icc[1];
         if add & 1 != 0 {
             let (Some(in_slot), Some(mut out_slot)) = (
-                self.read_context(space, input + CONTEXT_BYTES),
+                self.read_context(space, input.wrapping_add(CONTEXT_BYTES)),
                 self.read_context(space, output),
             ) else {
                 self.host_system_error();
@@ -2475,9 +2480,12 @@ impl Xhci {
             if add & (1 << dci) == 0 {
                 continue;
             }
-            let out_addr = output + u64::from(dci) * CONTEXT_BYTES;
+            let out_addr = output.wrapping_add(u64::from(dci) * CONTEXT_BYTES);
             let (Some(in_ep), Some(mut out_ep)) = (
-                self.read_context(space, input + u64::from(dci + 1) * CONTEXT_BYTES),
+                self.read_context(
+                    space,
+                    input.wrapping_add(u64::from(dci + 1) * CONTEXT_BYTES),
+                ),
                 self.read_context(space, out_addr),
             ) else {
                 self.host_system_error();
@@ -2505,7 +2513,7 @@ impl Xhci {
         let Some(output) = self.device_context(space, slot) else {
             return code::PARAMETER_ERROR;
         };
-        let addr = output + u64::from(dci) * CONTEXT_BYTES;
+        let addr = output.wrapping_add(u64::from(dci) * CONTEXT_BYTES);
         let Some(mut ep) = self.read_context(space, addr) else {
             self.host_system_error();
             return code::TRB_ERROR;
@@ -2542,7 +2550,7 @@ impl Xhci {
         let Some(output) = self.device_context(space, slot) else {
             return code::PARAMETER_ERROR;
         };
-        let addr = output + u64::from(dci) * CONTEXT_BYTES;
+        let addr = output.wrapping_add(u64::from(dci) * CONTEXT_BYTES);
         let Some(mut ep) = self.read_context(space, addr) else {
             self.host_system_error();
             return code::TRB_ERROR;
@@ -2580,7 +2588,11 @@ impl Xhci {
         for dci in 2..=MAX_DCI {
             let zero = [0u32; CONTEXT_DWORDS];
             if self
-                .write_context(space, output + u64::from(dci) * CONTEXT_BYTES, &zero)
+                .write_context(
+                    space,
+                    output.wrapping_add(u64::from(dci) * CONTEXT_BYTES),
+                    &zero,
+                )
                 .is_none()
             {
                 self.host_system_error();
@@ -2613,7 +2625,7 @@ impl Xhci {
             self.host_system_error();
             return;
         };
-        let ep_addr = output + u64::from(dci) * CONTEXT_BYTES;
+        let ep_addr = output.wrapping_add(u64::from(dci) * CONTEXT_BYTES);
         let Some(mut ep) = self.read_context(space, ep_addr) else {
             self.host_system_error();
             return;

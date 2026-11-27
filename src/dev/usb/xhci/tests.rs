@@ -229,7 +229,12 @@ struct Fixture {
 }
 
 fn build() -> Fixture {
-    let space = AddressSpace::new("mem", 32);
+    build_in(AddressSpace::new("mem", 32))
+}
+
+/// The same fixture in a space the caller chose, for a test that needs a
+/// pointer only a 64-bit space can name.
+fn build_in(space: AddressSpace) -> Fixture {
     {
         let mut topo = space.topology();
         topo.map(Region::ram("ram", Arc::new(RamStore::new(RAM_SIZE))), RAM)
@@ -695,6 +700,59 @@ fn address_device_gives_the_device_an_address_and_writes_the_output_context() {
             .address(),
         DeviceAddress(slot)
     );
+}
+
+#[test]
+fn an_input_context_at_the_top_of_the_address_space_wraps_rather_than_overflowing() {
+    use crate::core::space::UnassignedPolicy;
+    // The Input Context Pointer is 64 bits out of a Command TRB (§6.4.3.4),
+    // and the Slot and Endpoint Contexts are at 20h and 40h past it. On a bus
+    // whose unassigned policy answers rather than faults, a pointer in the
+    // last sixteen bytes of the address space reads as all-ones — A0 and A1
+    // both set — and the next context's address carries out of 64 bits.
+    let f = build_in(AddressSpace::new("mem", 64).with_unassigned(UnassignedPolicy::ONES));
+    f.init();
+    f.reset_port();
+    let _ = f.drain();
+    f.command([0, 0, 0, trb::ENABLE_SLOT << TRB_TYPE_SHIFT]);
+    let events = f.drain();
+    let slot = (events[0][3] >> 24) as u8;
+    for kind in [
+        trb::ADDRESS_DEVICE,
+        trb::CONFIGURE_ENDPOINT,
+        trb::EVALUATE_CONTEXT,
+    ] {
+        f.command([
+            0xffff_fff0,
+            0xffff_ffff,
+            0,
+            (kind << TRB_TYPE_SHIFT) | (u32::from(slot) << 24),
+        ]);
+        let events = f.drain();
+        assert_eq!(events.len(), 1, "the command was answered, not panicked on");
+    }
+
+    // And the same for the Output Device Context, whose base the xHC reads
+    // out of the Device Context Base Address Array (§6.1).
+    f.mem_w(DCBAA + 8 * u64::from(slot), 0xffff_ffc0);
+    f.mem_w(DCBAA + 8 * u64::from(slot) + 4, 0xffff_ffff);
+    for kind in [
+        trb::ADDRESS_DEVICE,
+        trb::CONFIGURE_ENDPOINT,
+        trb::EVALUATE_CONTEXT,
+        trb::RESET_ENDPOINT,
+        trb::STOP_ENDPOINT,
+        trb::SET_TR_DEQUEUE,
+        trb::RESET_DEVICE,
+    ] {
+        f.command([
+            IN_CTX as u32,
+            0,
+            0,
+            (kind << TRB_TYPE_SHIFT) | (u32::from(slot) << 24) | (3 << 16),
+        ]);
+        let _ = f.drain();
+    }
 }
 
 #[test]
