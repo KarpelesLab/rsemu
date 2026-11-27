@@ -106,6 +106,17 @@ fn machines_advertises_only_flags_that_run_takes() {
     }
 }
 
+/// `rsemu run --help` prints the help.
+#[test]
+fn run_help_is_the_help_and_not_an_unknown_option() {
+    for flag in ["--help", "-h"] {
+        let (code, stdout, stderr) = run(&["run", flag]);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.contains("RUN OPTIONS"), "{stdout}");
+        assert!(!stderr.contains("unknown option"), "{stderr}");
+    }
+}
+
 /// Two refusals whose text had a hole in it.
 ///
 /// Each message was a string literal continued over a line, and each lost its
@@ -298,4 +309,17 @@ fn an_unknown_class_is_reported_where_it_is_written() {
     );
     assert!(stderr.contains(&format!("{path}:3:12")), "{stderr}");
     assert!(stderr.contains("^^^^^^^^^^^^^^^"), "no caret: {stderr}");
+}
+
+/// A build without the gdb stub says so, rather than "unknown command".
+///
+/// The help lists `debug` in every build. `monitor` and `--gdb` have always
+/// named the missing feature; the subcommand was simply not matched.
+#[cfg(not(feature = "gdb"))]
+#[test]
+fn debug_without_the_stub_names_the_feature() {
+    let (code, _, stderr) = run(&["debug", "any"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("`gdb` feature"), "{stderr}");
+    assert!(!stderr.contains("unknown command"), "{stderr}");
 }

@@ -316,6 +316,14 @@ fn main() -> ExitCode {
         "run" => run(&args[1..]),
         #[cfg(feature = "gdb")]
         "debug" => debug(&args[1..]),
+        // The help lists `debug` whatever the build, so a build without the
+        // stub names the feature rather than calling a documented command
+        // unknown — what `monitor` below and `--gdb` have always done.
+        #[cfg(not(feature = "gdb"))]
+        "debug" => {
+            eprintln!("rsemu: debug needs a build with the `gdb` feature");
+            ExitCode::from(2)
+        }
         // Matched whatever the build, so that a binary without the feature
         // says which feature to rebuild with rather than "unknown command" —
         // the same rule `--trace` and `host::media`'s missing schemes follow.
@@ -540,6 +548,15 @@ fn run(args: &[String]) -> ExitCode {
     // error: a host with no facility for it keeps the disposition it always
     // had, which is what happened before this existed.
     let _ = rsemu::host::signal::arm();
+
+    // `rsemu run --help` is what a person types when `rsemu run` has just
+    // told them an option is unknown, and answering *that* with "unknown
+    // option `--help`" sends them nowhere. There is one help text and it is
+    // mostly about `run`, so this prints it.
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
 
     let parsed = match parse_run(args) {
         Ok(a) => a,
