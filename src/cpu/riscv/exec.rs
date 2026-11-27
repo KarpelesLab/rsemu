@@ -1879,7 +1879,26 @@ impl<'a> Exec<'a> {
             });
         }
         let width = Width::from_bytes(bytes).expect("4 or 8");
-        let old = self.read_once(addr, width, Access::Load)?;
+        // The whole access is a store, including its read. Volume II, "Machine
+        // Cause Register": "store, store-conditional, and AMO instructions
+        // generate store/AMO exceptions", and "Addressing and Memory
+        // Protection": "AMOs never raise load page-fault exceptions. Since any
+        // unreadable page is also unwritable, attempting to perform an AMO on
+        // an unreadable page always raises a store page-fault exception."
+        //
+        // So the address is translated *as a store* before anything is read:
+        // an unmapped or read-only page is refused here with the store's
+        // cause, the leaf's accessed and dirty bits are set by this walk or
+        // not at all, and PMP is asked about a write. Translating the read as
+        // a load reported an AMO on a not-yet-faulted page as a load fault,
+        // and marked a read-only page accessed on the way to refusing it.
+        let phys = self.translate(addr, Access::Store, bytes)?;
+        let old = self
+            .read_at(addr, phys, width, Access::Load)
+            .map_err(|_| Trap {
+                cause: cause::STORE_ACCESS,
+                tval: addr,
+            })?;
         let bits = (bytes * 8) as u32;
         let s_old = sign_extend(old, bytes * 8) as i64;
         let s_arg = sign_extend(operand, bytes * 8) as i64;

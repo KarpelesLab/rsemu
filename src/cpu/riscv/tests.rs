@@ -950,6 +950,86 @@ fn a_misaligned_atomic_traps() {
     assert_eq!(h.hart.csrs().mcause, cause::STORE_MISALIGNED);
 }
 
+/// Volume II, "Machine Cause Register": "store, store-conditional, and AMO
+/// instructions generate store/AMO exceptions." An AMO reads before it writes,
+/// and the read is not a load.
+#[test]
+fn an_amo_on_an_unmapped_page_raises_a_store_page_fault_not_a_load_one() {
+    // Volume II, "Addressing and Memory Protection": "AMOs never raise load
+    // page-fault exceptions. Since any unreadable page is also unwritable,
+    // attempting to perform an AMO on an unreadable page always raises a
+    // store page-fault exception."
+    let h = Harness::rv64gc(&[amo(0b00000, 3, 10, 11, 12)]); // amoadd.d
+    let v = super::mmu::pte::V;
+    let rwx = super::mmu::pte::R | super::mmu::pte::W | super::mmu::pte::X;
+    let ad = super::mmu::pte::A | super::mmu::pte::D;
+    let root = BASE + 0x1000;
+    // The first gigabyte is an identity leaf, so the fetch succeeds; nothing
+    // else is mapped.
+    h.put_u64(root, v | rwx | ad);
+    h.hart.set_x(11, 0x4000_1000);
+    let mut csrs = h.hart.csrs();
+    csrs.satp = (8 << 60) | (root >> 12);
+    csrs.priv_mode = Priv::Supervisor;
+    h.hart.set_csrs(csrs);
+    h.steps(1);
+    let c = h.hart.csrs();
+    assert_eq!(c.mcause, cause::STORE_PAGE_FAULT);
+    assert_eq!(c.mtval, 0x4000_1000);
+    assert_eq!(c.mepc, BASE);
+}
+
+#[test]
+fn an_amo_on_a_read_only_page_faults_without_marking_it_accessed() {
+    // The same rule from the other side: the page is readable, so the AMO's
+    // read would succeed, and the access as a whole is still refused. A
+    // refused access sets no accessed bit — Volume II's walk checks the
+    // permission (step 5) before it touches `pte.a` (step 7).
+    let h = Harness::rv64gc(&[amo(0b00001, 3, 10, 11, 12)]); // amoswap.d
+    let v = super::mmu::pte::V;
+    let r = super::mmu::pte::R;
+    let rwx = r | super::mmu::pte::W | super::mmu::pte::X;
+    let ad = super::mmu::pte::A | super::mmu::pte::D;
+    let root = BASE + 0x1000;
+    h.put_u64(root, v | rwx | ad);
+    h.put_u64(root + 8, (((BASE + 0x2000) >> 12) << 10) | v);
+    h.put_u64(BASE + 0x2000, (((BASE + 0x3000) >> 12) << 10) | v);
+    let leaf = BASE + 0x3000 + 8;
+    h.put_u64(leaf, (((BASE + 0x4000) >> 12) << 10) | v | r);
+    h.put_u64(BASE + 0x4000, 7);
+    h.hart.set_x(11, 0x4000_1000);
+    h.hart.set_x(12, 9);
+    let mut csrs = h.hart.csrs();
+    csrs.satp = (8 << 60) | (root >> 12);
+    csrs.priv_mode = Priv::Supervisor;
+    h.hart.set_csrs(csrs);
+    h.steps(1);
+    let c = h.hart.csrs();
+    assert_eq!(c.mcause, cause::STORE_PAGE_FAULT);
+    assert_eq!(c.mtval, 0x4000_1000);
+    assert_eq!(h.get_u64(BASE + 0x4000), 7, "nothing was written");
+    assert_eq!(h.hart.x(10), 0, "and rd is untouched");
+    assert_eq!(
+        h.get_u64(leaf) & super::mmu::pte::A,
+        0,
+        "a refused access does not mark the page accessed"
+    );
+}
+
+#[test]
+fn an_amo_on_nothing_raises_a_store_access_fault() {
+    // No translation at all: the address simply has nothing behind it. The
+    // refusal arrives on the AMO's read, and is still the AMO's.
+    let mut cfg = Config::rv64i();
+    cfg.ext.a = true;
+    let h = Harness::with(cfg, &[amo(0b00000, 3, 10, 11, 12)]);
+    h.hart.set_x(11, 0x9000_0000);
+    h.steps(1);
+    let c = h.hart.csrs();
+    assert_eq!(c.mcause, cause::STORE_ACCESS);
+    assert_eq!(c.mtval, 0x9000_0000);
+}
+
 // ---------------------------------------------------------------------------
 // C
 // ---------------------------------------------------------------------------
