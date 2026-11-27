@@ -605,34 +605,20 @@ pub(super) fn div(a: Parts, b: Parts, spec: Spec, env: Env) -> (Outcome, Flags) 
     }
 }
 
-/// The integer square root of a radicand extended by `extra` zero bit-pairs,
-/// and whether anything was left over.
+/// The integer square root of `radicand * 4^(31 + extra)` and whether anything
+/// was left over, for a radicand of at most 66 bits.
 ///
-/// Restoring, two bits of radicand per bit of root, so it needs no division —
-/// and no floating point, which is the whole point of the subsystem. The extra
-/// pairs are where the root's fraction bits come from: 40 of them put more than
-/// 70 significant bits in the root, which covers every format here.
+/// The first 31 bit-pairs are one call to the standard library's integer
+/// square root — the radicand shifted up by 62 still fits a `u128` — which
+/// yields the leading 63 or 64 bits of the root. The remaining `extra` pairs
+/// are restoring steps continued from its remainder, two bits of radicand
+/// (all zero by now) per bit of root, so the result is the same floor a
+/// restoring loop over every pair would reach. No floating point anywhere,
+/// which is the whole point of the subsystem.
 fn isqrt(radicand: u128, extra: u32) -> (u128, bool) {
-    if radicand == 0 {
-        return (0, false);
-    }
-    let mut rem: u128 = 0;
-    let mut root: u128 = 0;
-    // Start at the highest even bit position at or below the top of the value.
-    let mut shift = (127 - radicand.leading_zeros()) & !1;
-    loop {
-        rem = (rem << 2) | ((radicand >> shift) & 3);
-        root <<= 1;
-        let trial = (root << 1) | 1;
-        if rem >= trial {
-            rem -= trial;
-            root |= 1;
-        }
-        if shift == 0 {
-            break;
-        }
-        shift -= 2;
-    }
+    let wide = radicand << 62;
+    let mut root = wide.isqrt();
+    let mut rem = wide - root * root;
     for _ in 0..extra {
         rem <<= 2;
         root <<= 1;
@@ -666,10 +652,14 @@ pub(super) fn sqrt(a: Parts, spec: Spec, env: Env) -> (Outcome, Flags) {
                 frac <<= 1;
                 exp -= 1;
             }
-            const EXTRA_PAIRS: u32 = 40;
-            let (root, rest) = isqrt(frac, EXTRA_PAIRS);
+            // The normalised radicand has its top bit at 63 or 64, so the
+            // library call alone gives a root of 63 or 64 bits: enough for
+            // any precision up to 60 once two guard bits and the sticky bit
+            // are counted. The 80-bit format's 64 needs nine pairs more.
+            let extra: u32 = if spec.precision <= 60 { 0 } else { 9 };
+            let (root, rest) = isqrt(frac, extra);
             let sig = if rest { root | 1 } else { root };
-            round_exact(false, exp / 2 - EXTRA_PAIRS as i32, sig, spec, env)
+            round_exact(false, exp / 2 - 31 - extra as i32, sig, spec, env)
         }
     }
 }
