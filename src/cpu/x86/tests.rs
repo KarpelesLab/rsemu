@@ -2071,6 +2071,131 @@ fn an_iret_with_vm_set_runs_an_8086_task_and_an_interrupt_brings_it_back() {
     );
 }
 
+/// A far return or `IRET` whose instruction pointer lies outside the code
+/// segment it names is `#GP(0)` **at the return**, not at the next fetch.
+///
+/// *Intel SDM* volume 2, `IRET`, "Operation", `RETURN-TO-SAME-PRIVILEGE-LEVEL`:
+/// "IF EIP is not within CS limit THEN #GP(0); FI;" and `RET`: "IF the return
+/// instruction pointer is not within the return code segment limit THEN
+/// #GP(0); FI;". The check was missing, so the return succeeded and the fault
+/// was raised by the fetch that followed — with the *destination's* `CS:EIP`
+/// on the handler's frame instead of the returning instruction's.
+#[test]
+fn a_far_return_checks_the_instruction_pointer_against_the_new_code_segment() {
+    const HANDLER: u32 = 0x3100;
+    // pushfd ; push 0x18 ; push 0x2000 ; iretd
+    let iretd: &[u8] = &[0x9c, 0x6a, 0x18, 0x68, 0x00, 0x20, 0x00, 0x00, 0xcf];
+    // push 0x18 ; push 0x2000 ; retf
+    let retf: &[u8] = &[0x6a, 0x18, 0x68, 0x00, 0x20, 0x00, 0x00, 0xcb];
+    for (name, code) in [("iretd", iretd), ("retf", retf)] {
+        let pc = pc386();
+        pc.start_protected();
+        // A code segment 4 KiB long: offset 0x2000 is outside it.
+        pc.gdt(3, descriptor(0, 0xfff, rights::CODE32));
+        pc.idt(13, gate(0x08, HANDLER, sys_type::INT_GATE32, 0));
+        pc.write(u64::from(HANDLER), &[0xf4]);
+        pc.write(at::CODE0, code);
+        let steps = pc.run(20);
+        assert!(steps < 20, "{name}: the handler halted");
+        let regs = pc.regs();
+        assert_eq!(regs.rip, u64::from(HANDLER) + 1, "{name}: #GP was taken");
+        assert_eq!(pc.read32(regs.rsp), 0, "{name}: with an error code of zero");
+        assert_eq!(
+            pc.read32(regs.rsp + 4),
+            at::CODE0 + code.len() as u64 - 1,
+            "{name}: naming the return itself"
+        );
+        assert_eq!(
+            pc.read32(regs.rsp + 8) & 0xffff,
+            0x08,
+            "{name}: in the segment it was executed from"
+        );
+    }
+}
+
+/// An outward `IRET` that faults on its stack segment has not changed
+/// privilege: the fault is delivered at the level the `IRET` ran at.
+///
+/// `CS` was committed before the popped `SS` was validated, and a fault rolls
+/// back the register file but not the descriptor caches — so the `#GP` for a
+/// null stack selector was delivered with a cached `CS` already at privilege
+/// 3, which is an inter-privilege interrupt through a task state segment
+/// nobody loaded. *Intel SDM* volume 2, `IRET`, "Protected Mode Exceptions":
+/// "#GP(0) ... If the return code or stack segment selector is NULL."
+#[test]
+fn an_outward_iret_that_faults_on_its_stack_is_still_at_the_inner_level() {
+    const HANDLER: u32 = 0x3100;
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(3, descriptor(0, 0xffff_ffff, rights::CODE32 | rights::DPL3));
+    pc.idt(13, gate(0x08, HANDLER, sys_type::INT_GATE32, 0));
+    pc.write(u64::from(HANDLER), &[0xf4]);
+    // push 0 (SS: null) ; push 0xa000 (ESP) ; pushfd ; push 0x1b ;
+    // push 0x4000 ; iretd
+    pc.write(
+        at::CODE0,
+        &[
+            0x6a, 0x00, 0x68, 0x00, 0xa0, 0x00, 0x00, 0x9c, 0x6a, 0x1b, 0x68, 0x00, 0x40, 0x00,
+            0x00, 0xcf,
+        ],
+    );
+    let steps = pc.run(20);
+    assert!(steps < 20, "the handler halted");
+    let regs = pc.regs();
+    assert_eq!(regs.rip, u64::from(HANDLER) + 1, "#GP was taken");
+    assert_eq!(
+        regs.rsp,
+        at::STACK0 - 20 - 16,
+        "on the stack the IRET was using: five pushes, then the error code \
+         under a three-word frame, and no stack switch"
+    );
+    assert_eq!(pc.read32(regs.rsp + 4), at::CODE0 + 15, "naming the iretd");
+    assert_eq!(pc.read32(regs.rsp + 8) & 0xffff, 0x08);
+}
+
+/// The `IRET` into virtual-8086 mode checks `EIP` against the 64 KiB an 8086
+/// segment has, and does not truncate it.
+///
+/// *Intel SDM* volume 2, `IRET`, "Operation", `RETURN-TO-VIRTUAL-8086-MODE`:
+/// "IF EIP not within CS limit THEN #GP(0); FI;". The frame's `EIP` was cut
+/// to sixteen bits instead, which resumed the task at an address its monitor
+/// had not asked for.
+#[test]
+fn an_iret_into_a_virtual_8086_task_refuses_an_eip_beyond_64k() {
+    const HANDLER: u32 = 0x3100;
+    let pc = pc386();
+    pc.start_protected();
+    pc.idt(13, gate(0x08, HANDLER, sys_type::INT_GATE32, 0));
+    pc.write(u64::from(HANDLER), &[0xf4]);
+    let mut code: Vec<u8> = Vec::new();
+    for value in [
+        0u32,                                        // GS
+        0,                                           // FS
+        u32::from(v86_at::DATA),                     // DS
+        u32::from(v86_at::DATA),                     // ES
+        u32::from(v86_at::STACK),                    // SS
+        0x100,                                       // ESP
+        flags::VM | flags::IOPL | flags::ALWAYS_SET, // EFLAGS
+        u32::from(v86_at::CODE),                     // CS
+        0x0001_0000,                                 // EIP: one past the limit
+    ] {
+        code.push(0x68);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    code.push(0xcf);
+    pc.write(at::CODE0, &code);
+    // The task's first byte, were the `EIP` truncated to zero: a `hlt` the
+    // test must not reach.
+    pc.write(u64::from(v86_at::CODE) << 4, &[0xf4]);
+    let steps = pc.run(20);
+    assert!(steps < 20, "the handler halted");
+    let regs = pc.regs();
+    assert_eq!(regs.eflags & flags::VM, 0, "the task was never entered");
+    assert_eq!(regs.rip, u64::from(HANDLER) + 1, "#GP was taken instead");
+    assert_eq!(pc.read32(regs.rsp), 0, "with an error code of zero");
+    assert_eq!(pc.read32(regs.rsp + 4), at::CODE0 + 45, "naming the iretd");
+}
+
 #[test]
 fn a_virtual_8086_task_below_iopl_three_traps_on_the_six_sensitive_instructions() {
     // *Intel SDM* Vol 3A §20.2.7: `CLI`, `STI`, `PUSHF`, `POPF`, `INT n` and
@@ -6155,6 +6280,49 @@ mod long_mode {
         assert_eq!(regs.rdx, 0x0004, "and its SS, eight further on and wrapped");
         assert_eq!(regs.cs, 0x000b, "SYSRET's CS: 0xfff8 + 16, at privilege 3");
         assert_eq!(regs.ss, 0x0003, "and its SS: 0xfff8 + 8");
+    }
+
+    /// A far return or `IRETQ` to 64-bit code with a non-canonical `RIP`
+    /// is `#GP(0)` at the return.
+    ///
+    /// *Intel SDM* volume 2, `IRET`, "Operation": "ELSE (* new mode =
+    /// 64-bit mode *) IF RIP is non-canonical THEN #GP(0); FI;" and "64-Bit
+    /// Mode Exceptions": "#GP(0) ... If the return instruction pointer is
+    /// non-canonical." `RET`: "IF the return instruction pointer is not
+    /// within canonical address space THEN #GP(0); FI;". Unchecked, the
+    /// return went through and the *fetch* faulted, with the non-canonical
+    /// address as the saved `RIP`.
+    #[test]
+    fn a_return_to_a_non_canonical_rip_faults_at_the_return() {
+        // mov rax, 0x0001_0000_0000_0000
+        let mut head = alloc::vec![0x48, 0xb8];
+        head.extend_from_slice(&0x0001_0000_0000_0000u64.to_le_bytes());
+        // push 0x10 ; push rsp ; pushfq ; push 0x18 ; push rax ; iretq
+        let iretq: &[u8] = &[0x6a, 0x10, 0x54, 0x9c, 0x6a, 0x18, 0x50, 0x48, 0xcf];
+        // push 0x18 ; push rax ; retfq
+        let retfq: &[u8] = &[0x6a, 0x18, 0x50, 0x48, 0xcb];
+        for (name, tail) in [("iretq", iretq), ("retfq", retfq)] {
+            let pc = pc64();
+            pc.start_protected();
+            pc.prepare_long();
+            pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+            pc.idt64(13, 0x20, la::HANDLER);
+            pc.write(la::HANDLER, &[0xf4]);
+            let mut code = head.clone();
+            code.extend_from_slice(tail);
+            pc.write(la::CODE64, &code);
+            let steps = pc.run(200);
+            assert!(steps < 200, "{name}: the handler halted");
+            let regs = pc.regs();
+            assert_eq!(regs.rip, la::HANDLER + 1, "{name}: #GP was taken");
+            assert_eq!(pc.read64(regs.rsp), 0, "{name}: error code zero");
+            assert_eq!(
+                pc.read64(regs.rsp + 8),
+                la::CODE64 + code.len() as u64 - 2,
+                "{name}: naming the return itself"
+            );
+            assert_eq!(pc.read64(regs.rsp + 16), 0x18, "{name}: in its own segment");
+        }
     }
 
     #[test]

@@ -2156,6 +2156,34 @@ impl Exec<'_> {
         Ok(desc)
     }
 
+    /// The check every far return and `IRET` makes on the instruction
+    /// pointer it is about to load, against the code segment it is about to
+    /// load it into.
+    ///
+    /// *Intel SDM* (325462-093US) volume 2, `IRET`, "Operation", in each of
+    /// `RETURN-TO-SAME-PRIVILEGE-LEVEL` and `RETURN-TO-OUTER-PRIVILEGE-LEVEL`:
+    /// "IF new mode != 64-Bit Mode THEN IF EIP is not within CS limit THEN
+    /// #GP(0); FI; ELSE (* new mode = 64-bit mode *) IF RIP is non-canonical
+    /// THEN #GP(0); FI; FI;" — and `RET`, the same two tests: "IF the return
+    /// instruction pointer is not within the return code segment limit THEN
+    /// #GP(0); FI; IF the return instruction pointer is not within canonical
+    /// address space THEN #GP(0); FI;".
+    ///
+    /// It has to be made *here*, before anything is committed: the fault
+    /// belongs to the returning instruction, at the privilege it was executed
+    /// at, with its own `CS:IP` on the handler's frame. Left to the next
+    /// fetch, the same bad pointer faults at the *destination* — after the
+    /// privilege change, on the destination's stack, naming an address that
+    /// was never an instruction.
+    fn check_return_ip(&self, target: SegReg, ip: u64) -> Ex<()> {
+        let ok = if self.state.sys.long_mode() && target.long() {
+            canonical(ip)
+        } else {
+            target.in_bounds(ip, 1)
+        };
+        if ok { Ok(()) } else { Err(Fault::gp(0)) }
+    }
+
     /// A far return.
     pub(super) fn return_far(&mut self, opsize: u8, extra: u64) -> Ex<()> {
         let ip = self.pop(opsize)?;
@@ -2198,22 +2226,25 @@ impl Exec<'_> {
         if !desc.present() {
             return Err(Fault::coded(VEC_NP, u32::from(selector & 0xfffc)));
         }
+        let ip = if opsize == 2 { ip & 0xffff } else { ip };
 
         if sel.rpl() > cpl {
             // Returning outward: the caller's stack comes back off this one.
             let new_sp = self.pop(opsize)?;
             let new_ss = self.pop(opsize)? as u16;
             let ss_desc = self.validate_return_stack(new_ss, sel.rpl())?;
+            self.check_return_ip(desc.to_seg(selector), ip)?;
             self.commit_cs(selector, desc, sel.rpl());
             *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(new_ss);
             self.state.regs.ss = new_ss;
             self.set_sp(new_sp.wrapping_add(extra));
-            self.state.regs.rip = if opsize == 2 { ip & 0xffff } else { ip };
+            self.state.regs.rip = ip;
             self.drop_privileged_segments(sel.rpl());
             return Ok(());
         }
+        self.check_return_ip(desc.to_seg(selector), ip)?;
         self.commit_cs(selector, desc, cpl);
-        self.state.regs.rip = if opsize == 2 { ip & 0xffff } else { ip };
+        self.state.regs.rip = ip;
         Ok(())
     }
 
@@ -2373,35 +2404,42 @@ impl Exec<'_> {
         // more doublewords and load `SS` from whatever the second was.
         let long = self.sixty_four();
         let outward = sel.rpl() > cpl;
-        if long || outward {
-            let new_sp = self.pop(opsize)?;
-            let new_ss = self.pop(opsize)? as u16;
-            let new_cpl = sel.rpl();
-            self.commit_cs(selector, desc, new_cpl);
-            if long && Selector(new_ss).is_null() {
-                // Returning to 64-bit code with a null stack selector is
-                // legal: `SS` has no base or limit there, and the selector is
-                // kept only for its privilege level.
-                *self.state.sys.seg_mut(seg::SS) = SegReg {
-                    selector: new_ss,
-                    base: 0,
-                    limit: 0,
-                    ar: ar::PRESENT | ar::S | ar::RW | ar::ACCESSED,
-                };
-            } else {
-                let ss_desc = self.validate_return_stack(new_ss, new_cpl)?;
-                *self.state.sys.seg_mut(seg::SS) = ss_desc.to_seg(new_ss);
-            }
-            self.state.regs.ss = new_ss;
-            self.set_sp(new_sp);
-        } else {
-            self.commit_cs(selector, desc, cpl);
-        }
-        self.state.regs.rip = match opsize {
+        let ip = match opsize {
             2 => ip & 0xffff,
             4 => ip & 0xffff_ffff,
             _ => ip,
         };
+        if long || outward {
+            let new_sp = self.pop(opsize)?;
+            let new_ss = self.pop(opsize)? as u16;
+            let new_cpl = sel.rpl();
+            // Everything that can fault comes before the first commit: a
+            // fault rolls the register file back, not the descriptor caches,
+            // so a `CS` committed ahead of a refused stack segment would
+            // deliver that fault at the *new* privilege level.
+            let ss = if long && Selector(new_ss).is_null() {
+                // Returning to 64-bit code with a null stack selector is
+                // legal: `SS` has no base or limit there, and the selector is
+                // kept only for its privilege level.
+                SegReg {
+                    selector: new_ss,
+                    base: 0,
+                    limit: 0,
+                    ar: ar::PRESENT | ar::S | ar::RW | ar::ACCESSED,
+                }
+            } else {
+                self.validate_return_stack(new_ss, new_cpl)?.to_seg(new_ss)
+            };
+            self.check_return_ip(desc.to_seg(selector), ip)?;
+            self.commit_cs(selector, desc, new_cpl);
+            *self.state.sys.seg_mut(seg::SS) = ss;
+            self.state.regs.ss = new_ss;
+            self.set_sp(new_sp);
+        } else {
+            self.check_return_ip(desc.to_seg(selector), ip)?;
+            self.commit_cs(selector, desc, cpl);
+        }
+        self.state.regs.rip = ip;
         self.restore_flags(fl, cpl, opsize);
         if outward {
             self.drop_privileged_segments(sel.rpl());
@@ -2425,6 +2463,16 @@ impl Exec<'_> {
         let ds = self.pop(4)? as u16;
         let fs = self.pop(4)? as u16;
         let gs = self.pop(4)? as u16;
+        // `RETURN-TO-VIRTUAL-8086-MODE` opens with "IF EIP not within CS
+        // limit THEN #GP(0); FI;" (*Intel SDM* volume 2, `IRET`,
+        // "Operation"), and the limit of an 8086 segment is 64 KiB. Checked
+        // before the flags are written, because from there on the fault
+        // would be delivered out of the task rather than to the monitor
+        // that built the frame — and never truncated to sixteen bits, which
+        // resumed the task somewhere the monitor did not ask for.
+        if ip > 0xffff {
+            return Err(Fault::gp(0));
+        }
         // The flags first, because `VM` is what makes everything below an
         // 8086 load and what makes [`Exec::cpl`](super::exec) answer 3 from
         // here on. `RF` is cleared by `IRET` rather than restored, as it is on
