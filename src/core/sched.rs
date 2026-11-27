@@ -364,6 +364,11 @@ const WHEEL_SLOTS: usize = 1 << WHEEL_SLOT_BITS;
 /// to the far heap.
 pub const DEFAULT_GRANULE_SHIFT: u32 = 32;
 
+/// How many tombstones beyond twice the queue's length
+/// [`EventQueue::cancel`] tolerates before sweeping them, so a short queue is
+/// not swept on every call.
+const TOMBSTONE_SLACK: usize = 64;
+
 /// Where an event belongs right now.
 enum Placement {
     /// At or before the current granule: it goes to the due heap, which filters
@@ -462,8 +467,37 @@ impl EventQueue {
     /// The entry is tombstoned rather than hunted down: a queue that has to find
     /// an arbitrary element is a queue that cannot be a wheel. The memory is
     /// reclaimed when the event's instant is reached.
+    ///
+    /// Cancelling an event that has already fired — the ordinary shape of a
+    /// timer that re-arms itself, "cancel the old one, post the new one" — is
+    /// harmless, and its tombstone has no entry left to be reclaimed with. So
+    /// the tombstones are swept against the queue whenever they outnumber it
+    /// two to one, which keeps them bounded by the queue's own size at an
+    /// amortised constant number of look-ups per cancel.
     pub fn cancel(&mut self, id: EventId) {
+        if id.0 >= self.next_seq {
+            // Never issued by this queue, so there is nothing it could match.
+            return;
+        }
         self.cancelled.insert(id.0);
+        if self.cancelled.len() > 2 * self.len() + TOMBSTONE_SLACK {
+            self.sweep_tombstones();
+        }
+    }
+
+    /// Drops every tombstone whose event is no longer queued.
+    fn sweep_tombstones(&mut self) {
+        let cancelled = &self.cancelled;
+        let queued = self
+            .due
+            .iter()
+            .map(|Reverse(e)| e)
+            .chain(self.near.iter().flatten())
+            .chain(self.far.iter().map(|Reverse(e)| e))
+            .map(|e| e.id.0)
+            .filter(|seq| cancelled.contains(seq))
+            .collect();
+        self.cancelled = queued;
     }
 
     /// The earliest instant at which anything could fire, if anything is queued.
@@ -5185,6 +5219,37 @@ mod tests {
         q.cancel(c);
         assert_eq!(q.next_deadline(), Some(t(200)));
         assert_eq!(drain(&mut q, t(60_000_000_000)), alloc::vec![(2, 1)]);
+    }
+
+    #[test]
+    fn cancelling_fired_events_does_not_grow_the_queue_without_bound() {
+        // A self-re-arming timer cancels its previous event out of habit,
+        // after it has fired. Nothing is left in the queue for that tombstone
+        // to be reclaimed with.
+        let mut q = EventQueue::default();
+        let mut last = q.schedule(t(1), EventTarget(0), 0);
+        for round in 1..=10_000u64 {
+            assert_eq!(drain(&mut q, t(round)).len(), 1);
+            q.cancel(last);
+            last = q.schedule(t(round + 1), EventTarget(0), round);
+        }
+        assert!(
+            q.cancelled.len() <= 2 * q.len() + TOMBSTONE_SLACK + 1,
+            "{} tombstones for {} queued event(s)",
+            q.cancelled.len(),
+            q.len()
+        );
+        // A sweep keeps the tombstones that still have work to do.
+        let doomed = q.schedule(t(20_000), EventTarget(0), 77);
+        q.cancel(doomed);
+        for seq in 0..1_000 {
+            q.cancel(EventId::from_seq(seq));
+        }
+        assert_eq!(drain(&mut q, t(30_000)), alloc::vec![(10_000, 10_000)]);
+        // An id this queue never issued matches nothing and is not kept.
+        let before = q.cancelled.len();
+        q.cancel(EventId::from_seq(u64::MAX));
+        assert_eq!(q.cancelled.len(), before);
     }
 
     #[test]
