@@ -69,8 +69,7 @@
 //!   enabling NMI while the flag stands raises one, as on the part.
 //! * `NMITIMEN` bits 5–4 select the timer: H (every line at `HTIME`), V (line
 //!   `VTIME`, dot 0) or both. When it fires `TIMEUP` bit 7 sets and the `irq`
-//!   output follows it until `$4211` is read or the timer is disabled. The
-//!   event is scheduled from the PPU's beam handle, `master_until`.
+//!   output follows it until `$4211` is read or the timer is disabled.
 //! * With `NMITIMEN` bit 0, the pads are read automatically at the start of
 //!   vertical blank into `JOY1`/`JOY2`; `HVBJOY` bit 0 reads busy for 4224
 //!   clocks afterwards. `JOY3`/`JOY4` read zero (no multitap).
@@ -78,6 +77,25 @@
 //!   continuously, and each read of `$4016`/`$4017` shifts out one bit, B
 //!   first, with ones after the sixteenth. The pads come through
 //!   [`input::pads`](super::input::pads), named by the `pads` property.
+//!
+//! # One clock for the beam events
+//!
+//! HDMA, DRAM refresh and the H/V timer are beam positions, and the beam is
+//! the PPU's. But this device and the PPU are two lazily-advanced devices,
+//! each caught up when something needs it, and they are rarely at the same
+//! tick: the core runs a whole bus cycle (or a whole DMA stall) past one of
+//! this device's events before the scheduler delivers it, and anything that
+//! touches the PPU meanwhile has moved the PPU on.
+//!
+//! So an event is never "the PPU's distance to that dot, counted from here".
+//! Both chips hang off the same crystal with the same divider (the board
+//! gives them `clock = master`), which makes their ticks the same numbers,
+//! and the PPU publishes the [`Frame`] its beam is in: where line 0 began, as
+//! a master tick, and what decides the length of each line. From that, "dot
+//! `h` of line `v`" is an absolute tick by integer arithmetic, and it is the
+//! same tick wherever either chip has been caught up to. This device keeps
+//! the frame its own tick is in (`State::frame`), so that it still has it
+//! when the PPU has gone on into the next one.
 //!
 //! # Known deviations
 //!
@@ -118,7 +136,8 @@ use crate::core::value::Width;
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::cpu::w65c816::{AccessTiming, BusCycle, Pins, TimingPort};
 use crate::dev::snes::input::{Pad, pads};
-use crate::dev::snes::ppu::SnesPpuBeam;
+use crate::dev::snes::ppu::timing::{VBLANK_LINE, VBLANK_LINE_OVERSCAN};
+use crate::dev::snes::ppu::{Frame, SnesPpuBeam};
 use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
@@ -139,7 +158,9 @@ pub const IRQ_PIN: &str = "irq";
 /// The PPU's vertical-blank level, in.
 pub const VBLANK_PIN: &str = "vblank";
 
-const STATE_VERSION: u32 = 1;
+// 2: the chunk gained the frame this device's own tick is in; see
+// [`migrations`].
+const STATE_VERSION: u32 = 2;
 const DEFAULT_PADS: &str = "snes-pads";
 
 /// The CPU version `RDNMI` reports in bits 3–0 (fullsnes: "5A22 version
@@ -157,6 +178,20 @@ const HDMA_CHANNEL: u64 = 8;
 const HDMA_INDIRECT: u64 = 16;
 const REFRESH_CLOCKS: u64 = 40;
 const AUTO_JOY_CLOCKS: u64 = 4224;
+
+/// How many frames a search for a beam position looks through: the one the
+/// tick is in and the two after it, which is both interlace fields.
+const FRAMES_AHEAD: usize = 3;
+/// How many frames apart this device and the PPU may be before the frames in
+/// between stop being reconstructed one by one. No scheduler lets them get
+/// that far; a unit test that advances only one of them does.
+const FRAMES_APART: usize = 4;
+
+/// The beam events, in the order simultaneous ones fire.
+const EV_INIT: u8 = 0;
+const EV_LINE: u8 = 1;
+const EV_REFRESH: u8 = 2;
+const EV_IRQ: u8 = 3;
 
 const HDMA_INIT_DOT: u16 = 6;
 const HDMA_DOT: u16 = 278;
@@ -232,6 +267,11 @@ struct State {
     dma_byte: u32,
     /// The DMA's own data-bus latch.
     mdr: u8,
+    /// The frame this device's own tick is in, less the region (which is the
+    /// PPU's to say): where it started, its field, whether it is interlaced
+    /// and how many lines it has. `None` until the first time the beam is
+    /// asked, and after a reset.
+    frame: Option<(u64, bool, bool, u16)>,
     /// The next tick each beam event falls on.
     next_init: u64,
     next_line: u64,
@@ -279,6 +319,7 @@ impl State {
             dma_channel_started: false,
             dma_byte: 0,
             mdr: 0,
+            frame: None,
             next_init: 0,
             next_line: 0,
             next_refresh: 0,
@@ -414,47 +455,133 @@ impl Shared {
             .store(next.max(tick.saturating_add(1)), Ordering::Relaxed);
     }
 
-    /// Recompute every beam event from the beam's position now.
-    fn reschedule(&self) {
+    /// The frame master tick `t` of this device's own clock falls in, and the
+    /// interlace setting the frames after it are projected with.
+    ///
+    /// The PPU is the authority: whenever the frame it is in holds `t`, that
+    /// is the answer. When it has gone on into a later frame, the answer is
+    /// the frame this device was last in (or the ones that follow from it);
+    /// when it is behind, the ones that follow from the PPU's.
+    fn frame_at(&self, beam: &SnesPpuBeam, t: u64) -> (Frame, bool) {
+        let (ppu, interlace_next) = beam.beam_frame();
+        let stored = self
+            .state
+            .lock()
+            .frame
+            .map(|(start, field, interlace, lines)| Frame {
+                region: ppu.region,
+                start,
+                field,
+                interlace,
+                lines,
+            });
+        let walk = |mut f: Frame, step: &dyn Fn(Frame) -> Option<Frame>| -> Option<Frame> {
+            for _ in 0..FRAMES_APART {
+                if f.contains(t) {
+                    return Some(f);
+                }
+                f = step(f)?;
+            }
+            None
+        };
+        let frame = if ppu.contains(t) {
+            Some(ppu)
+        } else if t >= ppu.end() {
+            walk(ppu, &|f| Some(f.next(interlace_next)))
+        } else {
+            // The PPU is in a later frame than `t`. Forwards from the frame
+            // this device knows, stepping onto the PPU's own where they meet;
+            // failing that, backwards from the PPU's. A frame in between is
+            // taken to have the interlace setting of the PPU's.
+            stored
+                .filter(|f| f.start <= t)
+                .and_then(|f| {
+                    walk(f, &|f| {
+                        Some(if f.end() == ppu.start {
+                            ppu
+                        } else {
+                            f.next(ppu.interlace)
+                        })
+                    })
+                })
+                .or_else(|| walk(ppu, &|f| f.prev(ppu.interlace)))
+        };
+        // Further apart than any scheduler lets them get. There is no honest
+        // answer; a frame that starts here is at least a deterministic one.
+        let frame = frame.unwrap_or(Frame { start: t, ..ppu });
+        self.state.lock().frame = Some((frame.start, frame.field, frame.interlace, frame.lines));
+        (frame, interlace_next)
+    }
+
+    /// Recompute every beam event, as when a register that places one is
+    /// written: each is the first occurrence strictly after this device's
+    /// tick.
+    fn reschedule_all(&self) {
+        self.reschedule(None);
+    }
+
+    /// Recompute the beam events after `fired` has run at this device's tick.
+    ///
+    /// Each is the first occurrence strictly after the tick — except one that
+    /// is due *at* it and has not fired yet, which keeps its place and fires
+    /// next. (Strictly after, for the one that just fired, is what makes it
+    /// fire once.)
+    fn reschedule(&self, fired: Option<u8>) {
         let Some(beam) = self.beam() else {
             return;
         };
         let now = self.tick.load(Ordering::Relaxed);
-        let pos = beam.position();
-        let lines = beam.lines_in_frame().max(1);
-        let after = |h: u16| -> u64 {
-            let v = if pos.h < h {
-                pos.v
-            } else {
-                (pos.v + 1) % lines
-            };
-            beam.master_until(v, h).map_or(u64::MAX, |d| now + d.max(1))
+        let (frame, interlace_next) = self.frame_at(&beam, now);
+        // The first time the beam is at dot `h` of line `v` after `now`.
+        let at = |v: u16, h: u16| -> Option<u64> {
+            let mut f = frame;
+            for _ in 0..FRAMES_AHEAD {
+                if let Some(tick) = f.tick_of(v, h).filter(|&tick| tick > now) {
+                    return Some(tick);
+                }
+                f = f.next(interlace_next);
+            }
+            None
         };
-        let init = beam
-            .master_until(0, HDMA_INIT_DOT)
-            .map_or(u64::MAX, |d| now + d.max(1));
-        let line = after(HDMA_DOT);
-        let refresh = after(REFRESH_DOT);
+        // The first time it is at dot `h` of any line: this line's, or the
+        // next's.
+        let on_a_line = |h: u16| -> Option<u64> {
+            let v = frame.line_at(now)?;
+            frame
+                .tick_of(v, h)
+                .filter(|&tick| tick > now)
+                .or_else(|| frame.tick_of(v + 1, h))
+                .or_else(|| frame.next(interlace_next).tick_of(0, h))
+        };
         let mut s = self.state.lock();
         // A target the beam never reaches never fires, and the registers hold
         // one at power-on ($1FF in each). "Setting a value larger than the
         // maximum H counter value of 339 will prevent the timer's H condition
         // from being met", and likewise for V, whose maximum "depends on the
         // region (261 for NTSC, 311 for PAL) and interlacing" (SNESdev wiki,
-        // *MMIO registers*, HTIME and VTIME). `master_until` already answers
-        // `None` for a line or a dot that does not exist, so the targets go to
-        // it as written rather than folded into range first.
+        // *MMIO registers*, HTIME and VTIME). A `Frame` already answers `None`
+        // for a line or a dot it does not have, so the targets go to it as
+        // written rather than folded into range first.
         let irq = match (s.nmitimen >> 4) & 3 {
             0 => None,
             1 if s.htime > 339 => None,
-            1 => Some(after(s.htime)),
-            2 => beam.master_until(s.vtime, 0).map(|d| now + d.max(1)),
-            _ => beam.master_until(s.vtime, s.htime).map(|d| now + d.max(1)),
+            1 => on_a_line(s.htime),
+            2 => at(s.vtime, 0),
+            _ => at(s.vtime, s.htime),
         };
-        s.next_init = init;
-        s.next_line = line;
-        s.next_refresh = refresh;
-        s.next_irq = irq;
+        let pending = |kind: u8, next: u64| fired.is_some_and(|f| f != kind) && next == now;
+        if !pending(EV_INIT, s.next_init) {
+            s.next_init = at(0, HDMA_INIT_DOT).unwrap_or(u64::MAX);
+        }
+        if !pending(EV_LINE, s.next_line) {
+            s.next_line = on_a_line(HDMA_DOT).unwrap_or(u64::MAX);
+        }
+        if !pending(EV_REFRESH, s.next_refresh) {
+            s.next_refresh = on_a_line(REFRESH_DOT).unwrap_or(u64::MAX);
+        }
+        if !pending(EV_IRQ, s.next_irq.unwrap_or(u64::MAX)) {
+            s.next_irq = irq;
+        }
         self.publish_next(&s);
     }
 
@@ -463,8 +590,8 @@ impl Shared {
         loop {
             let (due, kind) = {
                 let s = self.state.lock();
-                let mut best = (s.next_init, 0u8);
-                for (t, k) in [(s.next_line, 1), (s.next_refresh, 2)] {
+                let mut best = (s.next_init, EV_INIT);
+                for (t, k) in [(s.next_line, EV_LINE), (s.next_refresh, EV_REFRESH)] {
                     if t < best.0 {
                         best = (t, k);
                     }
@@ -472,7 +599,7 @@ impl Shared {
                 if let Some(t) = s.next_irq
                     && t < best.0
                 {
-                    best = (t, 3);
+                    best = (t, EV_IRQ);
                 }
                 best
             };
@@ -481,9 +608,9 @@ impl Shared {
             }
             self.tick.store(due, Ordering::Relaxed);
             match kind {
-                0 => self.hdma_init(),
-                1 => self.hdma_line(),
-                2 => {
+                EV_INIT => self.hdma_init(),
+                EV_LINE => self.hdma_line(),
+                EV_REFRESH => {
                     self.owed.fetch_add(REFRESH_CLOCKS, Ordering::Relaxed);
                 }
                 _ => {
@@ -491,18 +618,13 @@ impl Shared {
                     self.drive_lines();
                 }
             }
-            self.reschedule_one(kind);
+            // Every event is a beam position; recomputing them all from the
+            // frame is cheap, cannot drift, and picks up a `SETINI` change.
+            self.reschedule(Some(kind));
         }
         self.tick.store(target, Ordering::Relaxed);
         let s = self.state.lock();
         self.publish_next(&s);
-    }
-
-    /// After an event fires, find its next occurrence.
-    fn reschedule_one(&self, _kind: u8) {
-        // Every event is a beam position; recomputing all of them from the
-        // beam is cheap and cannot drift.
-        self.reschedule();
     }
 
     fn hdma_init(&self) {
@@ -551,7 +673,16 @@ impl Shared {
         let Some(beam) = self.beam() else {
             return;
         };
-        if beam.peek_position().v >= beam.vblank_line() {
+        // The line this event is on — this device's tick, not wherever the
+        // PPU has got to, which may be the line after.
+        let now = self.tick.load(Ordering::Relaxed);
+        let Some(v) = self.frame_at(&beam, now).0.line_at(now) else {
+            return;
+        };
+        // Lines 225 to 239 are picture or blank by `SETINI`'s overscan bit,
+        // which the PPU samples at line 225 and has therefore sampled by now.
+        let blank = v >= VBLANK_LINE_OVERSCAN || (v >= VBLANK_LINE && v >= beam.vblank_line());
+        if blank {
             return;
         }
         let Some(space) = self.space() else {
@@ -870,7 +1001,7 @@ impl Regs {
             beam.set_extlatch(level);
         }
         if reschedule {
-            self.shared.reschedule();
+            self.shared.reschedule_all();
         }
         self.shared.drive_lines();
     }
@@ -1147,6 +1278,28 @@ pub static CLASS: DeviceClass = DeviceClass {
     construct: |props| Ok(Box::new(SCpu::new(props)?)),
 };
 
+/// Carry a v1 `snes.scpu` chunk forward.
+///
+/// v2 appends the frame the device's own tick is in. A v1 device kept none —
+/// it measured every event from the PPU's position — so the step writes "not
+/// known", and the first event after the load takes the PPU's, which is what
+/// v1 did every time.
+///
+/// # Errors
+///
+/// If the step is already registered.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS_NAME, 1, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_bool(false)?;
+        out.write_u64(0)?;
+        out.write_bool(false)?;
+        out.write_bool(false)?;
+        out.write_u16(0)
+    })
+}
+
 /// Add this class to a registry.
 ///
 /// # Errors
@@ -1252,7 +1405,7 @@ impl Device for SCpu {
         self.shared.memsel.store(false, Ordering::Relaxed);
         self.shared.owed.store(0, Ordering::Relaxed);
         self.shared.dma_active.store(false, Ordering::Relaxed);
-        self.shared.reschedule();
+        self.shared.reschedule_all();
         self.shared.drive_lines();
     }
 
@@ -1295,7 +1448,15 @@ impl Device for SCpu {
         }
         w.write_u64(s.next_irq.unwrap_or(u64::MAX))?;
         w.write_bool(s.nmi_level)?;
-        w.write_bool(s.irq_level)
+        w.write_bool(s.irq_level)?;
+        // The frame this device's tick is in. Not derivable at load either:
+        // the PPU may be in the next one.
+        let (start, field, interlace, lines) = s.frame.unwrap_or((0, false, false, 0));
+        w.write_bool(s.frame.is_some())?;
+        w.write_u64(start)?;
+        w.write_bool(field)?;
+        w.write_bool(interlace)?;
+        w.write_u16(lines)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1344,6 +1505,11 @@ impl Device for SCpu {
         s.next_irq = Some(r.read_u64()?).filter(|&t| t != u64::MAX);
         s.nmi_level = r.read_bool()?;
         s.irq_level = r.read_bool()?;
+        let known = r.read_bool()?;
+        let frame = (r.read_u64()?, r.read_bool()?, r.read_bool()?, r.read_u16()?);
+        // A frame with no lines has no tick in it, and the arithmetic that
+        // finds a line assumes there is one.
+        s.frame = (known && frame.3 > 0 && frame.3 <= 313).then_some(frame);
         self.shared.memsel.store(memsel, Ordering::Relaxed);
         self.shared.owed.store(owed, Ordering::Relaxed);
         self.shared.dma_active.store(dma_active, Ordering::Relaxed);
@@ -1388,7 +1554,7 @@ impl Instance for SCpu {
         if let Some(name) = &self.ppu_link {
             let beam = ctx.export_as::<SnesPpuBeam>(name, ExportId::SNES_PPU_BEAM)?;
             *self.shared.beam.lock() = Some(beam);
-            self.shared.reschedule();
+            self.shared.reschedule_all();
         }
         Ok(())
     }

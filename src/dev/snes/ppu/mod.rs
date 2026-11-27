@@ -113,7 +113,7 @@ pub use engine::{CGRAM_ENTRIES, Engine, FB_HEIGHT, FB_LEN, FB_WIDTH, OAM_LEN, VR
 pub use regs::{
     MPYL, OPHCT, OPVCT, PPU1_OPEN_BUS, RDCGRAM, RDOAM, RDVRAMH, RDVRAML, Regs, SLHV, STAT77, STAT78,
 };
-pub use timing::Region;
+pub use timing::{Frame, Region};
 
 /// Where the board maps the register block on the B-bus.
 pub const REGISTER_BASE: u64 = 0x2100;
@@ -382,8 +382,30 @@ impl SnesPpuBeam {
         self.shared.engine.lock().interlace_frame
     }
 
+    /// The frame the beam is in now, pinned to the master-clock timeline, and
+    /// the interlace setting the *next* frame will latch if `SETINI` is left
+    /// alone.
+    ///
+    /// What the S-CPU schedules its beam events from. A [`Frame`] answers
+    /// "when is dot `h` of line `v`" in absolute master ticks, so the answer
+    /// does not depend on where this chip has been caught up to — unlike
+    /// [`master_until`](SnesPpuBeam::master_until), which measures from the
+    /// PPU's own position and is only meaningful to a caller standing at
+    /// exactly that position.
+    pub fn beam_frame(&self) -> (Frame, bool) {
+        self.now();
+        self.peek_beam_frame()
+    }
+
+    /// [`beam_frame`](SnesPpuBeam::beam_frame), wherever the chip was last caught
+    /// up to.
+    pub fn peek_beam_frame(&self) -> (Frame, bool) {
+        let e = self.shared.engine.lock();
+        (e.beam_frame(), e.interlace_next())
+    }
+
     /// Master clocks from now until the beam next reaches the start of dot `h`
-    /// of line `v` — what an H/V timer IRQ is scheduled by. `None` if that
+    /// of line `v`. `None` if that
     /// position does not occur in the next two frames under the current
     /// `SETINI`. Zero if the beam is exactly there.
     pub fn master_until(&self, v: u16, h: u16) -> Option<u64> {

@@ -11,7 +11,7 @@ use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 
 use super::regs::Regs;
 use super::timing::{
-    HBLANK_END_DOT, HBLANK_START_DOT, RENDER_DOT, Region, VBLANK_LINE, VBLANK_LINE_OVERSCAN,
+    Frame, HBLANK_END_DOT, HBLANK_START_DOT, RENDER_DOT, Region, VBLANK_LINE, VBLANK_LINE_OVERSCAN,
     dot_at, dot_start,
 };
 
@@ -340,6 +340,31 @@ impl Engine {
             };
         }
         moved
+    }
+
+    /// The frame the beam is in, pinned to the master-clock timeline.
+    ///
+    /// Derived, not stored: the frame began `line_pos` clocks and `v` whole
+    /// lines ago.
+    pub fn beam_frame(&self) -> Frame {
+        let mut frame = Frame {
+            region: self.region,
+            start: 0,
+            field: self.field,
+            interlace: self.interlace_frame,
+            lines: self.lines_in_frame,
+        };
+        let into = frame.line_start(self.v) + u64::from(self.line_pos);
+        // Saturating only so a snapshot that names a beam position its master
+        // count is too small for cannot panic; no run produces one.
+        frame.start = self.master.saturating_sub(into);
+        frame
+    }
+
+    /// The interlace setting the next frame will latch if `SETINI` is left
+    /// alone.
+    pub fn interlace_next(&self) -> bool {
+        self.r.setini & 0x01 != 0
     }
 
     /// Master clocks from where the beam stands until it next reaches the

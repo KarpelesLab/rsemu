@@ -123,6 +123,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::cpu::w65c816::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-z80")]
     crate::cpu::z80::migrations(&mut migrations)?;
+    #[cfg(feature = "dev-snes-scpu")]
+    crate::dev::snes::scpu::migrations(&mut migrations)?;
     #[cfg(feature = "dev-sgx")]
     crate::dev::sgx::migrations(&mut migrations)?;
     #[cfg(feature = "dev-amiga-akiko")]
@@ -164,6 +166,8 @@ mod tests {
         "cpu.w65c816",
         #[cfg(feature = "cpu-z80")]
         "cpu.z80",
+        #[cfg(feature = "dev-snes-scpu")]
+        crate::dev::snes::scpu::CLASS_NAME,
     ];
 
     #[test]

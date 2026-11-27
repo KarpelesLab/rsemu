@@ -288,6 +288,17 @@ fn a_snapshot_round_trips() {
     use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
     let fs = scpu();
     let saved = &fs.c;
+    // With a beam, and part-way into a frame the PPU has already left: the
+    // frame this device's tick is in is then state nothing else holds.
+    let ppu = crate::dev::snes::ppu::SnesPpu::default();
+    *saved.shared.beam.lock() = Some(ppu.beam());
+    ppu.advance_to(1364 * 300);
+    saved.shared.advance_to(1364 * 100 + 7);
+    assert_eq!(
+        saved.shared.state.lock().frame,
+        Some((0, false, false, 262)),
+        "the first frame, not the PPU's second"
+    );
     wr(&fs, DMA + 0x32, 0x34);
     wr(&fs, REGS + 0x07, 0x55);
     wr(&fs, REGS + 0x0D, 1);
@@ -310,6 +321,73 @@ fn a_snapshot_round_trips() {
     let got = *restored.shared.state.lock();
     assert_eq!(got, want);
     assert!(restored.shared.memsel.load(Ordering::Relaxed));
+
+    // The invariant as stated: saving the restored device gives the same
+    // bytes.
+    let mut shape = MachineShape::new();
+    shape.add_device("scpu", CLASS_NAME).unwrap();
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w.chunk("scpu", CLASS_NAME, STATE_VERSION).unwrap();
+        Device::save(restored, &mut chunk).unwrap();
+    }
+    assert_eq!(w.to_vec().unwrap(), bytes, "a round trip is a fixed point");
+}
+
+#[test]
+fn a_v1_snapshot_loads_and_takes_its_frame_from_the_ppu() {
+    use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+    let fs = scpu();
+    let ppu = crate::dev::snes::ppu::SnesPpu::default();
+    *fs.c.shared.beam.lock() = Some(ppu.beam());
+    ppu.advance_to(1364 * 50);
+    fs.c.shared.advance_to(1364 * 50);
+    wr(&fs, REGS + 0x07, 0x55);
+    let chunk_of = |c: &SCpu, version: u32, trim: usize| {
+        let mut shape = MachineShape::new();
+        shape.add_device("scpu", CLASS_NAME).unwrap();
+        let mut body = alloc::vec::Vec::new();
+        let mut full = StateWriter::new(shape.clone());
+        {
+            let mut chunk = full.chunk("scpu", CLASS_NAME, STATE_VERSION).unwrap();
+            Device::save(c, &mut chunk).unwrap();
+        }
+        let bytes = full.to_vec().unwrap();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("scpu", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        let mut cr = chunk.reader();
+        body.extend_from_slice(cr.take(cr.remaining()).unwrap());
+        body.truncate(body.len() - trim);
+        let mut w = StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("scpu", CLASS_NAME, version).unwrap();
+            chunk.write_all(&body).unwrap();
+        }
+        w.to_vec().unwrap()
+    };
+    // A v1 chunk is today's without the frame: a flag, a tick, two flags and
+    // a line count.
+    let v1 = chunk_of(&fs.c, 1, 1 + 8 + 1 + 1 + 2);
+    let mut table = Migrations::new();
+    migrations(&mut table).unwrap();
+    let fr = scpu();
+    let reader = StateReader::new(&v1).unwrap();
+    let chunk = reader
+        .load("scpu", CLASS_NAME, STATE_VERSION, &table)
+        .expect("v1 migrates to the shipping version");
+    let mut cr = chunk.reader();
+    Device::load(&fr.c, &mut cr).unwrap();
+    cr.end().expect("every field read");
+    let mut want = *fs.c.shared.state.lock();
+    assert!(want.frame.is_some());
+    want.frame = None;
+    assert_eq!(*fr.c.shared.state.lock(), want);
+    // And it finds its frame again the first time it needs one.
+    *fr.c.shared.beam.lock() = Some(ppu.beam());
+    fr.c.shared.advance_to(1364 * 52);
+    assert_eq!(fr.c.shared.state.lock().frame, Some((0, false, false, 262)));
 }
 
 #[test]
@@ -390,4 +468,110 @@ fn a_timer_target_the_beam_never_reaches_never_fires() {
     wr(&f, REGS, 0x30);
     run(&f, &ppu);
     assert_eq!(rd(&f, REGS + 0x11) & 0x80, 0x80, "line 261, dot 100 exists");
+}
+
+/// Where the PPU stands when the S-CPU is at `tick`, in three flavours: in
+/// step, a constant distance ahead, and caught up in strides — which is where
+/// it really stands, because the core runs whole bus cycles (and whole DMA
+/// stalls) past an S-CPU event before the scheduler delivers it, and anything
+/// that touches the PPU on the way catches it up to the core.
+#[derive(Debug, Clone, Copy)]
+enum Lead {
+    Constant(u64),
+    Strides(u64),
+}
+
+impl Lead {
+    fn ppu_at(self, tick: u64) -> u64 {
+        match self {
+            Lead::Constant(n) => tick + n,
+            Lead::Strides(n) => (tick / n + 1) * n,
+        }
+    }
+}
+
+const LEADS: [Lead; 6] = [
+    Lead::Constant(0),
+    Lead::Constant(8),
+    Lead::Strides(40),
+    Lead::Strides(600),
+    Lead::Strides(1364 * 3 + 100),
+    Lead::Strides(1364 * 300),
+];
+
+#[test]
+fn a_beam_event_fires_on_its_own_tick_wherever_the_ppu_has_got_to() {
+    use crate::dev::snes::ppu::SnesPpu;
+    use crate::dev::snes::ppu::timing::dot_start;
+    // V=10, H=135: one dot after the DRAM refresh event at dot 134. Every
+    // event used to be re-derived, each time one fired, as "the PPU's distance
+    // to that position, counted from the S-CPU's tick" — two different clocks.
+    // With the PPU a constant 8 clocks ahead the interrupt came 8 clocks
+    // early; with it ahead by more than the distance to the next occurrence,
+    // that occurrence was replaced by the one after (a frame later, for a
+    // V-IRQ).
+    let want = 10 * 1364 + u64::from(dot_start(135, true));
+    for lead in LEADS {
+        let f = scpu();
+        let ppu = SnesPpu::default();
+        *f.c.shared.beam.lock() = Some(ppu.beam());
+        f.c.shared.reschedule_all();
+        wr(&f, REGS + 0x07, 135);
+        wr(&f, REGS + 0x08, 0);
+        wr(&f, REGS + 0x09, 10);
+        wr(&f, REGS + 0x0A, 0);
+        wr(&f, REGS, 0x30);
+        let mut fired = None;
+        for tick in 0..1364 * 30 {
+            ppu.advance_to(lead.ppu_at(tick));
+            f.c.shared.advance_to(tick);
+            if f.c.shared.state.lock().timeup {
+                fired = Some(tick);
+                break;
+            }
+        }
+        assert_eq!(fired, Some(want), "with the PPU led by {lead:?}");
+    }
+}
+
+#[test]
+fn hdma_and_refresh_run_once_a_line_wherever_the_ppu_has_got_to() {
+    use crate::dev::snes::ppu::SnesPpu;
+    // One HDMA channel writing one byte a line to $2100 from a table of
+    // single-line entries, so the byte on the B-bus counts the transfers.
+    for lead in LEADS {
+        let f = scpu();
+        let ppu = SnesPpu::default();
+        *f.c.shared.beam.lock() = Some(ppu.beam());
+        f.c.shared.reschedule_all();
+        for i in 0..240u64 {
+            f.low.write_u8(0x100 + 2 * i, 1).unwrap();
+            f.low.write_u8(0x101 + 2 * i, i as u8).unwrap();
+        }
+        f.low.write_u8(0x100 + 480, 0).unwrap();
+        wr(&f, DMA, 0x00);
+        wr(&f, DMA + 1, 0x00);
+        wr(&f, DMA + 2, 0x00);
+        wr(&f, DMA + 3, 0x01);
+        wr(&f, DMA + 4, 0x00);
+        wr(&f, REGS + 0x0C, 0x01);
+        // Dot 278 of lines 0 to 224 is 225 transfers: the last byte is 224,
+        // and vertical blank (line 225 on) adds none. Refresh is every line,
+        // blank or not.
+        let lines = 240u64;
+        let mut refreshes = 0;
+        for tick in 0..lines * 1364 {
+            ppu.advance_to(lead.ppu_at(tick));
+            let before = f.c.shared.owed.load(Ordering::Relaxed);
+            f.c.shared.advance_to(tick);
+            let added = f.c.shared.owed.load(Ordering::Relaxed) - before;
+            // HDMA's cost is 18 + 8 + 8 a line here; refresh is the 40.
+            if added == REFRESH_CLOCKS {
+                assert_eq!(tick % 1364, 536, "refresh is at dot 134 of its line");
+                refreshes += 1;
+            }
+        }
+        assert_eq!(f.b.read_u8(0).unwrap(), 224, "with the PPU led by {lead:?}");
+        assert_eq!(refreshes, lines, "with the PPU led by {lead:?}");
+    }
 }
