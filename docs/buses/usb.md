@@ -480,6 +480,15 @@ device, so the *device-side* controller takes `HCD_RANK` with no other
 `HCD_RANK` lock held — even when both ends are the same class on one bus, which
 is the case that would have caught it.
 
+A fourth additive change came later, with `st.usbfs`: **the data PID**.
+`UsbDevice::transfer_in_pid`/`transfer_out_pid` (and `UsbBus::read_pid`/
+`write_pid`) carry a `DataPid` for a device whose silicon sequences toggles —
+the STM32 block toggles `DTOG_RX`/`DTOG_TX` per transaction, and drops a
+retransmitted packet whose PID does not match. Both default to the plain
+methods, ignoring the PID and reporting none, so no device or host changed;
+a plain `transfer_out` reaching a toggle-keeping device means "PID unknown",
+which it takes as the one it expected.
+
 #### Why dwc2 and not ChipIdea
 
 Three reasons, in order of weight. The register map is **documented**: RM0090

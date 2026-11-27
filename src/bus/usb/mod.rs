@@ -487,6 +487,51 @@ impl fmt::Display for Status {
     }
 }
 
+/// The data PID a data packet carried (USB 2.0 §8.6): `DATA0` or `DATA1`.
+///
+/// The fabric's ordinary transaction calls ([`UsbBus::read`],
+/// [`UsbBus::write`]) carry no PID — a host model that does not keep toggles
+/// does not invent one, and a device that does not check them never sees one.
+/// The `_pid` variants exist for the pair that do: a device whose silicon
+/// checks the toggle (and so discards a retransmitted packet, §8.6.4) and a
+/// host, or a test, that wants to exercise that. Everything that predates them
+/// keeps working through their defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum DataPid {
+    /// `DATA0`.
+    #[default]
+    Data0,
+    /// `DATA1`.
+    Data1,
+}
+
+impl DataPid {
+    /// The PID a toggle bit names: `false` is `DATA0`, `true` is `DATA1`.
+    #[must_use]
+    pub const fn from_toggle(toggle: bool) -> DataPid {
+        if toggle {
+            DataPid::Data1
+        } else {
+            DataPid::Data0
+        }
+    }
+
+    /// The toggle bit this PID is: `DATA1` is `true`.
+    #[must_use]
+    pub const fn toggle(self) -> bool {
+        matches!(self, DataPid::Data1)
+    }
+
+    /// The other one — what the next packet carries after this one is ACKed.
+    #[must_use]
+    pub const fn next(self) -> DataPid {
+        match self {
+            DataPid::Data0 => DataPid::Data1,
+            DataPid::Data1 => DataPid::Data0,
+        }
+    }
+}
+
 /// What one transaction did: a handshake, and how many bytes moved with it.
 ///
 /// The byte count matters even when it is smaller than the buffer: a *short
@@ -771,6 +816,28 @@ pub trait UsbDevice: Send + Sync + fmt::Debug {
 
     /// An `OUT` transaction: the device takes `src`.
     fn transfer_out(&self, endpoint: u8, src: &[u8]) -> Completion;
+
+    /// An `IN` transaction that also reports the data PID the device sent.
+    ///
+    /// `None` is "this device does not say" — the default, which forwards to
+    /// [`UsbDevice::transfer_in`], so every device that predates the PID keeps
+    /// its behaviour. A device that tracks toggles answers `Some` whenever it
+    /// put a data packet on the wire.
+    fn transfer_in_pid(&self, endpoint: u8, dst: &mut [u8]) -> (Completion, Option<DataPid>) {
+        (self.transfer_in(endpoint, dst), None)
+    }
+
+    /// An `OUT` transaction whose data packet carried `pid`.
+    ///
+    /// The default ignores the PID and forwards to
+    /// [`UsbDevice::transfer_out`], which is what a device that does not
+    /// sequence toggles does. A device that does overrides it; its plain
+    /// `transfer_out` then means "the PID is unknown", which it treats as the
+    /// one it expected.
+    fn transfer_out_pid(&self, endpoint: u8, src: &[u8], pid: DataPid) -> Completion {
+        let _ = pid;
+        self.transfer_out(endpoint, src)
+    }
 
     /// What an `IN` would return, without taking it.
     ///
@@ -1185,6 +1252,35 @@ impl UsbBus {
     pub fn write(&self, address: DeviceAddress, endpoint: u8, src: &[u8]) -> Completion {
         match self.find(address) {
             Some(device) => device.transfer_out(endpoint, src),
+            None => Completion::absent(),
+        }
+    }
+
+    /// An `IN` transaction that also reports the data PID, where the device
+    /// says ([`UsbDevice::transfer_in_pid`]).
+    pub fn read_pid(
+        &self,
+        address: DeviceAddress,
+        endpoint: u8,
+        dst: &mut [u8],
+    ) -> (Completion, Option<DataPid>) {
+        match self.find(address) {
+            Some(device) => device.transfer_in_pid(endpoint, dst),
+            None => (Completion::absent(), None),
+        }
+    }
+
+    /// An `OUT` transaction whose data packet carries `pid`
+    /// ([`UsbDevice::transfer_out_pid`]).
+    pub fn write_pid(
+        &self,
+        address: DeviceAddress,
+        endpoint: u8,
+        src: &[u8],
+        pid: DataPid,
+    ) -> Completion {
+        match self.find(address) {
+            Some(device) => device.transfer_out_pid(endpoint, src, pid),
             None => Completion::absent(),
         }
     }

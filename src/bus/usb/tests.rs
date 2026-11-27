@@ -271,6 +271,39 @@ fn a_port_takes_one_device_and_says_so_if_offered_two() {
 }
 
 #[test]
+fn a_device_that_keeps_no_toggles_answers_the_pid_calls_through_its_plain_ones() {
+    // The `_pid` entry points are additive: a device that does not override
+    // them is the device it was, and says nothing about the PID it sent.
+    let bus = UsbBus::new(1);
+    bus.attach(0, Stub::new(Speed::Full, 3)).expect("empty");
+    bus.set_enabled(0, true);
+    let mut buf = [0u8; 4];
+    let (c, pid) = bus.read_pid(DeviceAddress(3), 1, &mut buf);
+    assert_eq!(c, Completion::ack(1));
+    assert_eq!(buf[0], 3, "the plain transfer_in ran");
+    assert_eq!(pid, None, "a device that does not say");
+    assert_eq!(
+        bus.write_pid(DeviceAddress(3), 1, &[1, 2], DataPid::Data1),
+        Completion::ack(2)
+    );
+    assert_eq!(
+        bus.write_pid(DeviceAddress(9), 1, &[1], DataPid::Data0),
+        Completion::absent(),
+        "nothing at that address"
+    );
+    assert_eq!(bus.read_pid(DeviceAddress(9), 1, &mut buf).1, None);
+}
+
+#[test]
+fn a_data_pid_is_its_toggle_bit() {
+    assert_eq!(DataPid::from_toggle(false), DataPid::Data0);
+    assert_eq!(DataPid::from_toggle(true), DataPid::Data1);
+    assert!(DataPid::Data1.toggle());
+    assert_eq!(DataPid::Data0.next(), DataPid::Data1);
+    assert_eq!(DataPid::Data1.next(), DataPid::Data0);
+}
+
+#[test]
 fn a_port_count_is_clamped_into_what_a_controller_can_report() {
     // `HCSPARAMS.N_PORTS` is four bits, and a bus with no ports is not a bus.
     assert_eq!(UsbBus::new(0).port_count(), 1);
