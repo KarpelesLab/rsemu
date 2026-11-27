@@ -18,7 +18,7 @@ use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 
 use super::io::{Button, Nationalisation, SmsIo};
 use super::mapper::{BANK_SIZE, FIXED_LEN, SegaMapper};
-use super::psg::{SAMPLE_DIVISOR, SmsPsg};
+use super::psg::{CLOCK_DIVIDER, SAMPLE_DIVISOR, SmsPsg};
 use super::sdsc::SdscConsole;
 use super::vdp::{DOTS_PER_LINE, SCREEN_WIDTH, SmsVdp, TvRegion, VdpMode};
 
@@ -518,6 +518,22 @@ fn writing_the_noise_control_resets_the_shift_register() {
     assert_ne!(shifted, 0x8000, "the register has moved");
     psg.write(0xe4);
     assert_eq!(psg.lfsr(), 0x8000, "and a control write seeds it again");
+}
+
+#[test]
+fn the_noise_register_shifts_once_for_every_two_counter_reloads() {
+    // SMS Power, *SN76489*, "The Linear Feedback Shift Register": "When its
+    // input changes from 0 to 1 (ie. only once for every two times the related
+    // counter reaches zero), the array is shifted by one bit". The counter
+    // drives a flip-flop exactly as a tone channel's does, and the register is
+    // clocked by that flip-flop's rising edge — not by the counter itself,
+    // which shifted it twice as often and put all noise an octave high.
+    let psg = SmsPsg::new();
+    psg.write(0xe4); // white noise, counter reload $10
+    assert_eq!(psg.lfsr(), 0x8000);
+    // 8 * 2 * $10 internal steps: sixteen reloads, eight rising edges.
+    psg.advance_by(CLOCK_DIVIDER * 0x10 * 16);
+    assert_eq!(psg.lfsr(), 0x8000 >> 8);
 }
 
 #[test]

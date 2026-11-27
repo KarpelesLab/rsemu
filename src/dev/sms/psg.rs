@@ -118,7 +118,11 @@ const LFSR_SEED: u16 = 0x8000;
 const WHITE_TAPS: u16 = 0x0009;
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 1;
+///
+/// 2 added the noise counter's flip-flop as a fourth output bit. A version 1
+/// chunk still loads, with that bit clear — which is where it stood for a
+/// version 1 engine, since it had no such bit and shifted on every reload.
+const STATE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // The engine
@@ -132,8 +136,9 @@ struct Engine {
     volume: [u8; 4],
     /// Down-counters, one a channel.
     counter: [u16; 4],
-    /// The three tone flip-flops.
-    output: [bool; 3],
+    /// The four counters' flip-flops. The three tone channels' go to the
+    /// mixer; the noise channel's clocks the shift register instead.
+    output: [bool; 4],
     /// The noise shift register.
     lfsr: u16,
     /// Which register a bare data byte completes: `channel << 1 | type`.
@@ -156,7 +161,7 @@ impl Default for Engine {
             // noise on reset that no real machine makes audible.
             volume: [0x0f; 4],
             counter: [0; 4],
-            output: [false; 3],
+            output: [false; 4],
             lfsr: LFSR_SEED,
             latched: 0,
             divider: CLOCK_DIVIDER,
@@ -232,14 +237,23 @@ impl Engine {
         }
         if self.counter[3] == 0 {
             self.counter[3] = self.noise_period();
-            let feedback = if self.tone[3] & 0x04 != 0 {
-                // White: the parity of the tapped bits.
-                (self.lfsr & WHITE_TAPS).count_ones() as u16 & 1
-            } else {
-                // Periodic: one bit, so the register cycles in fifteen steps.
-                self.lfsr & 1
-            };
-            self.lfsr = (self.lfsr >> 1) | (feedback << 15);
+            // "As with the tone channels, the output bit is toggled between 0
+            // and 1. However, this is not sent to the mixer, but to a 'linear
+            // feedback shift register'", and "When its input changes from 0 to
+            // 1 (ie. only once for every two times the related counter reaches
+            // zero), the array is shifted by one bit" (SMS Power, *SN76489*).
+            self.output[3] = !self.output[3];
+            if self.output[3] {
+                let feedback = if self.tone[3] & 0x04 != 0 {
+                    // White: the parity of the tapped bits.
+                    (self.lfsr & WHITE_TAPS).count_ones() as u16 & 1
+                } else {
+                    // Periodic: one bit, so the register cycles in fifteen
+                    // steps.
+                    self.lfsr & 1
+                };
+                self.lfsr = (self.lfsr >> 1) | (feedback << 15);
+            }
         }
         self.counter[3] -= 1;
     }
@@ -592,7 +606,7 @@ impl Device for SmsPsg {
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
         let version = r.read_u32()?;
-        if version != STATE_VERSION {
+        if version == 0 || version > STATE_VERSION {
             return Err(Error::State(alloc::format!(
                 "the PSG's snapshot is version {version}, this build writes {STATE_VERSION}"
             )));
@@ -607,7 +621,9 @@ impl Device for SmsPsg {
         for value in &mut engine.counter {
             *value = r.read_u16()?;
         }
-        for value in &mut engine.output {
+        let flip_flops = if version == 1 { 3 } else { 4 };
+        engine.output = [false; 4];
+        for value in &mut engine.output[..flip_flops] {
             *value = r.read_bool()?;
         }
         engine.lfsr = r.read_u16()?;
