@@ -441,6 +441,7 @@
 
 mod attrs;
 mod buslock;
+mod direct;
 mod dispatch;
 mod flat;
 mod monitor;
@@ -455,6 +456,7 @@ pub use attrs::{
     RequesterId,
 };
 pub use buslock::{BusLock, BusLockGuard};
+pub use direct::DirectSpan;
 pub use dispatch::{Dispatch, DispatchEntry, DispatchPolicy};
 pub use flat::{EntryKind, FlatEntry, FlatLeaf, FlatTarget, FlatView, RegionId};
 pub use monitor::{
@@ -963,6 +965,18 @@ impl AddressSpace {
     #[must_use]
     pub fn endian_at(&self, addr: u64) -> Endian {
         self.view().endian_at(addr)
+    }
+
+    /// Resolve the `len` bytes at `addr` to the store behind them, for a
+    /// master that will read them many times — [`SpaceView::direct_span`]
+    /// with the guard taken for you.
+    ///
+    /// `None` while a retopology holds the space as well as for every span
+    /// that has to keep taking [`AddressSpace::read`]; either way the caller
+    /// does exactly that.
+    #[must_use]
+    pub fn direct_span(&self, addr: u64, len: u64, need: Perms) -> Option<DirectSpan> {
+        self.try_view()?.direct_span(addr, len, need)
     }
 
     /// Read `width` bytes at `addr` and assemble them into a value using the
