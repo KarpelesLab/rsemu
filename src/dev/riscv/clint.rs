@@ -412,13 +412,59 @@ impl Registers {
         pending
     }
 
-    /// Drive the timer lines. Never called with the state lock held.
+    /// Drive the timer lines to `pending`, and go on until what was driven
+    /// is what the comparison says. Never called with the state lock held.
+    ///
+    /// # Why it looks again
+    ///
+    /// `pending` was computed under the state lock and is driven after the
+    /// lock is released (`ROADMAP.md` §4.7), so two callers — two harts
+    /// writing `mtimecmp`, or one of them and the scheduler's `advance_to` —
+    /// can drive in the opposite order to the one they compared in. The later
+    /// *drive* won and the later *comparison* lost: a hart that had just
+    /// pushed its deadline out was left with the line high, or one that had
+    /// pulled it in with the line low, until the next `advance_to` recomputed
+    /// everything a quantum later. Volume II, "Machine Timer Registers": "A
+    /// machine timer interrupt becomes pending whenever mtime contains a
+    /// value greater than or equal to mtimecmp ... The interrupt remains
+    /// posted until mtimecmp becomes greater than mtime" — the line is that
+    /// comparison.
+    ///
+    /// So, as [`Registers::drive_msip`] does, each caller checks what it
+    /// drove against the state as it is *afterwards* and goes round if they
+    /// differ. A drive made stale by a concurrent change is seen to be stale
+    /// by the thread that made it; the last drive to finish is therefore
+    /// always one that was checked against the final state.
+    /// `tests/riscv_clint_mtip_race.rs` is the instrument.
+    ///
+    /// The check is one uncontended lock and a compare per hart, with no
+    /// allocation unless it finds something: 66 instructions on top of the
+    /// 453 an `advance_to` of a four-hart block already took (callgrind),
+    /// once per scheduler quantum.
     fn drive_mtip(&self, pending: &[bool]) {
         let sources: Vec<Option<WireSource>> = self.outs.lock().mtip.clone();
-        for (source, on) in sources.iter().zip(pending) {
-            if let Some(source) = source {
-                source.set(Level::from_bool(*on));
+        let drive = |pending: &[bool]| {
+            for (source, on) in sources.iter().zip(pending) {
+                if let Some(source) = source {
+                    source.set(Level::from_bool(*on));
+                }
             }
+        };
+        drive(pending);
+        let mut redriven: Vec<bool>;
+        let mut driven = pending;
+        loop {
+            {
+                let state = self.state.lock();
+                let now = Self::now(&state);
+                let current = state.mtimecmp.iter().map(|cmp| now >= *cmp);
+                if current.clone().eq(driven.iter().copied()) {
+                    return;
+                }
+                redriven = current.collect();
+            }
+            drive(&redriven);
+            driven = &redriven;
         }
     }
 
