@@ -77,7 +77,16 @@ jobs:
         run: |
           set -uo pipefail
           failed=""
-          for t in $(cargo fuzz list); do
+          # Captured and checked, not expanded in the `for`: a command
+          # substitution in a loop header discards its status, so a
+          # `cargo fuzz list` that failed or printed nothing would smoke zero
+          # targets and reach "every fuzz target survived" below.
+          targets=$(cargo fuzz list) || { echo "::error title=fuzz smoke::cargo fuzz list failed"; exit 1; }
+          if [ -z "$targets" ]; then
+            echo "::error title=fuzz smoke::cargo fuzz list named no targets, so nothing was smoked"
+            exit 1
+          fi
+          for t in $targets; do
             echo "::group::$t"
             mkdir -p "/tmp/corpus-$t"
             # Not every target has committed seeds; libFuzzer treats a missing

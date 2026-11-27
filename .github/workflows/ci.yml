@@ -142,6 +142,14 @@ jobs:
           cargo build --no-default-features || exit 1
           feats=$(python3 scripts/feature-matrix.py features | awk "NR % 6 == ${{ matrix.shard }} % 6")
           echo "shard ${{ matrix.shard }}/6 sweeping: $feats"
+          # A shard with nothing in it is a failure, not a pass. The manifest
+          # has over two hundred features, so every one of six shards gets
+          # dozens; an empty list means the enumeration broke, and the loop
+          # below would otherwise print "sweep shard N ok" for zero builds.
+          if [ -z "$feats" ]; then
+            echo "::error title=feature sweep::shard ${{ matrix.shard }} was given no features, so nothing was swept"
+            exit 1
+          fi
           failed=""
           for f in $feats; do
             echo "::group::$f"
@@ -215,14 +223,26 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/feature-matrix.py plan
+          # Captured first, then looped over. Fed to the loop through a process
+          # substitution, the script's exit status went nowhere at all — not
+          # even `set -e` sees it — so a `merged` that failed built zero
+          # combinations and the job was green. And an empty answer is a
+          # failure in its own right: the tree has dozens of pair-gated items,
+          # so "no combinations" means the derivation broke, not that there is
+          # nothing to check.
+          sets=$(python3 scripts/feature-matrix.py merged) || {
+            echo "::error title=feature combination::feature-matrix.py merged failed"; exit 1; }
+          if [ -z "$sets" ]; then
+            echo "::error title=feature combination::feature-matrix.py derived no combinations, so nothing was built"
+            exit 1
+          fi
           failed=""
-          while read -r set_; do
-            [ -n "$set_" ] || continue
+          for set_ in $sets; do
             echo "::group::$set_"
             cargo test --no-default-features --features "$set_" || failed="$failed $set_"
             cargo clean -p rsemu || true
             echo "::endgroup::"
-          done < <(python3 scripts/feature-matrix.py merged)
+          done
           if [ -n "$failed" ]; then
             for f in $failed; do
               echo "::error title=feature combination::--no-default-features --features $f FAILED"
@@ -886,6 +906,18 @@ jobs:
       - name: torn-load searches, through a machine
         run: |
           set -uo pipefail
+          # The filter must match something. libtest reports "running 0 tests"
+          # and exits 0 when it does not, so renaming either search would turn
+          # this step into a green one that searched for nothing. Two, because
+          # there is one per board (RV64 and A64). Captured rather than piped
+          # into `grep -q`, for the SIGPIPE reason the preflight above gives.
+          listing=$(cargo test --release --all-features --test memory_model_litmus \
+            -- --list --ignored) || exit 1
+          found=$(printf '%s\n' "$listing" | grep -c 'a_torn_flag.*: test$' || true)
+          if [ "$found" -lt 2 ]; then
+            echo "::error title=weak memory::$found ignored test(s) match a_torn_flag, expected 2 - the searches were renamed or gated out and this step would run nothing"
+            exit 1
+          fi
           rc=0
           cargo test --release --all-features --test memory_model_litmus \
             -- --ignored --nocapture --test-threads=1 a_torn_flag || rc=$?

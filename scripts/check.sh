@@ -140,6 +140,53 @@ run() {
   fi
 }
 
+# Run `cargo test` with a libtest name filter, and fail if the filter matches
+# nothing.
+#
+# libtest treats "no test matched" as success: `running 0 tests`, exit 0. So a
+# leg that names one test is green for ever after that test is renamed, moved
+# behind a `cfg`, or has its file gated on a feature the leg does not pass —
+# which has already happened here once (`stage_long_m68k` says how). The
+# listing is asked for first and must contain the name; only then is the test
+# run. That is one extra process, not an extra build: both invocations compile
+# the same binary.
+#
+# Not a breach of "nothing here parses test output". The verdict of the run is
+# still its exit status; what is read is `--list`, whose `path::name: test`
+# lines are libtest's own listing, and it is read into a variable rather than
+# piped into `grep -q`, which under `pipefail` fails the pipeline whenever grep
+# closes the pipe before the producer has finished.
+#
+#   filtered_test <name> [VAR=value ...] <cargo test ...> [-- <libtest args>]
+#
+# An empty name asks only that the binary contain a test at all. `--ignored`
+# among the libtest arguments is honoured when listing, so an `#[ignore]`d
+# test is looked for among the ignored ones.
+filtered_test() {
+  local name="$1"; shift
+  local -a envs=() cargo_args=() test_args=() list_args=(--list)
+  while [ $# -gt 0 ] && [[ "$1" == [A-Za-z_]*=* ]]; do envs+=("$1"); shift; done
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do cargo_args+=("$1"); shift; done
+  [ $# -gt 0 ] && shift
+  test_args=("$@")
+  local a
+  for a in "${test_args[@]}"; do
+    [ "$a" = "--ignored" ] && list_args+=(--ignored)
+  done
+
+  local listing
+  listing=$(env "${envs[@]}" "${cargo_args[@]}" -- "${list_args[@]}") || return 1
+  case "$listing" in
+    *"$name: test"*) ;;
+    *)
+      echo "check.sh: no test matching '${name:-<any>}' in: ${cargo_args[*]}" >&2
+      echo "check.sh: libtest would print 'running 0 tests' and exit 0 -- this leg ran nothing." >&2
+      return 1
+      ;;
+  esac
+  env "${envs[@]}" "${cargo_args[@]}" -- "${test_args[@]}" ${name:+"$name"}
+}
+
 # ---------------------------------------------------------------------------
 
 stage_fast() {
@@ -241,6 +288,13 @@ stage_combos() {
   local sets rc=0 set_
   sets=$(python3 scripts/feature-matrix.py merged) || {
     record "FAIL  combos (feature-matrix.py failed)"; FAILED=$((FAILED+1)); return; }
+  # Succeeding with nothing to build is not the same as having nothing to
+  # check: the tree has dozens of pair-gated items, so an empty derivation
+  # means the script stopped finding them, and the loop below would then
+  # report "ok" for zero builds.
+  [ -n "$sets" ] || {
+    record "FAIL  combos (feature-matrix.py derived no combinations)"
+    FAILED=$((FAILED+1)); return; }
   bold "==> feature combinations"
   python3 scripts/feature-matrix.py plan | sed 's/^/    /'
   for set_ in $sets; do
@@ -257,9 +311,16 @@ stage_combos() {
 # Every feature on its own. Long, and every failure is collected: the point of
 # a sweep is the list of what is broken, not the first thing that is.
 stage_sweep() {
-  local f rc=0
+  local f rc=0 feats
   bold "==> feature sweep (one feature at a time)"
-  for f in $(python3 scripts/feature-matrix.py features); do
+  # Captured and checked rather than expanded in the `for`: a command
+  # substitution in a loop header discards its status, so a
+  # `feature-matrix.py` that died (no python3, a `cargo metadata` failure)
+  # swept zero features and recorded "ok    feature sweep".
+  feats=$(python3 scripts/feature-matrix.py features) && [ -n "$feats" ] || {
+    record "FAIL  feature sweep (feature-matrix.py listed no features)"
+    FAILED=$((FAILED + 1)); return 0; }
+  for f in $feats; do
     disk_guard
     printf '    -- %s\n' "$f"
     cargo test --no-default-features --features "$f" || {
@@ -619,7 +680,7 @@ stage_long() {
   # synthetic half sits.
   local syn="${RSEMU_LONGRUN_SYNTHETIC_MS:-300}"
   run "long synthetic (${syn}ms of guest time)" \
-    env RSEMU_LONGRUN_MS="$syn" \
+    filtered_test "" RSEMU_LONGRUN_MS="$syn" \
     cargo test --release --features "$LONGRUN_FEATURES" --test engine_longrun
 
   if [ ! -s "$kernel" ]; then
@@ -631,11 +692,11 @@ stage_long() {
     fi
   else
     run "long kernel boot (${ms}ms of guest time)" \
-      env RSEMU_ARM64_KERNEL="$kernel" RSEMU_ARM64_INITRD="$initrd" \
-          RSEMU_LONGRUN_MS="$ms" \
+      filtered_test a_real_arm64_linux_boot_agrees_across_the_engines \
+      RSEMU_ARM64_KERNEL="$kernel" RSEMU_ARM64_INITRD="$initrd" \
+      RSEMU_LONGRUN_MS="$ms" \
       cargo test --release --features "$LONGRUN_FEATURES" \
-        --test engine_longrun -- --ignored --nocapture --test-threads=1 \
-        a_real_arm64_linux_boot_agrees_across_the_engines
+        --test engine_longrun -- --ignored --nocapture --test-threads=1
   fi
 
   # A missing AArch64 kernel used to end the stage, which would now silently
@@ -679,11 +740,11 @@ stage_long_riscv() {
   # instructions to compare.
   [ -s "$initrd" ] || initrd=""
   run "long riscv kernel boot (${ms}ms of guest time)" \
-    env RSEMU_RISCV_FIRMWARE="$fw" RSEMU_RISCV_KERNEL="$kernel" \
-        RSEMU_RISCV_INITRD="$initrd" RSEMU_LONGRUN_MS="$ms" \
+    filtered_test a_real_riscv_linux_boot_agrees_across_the_engines \
+    RSEMU_RISCV_FIRMWARE="$fw" RSEMU_RISCV_KERNEL="$kernel" \
+    RSEMU_RISCV_INITRD="$initrd" RSEMU_LONGRUN_MS="$ms" \
     cargo test --release --features "$LONGRUN_FEATURES" \
-      --test engine_longrun -- --ignored --nocapture --test-threads=1 \
-      a_real_riscv_linux_boot_agrees_across_the_engines
+      --test engine_longrun -- --ignored --nocapture --test-threads=1
 }
 
 # The m68k IR frontend against the m68k interpreter over a random instruction
@@ -708,9 +769,12 @@ stage_long_m68k() {
   # `jit` as well as the frontend. The sweep file is gated on **both**, so
   # naming only `cpu-m68k-lift` compiles it to nothing and `cargo test` prints
   # "running 0 tests" and exits 0 — a green leg that swept nothing. This leg
-  # and the nightly job both shipped that way for exactly one commit.
+  # and the nightly job both shipped that way for exactly one commit, which is
+  # why it goes through `filtered_test` with an empty name: the binary must
+  # contain a test at all.
   run "long m68k differential ($((seeds * programs)) cases × 2 engines)" \
-    env RSEMU_M68K_DIFF_SEEDS="$seeds" RSEMU_M68K_DIFF_PROGRAMS="$programs" \
+    filtered_test "" \
+    RSEMU_M68K_DIFF_SEEDS="$seeds" RSEMU_M68K_DIFF_PROGRAMS="$programs" \
     cargo test --release --features cpu-m68k-lift,jit \
       --test m68k_lift_differential -- --nocapture
 }
@@ -764,11 +828,11 @@ stage_long_x86() {
   # this board can be given at all.
   [ -s "$initrd" ] || initrd=""
   run "long x86 kernel boot (${ms}ms of guest time)" \
-    env RSEMU_X86_KERNEL="$kernel" RSEMU_X86_INITRD="$initrd" \
-        RSEMU_LONGRUN_MS="$ms" \
+    filtered_test a_real_x86_linux_boot_agrees_across_the_engines \
+    RSEMU_X86_KERNEL="$kernel" RSEMU_X86_INITRD="$initrd" \
+    RSEMU_LONGRUN_MS="$ms" \
     cargo test --release --features "$LONGRUN_FEATURES" \
-      --test engine_longrun -- --ignored --nocapture --test-threads=1 \
-      a_real_x86_linux_boot_agrees_across_the_engines
+      --test engine_longrun -- --ignored --nocapture --test-threads=1
 }
 
 # ROADMAP.md phase 8's gate is two claims and the tree only ever held one of
