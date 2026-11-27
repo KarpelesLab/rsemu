@@ -2634,10 +2634,16 @@ impl<'a> Exec<'a> {
                     DualMulOp::Smmls => i64::from(self.reg(ra) as i32) << 32,
                     _ => 0,
                 };
+                // Wrapping, and meant: the pseudocode forms `(SInt(R[a]) <<
+                // 32) ± SInt(R[n]) * SInt(R[m])` in unbounded integers and
+                // keeps `result<63:32>` (DDI 0403E.b A7.7.142, A7.7.143), so
+                // only the low 64 bits matter — and an accumulator of
+                // `0x80000000` is already `i64::MIN` before the product
+                // moves it.
                 let total = if op == DualMulOp::Smmls {
-                    acc - product
+                    acc.wrapping_sub(product)
                 } else {
-                    acc + product
+                    acc.wrapping_add(product)
                 };
                 // The `R` bit rounds rather than truncating, by adding a half
                 // before the shift (DDI 0403 A7.7.163).

@@ -1502,6 +1502,30 @@ fn prigroup_masks_the_sub_priority_out_of_a_comparison() {
 }
 
 #[test]
+fn smmla_and_smmls_wrap_at_sixty_four_bits_instead_of_panicking() {
+    // `SMMLS r0, r1, r2, r3` ; `SMMLA r4, r5, r2, r3`, with the accumulator
+    // at `0x80000000`: `SInt(R[a]) << 32` is already the most negative
+    // sixty-four-bit value, and both products push it further. DDI 0403E.b
+    // A7.7.143: "result = (SInt(R[a]) << 32) - SInt(R[n]) * SInt(R[m]); [...]
+    // R[d] = result<63:32>" — unbounded integers, so the low sixty-four bits
+    // are all that is kept. A debug build used to panic on the subtraction.
+    let mut code = Vec::new();
+    code.extend(wide(0xfb61_3002));
+    code.extend(wide(0xfb55_3402));
+    let h = Harness::m4(&code);
+    h.cpu.set_reg(1, 1);
+    h.cpu.set_reg(2, 1);
+    h.cpu.set_reg(3, 0x8000_0000);
+    h.cpu.set_reg(5, 0xffff_ffff);
+    h.cpu.step();
+    // -2^63 - 1 wraps to 2^63 - 1.
+    assert_eq!(h.cpu.reg(0), 0x7fff_ffff);
+    h.cpu.step();
+    // -2^63 + (-1 * 1) likewise.
+    assert_eq!(h.cpu.reg(4), 0x7fff_ffff);
+}
+
+#[test]
 fn the_architectural_priorities_are_negative_and_fixed() {
     let sys = Sys::new(CPUID_CORTEX_M4, 8, 8);
     assert_eq!(sys.priority_of(Exception::RESET), -3);
