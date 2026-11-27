@@ -222,6 +222,14 @@ const KVM_INTERRUPT: Req<KvmInterrupt> =
 const KVM_GET_FPU: Req<KvmFpu> = Req::new(ioc(DIR_READ, 0x8c, size_of::<KvmFpu>() as u64));
 /// `KVM_SET_FPU`.
 const KVM_SET_FPU: Req<KvmFpu> = Req::new(ioc(DIR_WRITE, 0x8d, size_of::<KvmFpu>() as u64));
+/// `KVM_GET_XSAVE`: the vCPU's whole extended-state image.
+///
+/// `api.rst` section 4.42: capability `KVM_CAP_XSAVE`, a vcpu ioctl, parameter
+/// `struct kvm_xsave` (out). Used for one thing here — see
+/// [`Vcpu::set_fpu`] — and that thing is not reading it.
+const KVM_GET_XSAVE: Req<KvmXsave> = Req::new(ioc(DIR_READ, 0xa4, size_of::<KvmXsave>() as u64));
+/// `KVM_SET_XSAVE` (`api.rst` section 4.43).
+const KVM_SET_XSAVE: Req<KvmXsave> = Req::new(ioc(DIR_WRITE, 0xa5, size_of::<KvmXsave>() as u64));
 /// `KVM_GET_DEBUGREGS`.
 const KVM_GET_DEBUGREGS: Req<KvmDebugregs> =
     Req::new(ioc(DIR_READ, 0xa1, size_of::<KvmDebugregs>() as u64));
@@ -289,6 +297,11 @@ pub const KVM_CAP_READONLY_MEM: u64 = 81;
 /// `KVM_CAP_IMMEDIATE_EXIT`: the signal-free way to decline to enter the
 /// guest. See the module documentation.
 pub const KVM_CAP_IMMEDIATE_EXIT: u64 = 136;
+/// `KVM_CAP_XSAVE`: `KVM_GET_XSAVE` and `KVM_SET_XSAVE` exist.
+pub const KVM_CAP_XSAVE: u64 = 55;
+/// `KVM_CAP_XSAVE2`: asked of the **VM** descriptor, how many bytes
+/// `KVM_SET_XSAVE` reads from its argument. See [`Vm::xsave_fits`].
+pub const KVM_CAP_XSAVE2: u64 = 208;
 
 /// `KVM_MEM_READONLY`, the flag that makes a slot's pages read-only to the
 /// guest.
@@ -482,6 +495,63 @@ pub struct KvmFpu {
     pub pad2: u32,
 }
 const _: () = assert!(size_of::<KvmFpu>() == 416);
+
+/// `struct kvm_xsave` — the extended-state image, `__u32 region[1024]`.
+///
+/// Bytes rather than the UAPI's words, because every field this crate touches
+/// in it is at a byte offset from a manual and none of them is a `__u32`; the
+/// alignment is kept the same. The first 512 bytes are the `FXSAVE` image and
+/// the 64 after them the `XSAVE` header, whose first eight bytes are
+/// `XSTATE_BV` — one bit per state component, saying whether the area holds
+/// that component or the component is in its **initial configuration** and the
+/// area is to be ignored (*Intel SDM* volume 1 §13.4.1 and §13.4.2).
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct KvmXsave {
+    region: [u8; 4096],
+}
+const _: () = assert!(size_of::<KvmXsave>() == 4096);
+
+/// Offsets into the `FXSAVE` image at the head of a [`KvmXsave`], 64-bit form
+/// (*Intel SDM* volume 1 Table 10-2), and of `XSTATE_BV` behind it.
+mod xsave {
+    pub(super) const FCW: usize = 0;
+    pub(super) const FSW: usize = 2;
+    pub(super) const FTW: usize = 4;
+    pub(super) const FOP: usize = 6;
+    pub(super) const FIP: usize = 8;
+    pub(super) const FDP: usize = 16;
+    pub(super) const MXCSR: usize = 24;
+    pub(super) const ST: usize = 32;
+    pub(super) const XMM: usize = 160;
+    pub(super) const XSTATE_BV: usize = 512;
+    /// `XSTATE_BV` bit 0, x87 state, and bit 1, SSE state.
+    pub(super) const X87_AND_SSE: u8 = 0b11;
+}
+
+impl KvmXsave {
+    /// Write a [`KvmFpu`] over the legacy region, and mark the x87 and SSE
+    /// components present. Everything else in the image — `MXCSR_MASK`, the
+    /// `YMM` halves, whatever further components this host has — is left as
+    /// the kernel handed it over.
+    fn put_legacy(&mut self, fpu: &KvmFpu) {
+        let r = &mut self.region;
+        r[xsave::FCW..xsave::FCW + 2].copy_from_slice(&fpu.fcw.to_le_bytes());
+        r[xsave::FSW..xsave::FSW + 2].copy_from_slice(&fpu.fsw.to_le_bytes());
+        r[xsave::FTW] = fpu.ftwx;
+        r[xsave::FOP..xsave::FOP + 2].copy_from_slice(&fpu.last_opcode.to_le_bytes());
+        r[xsave::FIP..xsave::FIP + 8].copy_from_slice(&fpu.last_ip.to_le_bytes());
+        r[xsave::FDP..xsave::FDP + 8].copy_from_slice(&fpu.last_dp.to_le_bytes());
+        r[xsave::MXCSR..xsave::MXCSR + 4].copy_from_slice(&fpu.mxcsr.to_le_bytes());
+        for (i, st) in fpu.fpr.iter().enumerate() {
+            r[xsave::ST + 16 * i..xsave::ST + 16 * (i + 1)].copy_from_slice(st);
+        }
+        for (i, xmm) in fpu.xmm.iter().enumerate() {
+            r[xsave::XMM + 16 * i..xsave::XMM + 16 * (i + 1)].copy_from_slice(xmm);
+        }
+        r[xsave::XSTATE_BV] |= xsave::X87_AND_SSE;
+    }
+}
 
 /// `struct kvm_debugregs` — `DR0`-`DR3`, `DR6` and `DR7`.
 ///
@@ -1016,7 +1086,12 @@ impl Kvm {
             cpuid: board_cpuid(&self.supported_cpuid()?),
             immediate_exit: self.check_extension(KVM_CAP_IMMEDIATE_EXIT) != 0,
             readonly_mem: self.check_extension(KVM_CAP_READONLY_MEM) != 0,
+            xsave: false,
             slots: Mutex::with_rank(LockRank::MACHINE, Vec::new()),
+        };
+        let vm = Vm {
+            xsave: self.check_extension(KVM_CAP_XSAVE) != 0 && vm.xsave_fits(),
+            ..vm
         };
         vm.prepare_x86()?;
         Ok(vm)
@@ -1109,6 +1184,10 @@ pub struct Vm {
     cpuid: Vec<KvmCpuidEntry2>,
     immediate_exit: bool,
     readonly_mem: bool,
+    /// Whether a vCPU's floating-point state can be written through
+    /// `KVM_SET_XSAVE` — the capability is there *and* the image is the 4096
+    /// bytes [`KvmXsave`] is. See [`Vcpu::set_fpu`].
+    xsave: bool,
     /// The stores backing each slot, kept alive for as long as the kernel
     /// holds their addresses. Dropping a store whose slot is still installed
     /// would free memory the guest is executing out of, so the VM owns a
@@ -1237,6 +1316,22 @@ impl Vm {
     #[must_use]
     pub const fn has_immediate_exit(&self) -> bool {
         self.immediate_exit
+    }
+
+    /// Whether `KVM_SET_XSAVE` reads no more than a [`KvmXsave`] holds.
+    ///
+    /// The one request here whose argument size is not in its number.
+    /// `api.rst` section 4.43: "It copies as many bytes as are returned by
+    /// KVM_CHECK_EXTENSION(KVM_CAP_XSAVE2), when invoked on the vm file
+    /// descriptor" — a size that is at least 4096 and grows past it only on a
+    /// host where a dynamically enabled state component has been turned on
+    /// for guests. Zero is a kernel that predates the capability and copies
+    /// the structure's own 4096. Anything larger and the request is not made
+    /// at all: handing the kernel a buffer shorter than it will read is the
+    /// one mistake `ioctl_struct`'s size argument cannot catch.
+    fn xsave_fits(&self) -> bool {
+        let reads = ioctl_val(&self.fd, KVM_CHECK_EXTENSION, KVM_CAP_XSAVE2).unwrap_or(0);
+        reads == 0 || reads == size_of::<KvmXsave>() as i64
     }
 
     /// The scratch areas an Intel part without unrestricted-guest support
@@ -1506,6 +1601,7 @@ impl Vm {
         Ok(Vcpu {
             id,
             immediate_exit: self.immediate_exit,
+            xsave: self.xsave,
             inner: Mutex::with_rank(LockRank::BUS, Inner { fd, run }),
             memory,
             io,
@@ -1560,6 +1656,8 @@ pub struct VcpuStats {
 pub struct Vcpu {
     id: u32,
     immediate_exit: bool,
+    /// Whether [`set_fpu`](Vcpu::set_fpu) may go through `KVM_SET_XSAVE`.
+    xsave: bool,
     inner: Mutex<Inner>,
     memory: Arc<AddressSpace>,
     io: Option<Arc<AddressSpace>>,
@@ -1692,11 +1790,37 @@ impl Vcpu {
 
     /// Set the x87 and SSE register files.
     ///
+    /// **Through `KVM_SET_XSAVE` where the host has it, because `KVM_SET_FPU`
+    /// alone does not reach the guest.** A vCPU's floating-point state is an
+    /// `XSAVE` image, and its header says per component whether the image
+    /// holds that component or the component is in its initial configuration.
+    /// `KVM_SET_FPU` rewrites the legacy bytes and leaves the header alone, so
+    /// on a vCPU that has not yet used its x87 unit the bytes are stored, read
+    /// back faithfully by `KVM_GET_FPU`, and then ignored on entry: the guest
+    /// finds an empty stack. Measured on this backend's own test host — a
+    /// guest handed `ST(0) = pi` this way stored the *indefinite* from `FSTP`
+    /// with `IE` and `SF` set, and stored pi once it had executed a single
+    /// `FLD1` beforehand.
+    ///
+    /// So the image is read, the legacy region overwritten, the x87 and SSE
+    /// bits of `XSTATE_BV` set, and the whole thing written back. A host
+    /// without the capability, or one that refuses the image, gets the old
+    /// request and its limitation.
+    ///
     /// # Errors
     ///
     /// [`AccelError::Sys`] if `KVM_SET_FPU` fails.
     pub fn set_fpu(&self, fpu: &KvmFpu) -> AccelResult<()> {
         let inner = self.inner.lock();
+        if self.xsave {
+            let mut image = alloc::boxed::Box::new(KvmXsave { region: [0; 4096] });
+            if ioctl_struct(&inner.fd, KVM_GET_XSAVE, &mut *image).is_ok() {
+                image.put_legacy(fpu);
+                if ioctl_struct(&inner.fd, KVM_SET_XSAVE, &mut *image).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
         let mut fpu = *fpu;
         ioctl_struct(&inner.fd, KVM_SET_FPU, &mut fpu).map_err(sys_err("KVM_SET_FPU"))?;
         Ok(())

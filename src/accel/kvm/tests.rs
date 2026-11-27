@@ -997,6 +997,59 @@ fn the_x87_stack_crosses_in_stack_order_when_top_is_not_zero() {
     assert_eq!(back.ftwx, raw.ftwx);
 }
 
+/// A floating-point stack handed **to** a vCPU is what its guest then pops.
+///
+/// The check `KVM_GET_FPU` cannot make: that request reads back whatever
+/// `KVM_SET_FPU` stored whether or not the processor will ever load it, and
+/// on a vCPU that has not touched its x87 unit yet it will not — see
+/// [`Vcpu::set_fpu`]. So the witness is the guest: it is given `ST(0) = pi`
+/// with `TOP` at 6, on a vCPU that has executed nothing, and stores its top
+/// of stack to memory.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn a_vcpu_that_has_never_used_its_x87_unit_is_still_given_one() {
+    use crate::accel::state;
+    use crate::cpu::x86::{Config, X86};
+    use crate::float::x87::F80;
+
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    let one = F80::new(0x3fff, 1 << 63);
+    let pi = F80::new(0x4000, 0xc90f_daa2_2168_c235);
+
+    //   fstp tbyte [0x0800]    db 3e 00 08
+    //   hlt                    f4
+    let vcpu = guest.vcpu_at(&[0xdb, 0x3e, 0x00, 0x08, 0xf4]);
+
+    let cpu = X86::new(Config::I80486);
+    cpu.attach_space(Arc::clone(&guest.mem));
+    cpu.attach_io_space(Arc::clone(&guest.io));
+    cpu.step();
+    state::store_from_vcpu(&vcpu, &cpu).expect("KVM to the interpreter");
+    let mut x87 = cpu.x87();
+    x87.dec_top();
+    x87.set(0, one);
+    x87.dec_top();
+    x87.set(0, pi);
+    assert_eq!(x87.top(), 6);
+    cpu.set_x87(x87);
+    let mut regs = cpu.regs();
+    regs.rip = CODE;
+    cpu.set_regs(regs);
+
+    state::load_into_vcpu(&cpu, &vcpu).expect("the interpreter to KVM");
+    let run = vcpu.run_until_exit(8).expect("the guest runs");
+    assert_eq!(run.exit.expect("the guest halted").reason, ExitReason::HALT);
+
+    let mut stored = [0u8; 10];
+    guest.ram.read_at(0x800, &mut stored).expect("RAM answers");
+    assert_eq!(stored, pi.to_bytes(), "what the guest popped off its stack");
+    let after = vcpu.fpu().expect("KVM_GET_FPU");
+    assert_eq!(after.fsw & 0x7f, 0, "and it raised nothing doing so");
+    assert_eq!((after.fsw >> 11) & 7, 7, "one pop from 6");
+    assert_eq!(after.fpr[0][..10], one.to_bytes(), "ST(0) is now the other");
+}
+
 /// The counter crosses in **both** directions, and is a value rather than an
 /// offset.
 ///
