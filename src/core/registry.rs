@@ -118,11 +118,16 @@ impl Registry {
     /// people actually get wrong, and an edit distance over a dotted name scores
     /// that badly because the prefix dominates the length.
     fn nearest(&self, name: &str) -> Option<&'static str> {
+        // A fragment has to be long enough to mean something before "it
+        // occurs in a class name" is evidence. Every string contains the
+        // empty one, so `rsemu describe ""` was told it might have meant
+        // whichever class sorts first, and `describe e` likewise.
+        const FRAGMENT_MIN: usize = 3;
         let mut best: Option<(usize, &'static str)> = None;
         for candidate in self.classes.keys().copied() {
             let score = if candidate == name {
                 0
-            } else if candidate.ends_with(name) || candidate.contains(name) {
+            } else if name.len() >= FRAGMENT_MIN && candidate.contains(name) {
                 1
             } else {
                 let tail = candidate.rsplit('.').next().unwrap_or(candidate);
@@ -258,6 +263,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!e.contains("did you mean"), "{e}");
+    }
+
+    #[test]
+    fn a_name_too_short_to_mean_anything_gets_no_suggestion() {
+        // `contains("")` is true of every class, so an empty name — or a
+        // single letter, or a lone dot — was answered with the first class
+        // in the registry: "did you mean `ahci.hba`?", of nothing at all.
+        let r = registry();
+        for name in ["", ".", "e", "nv"] {
+            let e = r.create(name, &Props::new()).unwrap_err().to_string();
+            assert!(!e.contains("did you mean"), "`{name}`: {e}");
+        }
+        // Three letters of a real class still find it.
+        let e = r.create("nvm", &Props::new()).unwrap_err().to_string();
+        assert!(e.contains("did you mean `pci.nvme`?"), "{e}");
     }
 
     #[test]

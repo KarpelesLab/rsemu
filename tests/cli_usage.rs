@@ -349,3 +349,17 @@ fn a_disk_larger_than_the_host_is_refused_not_aborted() {
     );
     assert!(!stderr.contains("memory allocation of"), "{stderr}");
 }
+
+/// `describe` with nothing that could be a class name suggests nothing.
+///
+/// Every string contains the empty one, so `rsemu describe ""` was told it
+/// might have meant whichever class sorts first.
+#[test]
+fn an_empty_class_name_gets_no_suggestion() {
+    for name in ["", "."] {
+        let (code, _, stderr) = run(&["describe", name]);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("unknown device class"), "{stderr}");
+        assert!(!stderr.contains("did you mean"), "`{name}`: {stderr}");
+    }
+}
