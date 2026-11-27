@@ -127,9 +127,18 @@ impl FrameEncoder {
         let (aw, ah) = self.announced;
         if comparable && !resized {
             for (top, bottom) in self.damaged_bands(surface) {
-                let height = bottom - top;
-                let top16 = fits(top);
-                rects.push(self.raw_rect(surface, 0, top16, aw, fits(height)));
+                // The bands are rows of the *surface*; the rectangles are rows
+                // of the framebuffer the client was promised. They differ for
+                // a client that could not be told about a resize, and a band
+                // below the bottom edge it knows is one it has no memory for —
+                // so each is clipped to that edge, and one wholly past it is
+                // not sent at all.
+                let top = top.min(u32::from(ah));
+                let bottom = bottom.min(u32::from(ah));
+                if top >= bottom {
+                    continue;
+                }
+                rects.push(self.raw_rect(surface, 0, fits(top), aw, fits(bottom - top)));
             }
             if rects.is_empty() {
                 return None;
@@ -349,6 +358,35 @@ mod tests {
             "still the geometry it was promised"
         );
         assert_eq!(enc.announced(), (4, 2));
+    }
+
+    /// RFC 6143 §7.6.1 describes an update as "a sequence of rectangles of
+    /// pixel data that the client should put into its framebuffer" — its
+    /// framebuffer, which for a client that never asked for DesktopSize is
+    /// still the size ServerInit gave it. The first frame after a resize was
+    /// cropped; every incremental one after it was not.
+    #[test]
+    fn a_cropped_client_is_never_sent_a_row_below_its_own_framebuffer() {
+        let mut enc = FrameEncoder::new(PixelFormat::DEFAULT, 4, 2);
+        enc.set_encodings(&[encoding::RAW]);
+        let mut s = surface(8, 4, [0, 0, 0]);
+        enc.update(&s, false).expect("the cropped first frame");
+
+        // A change the client cannot see is not an update at all.
+        s.put(0, 3, [9, 9, 9]);
+        assert!(
+            enc.update(&s, true).is_none(),
+            "row 3 is outside a 4x2 framebuffer"
+        );
+
+        // One it can see, next to one it cannot: only the visible band goes,
+        // and it stops at the client's bottom edge.
+        s.put(0, 1, [7, 7, 7]);
+        s.put(0, 2, [7, 7, 7]);
+        let update = enc.update(&s, true).expect("row 1 changed");
+        assert_eq!(&update[..4], update_header(1));
+        assert_eq!(&update[4..16], rect_header(0, 1, 4, 1, encoding::RAW));
+        assert_eq!(update.len(), 4 + 12 + 4 * 4);
     }
 
     #[test]
