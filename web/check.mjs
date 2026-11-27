@@ -1020,6 +1020,47 @@ check(decodeGuest(guest("\xc1\xc2")) === "AB", "and bit 7 is the keyboard's, not
   check(apart === "A\nB\n", "but only the LF immediately after the CR is its other half");
 }
 
+// The frame loop's arithmetic, on its own, because the loop itself needs a
+// browser's requestAnimationFrame. The case that matters is the one a
+// foreground tab never reaches: a tab that was hidden comes back owing minutes,
+// and the cap has to *write off* what it does not run. Carrying it forward ran
+// the machine at four times speed until the arrears were gone.
+{
+  const { owedFrames } = await import("./src/session.js");
+  const period = 1000 / 60;
+  // A foreground tab a little slower than the machine: the remainder is
+  // carried, and over a minute no frame is lost or invented.
+  let pending = 0;
+  let ran = 0;
+  for (let i = 0; i < 3600; i++) {
+    const owed = owedFrames(pending, 16.7, period);
+    pending = owed.pending;
+    ran += owed.frames;
+  }
+  check(Math.abs(ran - (3600 * 16.7) / period) <= 1, `a steady tab runs exactly what it is owed (${ran} frames)`);
+  // A minute in the background, then foreground ticks again.
+  let owed = owedFrames(0.5, 60_000, period);
+  check(owed.frames === 4, `a tab back from the background runs the cap, once (${owed.frames} frames)`);
+  check(owed.pending === 0, `and owes nothing afterwards (${owed.pending} carried)`);
+  ran = 0;
+  pending = owed.pending;
+  for (let i = 0; i < 600; i++) {
+    owed = owedFrames(pending, period, period);
+    pending = owed.pending;
+    ran += owed.frames;
+  }
+  check(ran <= 601, `so the ten seconds after it are ten seconds, not forty (${ran} frames in 600 ticks)`);
+  // A host too slow for the machine is over the cap every tick: it runs slow.
+  owed = owedFrames(0, period * 9, period);
+  check(owed.frames === 4 && owed.pending === 0, "a host that cannot keep up runs slow rather than owing more each tick");
+  // Arrears within the cap are ordinary jitter and are kept.
+  owed = owedFrames(0, period * 4.5, period);
+  check(owed.frames === 4 && Math.abs(owed.pending - 0.5) < 1e-9, "arrears within the cap are carried exactly");
+  // A clock that steps backwards owes nothing and runs nothing.
+  owed = owedFrames(0, -50, period);
+  check(owed.frames === 0 && owed.pending === 0, "a negative interval runs no frames and owes none");
+}
+
 console.log(failures === 0 ? "\nall checks passed" : `\n${failures} check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);
 

@@ -39,8 +39,28 @@ const FPS_WINDOW_MS = 500;
 const CONSOLE_FLUSH_MS = 40;
 // A backgrounded tab comes back owing minutes of virtual time. Capping the
 // catch-up makes it run *slow*, which is the honest failure; the alternative
-// is a multi-second freeze while it sprints through the arrears.
+// is a multi-second freeze while it sprints through the arrears. `owedFrames`
+// is where the cap is applied — and where what is past it is written off.
 const MAX_CATCHUP_FRAMES = 4;
+
+/**
+ * How many whole frames the machine is owed this tick, and what is carried.
+ *
+ * `pending` is the fraction carried from the last tick, `elapsedMs` how long it
+ * has been, `periodMs` the machine's own frame period.
+ *
+ * Arrears past `MAX_CATCHUP_FRAMES` are **forgiven**, not deferred. Carrying
+ * them forward is what the loop did, and it is the opposite of the "runs slow"
+ * the cap was put there for: a tab that had been in the background for a minute
+ * came back owing 3600 frames, ran four a tick — four times speed, sound and
+ * all — and went on doing so until it had replayed the whole minute.
+ */
+export function owedFrames(pending, elapsedMs, periodMs) {
+  const owed = pending + elapsedMs / periodMs;
+  const whole = Math.max(Math.floor(owed), 0);
+  if (whole > MAX_CATCHUP_FRAMES) return { frames: MAX_CATCHUP_FRAMES, pending: 0 };
+  return { frames: whole, pending: Math.max(owed - whole, 0) };
+}
 // A monitor session prints for as long as you let it. Keep the pane bounded.
 const CONSOLE_LIMIT = 24000;
 const CONSOLE_TRIM = 18000;
@@ -317,11 +337,10 @@ export class Session {
     // Virtual time chases real time in whole frames, paced by the machine's
     // own frame period — an NTSC NES frame is 16 639 356 ns and a PAL one is
     // not, and neither is the 16.67 ms a display would assume.
-    const period = this.emu.frameMs();
-    this.pending += (now - this.last) / period;
+    const owed = owedFrames(this.pending, now - this.last, this.emu.frameMs());
     this.last = now;
-    const frames = Math.min(Math.floor(this.pending), MAX_CATCHUP_FRAMES);
-    this.pending -= frames;
+    this.pending = owed.pending;
+    const frames = owed.frames;
     if (frames <= 0) return;
 
     let drew = false;
