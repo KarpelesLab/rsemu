@@ -706,6 +706,38 @@ fn nan_propagation_is_a_parameter() {
 }
 
 #[test]
+fn subtraction_does_not_negate_the_nan_it_propagates() {
+    // `a - b` is computed as `a + (-b)`, but the NaN that comes out is the
+    // operand's, not the negated operand's. Read back from an x86 host (AMD
+    // Zen 5): `SUBSD x, fffffffffffffffe` delivers `fffffffffffffffe`, and
+    // `FSUB` of `7fff:fffffffffffffffe` from a number delivers it positive.
+    let neg = B64::QUIET_NAN | B64::SIGN | 0x1234;
+    let pos = B64::QUIET_NAN | 0x1234;
+    for env in [Env::X86_SSE, Env::ARM] {
+        assert_eq!(sub::<B64>(d(1.0), neg, env), (neg, Flags::NONE), "{env:?}");
+        assert_eq!(sub::<B64>(d(1.0), pos, env), (pos, Flags::NONE), "{env:?}");
+        assert_eq!(sub::<B64>(neg, d(1.0), env), (neg, Flags::NONE), "{env:?}");
+        // A signaling one is quieted and keeps its sign too.
+        let snan = B64::INF | B64::SIGN | 1;
+        assert_eq!(
+            sub::<B64>(d(1.0), snan, env),
+            (snan | B64::QUIET, Flags::INVALID),
+            "{env:?}"
+        );
+    }
+    let q = F80::new(0x7fff, 0xffff_ffff_ffff_fffe);
+    let (v, f) = x87::sub(e(d(1.0)), q, Precision::Extended, Env::X87);
+    assert_eq!((v, f), (q, Flags::NONE));
+    // The infinities are still subtracted: inf - inf is invalid, inf - -inf
+    // is not.
+    assert_eq!(sub::<B64>(B64::INF, B64::INF, RV).1, Flags::INVALID);
+    assert_eq!(
+        sub::<B64>(B64::INF, B64::INF | B64::SIGN, RV),
+        (B64::INF, Flags::NONE)
+    );
+}
+
+#[test]
 fn a_quiet_nan_operand_alone_never_raises_invalid() {
     // §7.2: only a *signaling* NaN operand signals invalid.
     let q = B64::QUIET_NAN | 7;

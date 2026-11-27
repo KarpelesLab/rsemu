@@ -492,12 +492,15 @@ fn cancelled_sign(env: Env) -> bool {
 /// A longer shift means the smaller operand cannot reach the top `p + 3` bits
 /// of the result at all, and folding it into a sticky bit loses nothing.
 pub(super) fn add(a: Parts, b: Parts, negate: bool, spec: Spec, env: Env) -> (Outcome, Flags) {
+    // The NaN sweep comes before the negation: a subtraction propagates its
+    // second operand's NaN as it stands, sign included, and does not deliver
+    // the NaN of the `-b` it is about to add.
+    if let Some(r) = nan_result(&[a, b], env) {
+        return r;
+    }
     let mut b = b;
     if negate {
         b.sign = !b.sign;
-    }
-    if let Some(r) = nan_result(&[a, b], env) {
-        return r;
     }
     match (a.class, b.class) {
         (Class::Inf, Class::Inf) => {
