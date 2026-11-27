@@ -872,6 +872,36 @@ fn a_coprocessor_snapshot_round_trips() -> Result<()> {
     Ok(())
 }
 
+/// A 68000 with a coprocessor on its bus saves what it will be asked to load.
+///
+/// `save` returned before the floating-point block for an MC68000 — which has
+/// none of the later models' registers, but can have a 68881 — and `load`
+/// read that block whenever a coprocessor was configured. So the one
+/// configuration wrote a snapshot it could not read back: the registers a
+/// debugger had set were lost, and the restore failed outright for running
+/// off the end of the chunk.
+#[test]
+fn a_68000_with_a_coprocessor_snapshot_round_trips() -> Result<()> {
+    let config = Config::MC68000.with_fpu(Coprocessor::M68881);
+    let cpu = M68k::new(config);
+    {
+        let mut session = cpu.session.lock();
+        session.state.fpu.fp[3] = F80::new(0x4001, 0xdead_beef_0000_0001);
+        session.state.fpu.fpcr = 0x00b0;
+        session.state.fpu.fpsr = 0x0a00_0208;
+        session.state.fpu.fpiar = 0x0000_0500;
+    }
+    let bytes = snapshot(&cpu)?;
+    let other = M68k::new(config);
+    restore(&other, &bytes)?;
+    assert_eq!(other.regs(), cpu.regs());
+    assert_eq!(other.regs().fp[3], F80::new(0x4001, 0xdead_beef_0000_0001));
+    assert_eq!(snapshot(&other)?, bytes, "a round trip is a fixed point");
+    // A plain 68000 still saves exactly what it did, and cannot take this.
+    assert!(restore(&M68k::new(Config::MC68000), &bytes).is_err());
+    Ok(())
+}
+
 #[test]
 fn the_coprocessors_registers_can_be_named() {
     let with = Reg::all_for_config(Config::MC68030.with_fpu(Coprocessor::M68881));

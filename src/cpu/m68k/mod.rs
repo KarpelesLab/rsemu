@@ -2372,7 +2372,9 @@ impl Device for M68k {
         w.write_bool(level_seven)?;
         w.write_u32(resets)?;
         if self.model == Model::M68000 {
-            return Ok(());
+            // None of the later models' registers, but possibly a
+            // coprocessor — and `load` reads one whenever one is configured.
+            return self.save_fpu(&state, w);
         }
         w.write_u8(self.model as u8)?;
         w.write_u32(state.sp(Bank::User))?;
@@ -2428,42 +2430,7 @@ impl Device for M68k {
             w.write_u64(state.mmu.crp)?;
             w.write_u64(state.mmu.srp)?;
         }
-        if !self.fpu.present() {
-            return Ok(());
-        }
-        for value in state.fpu.fp {
-            w.write_u16(value.sign_exp)?;
-            w.write_u64(value.sig)?;
-        }
-        w.write_u32(state.fpu.fpcr)?;
-        w.write_u32(state.fpu.fpsr)?;
-        w.write_u32(state.fpu.fpiar)?;
-        w.write_bool(state.fpu.null)?;
-        if !self.fpu.is_onchip_040() {
-            return Ok(());
-        }
-        // What a 68040's `FSAVE` still owes an emulation handler. It is
-        // architectural state — the handler will read it — so it travels,
-        // unlike the address translation cache beside it, which is derived.
-        let pending = state.fpu.pending_040;
-        w.write_bool(pending.is_some())?;
-        let pending = pending.unwrap_or(fpu::State040 {
-            command: 0,
-            etemp: F80::ZERO,
-            stag: 0,
-            fptemp: F80::ZERO,
-            dtag: 0,
-            post_instruction: false,
-        });
-        w.write_u16(pending.command)?;
-        for value in [pending.etemp, pending.fptemp] {
-            w.write_u16(value.sign_exp)?;
-            w.write_u64(value.sig)?;
-        }
-        w.write_u8(pending.stag)?;
-        w.write_u8(pending.dtag)?;
-        w.write_bool(pending.post_instruction)?;
-        Ok(())
+        self.save_fpu(&state, w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -2625,6 +2592,49 @@ impl Device for M68k {
         Ok(())
     }
 }
+impl M68k {
+    /// The floating-point block of a snapshot: the last thing in the chunk,
+    /// present exactly when a coprocessor is, on every model.
+    fn save_fpu(&self, state: &State, w: &mut ChunkWriter<'_>) -> Result<()> {
+        if !self.fpu.present() {
+            return Ok(());
+        }
+        for value in state.fpu.fp {
+            w.write_u16(value.sign_exp)?;
+            w.write_u64(value.sig)?;
+        }
+        w.write_u32(state.fpu.fpcr)?;
+        w.write_u32(state.fpu.fpsr)?;
+        w.write_u32(state.fpu.fpiar)?;
+        w.write_bool(state.fpu.null)?;
+        if !self.fpu.is_onchip_040() {
+            return Ok(());
+        }
+        // What a 68040's `FSAVE` still owes an emulation handler. It is
+        // architectural state — the handler will read it — so it travels,
+        // unlike the address translation cache beside it, which is derived.
+        let pending = state.fpu.pending_040;
+        w.write_bool(pending.is_some())?;
+        let pending = pending.unwrap_or(fpu::State040 {
+            command: 0,
+            etemp: F80::ZERO,
+            stag: 0,
+            fptemp: F80::ZERO,
+            dtag: 0,
+            post_instruction: false,
+        });
+        w.write_u16(pending.command)?;
+        for value in [pending.etemp, pending.fptemp] {
+            w.write_u16(value.sign_exp)?;
+            w.write_u64(value.sig)?;
+        }
+        w.write_u8(pending.stag)?;
+        w.write_u8(pending.dtag)?;
+        w.write_bool(pending.post_instruction)?;
+        Ok(())
+    }
+}
+
 impl Initiator for M68k {
     fn requester(&self) -> RequesterId {
         RequesterId(self.requester.load(Ordering::Relaxed))
