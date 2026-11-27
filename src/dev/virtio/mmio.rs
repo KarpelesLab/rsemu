@@ -411,7 +411,17 @@ impl Registers {
         // `avail` wraps at 16 bits, so the comparison is a difference and never
         // an ordering — the driver's index passing ours by 32768 is not a
         // reason to stop (§2.7.6).
-        while last != avail {
+        //
+        // But the difference is bounded by the ring. Virtio 1.2 §2.7: "Queue
+        // Size corresponds to the maximum number of buffers in the virtqueue",
+        // with the footnote "if Queue Size is 4 then at most 4 buffers can be
+        // queued at any given time". An index further ahead than that is not
+        // more work, it is the same ring slots named again, and a driver that
+        // writes 65535 into `idx` would otherwise buy 65535 requests with one
+        // notify. One pass serves at most a ring's worth.
+        let mut budget = queue.layout.size;
+        while last != avail && budget > 0 {
+            budget -= 1;
             let Ok(head) = q.avail_head(last) else {
                 break;
             };
@@ -1142,6 +1152,29 @@ mod tests {
         f.write(0x064, INT_USED_BUFFER);
         assert_eq!(f.read(0x060), 0);
         assert!(!f.device.irq_asserted());
+    }
+
+    #[test]
+    fn an_available_index_past_the_ring_buys_one_rings_worth_and_no_more() {
+        // The ring has eight entries, so eight buffers is the most a driver
+        // can have made available (virtio 1.2 §2.7). An `idx` of 65535 is a
+        // lie, and believing it serves the same eight slots 8191 times over
+        // inside a single notify.
+        let f = Fixture::new();
+        f.bring_up();
+        f.offer(0xffff);
+        f.write(0x050, 0);
+        assert_eq!(*f.echo.calls.lock(), 8, "one ring's worth of chains");
+        assert_eq!(f.space.read(USED + 2, W::U16, MemAttrs::DEBUG).unwrap(), 8);
+
+        // An honest driver that fills the whole ring still gets all of it.
+        let f = Fixture::new();
+        f.bring_up();
+        f.offer(8);
+        f.write(0x050, 0);
+        assert_eq!(*f.echo.calls.lock(), 8);
+        f.write(0x050, 0);
+        assert_eq!(*f.echo.calls.lock(), 8, "and nothing is left over");
     }
 
     #[test]
