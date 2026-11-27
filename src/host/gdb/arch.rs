@@ -582,6 +582,9 @@ static ALL: &[&Arch] = &[
 /// appended at the *end* of the chunk rather than slotted in beside the fields
 /// they belong with, precisely so the prefix these offsets index keeps the
 /// layout version 2 wrote. Nothing below moved.
+///
+/// Re-verified at chunk version 5, which appends the NMI edge detector's
+/// sampled level after `core_bus` — again at the end, again moving nothing.
 #[cfg(feature = "cpu-mos6502")]
 static MOS6502_REGS: &[RegDesc] = &[
     RegDesc::int("a", 1, 0),
@@ -609,7 +612,7 @@ static MOS6502_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-mos6502")]
 pub static MOS6502: Arch = Arch {
     class: &crate::cpu::mos6502::CLASS,
-    verified_version: 4,
+    verified_version: 5,
     features: &[Feature::whole("org.rsemu.mos6502")],
     architecture: None,
     regs: MOS6502_REGS,
@@ -630,7 +633,8 @@ pub static MOS6502: Arch = Arch {
 /// at — rather than as two registers a client would have to join. It is
 /// assembled by [`W65C816_COMPUTED`] into a 32-bit register, because a wire
 /// register is a power-of-two width and the chunk byte after `pbr` is `dbr`.
-/// Verified at chunk version 1.
+/// Verified at chunk version 1, and again at version 2, which appends the two
+/// edge detectors' sampled levels after the line bytes at the very end.
 #[cfg(feature = "cpu-w65c816")]
 static W65C816_REGS: &[RegDesc] = &[
     RegDesc::int("a", 2, 0),
@@ -662,7 +666,7 @@ static W65C816_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-w65c816")]
 pub static W65C816: Arch = Arch {
     class: &crate::cpu::w65c816::CLASS,
-    verified_version: 1,
+    verified_version: 2,
     features: &[Feature::whole("org.rsemu.w65c816")],
     architecture: None,
     regs: W65C816_REGS,
@@ -1637,6 +1641,9 @@ pub static A64: Arch = Arch {
 /// be a [`Computed`] byte swap, and inventing state that is not in the chunk to
 /// present it backwards is worse than showing the eight registers the core
 /// actually has.
+///
+/// Re-verified at chunk version 2, which appends the request lines' levels as
+/// the last byte of the chunk; every offset below is where it was.
 #[cfg(feature = "cpu-sm83")]
 static SM83_REGS: &[RegDesc] = &[
     RegDesc::int("a", 1, 0),
@@ -1673,7 +1680,7 @@ static SM83_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-sm83")]
 pub static SM83: Arch = Arch {
     class: &crate::cpu::sm83::CLASS,
-    verified_version: 1,
+    verified_version: 2,
     features: &[Feature::whole("org.rsemu.sm83")],
     architecture: None,
     regs: SM83_REGS,

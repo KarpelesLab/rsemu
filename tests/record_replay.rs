@@ -666,7 +666,7 @@ const FROZEN_SESSION: &[u8] = &[
 /// (`cargo test --target i686-unknown-linux-gnu`), which is the interesting
 /// direction: `usize` is four bytes there, and a snapshot that had leaked one
 /// would not produce this number.
-const FROZEN_HASH: u64 = 0xe2c6_ef17_b01e_2bb7;
+const FROZEN_HASH: u64 = 0x32dd_4233_90c7_e54f;
 
 /// The instant the replay ends at, in raw 2⁻⁶⁴-second units.
 ///
