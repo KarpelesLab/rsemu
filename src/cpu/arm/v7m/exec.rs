@@ -2761,11 +2761,19 @@ impl<'a> Exec<'a> {
             #[cfg(feature = "cpu-arm-v8m")]
             11 if privileged && self.cfg.is_v8m() => self.state.psplim = value & !7,
             16 if privileged => self.state.primask = value & 1 != 0,
-            17 if privileged => self.state.basepri = value as u8,
+            // DDI 0403E.b B1.4.3: "The number of implemented bits in BASEPRI
+            // is the same as the number of implemented bits in each field of
+            // the priority registers, and BASEPRI has the same format as
+            // those fields." So a value below the lowest implemented bit
+            // stores zero, which "disables masking by BASEPRI" rather than
+            // masking nearly everything.
+            17 if privileged => {
+                self.state.basepri = self.state.sys.quantize_priority(value as u8);
+            }
             18 if privileged => {
                 // `BASEPRI_MAX` only ever raises the priority ceiling: a
                 // write that would lower it is ignored (DDI 0403 B5.2.3).
-                let new = value as u8;
+                let new = self.state.sys.quantize_priority(value as u8);
                 if new != 0 && (self.state.basepri == 0 || new < self.state.basepri) {
                     self.state.basepri = new;
                 }

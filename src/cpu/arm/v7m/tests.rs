@@ -1526,6 +1526,32 @@ fn smmla_and_smmls_wrap_at_sixty_four_bits_instead_of_panicking() {
 }
 
 #[test]
+fn basepri_implements_only_the_priority_bits_the_part_has() {
+    // A Cortex-M4 here has three priority bits, so `BASEPRI[4:0]` is not
+    // there (DDI 0403E.b B1.4.3: "The number of implemented bits in BASEPRI
+    // is the same as the number of implemented bits in each field of the
+    // priority registers"). `MSR basepri, r0` ; `MRS r1, basepri` ;
+    // `MSR basepri_max, r2` ; `MRS r3, basepri`.
+    let mut code = Vec::new();
+    code.extend(wide(0xf380_8811));
+    code.extend(wide(0xf3ef_8111));
+    code.extend(wide(0xf382_8812));
+    code.extend(wide(0xf3ef_8311));
+    let h = Harness::m4(&code);
+    h.cpu.set_reg(0, 0x1f);
+    h.cpu.set_reg(2, 0x5f);
+    h.cpu.step();
+    h.cpu.step();
+    // Nothing implemented was written, and zero is "masking disabled" — not
+    // a mask of everything at priority 0x1f and below.
+    assert_eq!(h.cpu.reg(1), 0);
+    assert_eq!(h.cpu.regs().basepri, 0);
+    h.cpu.step();
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(3), 0x40);
+}
+
+#[test]
 fn the_architectural_priorities_are_negative_and_fixed() {
     let sys = Sys::new(CPUID_CORTEX_M4, 8, 8);
     assert_eq!(sys.priority_of(Exception::RESET), -3);
