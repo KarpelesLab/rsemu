@@ -2,7 +2,7 @@
 
 Consumed by: `cpu/arm/aprofile` (ARMv5TE, and ARMv7-A's A32 and T32 (Thumb-2)
 instruction sets with VFPv3; NEON to follow),
-`cpu/arm/v7m` (ARMv6-M, ARMv7E-M and Armv8-M Mainline, Cortex-M0/M0+/SC000/M3/SC300/M4/M7/M33), `cpu/arm/a64` (ARMv8-A AArch64).
+`cpu/arm/v7m` (ARMv6-M, ARMv7E-M and Armv8-M Mainline, Cortex-M0/M0+/SC000/M3/SC300/M4/M7/M33/M35P), `cpu/arm/a64` (ARMv8-A AArch64).
 
 ## Primary
 
@@ -22,6 +22,8 @@ instruction sets with VFPv3; NEON to follow),
 | SecurCore SC300 TRM | **Not public** (SecurCore NDA). `Config::SC300` is the Cortex-M3's options plus CMSIS `core_sc300.h`'s `VTOR` width; the gaps are in `tests/conformance/ledgers/cpu-arm-v7m.txt` | — |
 | CMSIS-Core `core_sc000.h`, `core_sc300.h`, `core_cm3.h` (Apache-2.0) | The SecurCore register layouts the TRMs would otherwise give: which SCB/SCnSCB registers exist, the `VTOR` field widths (`TBLBASE` at bit 29 and `TBLOFF` `[28:7]` on the SC300 and pre-r2p1 Cortex-M3), the IMPLEMENTATION DEFINED `SFCR` at `0xE000EF90` | `github.com/ARM-software/CMSIS_5`, `CMSIS/Core/Include/` |
 | Cortex-M4 TRM (DDI 0439), Cortex-M7 TRM (DDI 0489), Cortex-M33 TRM (100230) | The implementation-defined values a guest can see: `CPUID`, `MVFR0`/`MVFR1`/`MVFR2`, how many priority bits, how many MPU regions, instruction timings | developer.arm.com **[browser]** |
+| Cortex-M35P TRM (100883) | **Available from Arm on request only.** `Config::CORTEX_M35P` rests on the public Security Target below; the gaps are in `tests/conformance/ledgers/cpu-arm-v8m.txt` | — |
+| *Arm Cortex-M35P r1p1 Lite Security Target* (PJDOC-466751330-13922) | The M35P's revision (r1p1) and configuration options: the MPU, Security, FPU and DSP extensions, the optional 2-way 2-16 KiB instruction cache, 1-480 interrupts, 8-256 priority levels (§1.4) | `commoncriteriaportal.org` (a free PDF) |
 | PrimeCell UART (PL011), TRM DDI 0183 | The UART every ARM virtual board exposes | developer.arm.com **[browser]** |
 
 Arm's site blocks automated fetches but the documents are free to download after
@@ -132,6 +134,14 @@ secondary reference for the exception model.
   v7-M part, and the v7-M suite runs unchanged with the feature on.
   `src/cpu/arm/v7m/v8m.rs`'s documentation is the precise statement, and
   `tests/conformance/ledgers/cpu-arm-v8m.txt` the list of what is absent.
+- **The Cortex-M35P is a Cortex-M33 preset, not an architecture.**
+  `Config::CORTEX_M35P` / `CORTEX_M35PF` (`part = "cortex-m35p"` /
+  `"cortex-m35pf"`, under `cpu-arm-v8m`) are the M33's options with a
+  `CPUID` of `0x411F0001`: r1p1, the revision Arm certified, with a part
+  number of zero because the TRM that gives it is not public. What the M35P
+  adds — physical anti-tampering and an optional instruction cache — is
+  either invisible to software or modelled absent (the part built without
+  the cache); `tests/conformance/ledgers/cpu-arm-v8m.txt` says so.
 - **ARMv6-M is the same core cut down, not a fifth one.** A Cortex-M0 keeps
   every structural feature of the M profile and loses instructions and
   registers, so it is `Config::arch = Arch::V6m` behind `cpu-arm-v6m`

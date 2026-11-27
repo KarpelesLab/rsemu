@@ -64,3 +64,35 @@ mpu.memory-attributes       # MAIR0/1 and RLAR.AttrIndx are stored and read
 armv8.1-m                   # The Cortex-M55/M85 material -- MVE, RLAR.PXN,
                             # low-overhead loops, the PACBTI extension -- is
                             # Armv8.1-M and out of scope.
+
+# ---------------------------------------------------------------------------
+# 2026-11-27: the Cortex-M35P presets (Config::CORTEX_M35P / CORTEX_M35PF,
+# part = "cortex-m35p" / "cortex-m35pf"). The M35P is the Cortex-M33's
+# architecture and options; everything above applies to it unchanged. Its
+# configuration is from the public *Arm Cortex-M35P r1p1 Lite Security
+# Target* (PJDOC-466751330-13922, Common Criteria portal), its TRM (100883)
+# being available from Arm only on request.
+#
+#   * v8mtests.rs: the two M35P tests pass, and the v8-M suite with them.
+# ---------------------------------------------------------------------------
+
+m35p.cpuid-partno           # CPUID reads 0x411F0001: implementer 0x41, r1p1
+                            # (the certified revision) and architecture 0xF
+                            # are cited, the part number is not published in
+                            # any source this project may read, so it reads
+                            # zero. A board sets the real value with `cpuid`.
+
+m35p.instruction-cache      # The optional 2-way, 2-16 KiB instruction cache
+                            # (Security Target 1.4) is not modelled: the
+                            # preset is the part built without it, so CLIDR,
+                            # CTR and CCSIDR read zero, CCR.IC is RAZ/WI and
+                            # ICIALLU/ICIMVAU are ignored writes. Nothing a
+                            # cacheless interpreter fetches can go stale.
+
+m35p.anti-tamper            # The physical-security countermeasures against
+                            # fault injection and side channels -- the point
+                            # of the part -- are not modelled. They are not
+                            # software-visible beyond their external signals
+                            # (the Security Target's SM.* mechanisms, whose
+                            # details are in the TRM), so a guest sees a
+                            # Cortex-M33 that never detects tampering.

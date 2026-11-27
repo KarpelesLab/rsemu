@@ -2,7 +2,9 @@
 //! core this module sits inside.
 //!
 //! Selected per instance by [`Config::CORTEX_M33`](super::Config::CORTEX_M33)
-//! (or `part = "cortex-m33"` / `"cortex-m33f"`), and compiled only with the
+//! (or `part = "cortex-m33"` / `"cortex-m33f"`; the Cortex-M35P presets,
+//! `"cortex-m35p"` / `"cortex-m35pf"`, are the same architecture with their
+//! own `CPUID`), and compiled only with the
 //! `cpu-arm-v8m` feature, so a v7-M-only build links none of it. The same
 //! interpreter runs both architectures: what differs is keyed off one flag,
 //! [`Config::is_v8m`](super::Config::is_v8m), rather than off part names.
@@ -107,6 +109,21 @@ use super::sys::{Access, MPU_REGIONS, Sys, ccr, exc_return, fpccr};
 /// r0p4 is the revision ST ships in the STM32U5 family. A board modelling
 /// different silicon sets [`Config::cpuid`](super::Config::cpuid).
 pub const CPUID_CORTEX_M33: u32 = 0x410f_d214;
+
+/// `CPUID` for an Arm Cortex-M35P r1p1: implementer `0x41`, variant 1,
+/// architecture `0xF`, revision 1 — and a part number of **zero**.
+///
+/// r1p1 is the revision Arm put through Common Criteria (*Arm Cortex-M35P
+/// r1p1 Lite Security Target*, PJDOC-466751330-13922, §1: "The TOE is
+/// identified as Cortex-M35P r1p1"), and DDI 0553 puts the major revision in
+/// `Variant` and the minor in `Revision`. The part number is in the
+/// Cortex-M35P TRM (100883), which Arm distributes only on request, and no
+/// permissively licensed source this project may read prints it; the field
+/// reads zero rather than carry a number of unknown provenance, as
+/// [`CPUID_SC300`](super::CPUID_SC300)'s does. A board that knows its
+/// silicon's value sets [`Config::cpuid`](super::Config::cpuid) (or the
+/// `cpuid` property).
+pub const CPUID_CORTEX_M35P: u32 = 0x411f_0001;
 
 /// The `CCR` bits a v8-M part without caches lets software write.
 const CCR_WRITABLE: u32 =

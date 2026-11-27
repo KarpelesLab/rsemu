@@ -2025,7 +2025,9 @@ cpu-arm-v7m-fp = ["cpu-arm-v7m", "float"]
 # runs -- so there is no Secure state, no SAU and no _NS banking; TTA/TTAT,
 # BXNS and BLXNS are UNDEFINED. A v7-M-only build links none of it, and v7-M
 # parts behave identically with or without it. `no_std + alloc`, no `unsafe`,
-# no dependencies.
+# no dependencies. The Cortex-M35P (`part = "cortex-m35p"` / `"cortex-m35pf"`)
+# is the same architecture and options with its own CPUID; its instruction
+# cache and anti-tampering are not modelled.
 cpu-arm-v8m = ["cpu-arm-v7m"]
 
 # ARMv6-M for `cpu-arm-v7m` -- the Cortex-M0, Cortex-M0+ and SecurCore SC000

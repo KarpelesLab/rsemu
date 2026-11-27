@@ -28,7 +28,11 @@
 //! `EXC_RETURN` format, `LDA`/`STL`/`LDAEX`/`STLEX`, `TT`, the PMSAv8 MPU and
 //! the v8-M `CCR`/`FPCCR` bits — modelled **without the Security Extension**,
 //! which is what an STM32U5 with `TZEN = 0` presents. `v8m`'s own
-//! documentation says exactly what that includes and leaves out. Everything
+//! documentation says exactly what that includes and leaves out. The
+//! **Cortex-M35P** is the same architecture with its own `CPUID`:
+//! [`Config::CORTEX_M35P`] / `CORTEX_M35PF` (`part = "cortex-m35p"` /
+//! `"cortex-m35pf"`), its instruction cache and anti-tampering left out.
+//! Everything
 //! v8-M changes keys off [`Config::arch`]; a v7-M part behaves identically
 //! whether or not the feature is compiled in.
 //!
@@ -218,7 +222,7 @@ use sys::{Exception, Sys};
 pub use sys::{CPUID_CORTEX_M4, CPUID_CORTEX_M7, CPUID_SC300, SYST_CALIB_UNKNOWN};
 
 #[cfg(feature = "cpu-arm-v8m")]
-pub use v8m::CPUID_CORTEX_M33;
+pub use v8m::{CPUID_CORTEX_M33, CPUID_CORTEX_M35P};
 
 #[cfg(feature = "cpu-arm-v6m")]
 pub use v6m::{CPUID_CORTEX_M0, CPUID_CORTEX_M0PLUS, CPUID_SC000};
@@ -344,6 +348,29 @@ impl Extensions {
     #[cfg(feature = "cpu-arm-v8m")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
     pub const CORTEX_M33F: Extensions = Extensions::CORTEX_M7F;
+    /// A Cortex-M35P with the DSP extension and an MPU, without the FPU:
+    /// the Cortex-M33's options, which are the M35P's too (*Arm Cortex-M35P
+    /// r1p1 Lite Security Target*, §1.4: MPU, Security, FPU and DSP
+    /// extensions, each chosen by the IC designer). Kept apart from
+    /// [`Extensions::CORTEX_M33`] so a change to one part cannot quietly
+    /// move the other.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M35P: Extensions = Extensions {
+        dsp: true,
+        fp: FpUnit::None,
+        mpu: true,
+        unpriv: true,
+    };
+    /// A Cortex-M35P with its FPU: single-precision arithmetic with
+    /// double-precision loads and stores, sixteen `D` registers — what this
+    /// core calls FPv5-SP-D16.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M35PF: Extensions = Extensions {
+        fp: FpUnit::V5Sp,
+        ..Extensions::CORTEX_M35P
+    };
     /// A Cortex-M0: no DSP, no FPU, no MPU, and no unprivileged execution —
     /// "software execution is always privileged" (Cortex-M0 TRM, 3.2).
     #[cfg(feature = "cpu-arm-v6m")]
@@ -614,6 +641,33 @@ impl Config {
         ..Config::CORTEX_M33
     };
 
+    /// A Cortex-M35P: the Cortex-M33's architecture and options — Armv8-M
+    /// Mainline, DSP, the eight-region PMSAv8 MPU, three priority bits, no
+    /// bit-band and no Security Extension — with [`CPUID_CORTEX_M35P`].
+    ///
+    /// What the M35P adds over the M33 is physical: anti-tampering and
+    /// fault-injection countermeasures, which software cannot see, and an
+    /// optional two-way instruction cache of 2 to 16 KiB (*Arm Cortex-M35P
+    /// r1p1 Lite Security Target*, §1.4). The preset is the part built
+    /// **without** the cache, as every other preset here is cacheless:
+    /// `CLIDR` and `CTR` read zero and `CCR.IC` is RAZ/WI.
+    /// `tests/conformance/ledgers/cpu-arm-v8m.txt` lists all three gaps.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M35P: Config = Config {
+        ext: Extensions::CORTEX_M35P,
+        cpuid: CPUID_CORTEX_M35P,
+        ..Config::CORTEX_M33
+    };
+
+    /// A Cortex-M35P with its floating-point unit.
+    #[cfg(feature = "cpu-arm-v8m")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
+    pub const CORTEX_M35PF: Config = Config {
+        ext: Extensions::CORTEX_M35PF,
+        ..Config::CORTEX_M35P
+    };
+
     /// A Cortex-M0 r0p0: ARMv6-M, two priority bits, SysTick, no `VTOR`, no
     /// MPU, no unprivileged execution and no bit-band.
     ///
@@ -821,7 +875,8 @@ impl Default for Config {
 /// it could have said — rather than quietly getting a part with no FPU and
 /// faulting on its first `VMOV`. The same goes for each architecture: a
 /// `cortex-m33` needs `cpu-arm-v8m` and a `cortex-m0` needs `cpu-arm-v6m`,
-/// and `cortex-m33f` needs both `cpu-arm-v8m` and the FPU.
+/// and `cortex-m33f` needs both `cpu-arm-v8m` and the FPU — as do
+/// `cortex-m35p` and `cortex-m35pf`.
 const PARTS: &[&str] = &[
     #[cfg(feature = "cpu-arm-v6m")]
     "cortex-m0",
@@ -845,6 +900,10 @@ const PARTS: &[&str] = &[
     "cortex-m33",
     #[cfg(all(feature = "cpu-arm-v8m", feature = "cpu-arm-v7m-fp"))]
     "cortex-m33f",
+    #[cfg(feature = "cpu-arm-v8m")]
+    "cortex-m35p",
+    #[cfg(all(feature = "cpu-arm-v8m", feature = "cpu-arm-v7m-fp"))]
+    "cortex-m35pf",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1279,10 @@ impl ArmV7m {
             "cortex-m33" => Config::CORTEX_M33,
             #[cfg(all(feature = "cpu-arm-v8m", feature = "cpu-arm-v7m-fp"))]
             "cortex-m33f" => Config::CORTEX_M33F,
+            #[cfg(feature = "cpu-arm-v8m")]
+            "cortex-m35p" => Config::CORTEX_M35P,
+            #[cfg(all(feature = "cpu-arm-v8m", feature = "cpu-arm-v7m-fp"))]
+            "cortex-m35pf" => Config::CORTEX_M35PF,
             // `require_enum` has already rejected anything else.
             _ => Config::CORTEX_M4,
         };
@@ -1838,13 +1901,13 @@ pub static CLASS: DeviceClass = DeviceClass {
     // 2: the snapshot gained `DEMCR` and the DWT's two live registers. 0.0.x,
     // so the old layout is simply gone rather than read behind a shim.
     version: 2,
-    summary: "ARMv6-M / ARMv7E-M / Armv8-M Mainline (Cortex-M0/M4/M7/M33 class) CPU core with Thumb-2, DSP, NVIC and MPU",
+    summary: "ARMv6-M / ARMv7E-M / Armv8-M Mainline (Cortex-M0/M4/M7/M33/M35P class) CPU core with Thumb-2, DSP, NVIC and MPU",
     properties: &[
         PropertySpec {
             name: "part",
             kind: ValueKind::Str,
             required: false,
-            summary: "which part to model: cortex-m0, cortex-m0plus (cortex-m0+), sc000, cortex-m3, sc300, cortex-m4[f], cortex-m7[f] or cortex-m33[f]",
+            summary: "which part to model: cortex-m0, cortex-m0plus (cortex-m0+), sc000, cortex-m3, sc300, cortex-m4[f], cortex-m7[f], cortex-m33[f] or cortex-m35p[f]",
         },
         PropertySpec {
             name: "cpuid",

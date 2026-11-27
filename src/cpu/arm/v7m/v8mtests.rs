@@ -16,7 +16,7 @@ use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 
 use super::isa::{decode, is_32bit};
 use super::sys::{Access, Exception, ccr, control, exc_return, fsr, shcsr};
-use super::v8m::{CPUID_CORTEX_M33, decode_exc_return};
+use super::v8m::{CPUID_CORTEX_M33, CPUID_CORTEX_M35P, decode_exc_return};
 use super::{ArmV7m, Config};
 
 // ---------------------------------------------------------------------------
@@ -708,6 +708,59 @@ fn from_props_names_the_m33_parts() {
     );
     #[cfg(not(feature = "cpu-arm-v7m-fp"))]
     assert!(ArmV7m::from_props(&props).is_err());
+}
+
+#[test]
+fn the_m35p_is_an_m33_with_its_own_cpuid_and_no_instruction_cache() {
+    // Arm Cortex-M35P r1p1: implementer 0x41, r1 in Variant, architecture
+    // 0xF, p1 in Revision; the unpublished part number reads zero.
+    const { assert!(CPUID_CORTEX_M35P == 0x411f_0001) };
+    assert_eq!(
+        Config {
+            cpuid: CPUID_CORTEX_M33,
+            ..Config::CORTEX_M35P
+        },
+        Config::CORTEX_M33,
+        "everything bar CPUID is the Cortex-M33's"
+    );
+    assert_eq!(Config::CORTEX_M35PF.ext.fp, Config::CORTEX_M33F.ext.fp);
+    assert_eq!(Config::CORTEX_M35PF.cpuid, CPUID_CORTEX_M35P);
+
+    let h = Harness::new(Config::CORTEX_M35P, &[PARK]);
+    assert_eq!(h.ppb_read(0xe000_ed00), CPUID_CORTEX_M35P);
+    // Built without the optional instruction cache: CLIDR and CTR describe
+    // no cache, and CCR.IC (bit 17) does not stick.
+    assert_eq!(h.ppb_read(0xe000_ed78), 0, "CLIDR");
+    assert_eq!(h.ppb_read(0xe000_ed7c), 0, "CTR");
+    h.ppb_write(0xe000_ed14, 1 << 17);
+    assert_eq!(h.ppb_read(0xe000_ed14) & (1 << 17), 0, "CCR.IC");
+    assert_eq!(h.ppb_read(0xe000_ed14), 0x0000_0201, "the M33's CCR");
+}
+
+#[test]
+fn from_props_names_the_m35p_parts() {
+    let props = Props::new().with("part", Value::from("cortex-m35p"));
+    let cpu = ArmV7m::from_props(&props).unwrap();
+    assert_eq!(cpu.config(), Config::CORTEX_M35P);
+    assert!(cpu.config().is_v8m());
+
+    let props = Props::new().with("part", Value::from("cortex-m35pf"));
+    #[cfg(feature = "cpu-arm-v7m-fp")]
+    assert_eq!(
+        ArmV7m::from_props(&props).unwrap().config(),
+        Config::CORTEX_M35PF
+    );
+    #[cfg(not(feature = "cpu-arm-v7m-fp"))]
+    assert!(ArmV7m::from_props(&props).is_err());
+
+    // A board that knows its silicon's CPUID says so.
+    let props = Props::new()
+        .with("part", Value::from("cortex-m35p"))
+        .with("cpuid", Value::from(0x411f_1231u64));
+    assert_eq!(
+        ArmV7m::from_props(&props).unwrap().config().cpuid,
+        0x411f_1231
+    );
 }
 
 fn snapshot(cpu: &ArmV7m) -> Vec<u8> {
