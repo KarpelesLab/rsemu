@@ -30,11 +30,27 @@
 //! returns**. Polling from its own run slice instead would put the reply a
 //! scheduler round or two behind the byte, which is later than a master that
 //! times its slave's answer will wait for.
+//!
+//! # Snapshots
+//!
+//! Bytes one end has written and the other has not read are machine state —
+//! they are on the board's own wire, not in a host's buffer — and the link is
+//! not a device: it has no chunk, and a restored machine starts with a fresh
+//! one that holds nothing. So **each end carries the bytes on their way to
+//! it** in its own device's snapshot ([`LinkEnd::save_in_flight`],
+//! [`LinkEnd::load_in_flight`]). Two ends, two directions, each saved exactly
+//! once, and neither device has to know what the other is. It is the
+//! arrangement `bus::i2c` and `bus::spi` use for an open transaction, and for
+//! the same reason.
 
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 
+use crate::core::error::{Error, Result};
+use crate::core::state::{Sink, Source};
 use crate::core::sync::{LockRank, Mutex};
 use crate::host::chardev::CharDevice;
 
@@ -121,6 +137,37 @@ impl UartLink {
         })
     }
 
+    /// The bytes on their way to `side`: written by the other end and not yet
+    /// read by this one. For a snapshot; see the module documentation.
+    #[must_use]
+    pub fn in_flight(&self, side: Side) -> Vec<u8> {
+        let (inbound, _) = self.queues(side);
+        inbound.lock().iter().copied().collect()
+    }
+
+    /// Put the bytes on their way to `side` back where a snapshot found them,
+    /// replacing whatever is queued. Nobody is told: the end reads them when
+    /// it next reads, exactly as it would have.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if there are more than a direction holds. A link
+    /// never queues more than [`LINK_CAPACITY`], so a snapshot that says it
+    /// did was not written by one.
+    pub fn restore_in_flight(&self, side: Side, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > LINK_CAPACITY {
+            return Err(Error::State(format!(
+                "a snapshot has {} byte(s) in flight on a serial link that holds {LINK_CAPACITY}",
+                bytes.len()
+            )));
+        }
+        let (inbound, _) = self.queues(side);
+        let mut q = inbound.lock();
+        q.clear();
+        q.extend(bytes);
+        Ok(())
+    }
+
     fn queues(&self, side: Side) -> (&Mutex<VecDeque<u8>>, &Mutex<VecDeque<u8>>) {
         match side {
             // (inbound, outbound)
@@ -139,6 +186,65 @@ pub struct LinkEnd {
 impl fmt::Debug for LinkEnd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinkEnd").field("side", &self.side).finish()
+    }
+}
+
+impl LinkEnd {
+    /// Write the bytes on their way to this end into its device's chunk.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sink reports.
+    pub fn save_in_flight<S: Sink + ?Sized>(&self, w: &mut S) -> Result<()> {
+        w.write_bytes(&self.link.in_flight(self.side))
+    }
+
+    /// Read back what [`save_in_flight`](LinkEnd::save_in_flight) wrote.
+    ///
+    /// # Errors
+    ///
+    /// As [`UartLink::restore_in_flight`], or whatever the source reports.
+    pub fn load_in_flight<'a, S: Source<'a> + ?Sized>(&self, r: &mut S) -> Result<()> {
+        let bytes = r.read_bytes()?;
+        self.link.restore_in_flight(self.side, bytes)
+    }
+}
+
+/// [`LinkEnd::save_in_flight`] for a device that may be on a host port
+/// instead: no link is no bytes, and the chunk has the same shape either way.
+///
+/// # Errors
+///
+/// Whatever the sink reports.
+pub fn save_in_flight<S: Sink + ?Sized>(end: Option<&LinkEnd>, w: &mut S) -> Result<()> {
+    match end {
+        Some(end) => end.save_in_flight(w),
+        None => w.write_bytes(&[]),
+    }
+}
+
+/// [`LinkEnd::load_in_flight`] for a device that may be on a host port.
+///
+/// # Errors
+///
+/// [`Error::State`] if the snapshot carries bytes in flight and this device
+/// is on no link to put them on — it was taken from a board wired
+/// differently.
+pub fn load_in_flight<'a, S: Source<'a> + ?Sized>(end: Option<&LinkEnd>, r: &mut S) -> Result<()> {
+    match end {
+        Some(end) => end.load_in_flight(r),
+        None => {
+            let bytes = r.read_bytes()?;
+            if bytes.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::State(format!(
+                    "a snapshot has {} byte(s) in flight on a serial link, and this device is \
+                     on a host port",
+                    bytes.len()
+                )))
+            }
+        }
     }
 }
 
@@ -248,6 +354,66 @@ mod tests {
         assert_eq!(a.read(&mut buf), 0, "nothing came back");
         assert!(b.write_byte(0x06));
         assert_eq!(a.read_byte(), Some(0x06));
+    }
+
+    #[test]
+    fn bytes_in_flight_are_each_ends_own_to_save_and_restore() {
+        let link = Arc::new(UartLink::new());
+        let (a, b) = (link.end(Side::A), link.end(Side::B));
+        assert_eq!(a.write(b"to b"), 4);
+        assert_eq!(b.write(b"to a!"), 5);
+        // Each end holds what is on its way *to* it.
+        assert_eq!(link.in_flight(Side::A), b"to a!");
+        assert_eq!(link.in_flight(Side::B), b"to b");
+        let (mut for_a, mut for_b) = (Vec::new(), Vec::new());
+        a.save_in_flight(&mut for_a).unwrap();
+        b.save_in_flight(&mut for_b).unwrap();
+
+        // A restored machine has a fresh link with nothing on it.
+        let fresh = Arc::new(UartLink::new());
+        let (a2, b2) = (fresh.end(Side::A), fresh.end(Side::B));
+        a2.load_in_flight(&mut crate::core::state::SliceSource::new(&for_a))
+            .unwrap();
+        b2.load_in_flight(&mut crate::core::state::SliceSource::new(&for_b))
+            .unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(a2.read(&mut buf), 5);
+        assert_eq!(&buf[..5], b"to a!");
+        assert_eq!(b2.read(&mut buf), 4);
+        assert_eq!(&buf[..4], b"to b");
+
+        // Restoring replaces: it is a snapshot's view, not an append.
+        fresh.restore_in_flight(Side::A, b"xy").unwrap();
+        fresh.restore_in_flight(Side::A, b"z").unwrap();
+        assert_eq!(fresh.in_flight(Side::A), b"z");
+    }
+
+    #[test]
+    fn more_bytes_in_flight_than_a_direction_holds_is_refused() {
+        let link = UartLink::new();
+        let too_many = alloc::vec![0u8; LINK_CAPACITY + 1];
+        assert!(link.restore_in_flight(Side::B, &too_many).is_err());
+        assert!(link.in_flight(Side::B).is_empty(), "and nothing was queued");
+        let full = alloc::vec![7u8; LINK_CAPACITY];
+        link.restore_in_flight(Side::B, &full).unwrap();
+        assert_eq!(link.in_flight(Side::B).len(), LINK_CAPACITY);
+    }
+
+    #[test]
+    fn a_device_on_a_host_port_saves_no_bytes_and_refuses_any() {
+        let mut none = Vec::new();
+        save_in_flight(None, &mut none).unwrap();
+        load_in_flight(None, &mut crate::core::state::SliceSource::new(&none)).unwrap();
+
+        let link = Arc::new(UartLink::new());
+        let (a, b) = (link.end(Side::A), link.end(Side::B));
+        a.write(b"hi");
+        let mut some = Vec::new();
+        save_in_flight(Some(&b), &mut some).unwrap();
+        assert!(
+            load_in_flight(None, &mut crate::core::state::SliceSource::new(&some)).is_err(),
+            "bytes on a link this device is not on"
+        );
     }
 
     #[test]

@@ -86,7 +86,7 @@ use crate::machine::realize::Instance;
 pub const CLASS_NAME: &str = "navi.psc";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 const SOH: u8 = 0x01;
 const SYNC: u8 = 0x0f;
@@ -135,6 +135,11 @@ struct State {
 /// The PSC peer.
 pub struct Psc {
     line: Arc<dyn CharDevice>,
+    /// `line` again, as the link end it is when the machine file built this:
+    /// the bytes the SoC has sent and this peer has not yet read are machine
+    /// state, and this chunk is what carries them (`bus::uart`, "Snapshots").
+    /// `None` for a test's own line.
+    link: Option<Arc<crate::bus::uart::LinkEnd>>,
     log: Option<Arc<dyn CharDevice>>,
     version: u8,
     fan: u8,
@@ -229,7 +234,8 @@ impl Psc {
         let cycle = r.or_range("cycle", DEFAULT_CYCLE, 1..=u64::MAX / 2)?;
         r.finish()?;
         let side = Side::parse(side).unwrap_or(Side::B);
-        let line = links::attach(props, &link)?.end(side) as Arc<dyn CharDevice>;
+        let end = links::attach(props, &link)?.end(side);
+        let line = Arc::clone(&end) as Arc<dyn CharDevice>;
         let log = match log {
             Some(name) => Some(ports::attach(props, &name)? as Arc<dyn CharDevice>),
             None => None,
@@ -238,6 +244,7 @@ impl Psc {
         let inputs = [inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]];
         let mut psc = Psc::with_line(line, log, version, (fan / 50) as u8, inputs);
         psc.cycle = cycle;
+        psc.link = Some(end);
         Ok(psc)
     }
 
@@ -252,6 +259,7 @@ impl Psc {
     ) -> Psc {
         Psc {
             line,
+            link: None,
             log,
             version,
             fan,
@@ -417,6 +425,23 @@ impl Psc {
     }
 }
 
+/// The snapshot upgrades this class can perform.
+///
+/// v2 -> v3 appends the bytes in flight toward this end of the link. A v2
+/// snapshot never carried them — that is the defect v3 fixes — so the upgrade
+/// adds none: the line comes back idle, which is what v2 always restored to.
+///
+/// # Errors
+///
+/// If a step for this class is already registered.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS_NAME, 2, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_bytes(&[])
+    })
+}
+
 /// The `navi.psc` device class.
 pub static CLASS: DeviceClass = DeviceClass {
     name: CLASS_NAME,
@@ -518,7 +543,12 @@ impl Device for Psc {
         w.write_bytes(&s.outputs)?;
         w.write_u64(s.frames)?;
         w.write_bool(s.cyclic)?;
-        w.write_u64(s.elapsed)
+        w.write_u64(s.elapsed)?;
+        drop(s);
+        // What the SoC has sent and this peer has not yet read. `rx` above is
+        // the frame being assembled; this is what is still on the wire behind
+        // it, and no other chunk holds it.
+        crate::bus::uart::save_in_flight(self.link.as_deref(), w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -532,6 +562,7 @@ impl Device for Psc {
         let frames = r.read_u64()?;
         let cyclic = r.read_bool()?;
         let elapsed = r.read_u64()?;
+        crate::bus::uart::load_in_flight(self.link.as_deref(), r)?;
         *self.state.lock() = State {
             rx,
             inputs,
@@ -713,6 +744,101 @@ mod tests {
         let want = psc.state.lock().clone();
         assert_eq!(*back.state.lock(), want);
         assert_eq!(save(&back), bytes);
+    }
+
+    /// A peer built the way the machine file builds one: on end `b` of a
+    /// named link, which is what makes it carry that link's bytes.
+    fn linked() -> (Psc, Arc<UartLink>) {
+        let hosts = Arc::new(crate::core::hosts::HostObjects::new());
+        let props = Props::new()
+            .with("link", crate::core::props::Value::Str(String::from("psc")))
+            .with_hosts(Arc::clone(&hosts));
+        let psc = Psc::new(&props).expect("a peer");
+        let link = links::open(&hosts, "psc").expect("the link it attached to");
+        (psc, link)
+    }
+
+    fn chunk_of(p: &Psc) -> Vec<u8> {
+        let mut shape = crate::core::state::MachineShape::new();
+        shape.add_device("psc", CLASS.name).unwrap();
+        let mut w = crate::core::state::StateWriter::new(shape);
+        {
+            let mut chunk = w.chunk("psc", CLASS.name, CLASS.version).unwrap();
+            p.save(&mut chunk).unwrap();
+        }
+        w.to_vec().unwrap()
+    }
+
+    #[test]
+    fn bytes_the_soc_has_sent_and_the_peer_has_not_read_survive_a_snapshot() {
+        use crate::core::state::StateReader;
+
+        // A frame is on the wire and the peer has not had its run slice. The
+        // link is not a device and a restored machine has a fresh one, so the
+        // frame used to vanish — and the SoC, which had already sent it, went
+        // on waiting for an answer to nothing.
+        let (psc, link) = linked();
+        let request = frame(START, &[]);
+        assert_eq!(link.end(Side::A).write(&request), request.len());
+        let bytes = chunk_of(&psc);
+
+        let (back, fresh) = linked();
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load(
+                "psc",
+                CLASS.name,
+                CLASS.version,
+                &crate::core::state::Migrations::new(),
+            )
+            .unwrap();
+        back.load(&mut chunk.reader()).unwrap();
+        assert_eq!(
+            fresh.in_flight(Side::B),
+            request,
+            "the frame in flight was not restored"
+        );
+        assert_eq!(chunk_of(&back), bytes, "identical state bytes");
+
+        // The restored peer answers it, as the saved one was about to.
+        back.pump();
+        assert!(
+            !fresh.in_flight(Side::A).is_empty(),
+            "the restored peer never answered the frame"
+        );
+    }
+
+    #[test]
+    fn a_v2_chunk_loads_with_an_idle_line() {
+        use crate::core::state::{StateReader, StateWriter};
+
+        let (psc, link) = linked();
+        link.end(Side::A).write(b"lost");
+        let v3 = chunk_of(&psc);
+        let reader = StateReader::new(&v3).unwrap();
+        let (class, version, data) = reader.load_raw("psc").unwrap();
+        assert_eq!(version, 3, "this test knows how to undo v3");
+        // v2 is v3 without the in-flight sequence: its length and four bytes.
+        let mut w = StateWriter::new(reader.shape().clone());
+        w.raw_chunk("psc", class, 2, &data[..data.len() - 12])
+            .unwrap();
+        let v2 = w.to_vec().unwrap();
+
+        let (back, fresh) = linked();
+        let reader = StateReader::new(&v2).unwrap();
+        let chunk = reader
+            .load(
+                "psc",
+                CLASS.name,
+                CLASS.version,
+                &crate::machine::default_migrations().unwrap(),
+            )
+            .unwrap();
+        assert!(chunk.migrated(), "the chain ran");
+        back.load(&mut chunk.reader()).unwrap();
+        assert!(fresh.in_flight(Side::B).is_empty());
+        let want = psc.state.lock().clone();
+        assert_eq!(*back.state.lock(), want);
     }
 
     #[test]

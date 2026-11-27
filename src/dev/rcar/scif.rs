@@ -169,7 +169,7 @@ use crate::machine::realize::Instance;
 pub const CLASS_NAME: &str = "rcar.scif";
 
 /// The snapshot chunk version. Bump with the encoding, never on its own.
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 
 /// How much address space the register block answers.
 ///
@@ -436,6 +436,11 @@ struct Registers {
     /// The DMA request outputs: transmit and receive.
     dreq: Mutex<[Option<WireSource>; 2]>,
     port: Arc<dyn CharDevice>,
+    /// The same thing as `port`, when it is one end of a link to another
+    /// device on the board: kept because the bytes on their way to this end
+    /// are machine state, and this device's snapshot is what carries them
+    /// (`bus::uart`, "Snapshots").
+    link: Option<Arc<crate::bus::uart::LinkEnd>>,
     /// The name the port was opened under, for `Debug` and diagnostics.
     port_name: String,
     /// The functional clock, in hertz, or 0 if the board did not say.
@@ -485,8 +490,9 @@ impl Scif {
         if let Some(link) = link {
             let side = crate::bus::uart::Side::parse(side).unwrap_or(crate::bus::uart::Side::A);
             let end = crate::bus::uart::links::attach(props, &link)?.end(side);
-            return Ok(Scif::with_port(
-                end as Arc<dyn CharDevice>,
+            return Ok(Scif::build(
+                Arc::clone(&end) as Arc<dyn CharDevice>,
+                Some(end),
                 alloc::format!("link:{link}"),
                 variant,
                 clock_hz as u32,
@@ -510,6 +516,37 @@ impl Scif {
         variant: Variant,
         clock_hz: u32,
     ) -> Scif {
+        Scif::build(port, None, port_name, variant, clock_hz)
+    }
+
+    /// Build one on one end of a link to another device on the board.
+    ///
+    /// What the `link` property does. Unlike [`Scif::with_port`] the channel
+    /// knows its line is a link, so the bytes on their way to it travel in its
+    /// snapshot.
+    #[must_use]
+    pub fn with_link(
+        end: Arc<crate::bus::uart::LinkEnd>,
+        port_name: String,
+        variant: Variant,
+        clock_hz: u32,
+    ) -> Scif {
+        Scif::build(
+            Arc::clone(&end) as Arc<dyn CharDevice>,
+            Some(end),
+            port_name,
+            variant,
+            clock_hz,
+        )
+    }
+
+    fn build(
+        port: Arc<dyn CharDevice>,
+        link: Option<Arc<crate::bus::uart::LinkEnd>>,
+        port_name: String,
+        variant: Variant,
+        clock_hz: u32,
+    ) -> Scif {
         let regs = Arc::new(Registers {
             variant,
             dma: crate::core::sync::AtomicBool::new(false),
@@ -517,6 +554,7 @@ impl Scif {
             out: Mutex::with_rank(LockRank::LEAF, None),
             dreq: Mutex::with_rank(LockRank::LEAF, [None, None]),
             port,
+            link,
             port_name,
             clock_hz,
         });
@@ -993,6 +1031,15 @@ pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()>
         let body = r.take(r.remaining())?;
         out.extend_from_slice(body);
         out.write_bool(false)
+    })?;
+    // v3 -> v4 appends the bytes in flight toward this end of a `link`. A v3
+    // snapshot never carried them — that is the defect v4 fixes — so the
+    // honest upgrade is none: the line comes back idle, which is what v3
+    // always restored to.
+    migrations.register(CLASS_NAME, 3, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_bytes(&[])
     })
 }
 
@@ -1131,10 +1178,17 @@ impl Device for Scif {
         }
         w.write_bool(state.rx_armed)?;
         w.write_bool(state.rx_fresh)?;
-        w.write_bool(state.tx_draining)
-        // The port's queues are the host's state, not the machine's, and are
-        // deliberately absent (`ROADMAP.md` §4.5). The variant is a
+        w.write_bool(state.tx_draining)?;
+        drop(state);
+        // A host port's queues are the host's state, not the machine's, and
+        // are deliberately absent (`ROADMAP.md` §4.5). A *link* to another
+        // device on the board is the other case: the bytes that device has
+        // sent and this one has not yet taken are on the board's own wire,
+        // nobody else's chunk holds them, and a restore that dropped them
+        // would lose up to a link's worth of the conversation. An empty
+        // sequence on a host port, so the chunk is one shape. The variant is a
         // construction property and is the machine file's to restate.
+        crate::bus::uart::save_in_flight(self.regs.link.as_deref(), w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1174,6 +1228,7 @@ impl Device for Scif {
         state.rx_armed = r.read_bool()?;
         state.rx_fresh = r.read_bool()?;
         state.tx_draining = r.read_bool()?;
+        crate::bus::uart::load_in_flight(self.regs.link.as_deref(), r)?;
         *self.regs.state.lock() = state;
         self.regs.refresh();
         Ok(())
@@ -1573,16 +1628,19 @@ mod tests {
         write(&saved, SCSCR, 2, u32::from(SCR_TE | SCR_RE));
         port.feed(b"in");
         saved.pump();
-        let v3 = snapshot(&saved);
-        // v2 is v3 without the trailing `tx_draining` byte.
-        let reader = StateReader::new(&v3).unwrap();
+        let v4 = snapshot(&saved);
+        // v3 is v4 without the trailing in-flight bytes — an empty sequence
+        // here, so its eight-byte length and nothing else — and v2 is v3
+        // without the `tx_draining` byte before that.
+        let reader = StateReader::new(&v4).unwrap();
         let (class, version, data) = reader.load_raw("scif").unwrap();
         assert_eq!(
-            version, 3,
-            "this test knows how to undo v3 and nothing else"
+            version, 4,
+            "this test knows how to undo v4 and nothing else"
         );
+        assert_eq!(data[data.len() - 8..], [0u8; 8], "no bytes in flight");
         let mut w = StateWriter::new(reader.shape().clone());
-        w.raw_chunk("scif", class, 2, &data[..data.len() - 1])
+        w.raw_chunk("scif", class, 2, &data[..data.len() - 9])
             .unwrap();
         let v2 = w.to_vec().unwrap();
 
@@ -1605,6 +1663,91 @@ mod tests {
         restored.pump();
         assert_eq!(other.drain(), b"o".to_vec(), "and it transmits");
         assert_ne!(fsr(&restored) & FSR_TEND, 0);
+    }
+
+    /// A channel on end `a` of a link, and the link.
+    fn linked() -> (Scif, Arc<crate::bus::uart::UartLink>) {
+        let link = Arc::new(crate::bus::uart::UartLink::new());
+        let scif = Scif::with_link(
+            link.end(crate::bus::uart::Side::A),
+            "link:test".to_string(),
+            Variant::Scif,
+            66_666_666,
+        );
+        (scif, link)
+    }
+
+    #[test]
+    fn bytes_on_a_link_the_channel_has_not_taken_survive_a_snapshot() {
+        use crate::bus::uart::Side;
+
+        // The peer has sent a frame and the receiver is off, so nothing has
+        // pumped it into the FIFO: the bytes are on the board's own wire, in
+        // nobody's chunk but this one. A restored machine has a fresh link,
+        // and they used to be gone.
+        let (saved, link) = linked();
+        let peer = link.end(Side::B);
+        assert_eq!(peer.write(b"\x02frame\x03"), 7);
+        saved.pump();
+        assert_eq!(
+            link.in_flight(Side::A),
+            b"\x02frame\x03",
+            "still on the wire"
+        );
+        let bytes = snapshot(&saved);
+
+        let (restored, fresh) = linked();
+        assert!(fresh.in_flight(Side::A).is_empty());
+        let reader = StateReader::new(&bytes).unwrap();
+        let chunk = reader
+            .load("scif", CLASS.name, CLASS.version, &Migrations::new())
+            .unwrap();
+        restored.load(&mut chunk.reader()).unwrap();
+        assert_eq!(
+            fresh.in_flight(Side::A),
+            b"\x02frame\x03",
+            "the bytes in flight were not restored"
+        );
+        assert_eq!(snapshot(&restored), bytes, "identical state bytes");
+
+        // And the restored channel receives them once its receiver is on.
+        write(&restored, SCSCR, 2, u32::from(SCR_RE));
+        restored.pump();
+        assert_eq!(read(&restored, SCFRDR, 1), 0x02);
+        assert_eq!(read(&restored, SCFRDR, 1), u32::from(b'f'));
+    }
+
+    #[test]
+    fn a_v3_chunk_loads_with_an_idle_line() {
+        // v3 is v4 without the in-flight bytes. Upgrading adds none: a v3
+        // snapshot never had them, and inventing some would be worse.
+        let (saved, link) = linked();
+        link.end(crate::bus::uart::Side::B).write(b"lost");
+        let v4 = snapshot(&saved);
+        let reader = StateReader::new(&v4).unwrap();
+        let (class, version, data) = reader.load_raw("scif").unwrap();
+        assert_eq!(version, 4);
+        // The sequence is its eight-byte length and then the four bytes.
+        let mut w = StateWriter::new(reader.shape().clone());
+        w.raw_chunk("scif", class, 3, &data[..data.len() - 12])
+            .unwrap();
+        let v3 = w.to_vec().unwrap();
+
+        let (restored, fresh) = linked();
+        let reader = StateReader::new(&v3).unwrap();
+        let chunk = reader
+            .load(
+                "scif",
+                CLASS.name,
+                CLASS.version,
+                &crate::machine::default_migrations().unwrap(),
+            )
+            .unwrap();
+        assert!(chunk.migrated(), "the chain ran");
+        restored.load(&mut chunk.reader()).unwrap();
+        assert!(fresh.in_flight(crate::bus::uart::Side::A).is_empty());
+        let want = saved.regs.state.lock().clone();
+        assert_eq!(*restored.regs.state.lock(), want);
     }
 
     #[test]

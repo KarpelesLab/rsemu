@@ -109,6 +109,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::dev::ppu::migrations(&mut migrations)?;
     #[cfg(feature = "dev-rcar")]
     crate::dev::rcar::scif::migrations(&mut migrations)?;
+    #[cfg(feature = "dev-navi")]
+    crate::dev::navi::psc::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-arm-aprofile")]
     crate::cpu::arm::aprofile::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-x86")]
@@ -142,6 +144,8 @@ mod tests {
         crate::dev::stm32::octospi::CLASS_NAME,
         #[cfg(feature = "dev-rcar")]
         crate::dev::rcar::scif::CLASS_NAME,
+        #[cfg(feature = "dev-navi")]
+        crate::dev::navi::psc::CLASS_NAME,
         #[cfg(feature = "cpu-arm-aprofile")]
         "cpu.arm",
         #[cfg(feature = "cpu-x86")]
