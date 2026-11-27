@@ -1052,6 +1052,27 @@ impl Target for ScsiDisk {
             info: r.read_u32()?,
             valid: r.read_bool()?,
         };
+        // A snapshot is a file somebody can be handed, so what it says is
+        // checked before it is believed. In `DATA IN` the cursor indexes the
+        // buffer, and one past its end is a slice that panics on the next byte
+        // the initiator reads. (In `DATA OUT` the same field counts bytes still
+        // to discard and has no buffer to stay inside.)
+        if phase == Phase::DataIn && cursor > buffer.len() {
+            return Err(Error::State(format!(
+                "the snapshot's data-in cursor is {cursor} and its buffer holds {} byte(s)",
+                buffer.len()
+            )));
+        }
+        // The transfer still owed has to be on the drive: `lba * BLOCK` is the
+        // next medium offset and `left * BLOCK` the next buffer size, and
+        // neither is computed with a guard, because a command checks its range
+        // before it starts one.
+        if lba > self.blocks || left > self.blocks - lba {
+            return Err(Error::State(format!(
+                "the snapshot's transfer of {left} block(s) from {lba} is not on a drive of {}",
+                self.blocks
+            )));
+        }
         let mut state = self.state.lock();
         *state = State {
             phase,

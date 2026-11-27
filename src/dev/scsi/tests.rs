@@ -493,3 +493,82 @@ fn a_snapshot_from_a_different_address_is_refused() {
         .expect_err("address 0 is not address 5");
     assert!(alloc::format!("{e}").contains("address"), "{e}");
 }
+
+/// `bytes`, with the drive's chunk payload rewritten by `patch`.
+///
+/// The container is rebuilt around the patched payload rather than poked in
+/// place, so what reaches `load` is a well-formed snapshot that says something
+/// false — the case a file somebody was handed presents.
+fn doctored(bytes: &[u8], patch: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let reader = StateReader::new(bytes).unwrap();
+    let (class, version, data) = reader.load_raw("hd0").unwrap();
+    let mut data = data.to_vec();
+    patch(&mut data);
+    let mut shape = MachineShape::new();
+    shape.add_device("hd0", class).unwrap();
+    let mut w = StateWriter::new(shape);
+    w.raw_chunk("hd0", class, version, &data).unwrap();
+    w.to_vec().unwrap()
+}
+
+/// The fixed-length tail of the drive's chunk: cursor, LBA and blocks left
+/// (three `u64`s), then status, three sense bytes, the sense information and
+/// its valid flag.
+const TAIL: usize = 8 + 8 + 8 + 1 + 3 + 4 + 1;
+
+fn load_doctored(bytes: &[u8]) -> crate::core::error::Result<()> {
+    let restored = device(0);
+    let reader = StateReader::new(bytes).unwrap();
+    let chunk = reader
+        .load("hd0", CLASS_NAME, STATE_VERSION, &Migrations::new())
+        .unwrap();
+    crate::core::device::Device::load(&restored, &mut chunk.reader())?;
+    // Had it loaded, this is the access the bad state was going to break.
+    let back = restored.drive().expect("a drive");
+    let t: &dyn Target = back.as_ref();
+    let mut data = [0u8; 16];
+    t.read(&mut data);
+    t.write(&[0u8; 16]);
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_whose_data_in_cursor_is_past_its_buffer_is_refused() {
+    // Stopped inside the data phase of a one-block READ(10), 100 bytes in.
+    let saved = device(0);
+    {
+        let target = saved.drive().expect("a drive");
+        let t: &dyn Target = target.as_ref();
+        assert!(t.select(true));
+        t.write(&[message::IDENTIFY]);
+        assert_eq!(t.write(&[0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0]), 10);
+        assert_eq!(t.phase(), Phase::DataIn);
+        let mut head = [0u8; 100];
+        assert_eq!(t.read(&mut head), 100);
+    }
+    let good = snapshot(&saved);
+    load_doctored(&good).expect("the honest snapshot loads");
+
+    // The same snapshot, saying the cursor is one past the 512 bytes it holds.
+    // Believed, the next byte the initiator reads slices `buffer[513..513]`.
+    let bad = doctored(&good, |data| {
+        let at = data.len() - TAIL;
+        data[at..at + 8].copy_from_slice(&513u64.to_le_bytes());
+    });
+    let e = load_doctored(&bad).expect_err("a cursor outside the buffer");
+    assert!(alloc::format!("{e}").contains("cursor"), "{e}");
+
+    // And one whose remaining transfer is nowhere on a sixteen-block drive:
+    // `lba * 512` is the next medium offset, and it overflows.
+    let bad = doctored(&good, |data| {
+        let at = data.len() - TAIL + 8;
+        data[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    });
+    let e = load_doctored(&bad).expect_err("a transfer off the drive");
+    assert!(alloc::format!("{e}").contains("transfer"), "{e}");
+    let bad = doctored(&good, |data| {
+        let at = data.len() - TAIL + 16;
+        data[at..at + 8].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+    });
+    load_doctored(&bad).expect_err("more blocks left than the drive has");
+}
