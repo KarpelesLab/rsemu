@@ -2046,3 +2046,33 @@ fn a_gated_slave_face_answers_nothing() {
     );
     assert!(!ctrl.stretching(), "nor hold SCL down waiting for software");
 }
+
+#[test]
+fn a_dropped_controller_is_freed_with_its_slave_face() {
+    // The slave face is attached to the bit engine the controller owns, and
+    // to the bus. When it owned the controller's state in return, that was a
+    // cycle nothing reached from outside: the device's own `Arc` died with
+    // the machine and everything behind it — the engine, the bus, and every
+    // part on that bus — stayed for the life of the process.
+    for link in [Link::Wired, Link::Transactional] {
+        let bus = Arc::new(I2cBus::new());
+        let ctrl = Stm32I2cV2::with_bus(link, Some(Arc::clone(&bus))).expect("a controller");
+        let shared = Arc::downgrade(&ctrl.shared);
+        let wires = Arc::downgrade(ctrl.wires());
+        drop(ctrl);
+        assert_eq!(
+            shared.strong_count(),
+            0,
+            "{link:?}: the controller's state outlived the controller"
+        );
+        assert_eq!(wires.strong_count(), 0, "{link:?}: and so did its engine");
+        // The bus is the caller's and lives on with the face still on it. A
+        // face whose peripheral is gone is a part that is not there.
+        assert!(
+            !bus.start(Address::Seven(0x42), Direction::Write).is_ack(),
+            "{link:?}: a face with no peripheral behind it answered"
+        );
+        bus.stop();
+        assert_eq!(bus.peek(), 0xff);
+    }
+}

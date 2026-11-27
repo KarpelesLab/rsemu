@@ -133,7 +133,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::fmt;
 
 use crate::bus::i2c::wires::{
@@ -949,7 +949,7 @@ impl Stm32I2cV2 {
         // engine's target half. Building it once is what makes a wired slave
         // behave identically to a transactional one (§39.4.9).
         let face = Arc::new(SlaveFace {
-            shared: Arc::clone(&shared),
+            shared: Arc::downgrade(&shared),
         }) as Arc<dyn I2cSlave>;
         shared.wires.attach_slave(Arc::clone(&face));
         if let Some(bus) = bus.as_ref() {
@@ -1656,8 +1656,27 @@ impl Gated for Shared {
 /// and releases it before doing anything outward, which is the re-entrancy
 /// contract read literally — the outward part here is only re-driving the
 /// interrupt lines.
+///
+/// It holds the peripheral **weakly**. The face is owned by the bit engine
+/// inside [`Shared`] and by the bus, so a strong reference back would be a
+/// cycle that no drop of the device could reach — the state, the engine, the
+/// bus and every part on that bus would outlive the machine. The bus may also
+/// outlive the controller legitimately (an embedder owns it), and what it
+/// then holds is a face with no peripheral behind it, which answers exactly
+/// as an unclocked one does: nothing.
 struct SlaveFace {
-    shared: Arc<Shared>,
+    shared: Weak<Shared>,
+}
+
+impl SlaveFace {
+    /// The peripheral, if it still exists and its clock is running.
+    ///
+    /// `None` is "nobody home", and every method answers it the same way: no
+    /// clock, no slave — an unclocked peripheral cannot compare an address,
+    /// let alone pull SDA down for the acknowledge.
+    fn live(&self) -> Option<Arc<Shared>> {
+        self.shared.upgrade().filter(|shared| shared.gate.live())
+    }
 }
 
 impl fmt::Debug for SlaveFace {
@@ -1668,13 +1687,13 @@ impl fmt::Debug for SlaveFace {
 
 impl I2cSlave for SlaveFace {
     fn address(&self, address: Address, dir: Direction) -> Ack {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             // No clock, no slave: an unclocked peripheral cannot compare an
             // address, let alone pull SDA down for the acknowledge.
             return Ack::Nack;
-        }
+        };
         let answer = {
-            let mut state = self.shared.state.lock();
+            let mut state = shared.state.lock();
             // A part cannot address itself: while this controller is the master
             // its own slave face is deaf.
             if !state.enabled() || state.stage != Stage::Idle {
@@ -1715,15 +1734,15 @@ impl I2cSlave for SlaveFace {
                 }
             }
         };
-        self.shared.update_outputs();
+        shared.update_outputs();
         answer
     }
 
     fn ten_bit_header(&self, high: u8) -> bool {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             return false;
-        }
-        let state = self.shared.state.lock();
+        };
+        let state = shared.state.lock();
         state.enabled()
             && state.stage == Stage::Idle
             && state.oar1 & (OAR1_OA1EN | OAR1_OA1MODE) == (OAR1_OA1EN | OAR1_OA1MODE)
@@ -1731,11 +1750,11 @@ impl I2cSlave for SlaveFace {
     }
 
     fn write(&self, byte: u8) -> Ack {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             return Ack::Nack;
-        }
+        };
         let answer = {
-            let mut state = self.shared.state.lock();
+            let mut state = shared.state.lock();
             if !state.slave_active {
                 return Ack::Nack;
             }
@@ -1758,17 +1777,17 @@ impl I2cSlave for SlaveFace {
                 }
             }
         };
-        self.shared.update_outputs();
+        shared.update_outputs();
         answer
     }
 
     fn read(&self) -> u8 {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             // An undriven SDA reads as the pull-up, and a gated shift register
             // drives nothing.
             return 0xff;
-        }
-        let mut state = self.shared.state.lock();
+        };
+        let mut state = shared.state.lock();
         if state.any(ISR_TXE) {
             // Nothing loaded. §39.4.9: an underrun under `NOSTRETCH` sends
             // `0xFF` — an undriven, pulled-up SDA — and sets `OVR`.
@@ -1779,11 +1798,11 @@ impl I2cSlave for SlaveFace {
     }
 
     fn read_ack(&self, ack: Ack) {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             return;
-        }
+        };
         {
-            let mut state = self.shared.state.lock();
+            let mut state = shared.state.lock();
             state.set(ISR_TXE);
             state.clear(ISR_TXIS);
             if ack.is_ack() {
@@ -1791,16 +1810,16 @@ impl I2cSlave for SlaveFace {
                 state.set(ISR_TXIS);
             }
         }
-        self.shared.update_outputs();
+        shared.update_outputs();
     }
 
     fn stop(&self) {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             // There is no clock to latch `STOPF` with.
             return;
-        }
+        };
         {
-            let mut state = self.shared.state.lock();
+            let mut state = shared.state.lock();
             if !state.slave_active {
                 return;
             }
@@ -1808,25 +1827,25 @@ impl I2cSlave for SlaveFace {
             state.set(ISR_STOPF | ISR_TXE);
             state.clear(ISR_TXIS | ISR_DIR);
         }
-        self.shared.update_outputs();
+        shared.update_outputs();
     }
 
     fn stretching(&self) -> bool {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             // Whatever the flags say, a block with no clock is not the thing
             // holding SCL down — and if it were, nothing would ever release
             // it, because software cannot reach the registers to be served.
             return false;
-        }
-        let state = self.shared.state.lock();
+        };
+        let state = shared.state.lock();
         state.slave_active && state.stretching()
     }
 
     fn peek(&self) -> u8 {
-        if !self.shared.gate.live() {
+        let Some(shared) = self.live() else {
             return 0xff;
-        }
-        let state = self.shared.state.lock();
+        };
+        let state = shared.state.lock();
         if state.any(ISR_TXE) { 0xff } else { state.txdr }
     }
 }
