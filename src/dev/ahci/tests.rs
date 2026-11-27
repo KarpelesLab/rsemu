@@ -72,6 +72,12 @@ fn rig() -> Rig {
 /// `occupied` false leaves the bay empty, which is the case a board-level test
 /// cannot produce without a second machine file.
 fn rig_with(occupied: bool) -> Rig {
+    rig_in(occupied, 32)
+}
+
+/// And in an address space `width` bits wide, for a test that needs a data
+/// block only a 64-bit space can name.
+fn rig_in(occupied: bool, width: u32) -> Rig {
     let store = Arc::new(RamStore::new(SECTORS * SECTOR));
     for lba in 0..SECTORS {
         RamStore::write_at(&store, lba * SECTOR, &stamp(lba)).expect("the image fits");
@@ -88,7 +94,7 @@ fn rig_with(occupied: bool) -> Rig {
     }
     let hba = Arc::new(Hba::new(alloc::vec![(String::from("sata0"), bay)]));
 
-    let space = Arc::new(AddressSpace::new("mem", 32).with_unassigned(UnassignedPolicy::ONES));
+    let space = Arc::new(AddressSpace::new("mem", width).with_unassigned(UnassignedPolicy::ONES));
     {
         let mut topo = space.topology();
         topo.map(
@@ -375,6 +381,24 @@ fn a_command_list_base_that_is_not_mapped_stops_the_port() {
     );
     assert_eq!(rig.reg(P_CMD) & (1 << 15), 0, "PxCMD.CR cleared");
     assert_eq!(rig.reg(P_CI), 1, "and the slot is still outstanding");
+}
+
+#[test]
+fn a_data_block_that_ends_at_the_top_of_the_address_space_wraps_rather_than_overflowing() {
+    // `DBA`/`DBAU` are 64 bits the driver wrote (§4.2.3.3). A region that
+    // runs up to the last byte of the address space leaves the cursor at
+    // 2^64 once its last piece has moved, which is the guest's arithmetic
+    // wrapping and must not be the host's overflowing.
+    let rig = rig_in(true, 64);
+    rig.start();
+    let top = 0u64.wrapping_sub(2 * SECTOR);
+    rig.issue(
+        &Rig::fis(0x25, 2, 10, 0x40),
+        false,
+        &[prd(top, 2 * SECTOR, false)],
+    );
+    assert_eq!(rig.prdbc(), 2 * SECTOR as u32, "both sectors moved");
+    assert_eq!(rig.reg(P_CI), 0, "and the command completed");
 }
 
 #[test]

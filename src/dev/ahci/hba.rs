@@ -1358,7 +1358,10 @@ impl Prdt {
             if self.next >= self.len {
                 return None;
             }
-            let at = self.base + u64::from(self.next) * PRD_LEN;
+            // Wrapping, as every address derived from a guest pointer here
+            // is: the table's base is `CTBA` plus an offset, and `CTBA` is 64
+            // bits the driver wrote.
+            let at = self.base.wrapping_add(u64::from(self.next) * PRD_LEN);
             let mut raw = [0u8; PRD_LEN as usize];
             if space.read_bytes(at, &mut raw, hba.attrs()).is_err() {
                 return None;
@@ -1378,7 +1381,10 @@ impl Prdt {
 
     /// Advance past `n` bytes just moved.
     fn advance(&mut self, n: usize) {
-        self.addr += n as u64;
+        // Wrapping: a region may run up to the last byte of the address
+        // space, which leaves this cursor at 2^64 — the guest's arithmetic,
+        // not an overflow of the host's.
+        self.addr = self.addr.wrapping_add(n as u64);
         self.left -= n as u64;
         if self.left == 0 && self.interrupt {
             self.fired = true;
@@ -1694,7 +1700,7 @@ impl Hba {
                 }
             }
         }
-        let mut prdt = Prdt::new(header.ctba + PRDT_OFFSET, header.prdtl);
+        let mut prdt = Prdt::new(header.ctba.wrapping_add(PRDT_OFFSET), header.prdtl);
         let mut scratch = [0u8; CHUNK];
         let mut moved: u64 = 0;
         let mut blocks: u64 = 0;
