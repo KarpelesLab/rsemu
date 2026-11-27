@@ -54,8 +54,12 @@ pub struct CatalogEntry {
     pub name: &'static str,
     /// One line for `rsemu machines`.
     pub summary: &'static str,
-    /// Media slots the machine will not realize without, as
-    /// `rsemu run … --<slot> <file>` spells them.
+    /// The media slots the machine's description names, by slot name.
+    ///
+    /// `rsemu run … --media <slot>=<file>` binds any of them, and the common
+    /// ones have a flag of their own (`--cart`, `--bios`, `--hd0`). Not every
+    /// one is required: a host may bind an empty image to a drive bay or an
+    /// option-ROM socket, and the CLI does so when the slot is left unnamed.
     pub media: &'static [&'static str],
     /// The description text itself.
     pub source: &'static str,

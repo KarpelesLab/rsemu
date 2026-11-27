@@ -43,6 +43,69 @@ fn scratch(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rsemu-usage-{}-{name}", std::process::id()))
 }
 
+/// Every flag `rsemu machines` prints is one `rsemu run` accepts.
+///
+/// The listing printed `--<slot> <file>` for every media slot in the catalog,
+/// and only fifteen slots have such a flag: `--kernel`, `--firmware`,
+/// `--kickstart`, `--macrom`, `--nvme0` and the rest were advertised and then
+/// refused as unknown options. Each advertised flag is handed to `run` here,
+/// with a machine that does not exist so nothing is built, and must get past
+/// the argument parser.
+#[test]
+fn machines_advertises_only_flags_that_run_takes() {
+    let (code, stdout, stderr) = run(&["machines"]);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let mut flags: Vec<String> = Vec::new();
+    let mut media_lines = 0;
+    for line in stdout.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("media ") else {
+            continue;
+        };
+        if !line.starts_with(' ') {
+            continue;
+        }
+        media_lines += 1;
+        for spelling in rest.split(", ") {
+            let flag = spelling.split(' ').next().unwrap_or_default().to_string();
+            assert!(
+                flag.starts_with("--"),
+                "not a flag: {spelling:?} in {line:?}"
+            );
+            if flag == "--media" {
+                assert!(
+                    spelling.ends_with("=<file>"),
+                    "`--media` takes <slot>=<file>: {spelling:?}"
+                );
+            } else {
+                assert!(
+                    spelling.ends_with(" <file>"),
+                    "a slot's own flag takes a file: {spelling:?}"
+                );
+            }
+            if !flags.contains(&flag) {
+                flags.push(flag);
+            }
+        }
+    }
+    if media_lines == 0 {
+        // A build with no machine that takes media has nothing to advertise.
+        return;
+    }
+    for flag in &flags {
+        let value = if flag == "--media" {
+            "slot=/nonexistent"
+        } else {
+            "/nonexistent"
+        };
+        let (_, _, stderr) = run(&["run", "no-such-machine", flag, value]);
+        assert!(
+            !stderr.contains("unknown option"),
+            "`rsemu machines` advertises {flag}, and `rsemu run` answers: {stderr}"
+        );
+    }
+}
+
 /// A class this build lacks is reported at the line that names it.
 ///
 /// It was the one front-end mistake with no location: `registry: unknown

@@ -272,6 +272,26 @@ OPTIONS:
     -V, --version       Print version and build configuration
 ";
 
+/// The media slots that have a flag of their own: `--cart <file>` is
+/// `--media cart=<file>`, and exists because nobody types the long form.
+///
+/// One list, read by the argument parser *and* by `rsemu machines`, so the
+/// listing cannot advertise a flag the parser does not take. Every other slot
+/// is reached with `--media <slot>=<file>`.
+const MEDIA_FLAGS: &[&str] = &[
+    "cart", "rom", "disk", "bios", "vgabios", "floppy", "floppy2", "flash0", "flash1", "initrd",
+    "hd0", "hd1", "scsi0", "cd0", "cdrom",
+];
+
+/// How `rsemu run` spells binding `slot` to a file.
+fn media_flag(slot: &str) -> String {
+    if MEDIA_FLAGS.contains(&slot) {
+        format!("--{slot} <file>")
+    } else {
+        format!("--media {slot}=<file>")
+    }
+}
+
 fn main() -> ExitCode {
     // Hand-rolled argument parsing: the dependency policy has no room for a
     // CLI crate, and the surface is small enough that it does not need one.
@@ -331,11 +351,10 @@ fn machines() -> ExitCode {
     for entry in machines {
         println!("{:<13} {}", entry.name, entry.summary);
         if !entry.media.is_empty() {
-            let slots: Vec<String> = entry
-                .media
-                .iter()
-                .map(|s| format!("--{s} <file>"))
-                .collect();
+            // Spelled the way `run` takes them, which is not `--<slot>` for
+            // every slot: `--kernel`, `--firmware` and `--kickstart` were
+            // printed here for years and are not options.
+            let slots: Vec<String> = entry.media.iter().map(|s| media_flag(s)).collect();
             // "media", not "needs": a slot with no default is an error naming
             // itself when the machine is built, and `apple1` binds its own
             // monitor ROM when nothing else does.
@@ -3076,9 +3095,10 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             // list is easier to extend than a match with a line each. They
             // exist at all because `--media bios=…` is correct and nobody
             // types it.
-            "--cart" | "--rom" | "--disk" | "--bios" | "--vgabios" | "--floppy" | "--floppy2"
-            | "--flash0" | "--flash1" | "--initrd" | "--hd0" | "--hd1" | "--scsi0" | "--cd0"
-            | "--cdrom" => {
+            flag if flag
+                .strip_prefix("--")
+                .is_some_and(|slot| MEDIA_FLAGS.contains(&slot)) =>
+            {
                 let slot = arg.trim_start_matches('-').to_string();
                 let path = value(arg)?;
                 out.media.push((slot, path));
