@@ -441,22 +441,49 @@ fn a_subnormal_result_rounds_on_the_subnormal_grid() {
 
 #[test]
 fn tininess_detection_separates_exactly_one_case() {
-    // (1 - 2^-53) * 2^-1022 is exactly halfway between the largest subnormal
-    // and the smallest normal, and ties-to-even rounds it *up* to the smallest
-    // normal. The exact value is tiny; the rounded one is not. That is the
-    // whole difference between IEEE 754-2019 §7.5's two detection methods, and
-    // it is the only case where they disagree.
-    let a = d(1.0) - 1; // 1 - 2^-53
-    let (v, f) = mul::<B64>(a, MIN_NORM64, Env::RISCV);
+    // IEEE 754-2019 §7.5's two detection methods disagree for exactly one
+    // class of result: one that is below the smallest normal, and that rounds
+    // up to it **at the format's full precision** — "as though the exponent
+    // range were unbounded". 2^-1022 - 2^-1100 is such a value: 53 bits cannot
+    // hold it, and the nearest 53-bit number is 2^-1022 itself.
+    let tiny = (1023 - 550) << 52; // 2^-550
+    let (v, f) = fma::<B64>(tiny, tiny | B64::SIGN, MIN_NORM64, Env::RISCV);
     assert_eq!(v, MIN_NORM64);
     assert_eq!(f, Flags::INEXACT, "RISC-V detects tininess after rounding");
-    let (v, f) = mul::<B64>(a, MIN_NORM64, Env::ARM);
+    let (v, f) = fma::<B64>(tiny, tiny | B64::SIGN, MIN_NORM64, Env::ARM);
     assert_eq!(v, MIN_NORM64);
     assert_eq!(
         f,
         Flags::INEXACT | Flags::UNDERFLOW,
         "ARM detects tininess before rounding"
     );
+    // (1 - 2^-53) * 2^-1022 is **not** that case, though it too is delivered
+    // as the smallest normal. With an unbounded exponent it needs no rounding
+    // at all — it is the 53-bit number 0x1.fffffffffffffp-1023 — so it is tiny
+    // after rounding as well as before, and what turns it into 2^-1022 is the
+    // subnormal grid's missing bit. That is a denormalisation loss, and it is
+    // an underflow on every guest. An x86 host agrees: `MULSD` of these two
+    // operands sets `MXCSR.UE` and `.PE` (measured on a Zen 5; `tests_host.rs`
+    // checks the whole neighbourhood against the host's arithmetic).
+    let a = d(1.0) - 1; // 1 - 2^-53
+    for env in [Env::RISCV, Env::X86_SSE, Env::ARM] {
+        let (v, f) = mul::<B64>(a, MIN_NORM64, env);
+        assert_eq!(v, MIN_NORM64);
+        assert_eq!(f, Flags::INEXACT | Flags::UNDERFLOW, "{env:?}");
+    }
+    // The same pair under `MXCSR.FTZ`: tiny, so flushed, not delivered as the
+    // smallest normal (measured likewise: zero, `UE` and `PE`).
+    let (v, f) = mul::<B64>(a, MIN_NORM64, Env::X86_SSE.ftz(true));
+    assert_eq!((v, f), (0, Flags::INEXACT | Flags::UNDERFLOW));
+    // And in the 80-bit format, where the grid is the register's own.
+    let (v, f) = x87::mul(
+        F80::new(0x3ffe, u64::MAX),
+        F80::new(1, 1 << 63),
+        Precision::Extended,
+        Env::X87,
+    );
+    assert_eq!(v, F80::new(1, 1 << 63));
+    assert_eq!(f, Flags::INEXACT | Flags::UNDERFLOW);
     // A result that is tiny either way is an underflow under both.
     let (_, f) = mul::<B64>(MIN_SUB64, d(0.75), Env::RISCV);
     assert!(f.contains(Flags::UNDERFLOW));

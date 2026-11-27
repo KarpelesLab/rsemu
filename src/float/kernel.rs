@@ -274,6 +274,20 @@ pub(super) fn nan_result(ops: &[Parts], env: Env) -> Option<(Outcome, Flags)> {
     Some((out, flags))
 }
 
+/// Whether a significand rounds up, given the [`EXTRA`] bits below its last
+/// kept place and whether that place is odd (IEEE 754-2019 §4.3).
+#[inline]
+fn rounds_up(round: Round, sign: bool, rem: u128, odd: bool) -> bool {
+    let half = 1u128 << (EXTRA - 1);
+    match round {
+        Round::TiesEven => rem > half || (rem == half && odd),
+        Round::TiesAway => rem >= half,
+        Round::TowardZero => false,
+        Round::TowardNegative => rem != 0 && sign,
+        Round::TowardPositive => rem != 0 && !sign,
+    }
+}
+
 /// Round an exact value to a format and report the exceptions.
 ///
 /// `value = (-1)^sign * sig * 2^exp`, with everything already lost folded into
@@ -306,6 +320,20 @@ pub(super) fn round_exact(
     // The unrounded value is in [2^lead, 2^(lead+1)).
     let lead = exp + target as i32;
     let tiny_before = lead < spec.emin();
+    // §7.5 a): tiny after rounding is "when a non-zero result computed as
+    // though the exponent range were unbounded would lie strictly between
+    // ±b^emin". So the rounding that decides it is the one to `p` digits, done
+    // *here* while `sig` still has all of them — not the one on the subnormal
+    // grid below, which keeps one digit fewer just under 2^emin and therefore
+    // rounds twice as wide a band up to it. Only a significand of all ones
+    // that carries out can reach 2^emin, and only from the binade beneath it.
+    let tiny_after = tiny_before
+        && (lead < spec.emin() - 1 || {
+            let keep = sig >> EXTRA;
+            let carries = keep == (1u128 << p) - 1
+                && rounds_up(env.round, sign, sig & ((1 << EXTRA) - 1), true);
+            !carries
+        });
 
     // Below the smallest normal the result lives on the format's fixed
     // subnormal grid: precision is lost here rather than pretended away, and
@@ -317,18 +345,10 @@ pub(super) fn round_exact(
     }
 
     let rem = sig & ((1 << EXTRA) - 1);
-    let half = 1u128 << (EXTRA - 1);
     let mut keep = sig >> EXTRA;
     let inexact = rem != 0;
-    let up = match env.round {
-        Round::TiesEven => rem > half || (rem == half && keep & 1 != 0),
-        Round::TiesAway => rem >= half,
-        Round::TowardZero => false,
-        Round::TowardNegative => inexact && sign,
-        Round::TowardPositive => inexact && !sign,
-    };
     let mut ulp = exp + EXTRA as i32;
-    if up {
+    if rounds_up(env.round, sign, rem, keep & 1 != 0) {
         keep += 1;
         if keep >> p != 0 {
             // Carried out of the precision. The bit dropped here is zero —
@@ -369,7 +389,7 @@ pub(super) fn round_exact(
     }
 
     let tiny = match env.tininess {
-        Tininess::AfterRounding => lead_final < spec.emin(),
+        Tininess::AfterRounding => tiny_after,
         Tininess::BeforeRounding => tiny_before,
     };
     if tiny && env.flush_outputs {
@@ -809,17 +829,9 @@ pub(super) fn to_integer(p: Parts, env: Env) -> IntValue {
                 shr_sticky(u128::from(p.frac), (-shift) as u32)
             };
             let rem = scaled & ((1 << EXTRA) - 1);
-            let half = 1u128 << (EXTRA - 1);
             let mut magnitude = scaled >> EXTRA;
             let inexact = rem != 0;
-            let up = match env.round {
-                Round::TiesEven => rem > half || (rem == half && magnitude & 1 != 0),
-                Round::TiesAway => rem >= half,
-                Round::TowardZero => false,
-                Round::TowardNegative => inexact && p.sign,
-                Round::TowardPositive => inexact && !p.sign,
-            };
-            if up {
+            if rounds_up(env.round, p.sign, rem, magnitude & 1 != 0) {
                 magnitude += 1;
             }
             IntValue::Value {

@@ -81,6 +81,8 @@ pub mod x87;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_host;
 
 pub use binary::{
     B16, B32, B64, Category, Format, add, classify, compare, convert, div, eq, fma, from_signed,
