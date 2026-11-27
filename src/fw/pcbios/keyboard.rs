@@ -49,8 +49,15 @@ fn put(table: &mut [u8; KEY_TABLE_LEN], at: usize, text: &[u8]) {
     table[at..at + text.len()].copy_from_slice(text);
 }
 
+/// The set 1 make codes of F1 and F10, which bound the ten function keys of
+/// the base keyboard: RBIL's table 00006, "Values for keyboard make/break
+/// (scan) code", lists "3Bh F1" through "44h F10" in order.
+const F1_MAKE: u8 = 0x3b;
+const F10_MAKE: u8 = 0x44;
+
 /// Set 1 make code to ASCII, unshifted, US layout. Zero means the key produces
-/// no character and is reported by its scan code alone.
+/// no character; `INT 09h` reports F1 to F10 by their scan code alone and
+/// drops the rest.
 fn plain_table() -> [u8; KEY_TABLE_LEN] {
     let mut t = [0u8; KEY_TABLE_LEN];
     t[0x01] = 0x1b; // escape
@@ -192,8 +199,27 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.bind(no_shift);
     a.alu(Alu::ADD, SI, AX);
     a.mov8(AL, Mem::si(0).seg(CS));
+    let character = a.label();
     a.alui8(Alu::CMP, AL, 0);
-    a.jcc(Cc::E, eoi);
+    a.jcc(Cc::NE, character);
+    // No character. F1 to F10 are still keystrokes, and are reported by
+    // their scan code with a zero beside it; everything else with no
+    // character — the three locks, SysRq — is a state or nothing.
+    //
+    // Only unshifted: "The BIOS scan code [...] is the same for ASCII
+    // keystrokes and most unshifted special keys (F-keys, arrow keys, etc.),
+    // but differs for shifted special keys" (RBIL, `INT 16h AH=00h`), and
+    // the shifted codes are a table this firmware does not have. A shifted
+    // function key therefore still produces nothing, which is better than
+    // producing the unshifted key.
+    a.alui8(Alu::CMP, BH, F1_MAKE);
+    a.jcc(Cc::B, eoi);
+    a.alui8(Alu::CMP, BH, F10_MAKE);
+    a.jcc(Cc::A, eoi);
+    a.testi8(DL, 0x0f);
+    a.jcc(Cc::NE, eoi);
+    a.jmp(no_ctrl);
+    a.bind(character);
     a.testi8(DL, 0x04);
     a.jcc(Cc::E, no_ctrl);
     // Control folds a letter onto its control code, which is the whole of what

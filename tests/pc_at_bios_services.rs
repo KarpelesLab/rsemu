@@ -549,3 +549,35 @@ fn an_extended_key_does_not_type_the_keypad_digit_it_shares_a_code_with() {
     type_codes(&mut m, &hosts, &[0xe0, 0x5a, 0xe0, 0xf0, 0x5a]);
     assert_eq!(typed(&m), [0x1e61, 0x3042, 0x2e63, 0x1c0d]);
 }
+
+/// A function key reaches the type-ahead ring as its scan code and no
+/// character.
+///
+/// RBIL, `INT 16h AH=00h`: "The BIOS scan code is usually, but not always, the
+/// same as the hardware scan code processed by INT 09. It is the same for
+/// ASCII keystrokes and most unshifted special keys (F-keys, arrow keys,
+/// etc.), but differs for shifted special keys." The firmware's own key table
+/// says the same of its zero entries — "the key produces no character and is
+/// reported by its scan code alone" — and `INT 09h` dropped every one of them,
+/// so F1 to F10 did nothing at all: no F8 to step through a `CONFIG.SYS`, no
+/// F3 to recall a command line.
+#[test]
+fn an_unshifted_function_key_is_reported_by_its_scan_code() {
+    let (mut m, hosts) = run("function keys", |_| {});
+
+    // Set 2: F1 is 05h and F10 is 09h; set 1 makes them 3Bh and 44h.
+    type_codes(&mut m, &hosts, &[0x05, 0xf0, 0x05]);
+    type_codes(&mut m, &hosts, &[0x09, 0xf0, 0x09]);
+    assert_eq!(typed(&m), [0x3b00, 0x4400]);
+
+    // Caps lock (set 2 58h, set 1 3Ah) has no character either, and is a
+    // state rather than a keystroke: it must not be queued.
+    type_codes(&mut m, &hosts, &[0x58, 0xf0, 0x58]);
+    assert_eq!(typed(&m), [0x3b00, 0x4400], "caps lock was queued as a key");
+
+    // A *shifted* function key has a different BIOS scan code, which this
+    // firmware has no table for; it stays unreported rather than being
+    // reported as the unshifted key.
+    type_codes(&mut m, &hosts, &[0x12, 0x05, 0xf0, 0x05, 0xf0, 0x12]);
+    assert_eq!(typed(&m), [0x3b00, 0x4400]);
+}
