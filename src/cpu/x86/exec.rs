@@ -95,7 +95,7 @@ use alloc::vec::Vec;
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitReason};
 use crate::core::sched::TickCursor;
-use crate::core::space::{AddressSpace, DirectSpan, MemAttrs, Perms};
+use crate::core::space::{AddressSpace, DirectSpan, MemAttrs, Perms, ReadCache};
 use crate::core::value::Width;
 
 use super::fpu::{Sse, X87};
@@ -372,6 +372,11 @@ pub(super) struct State {
     /// Where the instruction stream was last fetched from. Derived state:
     /// never serialized.
     pub fetch: FetchWindow,
+    /// The pages of plain memory this core has read lately, resolved to their
+    /// stores: every operand load and every page-table entry of a walk comes
+    /// through [`Exec::bus_read`], and most of them land in a handful of
+    /// pages. Derived state: never serialized, and a clone of it is empty.
+    pub reads: ReadCache,
     /// The last value driven on the data bus.
     ///
     /// An 8086 has no bus-error input: an access nothing answers leaves the
@@ -517,6 +522,7 @@ impl State {
     /// the old one did, and would then be read through the old one's stores.
     pub(super) fn forget_memory(&mut self) {
         self.fetch = FetchWindow::new();
+        self.reads.clear();
     }
 
     /// The time-stamp counter as the guest reads it (`RDTSC`, `RDMSR`
@@ -588,6 +594,7 @@ impl State {
             int_shadow: false,
             queue: Queue::new(variant),
             fetch: FetchWindow::new(),
+            reads: ReadCache::new(),
             open_bus: 0,
             faults: 0,
             last_fault: 0,
@@ -1359,7 +1366,7 @@ impl<'a> Exec<'a> {
     fn bus_read(&mut self, addr: u64, size: u8) -> u64 {
         let width = Self::width_of(size);
         let addr = self.masked(addr);
-        match self.mem.read(addr, width, self.attrs) {
+        match self.state.reads.read(self.mem, addr, width, self.attrs) {
             Ok(value) => {
                 self.state.open_bus = (value >> ((size as u32 - 1) * 8)) as u8;
                 value
