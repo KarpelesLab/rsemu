@@ -68,6 +68,16 @@
 //! pending and the fall-through arrives having replayed the range the branch
 //! skipped.
 //!
+//! **A slot read is the one of those that can stop being one.** Against a
+//! host that keeps its guest state in an array and says so
+//! ([`FastMem::slot_plan`](crate::jit::FastMem::slot_plan)), a block is
+//! compiled under [`Slots::InPlace`] and a read that cannot publish is two
+//! `mov`s out of that array: no call, so nothing for the host to observe, so
+//! no flush ahead of it and no region ended at it. `reads_in_place` is the
+//! condition and the argument. Measured on the two Linux boots in
+//! `benches/`, the read thunk was 4.7% and 5.2% of all host instructions and
+//! is gone from both profiles; the whole runs fell 5.6% and 5.8%.
+//!
 //! Nothing is reordered, and nothing is batched for a host that has not asked
 //! for it (`rt`'s module docs say which hosts have, and what they promised):
 //! the replay makes the same
@@ -399,9 +409,19 @@ pub struct Compiled {
     /// standing in, so it must start here instead. See
     /// [`Compiler::epilogue`]'s chain pad.
     chain: u64,
+    /// Whether any slot read in this code is made in place.
+    in_place: bool,
 }
 
 impl Compiled {
+    /// Whether this code reads a guest state slot out of the host's own
+    /// array, and so may only be run against a host that published one.
+    #[inline]
+    #[must_use]
+    pub fn reads_slots_in_place(&self) -> bool {
+        self.in_place
+    }
+
     /// The machine code.
     #[inline]
     #[must_use]
@@ -500,6 +520,28 @@ pub enum Regs {
     Scan,
 }
 
+/// How a compiled block reads a guest state slot.
+///
+/// A property of the **host** a block will run against, decided before the
+/// block is compiled, because it changes what the block *is*: a slot read
+/// that is a call is a place the host can observe, so the bookkeeping pending
+/// ahead of it has to be replayed first and nothing that outlives it may sit
+/// in a register a call destroys. A slot read that is two `mov`s is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Slots {
+    /// Every [`Opcode::GET_SLOT`] calls
+    /// [`IrHost::read_slot`](crate::ir::IrHost::read_slot). Always correct,
+    /// and the only choice for a host with no
+    /// [`FastMem::slot_plan`](crate::jit::FastMem::slot_plan).
+    #[default]
+    Called,
+    /// A read that cannot publish — see `Compiler::unbound` — loads the slot
+    /// out of the array the host published, with no call and no flush ahead
+    /// of it. Code compiled this way **must not be run against a host that
+    /// publishes no array**; [`Engine`](super::rt::Engine) refuses to.
+    InPlace,
+}
+
 /// Compile `block`, or say why not.
 ///
 /// # Errors
@@ -515,7 +557,16 @@ pub fn compile(block: &Block) -> Result<Compiled, Refusal> {
 ///
 /// [`Refusal`], naming the op, type or shape that stopped it.
 pub fn compile_with(block: &Block, regs: Regs) -> Result<Compiled, Refusal> {
-    Compiler::new(block, regs)?.run()
+    compile_for(block, regs, Slots::Called)
+}
+
+/// The same, for a host whose slots are read as `slots` says.
+///
+/// # Errors
+///
+/// [`Refusal`], naming the op, type or shape that stopped it.
+pub fn compile_for(block: &Block, regs: Regs, slots: Slots) -> Result<Compiled, Refusal> {
+    Compiler::new(block, regs, slots)?.run()
 }
 
 /// The host registers a temporary may live in, by [`Reg`] number.
@@ -577,7 +628,8 @@ const fn calls_inside(op: Opcode) -> bool {
         op,
         // Every access has a slow path with a call on it, whether or not the
         // fast path is taken at run time, and the fast path has its own call
-        // to `note_fast_load`.
+        // to `note_fast_load`. A slot read is a call unless it is one
+        // `reads_in_place` names, which every caller of this asks as well.
         Opcode::LD | Opcode::ST | Opcode::GET_SLOT
     )
 }
@@ -649,7 +701,7 @@ impl Plan {
 /// points at no record. Refused here rather than replayed as a charge of zero
 /// or a boundary that never happens: the interpreter reports such a block as
 /// an error, and the two engines have to agree about that too.
-fn plan(block: &Block) -> Result<Plan, Refusal> {
+fn plan(block: &Block, in_place: &[bool]) -> Result<Plan, Refusal> {
     let insts = block.insts();
     let n = insts.len();
     let mut target = vec![false; n];
@@ -665,8 +717,10 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
     let mut region = 0u32;
     for (i, inst) in insts.iter().enumerate() {
         let op = inst.op;
+        // A slot read made in place is not a call and lets the host observe
+        // nothing, so it is an ordinary instruction inside its region.
         if target[i]
-            || calls_inside(op)
+            || (calls_inside(op) && !in_place[i])
             || op == Opcode::FENCE
             || op == Opcode::BRCOND
             || op.is_terminator()
@@ -825,6 +879,67 @@ fn summary(range: &[Event]) -> Option<Event> {
     })
 }
 
+/// Which instructions of `block` are slot reads this backend makes **in
+/// place** — out of the array the host published — rather than by a call.
+///
+/// None under [`Slots::Called`]. Under [`Slots::InPlace`], every
+/// [`Opcode::GET_SLOT`] whose slot no boundary *ahead of it* binds.
+///
+/// The condition is the whole of the soundness argument.
+/// [`IrHost::read_slot`](crate::ir::IrHost::read_slot) is not all a slot read
+/// does: `rt`'s `get_slot_thunk` first **publishes** when the pending
+/// boundary's live mapping names the slot, because the host's copy is then
+/// stale. A read made in place skips that thunk, so it may be made only where
+/// the thunk would have found nothing to publish — and that is decidable from
+/// the block. Control flow is forward only, so every boundary a run has
+/// passed on its way to an instruction is an [`Opcode::INSN_START`] at a lower
+/// index, whichever path it took, and the pending one is among them. If none
+/// of *those* names the slot, the pending one does not. It is conservative in
+/// the other direction on purpose: a boundary on a path the read is not
+/// reached by still counts.
+///
+/// A frontend that keeps [`InsnStart::live`](crate::ir::InsnStart)'s
+/// invariant reads a slot only while no boundary has bound it — once one has,
+/// it holds the temporary — so in practice this is every read, and
+/// `ir::hoist_slot_reads` refuses to move one for which it is not.
+///
+/// What such a read then *is*, is an ordinary instruction: it calls nothing,
+/// the host cannot observe it, and the value it produces is the one the call
+/// would have returned at the same point — the array is written only by
+/// [`IrHost::write_slot`](crate::ir::IrHost::write_slot), which runs inside a
+/// thunk, and by the host inside an access, and both are where they were. So
+/// `plan` does not end a region at one, and the allocator is not told it is a
+/// call.
+fn reads_in_place(block: &Block, slots: Slots) -> Vec<bool> {
+    let insts = block.insts();
+    let mut out = vec![false; insts.len()];
+    if slots != Slots::InPlace {
+        return out;
+    }
+    // The slots bound so far, sorted. A sorted `Vec` rather than a map: a
+    // block binds a few dozen at most, and nothing may hash where the answer
+    // decides what code is emitted (`ROADMAP.md` §0).
+    let mut bound: Vec<u16> = Vec::new();
+    for (i, inst) in insts.iter().enumerate() {
+        match inst.op {
+            Opcode::INSN_START => {
+                if let Some(mark) = block.marks().get(inst.aux as usize) {
+                    for &(slot, _) in &mark.live {
+                        if let Err(at) = bound.binary_search(&slot.0) {
+                            bound.insert(at, slot.0);
+                        }
+                    }
+                }
+            }
+            Opcode::GET_SLOT => {
+                out[i] = bound.binary_search(&((inst.aux & 0xffff) as u16)).is_err();
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The `mem` table, collected before anything is emitted so its addresses are
 /// final.
 fn descriptors(block: &Block) -> Box<[MemOp]> {
@@ -928,6 +1043,9 @@ struct Compiler<'a> {
     starts: Vec<usize>,
     /// The deferred bookkeeping and where it is replayed, from [`plan`].
     plan: Plan,
+    /// Which instructions are slot reads made in place rather than by a call.
+    /// See [`reads_in_place`].
+    in_place: Vec<bool>,
     /// Branches whose target is an IR instruction index.
     branches: Vec<(Fixup, usize)>,
     /// Jumps to the epilogue.
@@ -956,7 +1074,7 @@ const FRAME: i32 = 0x28;
 const PARKED: i32 = 8;
 
 impl<'a> Compiler<'a> {
-    fn new(block: &'a Block, regs: Regs) -> Result<Compiler<'a>, Refusal> {
+    fn new(block: &'a Block, regs: Regs, slots: Slots) -> Result<Compiler<'a>, Refusal> {
         // A temporary's frame slot is reached with a 32-bit displacement.
         if block
             .temp_count()
@@ -1002,13 +1120,19 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
-        let plan = plan(block)?;
+        let in_place = reads_in_place(block, slots);
+        let plan = plan(block, &in_place)?;
         let consts = constants(block);
         let alloc = match regs {
             Regs::Frame => Allocation::none(block),
             Regs::Scan => {
                 let live = Liveness::compute(block);
-                let inside: Vec<bool> = block.insts().iter().map(|i| calls_inside(i.op)).collect();
+                let inside: Vec<bool> = block
+                    .insts()
+                    .iter()
+                    .zip(&in_place)
+                    .map(|(i, &pure)| calls_inside(i.op) && !pure)
+                    .collect();
                 let before: Vec<bool> = plan.at.iter().map(Option::is_some).collect();
                 // A constant needs no home: every read of one is an immediate
                 // or a `mov` of one. The allocator declines the offer where a
@@ -1039,6 +1163,7 @@ impl<'a> Compiler<'a> {
             next_mem: 0,
             starts: Vec::with_capacity(block.insts().len()),
             plan,
+            in_place,
             branches: Vec::new(),
             exits: Vec::new(),
             spent: Vec::new(),
@@ -1078,6 +1203,7 @@ impl<'a> Compiler<'a> {
             alloc: self.alloc,
             offset: 0,
             chain: self.chain,
+            in_place: self.in_place.contains(&true),
         })
     }
 
@@ -1530,9 +1656,20 @@ impl<'a> Compiler<'a> {
                 self.write(inst, acc)?;
             }
             Opcode::GET_SLOT => {
-                self.ctx_to_rdi();
-                self.asm.mov_ri32(Reg::Rsi, inst.aux & 0xffff);
-                self.call(vt::GET_SLOT);
+                let slot = inst.aux & 0xffff;
+                if self.in_place[at] {
+                    // The host's own array, read where it is: no call, and so
+                    // no flush ahead of this either (`plan`). `reads_in_place`
+                    // is why this read may skip the thunk, and `rt::Engine`
+                    // is why `Ctx::slots` is not null here.
+                    self.asm.mov_rm(Reg::Rax, Reg::Rbx, off::SLOTS);
+                    // At most 0xffff * 8, which a displacement holds.
+                    self.asm.mov_rm(Reg::Rax, Reg::Rax, (slot * 8) as i32);
+                } else {
+                    self.ctx_to_rdi();
+                    self.asm.mov_ri32(Reg::Rsi, slot);
+                    self.call(vt::GET_SLOT);
+                }
                 self.write(inst, Reg::Rax)?;
             }
             Opcode::EXT_S => {

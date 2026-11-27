@@ -89,6 +89,17 @@ pub struct MemPlan {
     pub tag: u64,
 }
 
+/// A host's guest state slots, as a backend may read them in place.
+///
+/// What [`FastMem::slot_plan`] answers. A bare address rather than a slice
+/// for the reason [`FastSet`] is one: the reader is generated code, which is
+/// handed a number and indexes it.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotPlan {
+    /// The address of slot zero. Slot `n` is the `u64` at `base + 8 × n`.
+    pub base: *const u64,
+}
+
 /// A host whose accesses a backend may serve without calling it.
 ///
 /// Every method is defaulted to *no*, which is always correct — and the
@@ -135,6 +146,29 @@ pub trait FastMem {
     ///
     /// Returning `None` — the default — means every store takes the call.
     fn store_plan(&mut self) -> Option<MemPlan> {
+        None
+    }
+
+    /// Where this host keeps its guest state slots, if a backend may read one
+    /// without calling [`IrHost::read_slot`](crate::ir::IrHost::read_slot).
+    ///
+    /// Returning `Some` is a promise about that method: for every slot a
+    /// block run against this host names, it returns exactly the `u64` at
+    /// [`SlotPlan::base`]` + 8 × slot`, zero-extended, it has no effect, and
+    /// its answer does not depend on which boundaries and charges have been
+    /// announced so far. All three are what a register file in an array is;
+    /// a host that computes a slot, or keeps one anywhere else, returns
+    /// `None` — the default — and every read takes the call.
+    ///
+    /// A backend inlines a read only where it can also prove the call would
+    /// not have **published**: `IrHost::read_slot` is preceded by a publish
+    /// when the pending boundary binds the slot, and that is decided per
+    /// read, at compile time, from the block. A read it cannot decide takes
+    /// the call whatever this returns.
+    ///
+    /// The array must stay where it is for as long as the host is borrowed by
+    /// the run that asked — which a field of the host does.
+    fn slot_plan(&mut self) -> Option<SlotPlan> {
         None
     }
 

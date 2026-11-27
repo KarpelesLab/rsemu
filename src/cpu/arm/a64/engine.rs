@@ -1631,6 +1631,14 @@ impl FastMem for Host<'_, '_> {
         self.exec.mem_plan(Access::Store)
     }
 
+    /// The slot array, which is all [`IrHost::read_slot`] reads: a pure index
+    /// into it, whatever has been charged or announced.
+    fn slot_plan(&mut self) -> Option<crate::jit::SlotPlan> {
+        Some(crate::jit::SlotPlan {
+            base: self.slots.as_ptr(),
+        })
+    }
+
     fn note_fast_store(&mut self, addr: u64, bytes: u64) {
         // `Exec::write_once` minus the bytes, and then the same move of
         // `Exec::wrote` into this host's dirty log that `IrHost::store` makes

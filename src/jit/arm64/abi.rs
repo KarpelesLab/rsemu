@@ -229,6 +229,13 @@ pub struct Ctx {
     pub out_status: u64,
     /// How many blocks the chain executed inside generated code.
     pub blocks_run: u64,
+    /// The host's guest state slots, or null.
+    ///
+    /// `jit::x86::rt::Ctx::slots`, kept here so the two contexts stay one
+    /// layout. **This backend never reads it** and its runtime leaves it
+    /// null: inlining a slot read is code generation, and code this backend
+    /// generates cannot be executed on the host it is developed on.
+    pub slots: *const u64,
 }
 
 /// Byte offsets into [`Ctx`], as generated code bakes them in.
@@ -973,6 +980,7 @@ mod tests {
                 chain_ctl: core::ptr::null_mut(),
                 out_status: 0,
                 blocks_run: 0,
+                slots: core::ptr::null(),
             };
             let mut stopped = None;
             for (i, &(lo, hi)) in ranges.iter().enumerate() {

@@ -69,7 +69,7 @@ use crate::jit::dispatch::{Chain, Frontend, Step, StoreLog};
 use crate::jit::{BlockId, CodeRef, FastMem};
 
 use super::buf::{CodeBuf, DEFAULT_CAPACITY};
-use super::compile::{Compiled, Refusal, Regs, compile_with};
+use super::compile::{Compiled, Refusal, Regs, Slots, compile_for};
 
 /// Why a compiled block stopped, as generated code reports it in `rax`.
 ///
@@ -303,6 +303,15 @@ pub struct Ctx {
     /// The thunk cannot reach [`EngineStats`] — the engine is executing while
     /// it runs — so it counts here and [`Engine::run`] folds it in afterwards.
     pub blocks_run: u64,
+    /// The host's guest state slots, or null when it published none.
+    ///
+    /// [`FastMem::slot_plan`]'s answer, taken once when the run is entered:
+    /// the array is a field of the host, and the host is borrowed — so cannot
+    /// move — for exactly as long as this context exists. Generated code
+    /// reads slot `n` at `slots + 8 × n` and never writes through it, and
+    /// only code compiled under [`Slots::InPlace`] names it at all — which
+    /// [`Engine::run`] does not enter while this is null.
+    pub slots: *const u64,
 }
 
 /// Byte offsets into [`Ctx`], as generated code bakes them in.
@@ -346,6 +355,8 @@ pub mod off {
     pub const CHAIN: i32 = 192;
     /// [`Ctx::out_status`](super::Ctx::out_status).
     pub const OUT_STATUS: i32 = 208;
+    /// [`Ctx::slots`](super::Ctx::slots).
+    pub const SLOTS: i32 = 224;
 }
 
 /// The direct-link thunk: what a block calls at its exit instead of returning.
@@ -966,6 +977,11 @@ pub struct Engine {
     /// temporaries that code wrote into the frame.
     last: Option<CodeRef>,
     regs: Regs,
+    /// How blocks compiled from now on read a guest state slot.
+    slots: Slots,
+    /// Whether any block in the buffer was compiled under
+    /// [`Slots::InPlace`]. Cleared with the buffer.
+    in_place: bool,
     ticks: u64,
     boundaries: u64,
     mark: Option<u32>,
@@ -989,6 +1005,8 @@ impl Engine {
             temps: Vec::new(),
             last: None,
             regs: Regs::default(),
+            slots: Slots::default(),
+            in_place: false,
             ticks: 0,
             boundaries: 0,
             mark: None,
@@ -1012,6 +1030,19 @@ impl Engine {
     #[must_use]
     pub fn regs(&self) -> Regs {
         self.regs
+    }
+
+    /// How blocks compiled from now on read a guest state slot.
+    ///
+    /// [`Slots::InPlace`] is for a host that publishes a
+    /// [`FastMem::slot_plan`], and [`Dispatcher`](crate::jit::Dispatcher) sets
+    /// it from the host it is about to compile for, so nothing else has to.
+    /// Blocks already compiled keep what they were compiled under, and this
+    /// engine will not enter one that reads in place against a host with no
+    /// array: [`Engine::run`] answers `None`, exactly as for stale code, and
+    /// the caller interprets the block.
+    pub fn set_slots(&mut self, slots: Slots) {
+        self.slots = slots;
     }
 
     /// Fill the temporary frame with `value`, for a differential that needs to
@@ -1115,7 +1146,7 @@ impl Engine {
     ///
     /// [`Refusal`], naming the op or the shape that stopped it.
     pub fn compile(&mut self, block: &Block) -> core::result::Result<CodeRef, Refusal> {
-        let compiled = match compile_with(block, self.regs) {
+        let compiled = match compile_for(block, self.regs, self.slots) {
             Ok(c) => c,
             Err(e) => {
                 self.stats.refused += 1;
@@ -1127,6 +1158,7 @@ impl Engine {
             None => {
                 self.buf.reset();
                 self.arena.clear();
+                self.in_place = false;
                 self.stats.resets += 1;
                 self.buf
                     .push(compiled.code())
@@ -1134,6 +1166,7 @@ impl Engine {
             }
         };
         let index = u32::try_from(self.arena.len()).map_err(|_| Refusal::CodeBufferFull)?;
+        self.in_place |= compiled.reads_slots_in_place();
         let placed = compiled.at(offset);
         let chain = placed.chain_entry();
         self.arena.push(placed);
@@ -1276,6 +1309,19 @@ impl Engine {
         if !self.is_live(code) {
             return None;
         }
+        // The host's slot array, or null. Asked before anything else because
+        // it decides whether this code may be entered at all: a block that
+        // reads a slot in place does it through this pointer, unchecked, and a
+        // chain can reach any block in the buffer — so if any of them was
+        // compiled that way and this host published no array, none is run.
+        // `Dispatcher` compiles for the host it is about to run against, so
+        // this is a mismatch only a caller mixing hosts on one engine can
+        // produce, and the answer to it is the interpreter rather than a
+        // wild read.
+        let slots = host.slot_plan().map_or(core::ptr::null(), |p| p.base);
+        if self.in_place && slots.is_null() {
+            return None;
+        }
         // SAFETY: the caller's obligation, stated above. Nothing has run yet,
         // so this is the reference the caller handed over. It is read out
         // here and not held: a chain re-points the context at its successors,
@@ -1343,6 +1389,7 @@ impl Engine {
             chain_ctl: chain.map_or(core::ptr::null_mut(), |(_, c)| c),
             out_status: 0,
             blocks_run: 0,
+            slots,
         };
 
         // SAFETY: `offset` names the first byte of a function this buffer
@@ -1367,6 +1414,13 @@ impl Engine {
         // forbids — writing without marking the store dirty — is paid by
         // `FastMem::note_fast_store`, called on the same path before anything
         // can observe the write.
+        //
+        // And it reads the host's own slot array through `ctx.slots`, where
+        // the host published one. That pointer is into `*host`, which this
+        // function holds mutably for the whole call, so the array is alive and
+        // does not move; generated code only reads it, and never while a
+        // thunk holds the `&mut H` it reconstitutes — one thread, and the
+        // block is not running while a thunk is.
         let entry = unsafe { self.buf.entry(offset) }?;
         // SAFETY: as above. `ctx` is a live, initialized `Ctx` and the pointer
         // does not escape the call.
@@ -1491,6 +1545,7 @@ mod tests {
             core::mem::offset_of!(Ctx, out_status) as i32,
             off::OUT_STATUS
         );
+        assert_eq!(core::mem::offset_of!(Ctx, slots) as i32, off::SLOTS);
 
         // The six the bookkeeping took back are still where a displacement
         // *would* have reached them. They are asserted anyway, and not out of

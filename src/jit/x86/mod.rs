@@ -98,5 +98,5 @@ pub mod rt;
 mod tests;
 
 pub use buf::{CodeBuf, DEFAULT_CAPACITY};
-pub use compile::{Compiled, Refusal, Regs, compile, compile_with, compiles};
+pub use compile::{Compiled, Refusal, Regs, Slots, compile, compile_for, compile_with, compiles};
 pub use rt::{ChainFn, Ctx, Engine, EngineStats, Event, Linkage, Vtable};

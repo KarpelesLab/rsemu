@@ -1142,21 +1142,36 @@ impl Dispatcher {
                     // Asked once already, and the answer is a property of the
                     // block.
                     None if cache.refused(id) => None,
-                    None => match engine.compile(block) {
-                        Ok(code) => Some(code),
-                        // A refusal is not an error — the block is
-                        // interpreted — but it *is* recorded against the
-                        // block, because a compile attempt is tens of
-                        // thousands of host instructions and an op the
-                        // backend does not lower is refused identically every
-                        // time. A full code buffer is the one answer that is
-                        // about the buffer rather than the block, so that one
-                        // is asked again.
-                        Err(refusal) => {
-                            refused = !matches!(refusal, crate::jit::host::Refusal::CodeBufferFull);
-                            None
+                    None => {
+                        // For the host this block is about to run against:
+                        // one that keeps its slots in an array is compiled
+                        // code that reads them there. The answer is a
+                        // property of the host's *type* in every engine in
+                        // the tree, so it does not move between two compiles
+                        // — and where it somehow did, the backend declines to
+                        // enter the block rather than misread it.
+                        engine.set_slots(if host.slot_plan().is_some() {
+                            crate::jit::host::Slots::InPlace
+                        } else {
+                            crate::jit::host::Slots::Called
+                        });
+                        match engine.compile(block) {
+                            Ok(code) => Some(code),
+                            // A refusal is not an error — the block is
+                            // interpreted — but it *is* recorded against the
+                            // block, because a compile attempt is tens of
+                            // thousands of host instructions and an op the
+                            // backend does not lower is refused identically
+                            // every time. A full code buffer is the one
+                            // answer that is about the buffer rather than the
+                            // block, so that one is asked again.
+                            Err(refusal) => {
+                                refused =
+                                    !matches!(refusal, crate::jit::host::Refusal::CodeBufferFull);
+                                None
+                            }
                         }
-                    },
+                    }
                 };
                 if refused {
                     cache.set_refused(id);

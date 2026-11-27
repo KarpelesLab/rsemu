@@ -183,8 +183,8 @@ pub mod wasm;
 /// `cfg` around the use site is for.
 ///
 /// The two modules offer the same names deliberately: `Engine`, `EngineStats`,
-/// `Regs`, `Refusal`, `Compiled`, `compile`, `compile_with`, `compiles`,
-/// `CodeBuf`, `Ctx`, `Vtable`, `Event`. Nothing here is a trait and nothing is
+/// `Regs`, `Slots`, `Refusal`, `Compiled`, `compile`, `compile_with`,
+/// `compiles`, `CodeBuf`, `Ctx`, `Vtable`, `Event`. Nothing here is a trait and nothing is
 /// dynamically dispatched; this is a *name*, resolved at compile time, so a
 /// call through it costs exactly what a call through the concrete module
 /// costs.
@@ -227,7 +227,7 @@ pub use dispatch::{Chain, Step};
 pub use dispatch::{
     DirtyPages, DispatchStats, Dispatcher, Entry, Frontend, Run, Stop, StoreLog, Translation,
 };
-pub use fast::{FastMem, MemPlan};
+pub use fast::{FastMem, MemPlan, SlotPlan};
 pub use tlb::{
     Context, DEFAULT_ENTRIES, Epoch, FastSet, PAGE_MASK, PAGE_SIZE, STAMP_BITS, Tlb, TlbStats,
     executable_run,

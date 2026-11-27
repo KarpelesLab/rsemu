@@ -33,9 +33,9 @@ use crate::ir::{
     AccessKind, Block, BlockBuilder, Cond, Const, InsnStart, Interp, IrHost, MemOp, Opcode,
     Outcome, RegSlot, Sign, Stretch, Temp, Type, bitfield_aux, verify,
 };
-use crate::jit::{Context, FastMem, MemPlan, Tlb};
+use crate::jit::{Context, FastMem, MemPlan, SlotPlan, Tlb};
 
-use super::compile::Regs;
+use super::compile::{Regs, Slots};
 use super::rt::Engine;
 
 /// Where the test machine's RAM lives.
@@ -118,6 +118,32 @@ struct Scratch {
     at_last: u64,
     /// How many times [`IrHost::stretch`] was called.
     stretches: u64,
+    /// The slots again, as the array a host that publishes a
+    /// [`FastMem::slot_plan`] keeps them in: `mirror[n]` is what
+    /// [`IrHost::read_slot`] answers for slot `n`, for every `n` below
+    /// [`MIRROR`]. Kept in step by `write_slot` whether or not it is
+    /// published, so publishing it is one flag.
+    mirror: Vec<u64>,
+    /// Whether [`Scratch::mirror`] is offered to the backend.
+    planned: bool,
+    /// How many times [`IrHost::read_slot`] was called.
+    reads: u64,
+}
+
+/// How many slots [`Scratch::mirror`] covers: more than any block in this file
+/// names, the wide one in
+/// `a_slot_number_wider_than_a_byte_reaches_the_host_intact` included, since
+/// a read generated code makes in place is not bounds-checked by anybody.
+const MIRROR: u16 = 0x2000;
+
+/// What a slot nothing has written reads as: something specific to its
+/// **number** rather than the same zero for all of them. Generated code
+/// carries a slot number to the thunk as an immediate, and a zero for every
+/// number out of range is exactly the answer that cannot tell a truncated one
+/// from an intact one — see
+/// `a_slot_number_wider_than_a_byte_reaches_the_host_intact`.
+fn unseeded(slot: u16) -> u128 {
+    u128::from(slot) * 0x1000_0001 + 3
 }
 
 impl Scratch {
@@ -155,6 +181,17 @@ impl Scratch {
             seen: [None, None],
             at_last: 0,
             stretches: 0,
+            mirror: (0..MIRROR)
+                .map(|s| {
+                    if s < SLOTS {
+                        u64::from(s) * 0x1111 + 7
+                    } else {
+                        unseeded(s) as u64
+                    }
+                })
+                .collect(),
+            planned: false,
+            reads: 0,
         }
     }
 
@@ -199,20 +236,18 @@ impl Scratch {
 
 impl IrHost for Scratch {
     fn read_slot(&mut self, slot: RegSlot) -> u128 {
-        // A slot this harness did not seed still answers something specific to
-        // its **number**, rather than the same zero every unseeded slot would
-        // give. Generated code carries a slot number to the thunk as an
-        // immediate, and a zero for every number out of range is exactly the
-        // answer that cannot tell a truncated one from an intact one — see
-        // `a_slot_number_wider_than_a_byte_reaches_the_host_intact`.
+        self.reads += 1;
         self.slots
             .get(&slot.0)
             .copied()
-            .unwrap_or_else(|| u128::from(slot.0) * 0x1000_0001 + 3)
+            .unwrap_or_else(|| unseeded(slot.0))
     }
 
     fn write_slot(&mut self, slot: RegSlot, value: u128) {
         self.slots.insert(slot.0, value);
+        if let Some(cell) = self.mirror.get_mut(usize::from(slot.0)) {
+            *cell = value as u64;
+        }
         self.log.push(Event::Publish(slot.0, value));
     }
 
@@ -301,6 +336,12 @@ impl FastMem for Scratch {
     fn store_plan(&mut self) -> Option<MemPlan> {
         self.inline
             .then(|| self.tlb.plan(AccessKind::Store, STORE_WORLD))
+    }
+
+    fn slot_plan(&mut self) -> Option<SlotPlan> {
+        self.planned.then_some(SlotPlan {
+            base: self.mirror.as_ptr(),
+        })
     }
 
     fn note_fast_store(&mut self, addr: u64, bytes: u64) {
@@ -598,6 +639,87 @@ fn agree_under(block: &Block, inline: bool, regs: Regs, allowance: Option<u64>) 
         "the charged column, the retired count or the boundary moved with batching\n{block}"
     );
 
+    // ---- nor on a slot read being a call ---------------------------------
+    //
+    // The block compiled a second time, for a host that publishes its slots
+    // as an array (`FastMem::slot_plan`), which is how `Dispatcher` compiles
+    // for every engine in `cpu/`. That is different *code* — a read that
+    // cannot publish becomes two loads, stops being a place the bookkeeping
+    // is replayed at, and stops being a call the allocator has to keep
+    // values clear of — so it is a different set of flush ranges and a
+    // different allocation, and everything the guest and the host can see
+    // has to come out the same anyway.
+    //
+    // A block in this file names no slot the mirror does not cover, and that
+    // is asserted because nothing bounds-checks a read generated code makes
+    // for itself.
+    for inst in block.insts() {
+        assert!(
+            inst.op != Opcode::GET_SLOT || inst.aux & 0xffff < u32::from(MIRROR),
+            "slot {} is past the mirror\n{block}",
+            inst.aux
+        );
+    }
+    let mut placed = Engine::with_capacity(1 << 18).expect("a code buffer");
+    placed.set_regs(regs);
+    placed.set_slots(Slots::InPlace);
+    let in_place = placed
+        .compile(block)
+        .expect("a block that compiled with its slot reads called compiles with them in place");
+    placed.seed_frame(POISON, block.temp_count());
+    let mut arrayed = Scratch {
+        batched: true,
+        planned: true,
+        ..scratch(inline)
+    };
+    let read = placed
+        .run(block, in_place, &mut arrayed)
+        .expect("the code was compiled in this generation");
+    match (&stretched, &read) {
+        (Ok(a), Ok(b)) => assert_eq!(a, b, "the outcome moved with reading in place\n{block}"),
+        (Err(a), Err(b)) => assert_eq!(
+            alloc::format!("{a}"),
+            alloc::format!("{b}"),
+            "the error moved with reading in place\n{block}"
+        ),
+        _ => panic!("reading in place decided whether the block failed\n{block}"),
+    }
+    assert_eq!(
+        batched.slots, arrayed.slots,
+        "guest state moved with reading in place\n{block}"
+    );
+    assert_eq!(
+        batched.standing(),
+        arrayed.standing(),
+        "the ticks, or the boundary the host is standing at, moved with reading in place\n{block}"
+    );
+    assert_eq!(
+        batched.published(),
+        arrayed.published(),
+        "different slots were published, or in a different order\n{block}"
+    );
+    assert_eq!(
+        batched.bytes(),
+        arrayed.bytes(),
+        "guest memory moved with reading in place\n{block}"
+    );
+    assert_eq!(
+        batched.inlined_stores, arrayed.inlined_stores,
+        "the inlined stores moved with reading in place\n{block}"
+    );
+    assert_eq!(
+        (ticks, boundaries, mark),
+        (placed.ticks(), placed.boundaries(), placed.mark()),
+        "the charged column, the retired count or the boundary moved with reading in place\n{block}"
+    );
+    // And the same code against a host that kept no array is not entered.
+    assert!(
+        !arrayed.mirror.is_empty()
+            && (!placed_reads(block)
+                || placed.run(block, in_place, &mut scratch(inline)).is_none()),
+        "code that reads a slot in place ran against a host with nowhere to read it\n{block}"
+    );
+
     for (t, was) in kept.iter().enumerate() {
         let temp = Temp(t as u32);
         match (was, engine.temp_value(temp)) {
@@ -617,6 +739,13 @@ fn agree_under(block: &Block, inline: bool, regs: Regs, allowance: Option<u64>) 
         }
     }
     true
+}
+
+/// Whether compiling `block` under [`Slots::InPlace`] reads any slot in place.
+fn placed_reads(block: &Block) -> bool {
+    super::compile::compile_for(block, Regs::Scan, Slots::InPlace)
+        .expect("compiles")
+        .reads_slots_in_place()
 }
 
 /// What a differential run fills the temporary frame with the second time.
@@ -1324,6 +1453,16 @@ fn events_of(block: &Block) -> Vec<super::rt::Event> {
         .collect()
 }
 
+/// How many flush ranges `plan` summarised for `block` under `slots`.
+fn events_under(block: &Block, slots: Slots) -> usize {
+    super::compile::compile_for(block, Regs::Scan, slots)
+        .expect("compiles")
+        .events()
+        .iter()
+        .filter(|e| matches!(e, super::rt::Event::Head { .. }))
+        .count()
+}
+
 /// The summary `plan` put ahead of each flush range of `block`, in order.
 fn summaries_of(block: &Block) -> Vec<super::rt::Event> {
     use super::rt::Event;
@@ -1478,6 +1617,80 @@ fn a_host_with_headroom_is_handed_a_range_whole_and_one_without_is_not() {
         outcome
     );
     assert_eq!(oracle.standing(), host.standing());
+}
+
+#[test]
+fn a_slot_is_read_in_place_unless_the_read_could_publish() {
+    // Three reads. The first is ahead of every boundary that binds anything,
+    // and the third is of a slot no boundary binds, so neither can be a read
+    // that publishes and both are made in place. The second is of a slot the
+    // boundary just ahead of it bound to a temporary: the host's copy is
+    // stale until that mapping is written out, which is the thunk's job, so
+    // that one takes the call — and has to come back with the temporary's
+    // value rather than the slot's old one.
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let first = b.get_slot(Type::I64, RegSlot(2));
+    let one = b.imm(Type::I64, Const::Int(1));
+    let bumped = b.binary(Opcode::ADD, Type::I64, first, one);
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live: vec![(RegSlot(5), bumped)],
+    });
+    b.charge(1);
+    let stale = b.get_slot(Type::I64, RegSlot(5));
+    let third = b.get_slot(Type::I64, RegSlot(3));
+    let sum = b.binary(Opcode::ADD, Type::I64, stale, third);
+    b.insn_start(InsnStart {
+        pc: BASE + 8,
+        next_pc: BASE + 8,
+        ticks: 2,
+        live: vec![(RegSlot(5), bumped), (RegSlot(6), sum)],
+    });
+    b.exit_tb();
+    let block = b.finish();
+    verify(&block).expect("well formed");
+    assert!(agree(&block, true), "{block}");
+
+    let run = |slots: Slots| {
+        let mut engine = Engine::with_capacity(1 << 18).expect("a code buffer");
+        engine.set_slots(slots);
+        let code = engine.compile(&block).expect("compiles");
+        let mut host = Scratch {
+            planned: slots == Slots::InPlace,
+            ..Scratch::new(true)
+        };
+        let outcome = engine
+            .run(&block, code, &mut host)
+            .expect("live")
+            .expect("runs");
+        assert_eq!(outcome, Outcome::Exit);
+        host
+    };
+    let called = run(Slots::Called);
+    let in_place = run(Slots::InPlace);
+    assert_eq!(called.reads, 3, "every read is a call");
+    assert_eq!(in_place.reads, 1, "only the read that could publish");
+    // And it is fewer replays as well as fewer calls: called, the first read
+    // is a place the bookkeeping pending ahead of it has to be delivered at;
+    // in place it is not, and that boundary rides with the next one.
+    assert!(
+        events_under(&block, Slots::InPlace) < events_under(&block, Slots::Called),
+        "{block}"
+    );
+    assert_eq!(called.slots, in_place.slots);
+    // Slot 2 is seeded with 2 * 0x1111 + 7 and slot 3 with 3 * 0x1111 + 7.
+    let bumped = 2 * 0x1111 + 7 + 1;
+    assert_eq!(in_place.slots[&5], bumped);
+    assert_eq!(in_place.slots[&6], bumped + 3 * 0x1111 + 7);
 }
 
 #[test]

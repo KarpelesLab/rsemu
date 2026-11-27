@@ -2009,6 +2009,15 @@ impl FastMem for Host<'_, '_> {
         self.exec.mem_plan(crate::ir::AccessKind::Store)
     }
 
+    /// The slot array, which is all [`IrHost::read_slot`] reads — [`OPEN_BUS`]
+    /// included, whose *write* is the one that goes elsewhere. A pure index
+    /// into it, whatever has been charged or announced.
+    fn slot_plan(&mut self) -> Option<crate::jit::SlotPlan> {
+        Some(crate::jit::SlotPlan {
+            base: self.slots.as_ptr(),
+        })
+    }
+
     /// One aligned load was served inline; charge for it.
     ///
     /// Everything [`IrHost::load`] would have done, minus the bytes:

@@ -108,7 +108,7 @@ pub mod rt;
 mod tests;
 
 pub use abi::{ChainFn, Ctx, Event, Vtable};
-pub use compile::{Compiled, Refusal, Regs, compile, compile_with, compiles};
+pub use compile::{Compiled, Refusal, Regs, Slots, compile, compile_with, compiles};
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub use buf::{CodeBuf, DEFAULT_CAPACITY};

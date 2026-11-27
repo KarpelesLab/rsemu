@@ -347,6 +347,24 @@ pub enum Regs {
     Scan,
 }
 
+/// How a compiled block reads a guest state slot — `jit::x86::compile`'s
+/// switch, offered under the same name so that code written against
+/// `jit::host` builds on either backend.
+///
+/// **This backend accepts both and compiles the same code for both**: every
+/// slot read is a call to the thunk. Reading a slot in place is two loads of
+/// generated code, and generated code is the half of this backend that
+/// cannot be executed on the host it is developed on, so it is not emitted
+/// until something can run it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Slots {
+    /// Every slot read calls the host.
+    #[default]
+    Called,
+    /// The host publishes its slot array. Accepted, and not acted on.
+    InPlace,
+}
+
 /// Compile `block`, or say why not.
 ///
 /// # Errors

@@ -232,6 +232,15 @@ impl Engine {
         self.regs
     }
 
+    /// How blocks compiled from now on read a guest state slot.
+    ///
+    /// `jit::x86::rt::Engine::set_slots`, so that a dispatcher written
+    /// against `jit::host` builds here. It changes nothing: see
+    /// [`Slots`](super::compile::Slots).
+    pub fn set_slots(&mut self, slots: super::compile::Slots) {
+        let _ = slots;
+    }
+
     /// Fill the temporary frame with `value`, for a differential that needs to
     /// know what a run does *not* depend on.
     #[cfg(test)]
@@ -505,6 +514,7 @@ impl Engine {
             chain_ctl: chain.map_or(core::ptr::null_mut(), |(_, c)| c),
             out_status: 0,
             blocks_run: 0,
+            slots: core::ptr::null(),
         };
 
         // SAFETY: `offset` names the first byte of a function this buffer
