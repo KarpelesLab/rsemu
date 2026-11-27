@@ -153,32 +153,46 @@ impl<'a> Queue<'a> {
             return Ok(None);
         }
         let at = self.layout.desc + u64::from(index) * DESC_SIZE;
-        Ok(Some(Descriptor {
+        self.read_descriptor(at).map(Some)
+    }
+
+    /// Read the sixteen bytes of one descriptor at `at`.
+    fn read_descriptor(&self, at: u64) -> MemResult<Descriptor> {
+        Ok(Descriptor {
             addr: self.read64(at)?,
             len: self.read32(at + 8)?,
             flags: self.read16(at + 12)?,
             next: self.read16(at + 14)?,
-        }))
+        })
     }
 
     /// Walk a descriptor chain from `head`, following [`DESC_F_INDIRECT`] one
     /// level deep as the specification allows (§2.7.7).
     ///
-    /// The walk is bounded by the queue size in each table, so a chain that
-    /// loops back on itself ends rather than spinning.
+    /// The walk is bounded by the queue size **in total**, across the main
+    /// table and every indirect table it names, so a chain that loops back on
+    /// itself ends rather than spinning. §2.7.5.3.1: *"A driver MUST NOT
+    /// create a descriptor chain longer than the Queue Size of the device."*
+    /// An indirect table's own length is no bound at all — it is a `u32` the
+    /// guest wrote, so a table whose first entry chains to itself would
+    /// otherwise be walked a quarter of a billion times into a `Vec`.
     ///
     /// # Errors
     ///
     /// Whatever the address space refuses.
     pub fn chain(&self, head: u16) -> MemResult<Vec<Descriptor>> {
+        let limit = self.layout.size as usize;
         let mut out = Vec::new();
         let mut index = head;
         for _ in 0..self.layout.size {
+            if out.len() >= limit {
+                break;
+            }
             let Some(desc) = self.descriptor(index)? else {
                 break;
             };
             if desc.flags & DESC_F_INDIRECT != 0 {
-                self.walk_indirect(&desc, &mut out)?;
+                self.walk_indirect(&desc, limit, &mut out)?;
             } else {
                 out.push(desc);
             }
@@ -192,17 +206,22 @@ impl<'a> Queue<'a> {
 
     /// Walk an indirect descriptor table. Nested indirection is illegal
     /// (§2.7.7), so a nested flag ends the walk rather than recursing.
-    fn walk_indirect(&self, desc: &Descriptor, out: &mut Vec<Descriptor>) -> MemResult<()> {
+    ///
+    /// Stops once `out` holds `limit` descriptors — the queue size, which is
+    /// the longest chain a driver may build whichever table it is in.
+    fn walk_indirect(
+        &self,
+        desc: &Descriptor,
+        limit: usize,
+        out: &mut Vec<Descriptor>,
+    ) -> MemResult<()> {
         let count = u64::from(desc.len) / DESC_SIZE;
         let mut index = 0u64;
         for _ in 0..count {
-            let at = desc.addr + index * DESC_SIZE;
-            let entry = Descriptor {
-                addr: self.read64(at)?,
-                len: self.read32(at + 8)?,
-                flags: self.read16(at + 12)?,
-                next: self.read16(at + 14)?,
-            };
+            if out.len() >= limit {
+                return Ok(());
+            }
+            let entry = self.read_descriptor(desc.addr + index * DESC_SIZE)?;
             if entry.flags & DESC_F_INDIRECT != 0 {
                 return Ok(());
             }
@@ -484,6 +503,34 @@ mod tests {
         // A nested indirect is illegal and ends the walk.
         g.poke(0x4000 + 12, Width::U16, u64::from(DESC_F_INDIRECT));
         assert!(g.queue().chain(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_indirect_table_that_loops_is_bounded_by_the_queue_size() {
+        // The table claims 65536 entries and its first one chains to itself.
+        // §2.7.5.3.1 caps a chain at the queue size, so that is where the walk
+        // stops — not at the table length, which is a number the guest wrote
+        // and may be 2^28.
+        let g = Guest::new();
+        g.desc(0, 0x4000, 0x1_0000 * DESC_SIZE as u32, DESC_F_INDIRECT, 0);
+        g.poke(0x4000, Width::U64, 0x8000);
+        g.poke(0x4000 + 8, Width::U32, 16);
+        g.poke(0x4000 + 12, Width::U16, u64::from(DESC_F_NEXT));
+        g.poke(0x4000 + 14, Width::U16, 0);
+        let chain = g.queue().chain(0).unwrap();
+        assert_eq!(chain.len(), SIZE as usize, "bounded by the queue size");
+
+        // And a main-table chain of indirect descriptors is bounded in total,
+        // not per table.
+        g.desc(
+            0,
+            0x4000,
+            0x1_0000 * DESC_SIZE as u32,
+            DESC_F_INDIRECT | DESC_F_NEXT,
+            0,
+        );
+        let chain = g.queue().chain(0).unwrap();
+        assert_eq!(chain.len(), SIZE as usize, "in total, not per table");
     }
 
     #[test]
