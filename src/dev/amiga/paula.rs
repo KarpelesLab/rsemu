@@ -1484,6 +1484,16 @@ impl Shared {
     }
 
     fn advance_to(&self, target: u64) {
+        // Already there, which is most calls: every `PaulaPort` method
+        // catches up first, and Agnus makes eight or more of them for one
+        // line's slots, all with the same `at`. The published count is stored
+        // under the state lock on every change, so it is the state's own; it
+        // is asked first because the drive list below is a lock, an
+        // allocation and a reference count per drive, and none of that is
+        // needed to find there is nothing to do.
+        if target <= self.ticks.load(Ordering::Relaxed) {
+            return;
+        }
         let drives = self.drives();
         let (moved, bytes) = {
             let mut state = self.state.lock();
