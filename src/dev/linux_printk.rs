@@ -224,6 +224,18 @@ impl LinuxPrintk {
                 )));
             }
         };
+        // The trampoline is eight words, and the `write` hook and its format
+        // run on to `tramp-va + 0x60`. Their branches and the format's
+        // address are computed from `tramp-va` in 32 bits, so a block that
+        // ran off the top of the address space would be patched with
+        // addresses that wrapped: refuse it here, not at the first poll.
+        let block: u64 = if write.is_some() { 0x60 } else { 0x20 };
+        if tramp_va > (1 << 32) - block {
+            return Err(Error::Property(alloc::format!(
+                "linux.printk `tramp-va` {tramp_va:#x} leaves no room for the \
+                 {block:#x}-byte trampoline below 4 GiB"
+            )));
+        }
         let layout = Layout {
             stub,
             stub_va: word(stub_va, "stub-va")?,
@@ -656,6 +668,43 @@ mod tests {
             !tap.state.lock().patched,
             "the patched branch is not the stub: stays down"
         );
+    }
+
+    #[test]
+    fn a_trampoline_that_runs_off_the_address_space_is_a_property_error() {
+        use crate::core::props::Value;
+        let props = |tramp_va: u64, write: bool| {
+            let mut p = Props::new()
+                .with("port", Value::Str("console".into()))
+                .with("stub", Value::Uint(0x1000))
+                .with("vprintk", Value::Uint(0x2000))
+                .with("tramp", Value::Uint(0x3000))
+                .with("tramp-va", Value::Uint(tramp_va))
+                .with("log-buf", Value::Uint(0x8000))
+                .with("log-end", Value::Uint(0x7000));
+            if write {
+                p.insert("write-syscall", Value::Uint(0x7200));
+                p.insert("sys-write", Value::Uint(0x2400));
+            }
+            p
+        };
+        // `tramp-va + 0x20` and the hook's `at + 32` used to be computed
+        // unchecked at the first poll: a debug-build panic on a property.
+        for (va, write) in [
+            (u64::from(u32::MAX), true),
+            (0xffff_ffa4, true),
+            (0xffff_ffe4, false),
+        ] {
+            let err = LinuxPrintk::new(&props(va, write)).unwrap_err();
+            assert!(
+                matches!(&err, Error::Property(m) if m.contains("tramp-va")),
+                "{va:#x}: {err:?}"
+            );
+        }
+        // The last address that fits is accepted.
+        for (va, write) in [(0xffff_ffa0, true), (0xffff_ffe0, false)] {
+            LinuxPrintk::new(&props(va, write)).unwrap();
+        }
     }
 
     #[test]
