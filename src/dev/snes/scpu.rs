@@ -436,15 +436,20 @@ impl Shared {
         let line = after(HDMA_DOT);
         let refresh = after(REFRESH_DOT);
         let mut s = self.state.lock();
+        // A target the beam never reaches never fires, and the registers hold
+        // one at power-on ($1FF in each). "Setting a value larger than the
+        // maximum H counter value of 339 will prevent the timer's H condition
+        // from being met", and likewise for V, whose maximum "depends on the
+        // region (261 for NTSC, 311 for PAL) and interlacing" (SNESdev wiki,
+        // *MMIO registers*, HTIME and VTIME). `master_until` already answers
+        // `None` for a line or a dot that does not exist, so the targets go to
+        // it as written rather than folded into range first.
         let irq = match (s.nmitimen >> 4) & 3 {
             0 => None,
-            1 => Some(after(s.htime.min(339))),
-            2 => beam
-                .master_until(s.vtime % lines, 0)
-                .map(|d| now + d.max(1)),
-            _ => beam
-                .master_until(s.vtime % lines, s.htime.min(339))
-                .map(|d| now + d.max(1)),
+            1 if s.htime > 339 => None,
+            1 => Some(after(s.htime)),
+            2 => beam.master_until(s.vtime, 0).map(|d| now + d.max(1)),
+            _ => beam.master_until(s.vtime, s.htime).map(|d| now + d.max(1)),
         };
         s.next_init = init;
         s.next_line = line;

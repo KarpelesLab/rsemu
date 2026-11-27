@@ -333,3 +333,61 @@ fn starting_a_multiplication_also_loads_the_quotient_register() {
         "RDDIV is the multiplier, zero-extended"
     );
 }
+
+#[test]
+fn a_timer_target_the_beam_never_reaches_never_fires() {
+    // SNESdev wiki, *MMIO registers*, HTIME: "Note that setting a value larger
+    // than the maximum H counter value of 339 will prevent the timer's H
+    // condition from being met." And VTIME: "Note that setting a value larger
+    // than the maximum V counter value will prevent the timer's V condition
+    // from being met. The maximum depends on the region (261 for NTSC, 311 for
+    // PAL) and interlacing".
+    //
+    // The targets were folded into range instead — HTIME clamped to 339, VTIME
+    // taken modulo the line count — so the power-on value of $1FF in either
+    // register fired an interrupt every line or every frame the moment a
+    // program enabled the timer before setting it.
+    use crate::dev::snes::ppu::SnesPpu;
+    // A little over a frame, with the two devices kept in step the way a
+    // scheduler keeps them: the S-CPU measures its events from the beam.
+    let run = |f: &Fixture, ppu: &SnesPpu| {
+        for tick in (0..1364 * 270).step_by(4) {
+            ppu.advance_to(tick);
+            f.c.shared.advance_to(tick);
+        }
+    };
+    for (nmitimen, htime, vtime) in [
+        (0x20u8, 0u16, 300u16), // V-IRQ at a line NTSC does not have
+        (0x20, 0, 262),         // ... including the first one past the end
+        (0x10, 511, 0),         // H-IRQ at a dot no line has
+        (0x30, 340, 10),        // both, with only H out of range
+        (0x30, 10, 400),        // both, with only V out of range
+    ] {
+        let f = scpu();
+        let ppu = SnesPpu::default();
+        *f.c.shared.beam.lock() = Some(ppu.beam());
+        wr(&f, REGS + 0x07, htime as u8);
+        wr(&f, REGS + 0x08, (htime >> 8) as u8);
+        wr(&f, REGS + 0x09, vtime as u8);
+        wr(&f, REGS + 0x0A, (vtime >> 8) as u8);
+        wr(&f, REGS, nmitimen);
+        run(&f, &ppu);
+        assert_eq!(
+            rd(&f, REGS + 0x11) & 0x80,
+            0,
+            "NMITIMEN=${nmitimen:02x} HTIME={htime} VTIME={vtime}: TIMEUP stays clear"
+        );
+    }
+
+    // And a target the beam does reach still fires.
+    let f = scpu();
+    let ppu = SnesPpu::default();
+    *f.c.shared.beam.lock() = Some(ppu.beam());
+    wr(&f, REGS + 0x07, 100);
+    wr(&f, REGS + 0x08, 0);
+    wr(&f, REGS + 0x09, 0x05); // 261 = $105
+    wr(&f, REGS + 0x0A, 0x01);
+    wr(&f, REGS, 0x30);
+    run(&f, &ppu);
+    assert_eq!(rd(&f, REGS + 0x11) & 0x80, 0x80, "line 261, dot 100 exists");
+}
