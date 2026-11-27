@@ -1134,6 +1134,31 @@ fn a_trap_saves_and_restores_the_interrupt_enable() {
 }
 
 #[test]
+fn mret_on_a_machine_only_hart_stays_in_machine_mode() {
+    // A hart with no U-mode has nowhere below M to return to, and `mstatus.MPP`
+    // cannot say otherwise — not after reset, and not after software writes a
+    // zero to it. Volume II: "xPP fields are WARL fields that can hold only
+    // privilege mode x and any implemented privilege mode lower than x."
+    let h = Harness::rv64i(&[
+        MRET,
+        csrrw(0, num::MSTATUS, 0), // mstatus = 0, MPP included
+        MRET,
+    ]);
+    let mut csrs = h.hart.csrs();
+    csrs.mepc = BASE + 4;
+    h.hart.set_csrs(csrs);
+    h.steps(1);
+    assert_eq!(h.hart.priv_mode(), Priv::Machine, "straight out of reset");
+    assert_eq!(h.hart.pc(), BASE + 4);
+    let mut csrs = h.hart.csrs();
+    csrs.mepc = BASE + 12;
+    h.hart.set_csrs(csrs);
+    h.steps(2);
+    assert_eq!(h.hart.priv_mode(), Priv::Machine, "after writing MPP = 0");
+    assert_eq!(h.hart.pc(), BASE + 12);
+}
+
+#[test]
 fn ebreak_reports_its_own_address() {
     let h = Harness::rv64i(&[EBREAK]);
     h.steps(1);

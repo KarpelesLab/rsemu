@@ -695,10 +695,20 @@ impl Csrs {
         if xlen == Xlen::Rv64 {
             // UXL and SXL report 64-bit and are read-only: this core does not
             // support running S-mode or U-mode in a narrower width than M.
-            mstatus |= 2 << status::UXL_SHIFT;
+            // Each exists only with its mode — Volume II: "When MXLEN=64, if
+            // U-mode is not supported, then UXL is read-only zero."
+            if ext.u {
+                mstatus |= 2 << status::UXL_SHIFT;
+            }
             if ext.s {
                 mstatus |= 2 << status::SXL_SHIFT;
             }
+        }
+        // MPP names a mode this hart has, from the first instruction on: a
+        // machine-only hart that reset with MPP = 0 would drop into a user
+        // mode it does not implement on its first MRET.
+        if !ext.u {
+            mstatus |= status::MPP;
         }
         Csrs {
             xlen,
@@ -744,6 +754,16 @@ impl Csrs {
         match self.xlen {
             Xlen::Rv32 => 0xffff_ffff,
             Xlen::Rv64 => u64::MAX,
+        }
+    }
+
+    /// Whether this hart implements a privilege mode.
+    #[must_use]
+    pub const fn implements(&self, mode: Priv) -> bool {
+        match mode {
+            Priv::Machine => true,
+            Priv::Supervisor => self.ext.s,
+            Priv::User => self.ext.u,
         }
     }
 
@@ -1197,9 +1217,17 @@ impl Csrs {
 
             num::MSTATUS => {
                 self.mstatus = (self.mstatus & !status::M_WRITABLE) | (value & status::M_WRITABLE);
-                // A reserved MPP encoding is WARL; the specification lets an
-                // implementation pick, and machine mode is the safe pick.
-                if Priv::from_bits((self.mstatus & status::MPP) >> status::MPP_SHIFT).is_none() {
+                // Volume II: "xPP fields are WARL fields that can hold only
+                // privilege mode x and any implemented privilege mode lower
+                // than x." The reserved encoding and a mode this hart was
+                // built without are both illegal values; the specification
+                // lets an implementation pick what a WARL field reads back
+                // as, and machine mode is the safe pick — it is always
+                // implemented, and it is the answer that tells the probe the
+                // specification describes ("writing that mode to MPP then
+                // reading it back") that the mode is not there.
+                let held = Priv::from_bits((self.mstatus & status::MPP) >> status::MPP_SHIFT);
+                if !held.is_some_and(|mode| self.implements(mode)) {
                     self.mstatus |= status::MPP;
                 }
                 if !self.ext.s {
@@ -1433,6 +1461,56 @@ mod tests {
         let mut c = csrs();
         c.write(num::MEDELEG, u64::MAX).unwrap();
         assert_eq!(c.medeleg & (1 << cause::ECALL_M), 0);
+    }
+
+    /// Volume II, "Privilege and Global Interrupt-Enable Stack in mstatus
+    /// register": "xPP fields are WARL fields that can hold only privilege
+    /// mode x and any implemented privilege mode lower than x."
+    #[test]
+    fn mpp_holds_only_a_privilege_mode_the_hart_implements() {
+        let mpp = |c: &Csrs| (c.read(num::MSTATUS, 0).unwrap() & status::MPP) >> status::MPP_SHIFT;
+
+        // Machine mode only: M is the one mode there is, from reset onwards.
+        let mut c = Csrs::new(Xlen::Rv64, Extensions::I, 0, 0);
+        assert_eq!(mpp(&c), 3, "reset must not name a mode that does not exist");
+        c.write(num::MSTATUS, 0).unwrap();
+        assert_eq!(mpp(&c), 3, "U is not implemented");
+        c.write(num::MSTATUS, 1 << status::MPP_SHIFT).unwrap();
+        assert_eq!(mpp(&c), 3, "S is not implemented");
+
+        // M and U: the probe the specification describes — "M-mode software
+        // can determine whether a privilege mode is implemented by writing
+        // that mode to MPP then reading it back" — has to say no to S.
+        let mut mu = Extensions::I;
+        mu.u = true;
+        let mut c = Csrs::new(Xlen::Rv64, mu, 0, 0);
+        assert_eq!(mpp(&c), 0);
+        c.write(num::MSTATUS, 1 << status::MPP_SHIFT).unwrap();
+        assert_ne!(mpp(&c), 1, "S is not implemented");
+        c.write(num::MSTATUS, 0).unwrap();
+        assert_eq!(mpp(&c), 0, "U is");
+
+        // And a full hart holds all three.
+        let mut c = csrs();
+        for mode in [0, 1, 3] {
+            c.write(num::MSTATUS, mode << status::MPP_SHIFT).unwrap();
+            assert_eq!(mpp(&c), mode);
+        }
+    }
+
+    /// Volume II, "Base ISA Control in mstatus Register": "When MXLEN=64, if
+    /// U-mode is not supported, then UXL is read-only zero."
+    #[test]
+    fn uxl_is_zero_on_a_hart_with_no_user_mode() {
+        let c = Csrs::new(Xlen::Rv64, Extensions::I, 0, 0);
+        assert_eq!(
+            (c.read(num::MSTATUS, 0).unwrap() >> status::UXL_SHIFT) & 3,
+            0
+        );
+        assert_eq!(
+            (csrs().read(num::MSTATUS, 0).unwrap() >> status::UXL_SHIFT) & 3,
+            2
+        );
     }
 
     #[test]
