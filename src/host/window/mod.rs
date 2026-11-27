@@ -115,8 +115,11 @@ impl WindowSession {
             scale_mode: ScaleMode::AspectRatioStretch,
             ..WindowOptions::default()
         };
+        // `{e:?}`, not `{e}`: minifb's Display drops the reason it carries, so
+        // an XOpenIM failure under an unusable XMODIFIERS read only as "Failed
+        // to create window".
         let window = Window::new(title, info.width as usize, info.height as usize, options)
-            .map_err(|e| WindowError(format!("cannot open a window: {e}")))?;
+            .map_err(|e| WindowError(format!("cannot open a window: {e:?}")))?;
         Ok(WindowSession {
             window,
             surface: Surface::new(PixelFormat::BGRA8888, info.width, info.height),
