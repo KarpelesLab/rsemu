@@ -1013,6 +1013,46 @@ fn a_bkpt_inside_an_it_block_executes_whatever_the_condition() {
 }
 
 #[test]
+fn a_return_to_thread_mode_with_a_stacked_ipsr_is_an_invpc_usage_fault() {
+    // `SVC #0`, whose handler is a bare `BX lr` — and whose frame is edited
+    // underneath it so the stacked `xPSR` claims exception 11. DDI 0403E.b
+    // B1.5.8, `ExceptionReturn()`: "if CurrentMode==Mode_Thread && IPSR<8:0>
+    // != '000000000' then UFSR.INVPC = '1'; PushStack(UsageFault); LR =
+    // '1111':EXC_RETURN; ExceptionTaken(UsageFault)". The core used to take
+    // the field as given, which left Thread-mode code running as a handler.
+    let h = Harness::m4(&[0xdf00, 0xe7fe]);
+    h.set_word(11 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
+    h.set_word(6 * 4, 0x401);
+    h.set_word(0x400, 0xe7fe);
+    h.cpu.with_sys(|s| s.shcsr |= shcsr::USGFAULTENA);
+    h.cpu.step();
+    let frame = h.cpu.msp();
+    h.set_word(frame + 28, h.word(frame + 28) | 11);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::USAGE_FAULT);
+    assert_ne!(h.cpu.with_sys(|s| s.cfsr) & fsr::UF_INVPC, 0);
+    assert_eq!(h.cpu.pc(), 0x400);
+    // The frame is where it was, and the UsageFault handler holds the
+    // `EXC_RETURN` that names it.
+    assert_eq!(h.cpu.msp(), frame);
+    assert_eq!(h.cpu.reg(14), exc_return::THREAD_MSP);
+    assert!(h.cpu.with_sys(|s| !s.is_active(Exception::SVCALL)));
+    assert!(h.cpu.with_sys(|s| s.is_active(Exception::USAGE_FAULT)));
+
+    // With UsageFault disabled the same return escalates to HardFault.
+    let h = Harness::m4(&[0xdf00, 0xe7fe]);
+    h.set_word(11 * 4, 0x301);
+    h.set_word(0x300, 0x4770);
+    h.cpu.step();
+    let frame = h.cpu.msp();
+    h.set_word(frame + 28, h.word(frame + 28) | 11);
+    h.cpu.step();
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_ne!(h.cpu.with_sys(|s| s.hfsr) & fsr::HF_FORCED, 0);
+}
+
+#[test]
 fn thread_mode_can_run_on_the_process_stack() {
     // `MSR psp, r0` ; `MSR control, r1` ; `ISB` ; `MOV r2, sp`
     let mut code = Vec::new();

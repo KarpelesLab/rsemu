@@ -1400,31 +1400,8 @@ impl<'a> Exec<'a> {
         if let Some((next, prio)) = self.state.sys.highest_pending()
             && prio < self.state.execution_priority()
         {
-            self.state.sys.set_pending(next, false);
             self.state.sys.set_active(next, true);
-            self.state.r[14] = magic;
-            self.state.xpsr = (self.state.xpsr & !(xpsr::EXCEPTION | xpsr::IT_MASK))
-                | u32::from(next.0) & xpsr::EXCEPTION;
-            self.state.sync_stack();
-            // Tail-chaining skips the unstack and the restack, but it is
-            // still an `ExceptionTaken`: the new handler starts with no
-            // floating-point context of its own and with `FPSCR` back at
-            // `FPDSCR`, exactly as if it had been entered the long way.
-            self.enter_fp_context();
-            let vector = self.state.sys.vtor.wrapping_add(next.vector_offset());
-            match self.read_vector(vector) {
-                Some(entry) => {
-                    self.state.r[15] = entry & !1;
-                    self.set_flag(xpsr::T, entry & 1 != 0);
-                }
-                None => {
-                    self.state.sys.hfsr |= fsr::HF_VECTTBL;
-                    self.state.locked_up = true;
-                    self.state.r[15] = 0xffff_fffe;
-                }
-            }
-            self.branched = true;
-            self.cycle(6);
+            self.exception_taken_on_frame(next, magic);
             return Ok(());
         }
 
@@ -1450,6 +1427,45 @@ impl<'a> Exec<'a> {
             match self.read_mem(at, 4, privileged) {
                 Ok(v) => *slot = v,
                 Err(_) => unstack_failed = true,
+            }
+        }
+        // `ExceptionReturn()` (DDI 0403E.b B1.5.8), after `PopStack()`:
+        //
+        //   if CurrentMode==Mode_Handler && IPSR<8:0> == '000000000' then
+        //       UFSR.INVPC = '1';
+        //       PushStack(UsageFault);       // to negate PopStack()
+        //       LR = '1111':EXC_RETURN;
+        //       ExceptionTaken(UsageFault);  // return IPSR is inconsistent
+        //
+        // and the same for `Mode_Thread` with a non-zero `IPSR`. The mode is
+        // derived from `IPSR` here, so taking a forged one on a return to
+        // Thread would hand code that writes its own process-stack frame
+        // Handler mode, and with it privilege. Checked before anything is
+        // popped, which is the pop-and-push-back the pseudocode describes:
+        // the frame stays where it was and the UsageFault handler inherits
+        // the `EXC_RETURN` that names it. ARMv6-M has no UsageFault and its
+        // `PopStack()` forces the field instead (below); Armv8-M is left to
+        // `super::v8m`.
+        if !unstack_failed && !self.cfg.is_v6m() && !self.cfg.is_v8m() {
+            let stacked_ipsr = frame[7] & xpsr::EXCEPTION;
+            if to_handler == (stacked_ipsr == 0) {
+                self.state.sys.cfsr |= fsr::UF_INVPC;
+                let prio = self.state.execution_priority();
+                let mut target = Exception::USAGE_FAULT;
+                if !self.state.sys.is_enabled(target) || self.state.sys.priority_of(target) >= prio
+                {
+                    self.state.sys.hfsr |= fsr::HF_FORCED;
+                    target = Exception::HARD_FAULT;
+                }
+                if target == Exception::HARD_FAULT && prio <= -1 {
+                    self.state.locked_up = true;
+                    self.state.r[15] = 0xffff_fffe;
+                    self.branched = true;
+                    return Ok(());
+                }
+                self.state.sys.set_active(target, true);
+                self.exception_taken_on_frame(target, magic);
+                return Ok(());
             }
         }
         // The floating-point half, if the frame has one. A frame that was
@@ -1522,6 +1538,45 @@ impl<'a> Exec<'a> {
         self.branched = true;
         self.cycle(10);
         Ok(())
+    }
+
+    /// Enter `exc`'s handler on a frame that is already on the stack, with
+    /// `magic` as the `EXC_RETURN` that names it: `ExceptionTaken()` without
+    /// the `PushStack()` (DDI 0403E.b B1.5.6). Tail-chaining is the usual
+    /// caller — the frame the returning handler would have popped is the one
+    /// the next handler would have pushed — and a return that fails its
+    /// consistency check after `PopStack()` is the other.
+    ///
+    /// The caller has marked `exc` active.
+    fn exception_taken_on_frame(&mut self, exc: Exception, magic: u32) {
+        self.state.sys.set_pending(exc, false);
+        // The handler that just returned consumed its `EXC_RETURN` (`BX LR`,
+        // `POP {PC}`), and `LR` now holds whatever it last left there.
+        self.state.r[14] = magic;
+        self.state.control &= !control::SPSEL;
+        self.state.xpsr = (self.state.xpsr & !(xpsr::EXCEPTION | xpsr::IT_MASK))
+            | u32::from(exc.0) & xpsr::EXCEPTION;
+        self.state.sync_stack();
+        self.state.exclusive = None;
+        // No unstack and no restack, but still an `ExceptionTaken`: the new
+        // handler starts with no floating-point context of its own and with
+        // `FPSCR` back at `FPDSCR`, exactly as if it had been entered the
+        // long way.
+        self.enter_fp_context();
+        let vector = self.state.sys.vtor.wrapping_add(exc.vector_offset());
+        match self.read_vector(vector) {
+            Some(entry) => {
+                self.state.r[15] = entry & !1;
+                self.set_flag(xpsr::T, entry & 1 != 0);
+            }
+            None => {
+                self.state.sys.hfsr |= fsr::HF_VECTTBL;
+                self.state.locked_up = true;
+                self.state.r[15] = 0xffff_fffe;
+            }
+        }
+        self.branched = true;
+        self.cycle(6);
     }
 
     // -----------------------------------------------------------------
