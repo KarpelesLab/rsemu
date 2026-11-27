@@ -212,6 +212,49 @@ fn rdnmi_and_timeup_clear_on_read_and_drive_the_lines() {
 }
 
 #[test]
+fn a_reset_releases_the_interrupt_lines_it_was_driving() {
+    // NMITIMEN comes out of reset as $00, both sources off (fullsnes, "4200h
+    // - NMITIMEN"), so neither line can still be asserted afterwards. The
+    // reset zeroed the device's record of what it had driven along with
+    // everything else, compared the new state against that record, found no
+    // change, and left the wires high: a level-sensitive IRQ with nothing
+    // left to acknowledge it, and an NMI line already high for the next
+    // vblank, whose edge the CPU therefore never saw.
+    #[derive(Debug, Default)]
+    struct Probe(AtomicBool);
+    impl WireSink for Probe {
+        fn set_level(&self, _: WireId, _: u32, level: Level) {
+            self.0.store(level.is_high(), Ordering::Relaxed);
+        }
+    }
+    let f = scpu();
+    let c = &f.c;
+    let ids = WireIdAllocator::new();
+    let probe = |port: &str| {
+        let id = ids.alloc();
+        let p = Arc::new(Probe::default());
+        let wire = Wire::builder()
+            .source(id)
+            .sink(Arc::clone(&p) as Arc<dyn WireSink>, 0)
+            .build_shared();
+        Device::connect(c, port, WireSource::new(wire, id)).unwrap();
+        p
+    };
+    let nmi = probe(NMI_PIN);
+    let irq = probe(IRQ_PIN);
+    let vblank = Device::sink(c, VBLANK_PIN, &[WireId::new(99)]).unwrap();
+    vblank.sink.set_level(WireId::new(99), 0, Level::High);
+    wr(&f, REGS, 0x80);
+    c.shared.state.lock().timeup = true;
+    c.shared.drive_lines();
+    assert!(nmi.0.load(Ordering::Relaxed) && irq.0.load(Ordering::Relaxed));
+
+    Device::reset(c, ResetKind::Warm);
+    assert!(!irq.0.load(Ordering::Relaxed), "IRQ is released");
+    assert!(!nmi.0.load(Ordering::Relaxed), "and so is NMI");
+}
+
+#[test]
 fn the_manual_joypad_shifts_b_first_then_ones() {
     let f = scpu();
     let c = &f.c;

@@ -1233,9 +1233,16 @@ impl Device for SCpu {
     fn reset(&self, _kind: ResetKind) {
         {
             let mut s = self.shared.state.lock();
-            let vblank = s.vblank;
+            let (vblank, nmi_level, irq_level) = (s.vblank, s.nmi_level, s.irq_level);
             *s = State::reset();
             s.vblank = vblank;
+            // What the two output wires were last driven to is not register
+            // state, and a reset does not make it false: `drive_lines` below
+            // compares against it, and has to see that a line which was high
+            // must now be driven low. NMITIMEN is $00 after a reset, so
+            // neither can stay asserted.
+            s.nmi_level = nmi_level;
+            s.irq_level = irq_level;
         }
         self.shared.memsel.store(false, Ordering::Relaxed);
         self.shared.owed.store(0, Ordering::Relaxed);
