@@ -1380,6 +1380,49 @@ fn a_cold_reset_returns_every_register_to_its_documented_value() {
     });
 }
 
+/// What a reset-line pulse leaves alone, and what it must not let through.
+///
+/// NESdev, *PPU power up state*, the "After Reset" column: `PPUADDR ($2006)`
+/// is "unchanged" — "Note that the VRAM address itself (V) is ''not''
+/// cleared" — and "The VBL flag (PPUSTATUS bit 7) is random at power, and
+/// unchanged by reset", while `PPUMASK ($2001)` is `0000 0000`. A `$2001`
+/// write still in its three-dot flight when the reset arrived used to land
+/// afterwards and switch rendering back on inside the lockout.
+#[test]
+fn a_warm_reset_keeps_v_and_the_vblank_flag_and_drops_a_mask_write_in_flight() {
+    let (ppu, _, _) = new_ppu();
+    ppu.write_register(PPUADDR, 0x21);
+    ppu.write_register(PPUADDR, 0x08);
+    settle(&ppu);
+    assert_eq!(ppu.with_engine(|e| e.v), 0x2108);
+    ppu.with_engine(|e| e.status |= STATUS_VBLANK | STATUS_SPRITE0);
+    ppu.write_register(PPUMASK, MASK_BG | MASK_SPRITE);
+
+    ppu.reset(ResetKind::Warm);
+    ppu.with_engine(|e| {
+        assert_eq!(e.v, 0x2108, "V is not cleared by reset");
+        assert_eq!(e.t, 0, "T is");
+        assert!(!e.w, "and so is the write toggle");
+        assert_eq!(e.status & STATUS_VBLANK, STATUS_VBLANK, "VBL is unchanged");
+    });
+    ppu.advance_by(8);
+    assert_eq!(
+        ppu.with_engine(|e| e.mask),
+        0,
+        "the write died with the reset"
+    );
+
+    // A cold reset drops it too, and does clear V and the flag.
+    ppu.write_register(PPUMASK, MASK_BG | MASK_SPRITE);
+    ppu.reset(ResetKind::Cold);
+    ppu.advance_by(8);
+    ppu.with_engine(|e| {
+        assert_eq!(e.mask, 0);
+        assert_eq!(e.v, 0);
+        assert_eq!(e.status, 0);
+    });
+}
+
 /// A reset restarts the frame; it does not rewind the device's clock.
 ///
 /// `Engine::dots` is the lazily-advanced tick the scheduler reads, and

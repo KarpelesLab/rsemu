@@ -616,7 +616,11 @@ impl Engine {
 
     /// A reset-line pulse: the same as a cold reset except that OAM, palette RAM
     /// and the frame buffer keep their contents, because nothing discharges
-    /// them.
+    /// them — and neither does anything clear `v` or the vblank flag. NESdev,
+    /// *PPU power up state*, "After Reset": `PPUADDR ($2006)` is "unchanged"
+    /// ("Note that the VRAM address itself (V) is ''not'' cleared"), and "The
+    /// VBL flag (PPUSTATUS bit 7) is random at power, and unchanged by reset".
+    /// The other two status flags are listed as unknown and come back clear.
     pub fn reset_warm(&mut self) {
         self.reset_dot = self.dots;
         self.frame = 0;
@@ -624,8 +628,7 @@ impl Engine {
         self.dot = 0;
         self.ctrl = 0;
         self.mask = 0;
-        self.status = 0;
-        self.v = 0;
+        self.status &= STATUS_VBLANK;
         self.t = 0;
         self.x = 0;
         self.w = false;
@@ -634,6 +637,10 @@ impl Engine {
     }
 
     fn reset_pipelines(&mut self) {
+        // A `$2001` write still travelling dies with the reset: the register
+        // comes back `0000 0000` and stays there until something writes it.
+        self.mask_pending = 0;
+        self.mask_delay = 0;
         self.data_sm = 0;
         self.data_sm_addr = 0;
         self.v_pending = 0;
