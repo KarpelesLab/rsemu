@@ -6357,6 +6357,49 @@ mod long_mode {
         assert_eq!(sys.seg(isa::seg::CS).dpl(), 0, "CS.DPL := 0");
     }
 
+    /// The `IRET` into virtual-8086 mode loads `FS` and `GS` like any other
+    /// load of them, base register included.
+    ///
+    /// On a part with long mode the two have a second copy of their base
+    /// ([`Sys::fs_base`], what `RDMSR` of `IA32_FS_BASE` returns and what a
+    /// 64-bit access adds). A selector load keeps the two in step; this
+    /// path wrote the descriptor cache directly and left the copy naming
+    /// whatever the monitor had loaded before.
+    #[test]
+    fn an_iret_into_a_virtual_8086_task_moves_the_fs_and_gs_base_registers() {
+        let pc = pc64();
+        pc.start_protected();
+        let mut sys = pc.cpu.sys();
+        sys.fs_base = 0xdead_0000;
+        sys.gs_base = 0xbeef_0000;
+        pc.cpu.set_sys(sys);
+        let mut code: Vec<u8> = Vec::new();
+        for value in [
+            0x2345u32, // GS
+            0x1234,    // FS
+            0x0c00,    // DS
+            0x0c00,    // ES
+            0x0d00,    // SS
+            0x100,     // ESP
+            flags::VM | flags::IOPL | flags::ALWAYS_SET,
+            0x0b00, // CS
+            0,      // EIP
+        ] {
+            code.push(0x68);
+            code.extend_from_slice(&value.to_le_bytes());
+        }
+        code.push(0xcf);
+        pc.write(at::CODE0, &code);
+        for _ in 0..10 {
+            pc.cpu.step();
+        }
+        assert_ne!(pc.regs().eflags & flags::VM, 0, "the IRET entered the task");
+        let sys = pc.cpu.sys();
+        assert_eq!(sys.seg(isa::seg::FS).base, 0x1_2340);
+        assert_eq!(sys.fs_base, 0x1_2340, "FS base follows the segment");
+        assert_eq!(sys.gs_base, 0x2_3450, "and so does GS");
+    }
+
     #[test]
     fn swapgs_exchanges_the_gs_base_with_the_kernels() {
         // The one instruction a 64-bit kernel cannot do without: entered from

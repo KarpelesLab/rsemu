@@ -1706,6 +1706,15 @@ impl Exec<'_> {
     /// base register is unaffected by.
     pub(super) fn load_segment(&mut self, index: u8, selector: u16) -> Ex<()> {
         self.load_segment_cache(index, selector)?;
+        self.sync_long_base(index);
+        Ok(())
+    }
+
+    /// Carry a freshly loaded `FS` or `GS` descriptor-cache base across to
+    /// [`Sys::fs_base`] / [`Sys::gs_base`] — the second half of
+    /// [`Exec::load_segment`], for the paths that fill the cache without
+    /// going through it.
+    fn sync_long_base(&mut self, index: u8) {
         if self.cfg.features.long && matches!(index, seg::FS | seg::GS) {
             let loaded = self.state.sys.seg(index);
             // In protected mode a null selector marks the register unusable
@@ -1720,7 +1729,6 @@ impl Exec<'_> {
                 }
             }
         }
-        Ok(())
     }
 
     /// [`Exec::load_segment`] as far as the descriptor cache.
@@ -2490,6 +2498,9 @@ impl Exec<'_> {
         ] {
             *self.state.sys.seg_mut(index) = v86_seg(selector, false);
             self.state.regs.set_segment(index, selector);
+            // `FS` and `GS` have a second copy of their base on a part with
+            // long mode, and this is a load of them like any other.
+            self.sync_long_base(index);
         }
         // `ESP` in full rather than through `set_sp`: the frame carries the
         // whole register and the task's stack segment is sixteen-bit, so
