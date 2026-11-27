@@ -18,6 +18,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::core::error::BusError;
@@ -1066,4 +1067,383 @@ fn install_is_what_an_engine_built_afterwards_picks_up() {
     if let Some(back) = previous {
         embed::install(back);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Random blocks
+// ---------------------------------------------------------------------------
+
+/// A tiny deterministic source of randomness: xorshift64*, so a seed
+/// reproduces a case exactly.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
+        xs[self.below(xs.len() as u64) as usize]
+    }
+}
+
+const CONDS: [Cond; 10] = [
+    Cond::Eq,
+    Cond::Ne,
+    Cond::LtS,
+    Cond::LeS,
+    Cond::GtS,
+    Cond::GeS,
+    Cond::LtU,
+    Cond::LeU,
+    Cond::GtU,
+    Cond::GeU,
+];
+
+const TYPES: [Type; 4] = [Type::I1, Type::I32, Type::I64, Type::I64];
+
+/// A temporary of exactly `ty`.
+fn typed(r: &mut Rng, pool: &[(Temp, Type)], ty: Type) -> Temp {
+    let matching: Vec<Temp> = pool
+        .iter()
+        .filter(|(_, t)| *t == ty)
+        .map(|(temp, _)| *temp)
+        .collect();
+    matching[r.below(matching.len() as u64) as usize]
+}
+
+/// A temporary of `ty` most of the time, and of *any* type the rest.
+///
+/// The IR lets an instruction's type differ from its operands' wherever
+/// `verify` does not say otherwise, and `Interp` then computes on the
+/// operand's own bits and masks at the instruction's width. A backend has to
+/// reproduce that, so the generator has to ask for it.
+fn loosely(r: &mut Rng, pool: &[(Temp, Type)], ty: Type) -> Temp {
+    if r.below(4) == 0 {
+        pool[r.below(pool.len() as u64) as usize].0
+    } else {
+        typed(r, pool, ty)
+    }
+}
+
+/// Emit one random operation over the compiled set, returning what it defined.
+#[allow(clippy::too_many_lines)]
+fn emit_one(b: &mut BlockBuilder, r: &mut Rng, pool: &[(Temp, Type)]) -> Vec<(Temp, Type)> {
+    let ty = r.pick(&TYPES);
+    let w = ty.bits();
+    // The destination is the instruction's type most of the time, and
+    // sometimes narrower or **wider**: `Interp` masks an arithmetic result to
+    // the instruction's width and then again to the destination's, and only
+    // the second of those is the same thing as "what fits".
+    let dst_ty = if r.below(4) == 0 { r.pick(&TYPES) } else { ty };
+    let raw = |b: &mut BlockBuilder, op, srcs: &[Temp], imm, cond, aux| {
+        let dst = b.temp(dst_ty);
+        b.emit_raw(op, ty, Some(dst), None, srcs, imm, cond, aux);
+        vec![(dst, dst_ty)]
+    };
+
+    match r.below(18) {
+        0 | 1 => {
+            let op = r.pick(&[
+                Opcode::ADD,
+                Opcode::SUB,
+                Opcode::MUL,
+                Opcode::AND,
+                Opcode::OR,
+                Opcode::XOR,
+                Opcode::ANDC,
+            ]);
+            let (x, y) = (loosely(r, pool, ty), loosely(r, pool, ty));
+            raw(b, op, &[x, y], None, None, 0)
+        }
+        2 => {
+            let op = r.pick(&[Opcode::NOT, Opcode::NEG, Opcode::MOV]);
+            let x = loosely(r, pool, ty);
+            raw(b, op, &[x], None, None, 0)
+        }
+        3 => {
+            let op = r.pick(&[Opcode::SHL, Opcode::SHR, Opcode::SAR]);
+            let (x, y) = (loosely(r, pool, ty), loosely(r, pool, ty));
+            raw(b, op, &[x, y], None, None, 0)
+        }
+        4 => {
+            // A chosen amount, so the in-range path and the boundary at
+            // exactly the width are reached on purpose rather than by luck.
+            let op = r.pick(&[Opcode::SHL, Opcode::SHR, Opcode::SAR]);
+            let x = loosely(r, pool, ty);
+            let n = match r.below(6) {
+                0 => u64::from(w) - 1,
+                1 => u64::from(w),
+                2 => u64::from(w) + 1,
+                3 => 0,
+                _ => r.below(u64::from(w)),
+            };
+            let amount = b.imm(Type::I64, Const::Int(u128::from(n)));
+            raw(b, op, &[x, amount], None, None, 0)
+        }
+        5 => {
+            // The value operand is the op's own type — `verify` insists — and
+            // the amount is anything, a whole number of turns included.
+            let op = r.pick(&[Opcode::ROTL, Opcode::ROTR]);
+            let x = typed(r, pool, ty);
+            let y = if r.below(3) == 0 {
+                b.imm(Type::I64, Const::Int(u128::from(r.below(3) * u64::from(w))))
+            } else {
+                loosely(r, pool, ty)
+            };
+            raw(b, op, &[x, y], None, None, 0)
+        }
+        6 => {
+            let op = r.pick(&[Opcode::CLZ, Opcode::CTZ, Opcode::POPCOUNT]);
+            let x = if r.below(3) == 0 {
+                b.imm(ty, Const::Int(0))
+            } else {
+                typed(r, pool, ty)
+            };
+            raw(b, op, &[x], None, None, 0)
+        }
+        7 => {
+            let (x, y) = (loosely(r, pool, ty), loosely(r, pool, ty));
+            vec![(b.setcond(r.pick(&CONDS), ty, x, y), Type::I1)]
+        }
+        8 => {
+            let sel = loosely(r, pool, Type::I1);
+            let (t, f) = (loosely(r, pool, ty), loosely(r, pool, ty));
+            raw(b, Opcode::MOVCOND, &[sel, t, f], None, None, 0)
+        }
+        9 => {
+            let (x, y) = (loosely(r, pool, ty), loosely(r, pool, ty));
+            let (t, f) = (loosely(r, pool, ty), loosely(r, pool, ty));
+            let cond = Some(r.pick(&CONDS));
+            raw(b, Opcode::MOVCOND, &[x, y, t, f], None, cond, 0)
+        }
+        10 => {
+            let op = r.pick(&[Opcode::EXT_S, Opcode::EXT_Z, Opcode::TRUNC]);
+            let x = loosely(r, pool, ty);
+            raw(b, op, &[x], None, None, 0)
+        }
+        11 if w >= 16 => {
+            let x = typed(r, pool, ty);
+            let lane = r.pick(&[8u32, 16, 32, 64]);
+            let imm = (lane <= w && r.below(4) != 0).then(|| Const::Int(u128::from(lane)));
+            raw(b, Opcode::BSWAP, &[x], imm, None, 0)
+        }
+        12 => {
+            let len = 1 + r.below(u64::from(w)) as u32;
+            let pos = r.below(u64::from(w - len) + 1) as u32;
+            let x = loosely(r, pool, ty);
+            raw(b, Opcode::EXTRACT, &[x], None, None, bitfield_aux(pos, len))
+        }
+        13 => {
+            let len = 1 + r.below(u64::from(w)) as u32;
+            let pos = r.below(u64::from(w - len) + 1) as u32;
+            let (into, what) = (loosely(r, pool, ty), loosely(r, pool, ty));
+            raw(
+                b,
+                Opcode::DEPOSIT,
+                &[into, what],
+                None,
+                None,
+                bitfield_aux(pos, len),
+            )
+        }
+        14 => {
+            let slot = RegSlot(r.below(u64::from(SLOTS)) as u16);
+            let ty = r.pick(&[Type::I32, Type::I64]);
+            vec![(b.get_slot(ty, slot), ty)]
+        }
+        15 => {
+            let size = r.pick(&[Width::U8, Width::U16, Width::U32, Width::U64]);
+            let addr = address(b, r);
+            let mut mem = MemOp::load(size);
+            if r.below(2) == 0 {
+                mem.sign = Sign::Signed;
+            }
+            mem.volatile = r.below(2) == 0;
+            let ty = r.pick(&[Type::I32, Type::I64]);
+            vec![(b.load(ty, addr, mem), ty)]
+        }
+        16 => {
+            let size = r.pick(&[Width::U8, Width::U16, Width::U32, Width::U64]);
+            let addr = address(b, r);
+            let value = loosely(r, pool, Type::I64);
+            b.store(Type::I64, addr, value, MemOp::store(size));
+            Vec::new()
+        }
+        _ => {
+            let ty = r.pick(&TYPES);
+            vec![(b.imm(ty, Const::Int(u128::from(r.next()))), ty)]
+        }
+    }
+}
+
+/// An address temporary: usually inside RAM, and sometimes off the end of it,
+/// because the fault path is the half that is hard.
+fn address(b: &mut BlockBuilder, r: &mut Rng) -> Temp {
+    let value = if r.below(8) == 0 {
+        BASE + RAM + r.below(64)
+    } else {
+        BASE + r.below(RAM - 8)
+    };
+    b.imm(Type::I64, Const::Int(u128::from(value)))
+}
+
+/// A random block shaped like a frontend's: boundaries, charges, a live map
+/// that grows, one side exit, and each of the three terminators.
+fn random_block(seed: u64, insns: usize) -> Block {
+    let mut r = Rng(seed ^ 0x9e37_79b9_7f4a_7c15);
+    let mut b = BlockBuilder::new(0x100, 0);
+    let mut pool: Vec<(Temp, Type)> = Vec::new();
+    let mut live: Vec<(RegSlot, Temp)> = Vec::new();
+    let mut ticks = 0u64;
+    let mut pc = 0x100u64;
+
+    for ty in [Type::I1, Type::I32, Type::I64, Type::I32, Type::I64] {
+        let t = b.imm(ty, Const::Int(u128::from(r.next())));
+        pool.push((t, ty));
+    }
+    let mut side_exit_at = (insns > 4).then(|| 2 + r.below(insns as u64 - 3) as usize);
+
+    for step in 0..insns {
+        b.insn_start(InsnStart {
+            pc,
+            next_pc: pc + 4,
+            ticks,
+            live: live.clone(),
+        });
+        if r.below(4) != 0 {
+            let charge = 1 + r.below(3);
+            b.charge(charge);
+            ticks += charge;
+        }
+        pc += 4;
+
+        if side_exit_at == Some(step) {
+            side_exit_at = None;
+            // A side exit a `brcond` jumps over, in both of the branch's
+            // shapes, on a condition that is opaque to the builder and
+            // constant at run time: `x < x` never holds, `x == x` always does.
+            let sel = typed(&mut r, &pool, Type::I64);
+            let cond = if r.below(2) == 0 { Cond::LtU } else { Cond::Eq };
+            let over = if r.below(2) == 0 {
+                let taken = b.setcond(cond, Type::I64, sel, sel);
+                brcond_sel(&mut b, taken)
+            } else {
+                b.emit_raw(
+                    Opcode::BRCOND,
+                    Type::I64,
+                    None,
+                    None,
+                    &[sel, sel],
+                    None,
+                    Some(cond),
+                    0,
+                )
+            };
+            b.insn_start(InsnStart {
+                pc,
+                next_pc: pc,
+                ticks,
+                live: live.clone(),
+            });
+            b.exit_tb();
+            b.patch_aux(over, b.next_index() as u32);
+        }
+
+        for (t, ty) in emit_one(&mut b, &mut r, &pool) {
+            pool.push((t, ty));
+            // Publish nearly everything: a temporary no boundary names lives
+            // in a wasm local and cannot be compared at all.
+            if r.below(5) != 0 {
+                let slot = RegSlot(r.below(u64::from(SLOTS)) as u16);
+                match live.iter_mut().find(|(s, _)| *s == slot) {
+                    Some(entry) => entry.1 = t,
+                    None => live.push((slot, t)),
+                }
+            }
+        }
+    }
+
+    let t = b.imm(Type::I64, Const::Int(u128::from(pc)));
+    live.push((RegSlot(SLOTS), t));
+    b.insn_start(InsnStart {
+        pc,
+        next_pc: pc,
+        ticks,
+        live,
+    });
+    match r.below(3) {
+        0 => goto_tb(&mut b, pc),
+        1 => lookup_and_goto(&mut b, t),
+        _ => b.exit_tb(),
+    }
+    b.finish()
+}
+
+/// Run `block` both ways under a tick allowance and compare what the guest
+/// can see. Returns whether the block left part-way through.
+fn agree_within(block: &Block, allowance: u64) -> bool {
+    let mut host = Host::new();
+    host.allowance = allowance;
+    let (want, interp) = interpreted(block, host.clone());
+    let (got, engine, _) = compiled(block, host);
+    assert_eq!(want, got, "allowance {allowance}\n{block}");
+    assert_eq!(interp.ticks(), engine.ticks(), "{block}");
+    assert_eq!(interp.boundaries(), engine.boundaries(), "{block}");
+    assert_eq!(interp.mark(), engine.mark(), "{block}");
+    matches!(want.outcome, Some(Outcome::Spent { .. }))
+}
+
+#[test]
+fn two_thousand_random_blocks_agree_with_the_interpreter() {
+    // The targeted tests above each pin one lowering at the operand types a
+    // frontend would pick. This is the other half: every shape `verify`
+    // accepts and this backend takes — operands that are not the
+    // instruction's type, destinations narrower and wider than it, one-bit
+    // arithmetic — against the oracle, on every temporary a boundary names.
+    let mut seen = alloc::collections::BTreeSet::new();
+    let mut faulted = 0;
+    for seed in 0..2000u64 {
+        let block = random_block(seed, 6 + (seed % 11) as usize);
+        for inst in block.insts() {
+            seen.insert(inst.op);
+        }
+        agree(&block);
+        let mut host = Host::new();
+        if matches!(Interp::new().run(&block, &mut host), Ok(Outcome::Fault(_))) {
+            faulted += 1;
+        }
+    }
+    // Non-vacuity: the generator reaches every op the backend claims, and the
+    // fault path is really taken.
+    for raw in 0..0x80u16 {
+        let op = Opcode(raw);
+        assert!(
+            !compiles(op) || seen.contains(&op),
+            "the generator never emitted `{op}`"
+        );
+    }
+    assert!(faulted > 50, "only {faulted} of 2000 blocks faulted");
+}
+
+#[test]
+fn two_thousand_random_blocks_leave_at_the_same_boundary_under_an_allowance() {
+    let mut left_early = 0;
+    for seed in 0..2000u64 {
+        let block = random_block(seed, 6 + (seed % 11) as usize);
+        if agree_within(&block, seed % 13) {
+            left_early += 1;
+        }
+    }
+    assert!(
+        left_early > 800,
+        "only {left_early} of 2000 blocks left part-way through"
+    );
 }

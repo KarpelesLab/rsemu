@@ -472,6 +472,36 @@ impl<'a> Compiler<'a> {
         self.write_temp(dst)
     }
 
+    /// The same, for an op whose result `Interp` masks to the **operation's**
+    /// width before it masks to the destination's.
+    ///
+    /// Those are two masks and usually one type: a builder allocates the
+    /// destination with the instruction's own type. `verify` does not require
+    /// it, though, and where the destination is *wider* the first mask is the
+    /// only one that takes anything off — an `or.i1` into an `i32` temporary
+    /// is one bit in the interpreter, and without this it was thirty-two here.
+    /// `jit::x86` refuses that shape outright; this backend holds every value
+    /// in the same `i64`, so reproducing the oracle costs one `and` on a shape
+    /// no frontend in the tree emits and nothing at all on the ones they do.
+    ///
+    /// Which ops: exactly the arms of `Interp::step` that end in `& m` — the
+    /// arithmetic, the logic, the shifts and the rotates. The rest (`mov`, the
+    /// extensions, the bitfields, the bit counts, `movcond`, a load, a slot
+    /// read) are masked by the destination alone, there and here.
+    fn write_op(&mut self, inst: &Inst) -> Result<(), Refusal> {
+        let dst = inst
+            .dst
+            .ok_or(Refusal::Shape("this op must have a destination"))?;
+        if self
+            .block
+            .type_of(dst)
+            .is_some_and(|ty| ty.bits() > inst.ty.bits())
+        {
+            self.mask(inst.ty.bits());
+        }
+        self.write_temp(dst)
+    }
+
     fn write_temp(&mut self, dst: Temp) -> Result<(), Refusal> {
         let ty = self
             .block
@@ -690,13 +720,13 @@ impl<'a> Compiler<'a> {
                 self.f.i64_const(0);
                 self.push(src(0)?)?;
                 self.f.op(op::I64_SUB);
-                self.write(inst)?;
+                self.write_op(inst)?;
             }
             Opcode::NOT => {
                 self.push(src(0)?)?;
                 self.f.i64_const(-1);
                 self.f.op(op::I64_XOR);
-                self.write(inst)?;
+                self.write_op(inst)?;
             }
             Opcode::ADD | Opcode::SUB | Opcode::MUL | Opcode::AND | Opcode::OR | Opcode::XOR => {
                 self.push(src(0)?)?;
@@ -709,7 +739,7 @@ impl<'a> Compiler<'a> {
                     Opcode::OR => op::I64_OR,
                     _ => op::I64_XOR,
                 });
-                self.write(inst)?;
+                self.write_op(inst)?;
             }
             Opcode::ANDC => {
                 self.push(src(0)?)?;
@@ -717,7 +747,7 @@ impl<'a> Compiler<'a> {
                 self.f.i64_const(-1);
                 self.f.op(op::I64_XOR);
                 self.f.op(op::I64_AND);
-                self.write(inst)?;
+                self.write_op(inst)?;
             }
 
             // ---- Shifts ----------------------------------------------------
@@ -745,7 +775,7 @@ impl<'a> Compiler<'a> {
                 self.f.i64_const(i64::from(w));
                 self.f.op(op::I64_LT_U);
                 self.f.op(op::SELECT);
-                self.write(inst)?;
+                self.write_op(inst)?;
             }
             Opcode::SAR => {
                 let a = src(0)?;
@@ -764,7 +794,7 @@ impl<'a> Compiler<'a> {
                 self.f.i64_const(i64::from(w));
                 self.f.op(op::I64_LT_U);
                 self.f.op(op::SELECT);
-                self.write(inst)?;
+                self.write_op(inst)?;
             }
             Opcode::ROTL | Opcode::ROTR => {
                 // A rotate is defined for every amount, so it reduces rather
@@ -796,7 +826,7 @@ impl<'a> Compiler<'a> {
                 self.f.op(op::I64_SUB);
                 self.f.op(op::I64_SHR_U);
                 self.f.op(op::I64_OR);
-                self.write(inst)?;
+                self.write_op(inst)?;
             }
 
             // ---- Bit counting ----------------------------------------------
