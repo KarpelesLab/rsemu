@@ -2824,6 +2824,75 @@ fn enter_and_leave_build_and_unmake_a_frame() {
     assert_eq!(regs.rsp, at::STACK0);
 }
 
+/// One step of a repeated string instruction is bounded, and the instruction
+/// restarts from its registers.
+///
+/// Nothing can reach an interrupt pin while a step is executing — the
+/// scheduler that would advance the timer is waiting for the step — so a
+/// repeat with a 32-bit count used to run to completion inside one step:
+/// four thousand million iterations for `rep lodsb` with `ECX` of all ones,
+/// with no safe point and no way for the host to stop the machine. A repeat
+/// is restartable between iterations by design (*Intel SDM* volume 2,
+/// `REP/REPE/REPZ/REPNE/REPNZ`), so the step hands the core back instead.
+#[test]
+fn a_long_repeat_is_executed_in_bounded_steps_and_restarts_where_it_stopped() {
+    const FILL: u64 = 0x10_0000;
+    const COUNT: u32 = 0x2_8000;
+    let pc = pc386();
+    pc.start_protected();
+    let mut code = alloc::vec![0xbf]; // mov edi, FILL
+    code.extend_from_slice(&(FILL as u32).to_le_bytes());
+    code.push(0xb9); // mov ecx, COUNT
+    code.extend_from_slice(&COUNT.to_le_bytes());
+    code.extend_from_slice(&[0xb0, 0x5a, 0xf3, 0xaa, 0xf4]); // mov al, 0x5a ; rep stosb ; hlt
+    pc.write(at::CODE0, &code);
+    for _ in 0..3 {
+        pc.cpu.step();
+    }
+    let rep = at::CODE0 + 12;
+    assert_eq!(pc.regs().rip, rep, "about to execute the repeat");
+
+    pc.cpu.step();
+    let regs = pc.regs();
+    assert_eq!(regs.rip, rep, "the step ended with EIP back on the prefix");
+    assert_eq!(regs.rcx, u64::from(COUNT) - 0x1_0000, "one slice done");
+    assert_eq!(regs.rdi, FILL + 0x1_0000, "and the index says so too");
+    assert_eq!(pc.ram.read_u8(FILL + 0xffff).unwrap(), 0x5a);
+    assert_eq!(
+        pc.ram.read_u8(FILL + 0x1_0000).unwrap(),
+        0,
+        "and no further"
+    );
+
+    // It finishes in two more steps, having written every byte exactly once.
+    pc.cpu.step();
+    pc.cpu.step();
+    let regs = pc.regs();
+    assert_eq!(regs.rip, rep + 2, "past the instruction");
+    assert_eq!(regs.rcx, 0);
+    assert_eq!(regs.rdi, FILL + u64::from(COUNT));
+    assert_eq!(pc.ram.read_u8(FILL + u64::from(COUNT) - 1).unwrap(), 0x5a);
+    assert_eq!(pc.ram.read_u8(FILL + u64::from(COUNT)).unwrap(), 0);
+
+    // A 16-bit count cannot reach the bound, so a repeat under a 16-bit
+    // address size is one step however long it is.
+    let pc = pc386();
+    pc.write(0x1000, &[0xf3, 0xaa, 0xf4]); // rep stosb ; hlt
+    pc.start_real(0, 0x1000);
+    let mut regs = pc.cpu.regs();
+    regs.rcx = 0xffff;
+    regs.rdi = 0x2000;
+    regs.es = 0x1000;
+    pc.cpu.set_regs(regs);
+    let mut sys = pc.cpu.sys();
+    sys.segs[usize::from(isa::seg::ES)].base = 0x1_0000;
+    pc.cpu.set_sys(sys);
+    pc.cpu.step();
+    let regs = pc.regs();
+    assert_eq!(regs.rcx, 0, "all 65535 iterations in the one step");
+    assert_eq!(regs.rip, 0x1002);
+}
+
 /// A segment base plus an offset is a 32-bit sum outside 64-bit mode.
 ///
 /// *Intel SDM* volume 3A §5.1.1: "legacy protected mode cannot produce linear

@@ -108,6 +108,26 @@ use super::{Config, Lines, Regs, Variant, flags, linear};
 /// Clocks the reset sequence spends before the first fetch.
 const RESET_CLOCKS: u32 = 7;
 
+/// How many iterations of a repeated string instruction one step executes
+/// before it hands the core back, with the instruction pointer on the prefix
+/// and the count and indexes saying how far it got.
+///
+/// A repeat is interruptible between iterations and restarts from its
+/// registers, so stopping here is the path an interrupt already takes
+/// ([`Exec::string`]) and is invisible to the guest except as time. What it
+/// bounds is the *host*: nothing can arrive on an interrupt pin while a step
+/// is executing, because the scheduler that would advance a timer is waiting
+/// for that step to return — so without a bound `rep lodsb` with `ECX` of
+/// `0xffffffff` was four thousand million iterations in one step, and with
+/// `RCX` of all ones it never returned at all, to the scheduler, to a
+/// stop-the-world safe point, or to a host trying to shut the machine down.
+///
+/// Sixty-five thousand five hundred and thirty-six, which is one more than a
+/// 16-bit count can ask for: a repeat on an 8086, or under a 16-bit address
+/// size anywhere, runs exactly as it did, hardware-corpus cycle counts
+/// included.
+const REP_SLICE: u32 = 0x1_0000;
+
 /// Type 0: divide error.
 pub(super) const VEC_DIVIDE: u8 = 0;
 /// Type 1: debug — single step, and the 386's `ICEBP`.
@@ -3903,6 +3923,7 @@ impl<'a> Exec<'a> {
         };
         // `REP` with a zero count does nothing at all — not even one
         // iteration.
+        let mut done = 0u32;
         while self.counter(f) != 0 {
             if let Err(fault) = self.string_step(f, size, delta) {
                 // A fault part-way through a repeat restarts the instruction
@@ -3938,7 +3959,11 @@ impl<'a> Exec<'a> {
             // backs the instruction pointer up to the prefix and re-enters.
             // Modelled as a clean restart; the 8086 erratum where it forgets
             // all but the last prefix on resume is not.
-            if self.lines.nmi_pending() || (self.flag(flags::IF) && self.lines.intr_pending()) {
+            done += 1;
+            if self.lines.nmi_pending()
+                || (self.flag(flags::IF) && self.lines.intr_pending())
+                || done >= REP_SLICE
+            {
                 self.state.regs.rip = self.start_ip;
                 self.state.queue.flush();
                 return Ok(());
