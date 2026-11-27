@@ -202,6 +202,22 @@ fn a_date_becomes_seconds_since_1904() {
         1_767_225_600
     );
 
+    // The counter is thirty-two bits of seconds, and its last one is
+    // 06:28:15 on 6 February 2040. A date past it is refused by name, not
+    // wrapped back into 1904 (and not an overflow panic in a debug build).
+    assert_eq!(parse_time("2040-02-06T06:28:15").unwrap(), u32::MAX);
+    for late in [
+        "2040-02-06T06:28:16",
+        "2041-01-01T00:00:00",
+        "9999-12-31T23:59:59",
+    ] {
+        let err = parse_time(late).expect_err(late);
+        assert!(
+            alloc::format!("{err}").contains("2040-02-06"),
+            "{late}: the message says where the counter ends: {err}"
+        );
+    }
+
     for bad in [
         "",
         "2026-01-01",

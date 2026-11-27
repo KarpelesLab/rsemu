@@ -177,6 +177,10 @@ pub const TICKS_PER_SECOND: u64 = 32_768;
 /// The date the chip starts at when a machine file does not say.
 pub const DEFAULT_TIME: &str = "2026-01-01T00:00:00";
 
+/// The last date the counter can hold: `$FFFF_FFFF` seconds after midnight on
+/// 1 January 1904.
+pub const LAST_TIME: &str = "2040-02-06T06:28:15";
+
 /// Seconds from the Macintosh epoch — midnight, 1 January 1904 — to the Unix
 /// one, which is what the date arithmetic below is easiest to do in.
 ///
@@ -417,8 +421,8 @@ impl State {
 ///
 /// # Errors
 ///
-/// [`Error::Property`] if it is not a date in that shape, or is before 1904 —
-/// the chip's counter has no way to say so.
+/// [`Error::Property`] if it is not a date in that shape, or is before 1904
+/// or after [`LAST_TIME`] — the chip's counter has no way to say either.
 pub fn parse_time(text: &str) -> Result<u32> {
     let bad = || {
         Error::Property(format!(
@@ -461,15 +465,23 @@ pub fn parse_time(text: &str) -> Result<u32> {
     {
         return Err(bad());
     }
-    let mut days = 0u32;
+    // In sixty-four bits, because the year field admits 9999 and the counter
+    // does not: thirty-two bits of seconds from 1904 end in February 2040.
+    let mut days = 0u64;
     for y in 1904..year {
         days += if leap(y) { 366 } else { 365 };
     }
     for m in 1..month {
-        days += month_days(year, m);
+        days += u64::from(month_days(year, m));
     }
-    days += day - 1;
-    Ok(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    days += u64::from(day - 1);
+    let seconds = days * 86_400 + u64::from(hour * 3_600 + minute * 60 + second);
+    u32::try_from(seconds).map_err(|_| {
+        Error::Property(format!(
+            "{CLASS_NAME}: `time` \"{text}\" is past {LAST_TIME}, the last second the chip's \
+             32-bit counter can hold"
+        ))
+    })
 }
 
 /// The same date as seconds since the Unix epoch, for a caller that thinks in
