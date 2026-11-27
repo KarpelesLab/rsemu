@@ -445,6 +445,20 @@ impl Shared {
         }
     }
 
+    /// Put `WRIO` bit 7 on the PPU's `EXTLATCH` input.
+    ///
+    /// The register is `$FF` out of reset ("On power-on: WRIO = $FF", SNESdev
+    /// wiki, *MMIO registers*), so the line is high before any program has
+    /// written it — and it has to be, because `$2137` latches the counters
+    /// only while it is. Raising it is not an edge that latches; only the
+    /// fall is.
+    fn drive_extlatch(&self) {
+        let level = self.state.lock().wrio & 0x80 != 0;
+        if let Some(beam) = self.beam() {
+            beam.set_extlatch(level);
+        }
+    }
+
     fn publish_next(&self, s: &State) {
         let mut next = s.next_init.min(s.next_line).min(s.next_refresh);
         if let Some(irq) = s.next_irq {
@@ -1405,6 +1419,7 @@ impl Device for SCpu {
         self.shared.memsel.store(false, Ordering::Relaxed);
         self.shared.owed.store(0, Ordering::Relaxed);
         self.shared.dma_active.store(false, Ordering::Relaxed);
+        self.shared.drive_extlatch();
         self.shared.reschedule_all();
         self.shared.drive_lines();
     }
@@ -1554,6 +1569,7 @@ impl Instance for SCpu {
         if let Some(name) = &self.ppu_link {
             let beam = ctx.export_as::<SnesPpuBeam>(name, ExportId::SNES_PPU_BEAM)?;
             *self.shared.beam.lock() = Some(beam);
+            self.shared.drive_extlatch();
             self.shared.reschedule_all();
         }
         Ok(())

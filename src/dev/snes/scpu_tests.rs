@@ -575,3 +575,41 @@ fn hdma_and_refresh_run_once_a_line_wherever_the_ppu_has_got_to() {
         assert_eq!(refreshes, lines, "with the PPU led by {lead:?}");
     }
 }
+
+#[test]
+fn wrio_comes_up_high_so_the_counters_can_be_latched() {
+    // SNESdev wiki, *MMIO registers*, WRIO ($4201): "On power-on: WRIO = $FF",
+    // and "Joypad port 2's I/O bit is also connected to the PPU's /EXTLATCH
+    // input, allowing the PPU's H and V counters to be latched when this bit
+    // is set to 0 by the CPU or joypad. [...] This should normally be set to 1
+    // by the CPU to allow the counters to be latched." fullsnes, SLHV: the
+    // $2137 read latches "only if WRIO.Bit7 is (or was) set".
+    //
+    // The register came up $FF and the PPU's input came up low, because the
+    // level only ever reached the PPU from a *write* to $4201 — so a program
+    // that left WRIO alone, as most do, read $2137 and latched nothing.
+    use crate::dev::snes::ppu::SnesPpu;
+    let f = scpu();
+    let ppu = SnesPpu::default();
+    *f.c.shared.beam.lock() = Some(ppu.beam());
+    Device::reset(&f.c, ResetKind::Cold);
+    assert_eq!(rd(&f, REGS + 0x13), 0xFF, "RDIO reads the power-on WRIO");
+    ppu.advance_to(1364 * 50 + 400);
+    ppu.read_register(0x37, 0);
+    assert_eq!(
+        ppu.read_register(0x3F, 0) & 0x40,
+        0x40,
+        "STAT78 bit 6: the counters were latched"
+    );
+    // And the reset itself latched nothing: there was no falling edge.
+    let g = scpu();
+    let ppu = SnesPpu::default();
+    *g.c.shared.beam.lock() = Some(ppu.beam());
+    Device::reset(&g.c, ResetKind::Cold);
+    assert_eq!(ppu.read_register(0x3F, 0) & 0x40, 0);
+    // A reset with WRIO bit 7 low raises the line again without latching.
+    wr(&g, REGS + 0x01, 0x00);
+    assert_eq!(ppu.read_register(0x3F, 0) & 0x40, 0x40, "1 -> 0 latches");
+    Device::reset(&g.c, ResetKind::Warm);
+    assert_eq!(ppu.read_register(0x3F, 0) & 0x40, 0);
+}
