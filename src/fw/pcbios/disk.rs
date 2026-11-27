@@ -710,6 +710,20 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // the command block until `BSY` drops (T13/1410D §7.15).
     a.call(l.ata_wait_ready);
     a.jcc(Cc::B, fail);
+    // And it has not *succeeded* until the status says so. Every block but
+    // the last is vouched for by the `ata_wait_drq` that precedes the next
+    // one, which refuses `ERR`; nothing follows the last, so its status is
+    // read here. T13/1410D §9.6, transition DPIOO0:DI0, is one exit for both
+    // outcomes — "When all data for the command has been transferred or an
+    // error occurs that causes the command to abort ... the device shall set
+    // the interrupt pending, set appropriate error bits, clear BSY to zero" —
+    // so `BSY` dropping says the command is over and only the error bits say
+    // how. Without this a write whose final sector the drive refused came
+    // back with carry clear.
+    a.movi(DX, CMD_BASE + 7);
+    a.in_al_dx();
+    a.testi8(AL, 0x21); // ERR | DF
+    a.jcc(Cc::NE, fail);
     a.clc();
     a.jmp(finish);
     a.bind(fail);

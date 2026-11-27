@@ -56,9 +56,11 @@ use std::sync::Arc;
 use rsemu::core::Captured;
 use rsemu::core::clock::GlobalTime;
 use rsemu::core::device::ResetKind;
-use rsemu::core::space::MemAttrs;
+use rsemu::core::error::BusError;
+use rsemu::core::space::{MemAttrs, MemResult, RamStore};
 use rsemu::core::value::Width;
 use rsemu::cpu::x86::{Variant, X86};
+use rsemu::dev::medium::Medium;
 use rsemu::fw::asm16::{
     AH, AL, AX, Alu, Asm, BL, BX, CX, Cc, DH, DI, DL, DS, DX, ES, Mem, SI, SP, SS,
 };
@@ -305,6 +307,16 @@ fn board(
     floppy: Vec<u8>,
     hd0: Vec<u8>,
 ) -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>) {
+    board_with(floppy, hd0, None)
+}
+
+/// [`board`], with the fixed disk on a medium the test supplies — which is
+/// how a drive that refuses a sector gets under the firmware.
+fn board_with(
+    floppy: Vec<u8>,
+    hd0: Vec<u8>,
+    medium: Option<Arc<dyn Medium>>,
+) -> (Machine, Arc<X86>, Arc<rsemu::core::hosts::HostObjects>) {
     let cpus: Arc<Captured<X86>> = Arc::new(Captured::new());
     let mut b = Bindings::new();
     rsemu::machine::builtin::bind(&mut b).expect("ram and rom");
@@ -328,6 +340,12 @@ fn board(
     options.realize.media.insert("vgabios", Vec::new());
     options.realize.media.insert("floppy", floppy);
     options.realize.media.insert("hd0", hd0);
+    if let Some(medium) = medium {
+        // The medium wins over the bytes bound to the slot, exactly as
+        // `--drive hd0=disk.qcow2` does.
+        rsemu::dev::medium::install(&options.realize.hosts, "hd0", medium)
+            .expect("nothing else claimed the name");
+    }
     options.realize.media.insert("hd1", Vec::new());
     // The CD-ROM drive with no disc in it, which is what no bytes bound means.
     options.realize.media.insert("cdrom", Vec::new());
@@ -568,4 +586,210 @@ fn a_diskette_swap_raises_the_change_line_and_a_seek_clears_it() {
         boot_sector(FIXED_MARKER),
         "the drive answered with the diskette that was taken out"
     );
+}
+
+// ---------------------------------------------------------------------------
+// a transfer the drive refuses part way through
+// ---------------------------------------------------------------------------
+
+/// A fixed-disk medium with one sector that will not read and some that will
+/// not write.
+///
+/// An access fails if it covers one of them, which is how a host file with a
+/// bad block behaves.
+#[derive(Debug)]
+struct Flawed {
+    ram: RamStore,
+    unreadable: u64,
+    unwritable: Vec<u64>,
+}
+
+impl Flawed {
+    fn covers(lba: u64, offset: u64, len: u64) -> bool {
+        lba * 512 < offset + len && offset < (lba + 1) * 512
+    }
+
+    fn holds(&self, lba: u64) -> Vec<u8> {
+        let mut out = vec![0u8; 512];
+        RamStore::read_at(&self.ram, lba * 512, &mut out).expect("in range");
+        out
+    }
+}
+
+impl Medium for Flawed {
+    fn capacity(&self) -> u64 {
+        Medium::capacity(&self.ram)
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> MemResult {
+        if Flawed::covers(self.unreadable, offset, dst.len() as u64) {
+            return Err(BusError::Unassigned);
+        }
+        RamStore::read_at(&self.ram, offset, dst)
+    }
+
+    fn write_at(&self, offset: u64, src: &[u8]) -> MemResult {
+        if self
+            .unwritable
+            .iter()
+            .any(|lba| Flawed::covers(*lba, offset, src.len() as u64))
+        {
+            return Err(BusError::Unassigned);
+        }
+        RamStore::write_at(&self.ram, offset, src)
+    }
+}
+
+/// Where the short-transfer guest keeps its packet, its buffer and its
+/// results: six bytes a call — `AX`, the carry flag, and the packet's block
+/// count as the firmware left it.
+const XFER_PACKET: u16 = 0x0700;
+const XFER_BUFFER: u16 = 0x1000;
+const XFER_RESULTS: u16 = 0x0740;
+const XFER_DONE: u16 = 0x0720;
+
+/// The byte the short-transfer guest fills its write buffer with.
+const XFER_FILL: u16 = 0xc3c3;
+
+/// One extended transfer the guest makes: function, block count, the block
+/// number's low and high double words.
+type Call = (u8, u16, u32, u32);
+
+/// The calls, in the order their results are stored.
+fn calls() -> [Call; 6] {
+    [
+        // A write whose **last** sector the drive refuses.
+        (0x43, 4, 300, 0),
+        // A write refused in the middle.
+        (0x43, 8, 200, 0),
+        // A read refused in the middle.
+        (0x42, 8, 100, 0),
+        // A read that works, which must leave its count alone.
+        (0x42, 4, 500, 0),
+        // A read that runs off the end of the drive: refused before a sector
+        // moves.
+        (0x42, 4, (HD_SECTORS - 2) as u32, 0),
+        // A block number the command cannot carry: refused by the firmware.
+        (0x42, 4, 7, 1),
+    ]
+}
+
+/// A boot sector that makes [`calls`] and records what each answered.
+fn short_transfer_guest() -> Vec<u8> {
+    let mut a = Asm::new(usize::from(BOOT_ADDRESS) + 512, 0x00);
+    a.seek(BOOT_ADDRESS);
+    let transfer = a.label();
+
+    a.cli();
+    a.movi(AX, 0);
+    a.movsr(DS, AX);
+    a.movsr(ES, AX);
+    a.movsr(SS, AX);
+    a.movi(SP, BOOT_ADDRESS);
+    a.sti();
+    // Eight sectors of something that is not what the disk holds.
+    a.movi(DI, XFER_BUFFER);
+    a.movi(CX, 8 * 256);
+    a.movi(AX, XFER_FILL);
+    a.rep();
+    a.stosw();
+
+    for (i, (function, count, low, high)) in calls().into_iter().enumerate() {
+        a.movmi(Mem::abs(XFER_PACKET + 2), count);
+        a.movmi32(Mem::abs(XFER_PACKET + 8), low);
+        a.movmi32(Mem::abs(XFER_PACKET + 12), high);
+        a.movi8(AH, function);
+        a.movi(DI, XFER_RESULTS + (i as u16) * 6);
+        a.call(transfer);
+    }
+    a.movmi(Mem::abs(XFER_DONE), 0xd0e5);
+    let park = a.here_label();
+    a.hlt();
+    a.jmp(park);
+
+    // `AH` is the function and `DI` where the three result words go; the
+    // packet's count and block number are already in it.
+    a.bind(transfer);
+    a.movmi8(Mem::abs(XFER_PACKET), 0x10);
+    a.movmi8(Mem::abs(XFER_PACKET + 1), 0x00);
+    a.movmi(Mem::abs(XFER_PACKET + 4), XFER_BUFFER);
+    a.movmi(Mem::abs(XFER_PACKET + 6), 0x0000);
+    a.movi(DX, 0x0080);
+    a.movi(SI, XFER_PACKET);
+    a.int(0x13);
+    a.movto(Mem::di(0), AX);
+    // `MOV` leaves the flags alone, so the carry is still `INT 13h`'s.
+    a.movi(AX, 0);
+    let no_carry = a.label();
+    a.jcc(Cc::AE, no_carry);
+    a.movi(AX, 1);
+    a.bind(no_carry);
+    a.movto(Mem::di(2), AX);
+    a.mov(AX, Mem::abs(XFER_PACKET + 2));
+    a.movto(Mem::di(4), AX);
+    a.ret();
+
+    assert!(
+        a.here() <= BOOT_ADDRESS + 510,
+        "the boot sector is {} bytes and a sector has 510",
+        a.here() - BOOT_ADDRESS
+    );
+    a.seek(BOOT_ADDRESS + 510);
+    a.db(&[0x55, 0xaa]);
+    let image = a.finish();
+    image[usize::from(BOOT_ADDRESS)..].to_vec()
+}
+
+/// What one of [`calls`] answered: `AH`, whether carry was set, and the block
+/// count the packet held afterwards.
+fn answer(m: &Machine, index: u64) -> (u8, bool, u16) {
+    let at = u64::from(XFER_RESULTS) + index * 6;
+    (
+        (peek16(m, at) >> 8) as u8,
+        peek16(m, at + 2) != 0,
+        peek16(m, at + 4),
+    )
+}
+
+/// The board with [`short_transfer_guest`] on its diskette and a flawed fixed
+/// disk, run until the guest has made every call.
+fn short_transfers() -> (Machine, Arc<Flawed>) {
+    let medium = Arc::new(Flawed {
+        ram: RamStore::new(HD_SECTORS * 512),
+        unreadable: 103,
+        unwritable: vec![203, 303],
+    });
+    let mut floppy = short_transfer_guest();
+    floppy.resize(1_474_560, 0);
+    let (mut m, _cpu, _hosts) = board_with(
+        floppy,
+        Vec::new(),
+        Some(Arc::clone(&medium) as Arc<dyn Medium>),
+    );
+    m.run_for(BOOTED).expect("the machine runs");
+    assert_eq!(
+        peek16(&m, u64::from(XFER_DONE)),
+        0xd0e5,
+        "the guest did not get through its calls"
+    );
+    (m, medium)
+}
+
+#[test]
+fn a_write_whose_last_sector_the_drive_refuses_is_reported_as_a_failure() {
+    // Four sectors to 300..=303, and the drive will not take 303. Every sector
+    // but the last is vouched for by the wait that precedes the next one; the
+    // last had nothing after it, and the command came back with carry clear —
+    // a write that lost its final sector and said it had not.
+    let (m, medium) = short_transfers();
+    let (ah, carry, _count) = answer(&m, 0);
+    assert!(carry, "a write the drive refused came back as a success");
+    assert_ne!(ah, 0, "with a status of zero");
+
+    // The three sectors ahead of it are on the medium, and it is not.
+    let filled = XFER_FILL.to_le_bytes().repeat(256);
+    for lba in 300..303 {
+        assert_eq!(medium.holds(lba), filled, "sector {lba}");
+    }
+    assert_eq!(medium.holds(303), vec![0u8; 512], "the sector that failed");
 }
