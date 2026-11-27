@@ -193,6 +193,48 @@ fn a_file_for_a_slot_the_machine_lacks_is_reported_as_unused() {
     assert!(!stderr.contains("warning"), "{code:?}: {stderr}");
 }
 
+/// An output file that cannot be written is refused before the run.
+///
+/// All three are written when the run ends, so a misspelt directory used to
+/// cost the whole span: the machine ran, the summary was printed, and only
+/// then did `--record-input` report that there was nowhere to put the log.
+#[cfg(feature = "machine-apple1")]
+#[test]
+fn an_output_that_cannot_be_written_is_refused_before_the_run() {
+    let (code, stdout, stderr) = run(&[
+        "run",
+        "apple1",
+        "--headless",
+        "--for",
+        "1ms",
+        "--record-input",
+        "/no-such-directory-rsemu/session.trace",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("--record-input"), "{stderr}");
+    assert!(stderr.contains("cannot be written"), "{stderr}");
+    assert!(!stdout.contains("ran to"), "it ran first: {stdout}");
+
+    // A path that can be written is still written, and the probe that asked
+    // leaves nothing of its own behind: the file holds the log.
+    let log = scratch("session.trace");
+    let _ = std::fs::remove_file(&log);
+    let (code, stdout, stderr) = run(&[
+        "run",
+        "apple1",
+        "--headless",
+        "--for",
+        "1ms",
+        "--record-input",
+        log.to_str().expect("a UTF-8 temp dir"),
+    ]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("ran to"), "{stdout}");
+    let written = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(&log);
+    assert!(written > 0, "the input log was not written");
+}
+
 /// `--drive` backs whichever slot it names, not only the ones on a list.
 ///
 /// The drive's device finds its image by the slot's name, which it learns

@@ -1229,7 +1229,53 @@ fn check_outputs(args: &RunArgs, display: bool, audio: bool) -> Result<(), Strin
             "--record-audio {path}: this machine has no audio device this build can hear"
         ));
     }
+    // And whether the file itself can be written. All three of these are
+    // written when the run *ends*, so a directory that does not exist used to
+    // be discovered then: `--for 1400s --record-input /typo/session.trace`
+    // simulated the whole span and reported "No such file or directory" with
+    // nothing to show for it.
+    for (flag, path) in [
+        ("--screenshot", &args.screenshot),
+        ("--record-audio", &args.record_audio),
+        ("--record-input", &args.record_input),
+    ] {
+        if let Some(path) = path {
+            check_writable(flag, path)?;
+        }
+    }
     Ok(())
+}
+
+/// Whether an output file can be created, asked before the run rather than
+/// after it.
+///
+/// The probe opens `path` for writing without truncating it, and removes the
+/// file again if the probe is what created it — so a run that is refused, or
+/// fails for a reason of its own, leaves no empty file behind and never
+/// shortens one that was already there. Anything that exists and is not a
+/// regular file is left alone: opening a FIFO for writing waits for a reader,
+/// and `/dev/stdout` needs no asking.
+fn check_writable(flag: &str, path: &str) -> Result<(), String> {
+    let existed = match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() && !meta.is_dir() => return Ok(()),
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => {
+            drop(file);
+            if !existed {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("{flag} {path}: cannot be written: {e}")),
+    }
 }
 
 /// Whether the host has asked this run to stop — and, if it has, the
