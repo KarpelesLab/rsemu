@@ -1031,6 +1031,100 @@ fn a_drive_card_snapshot_refers_to_its_medium_rather_than_copying_it() {
     assert_eq!(other.phase(), Phase::Transfer);
 }
 
+/// A medium that counts how often it was asked to make its writes durable,
+/// which is the only thing a `RamStore` cannot show.
+#[derive(Debug)]
+struct Counted {
+    store: RamStore,
+    flushes: crate::core::sync::AtomicU32,
+}
+
+impl Counted {
+    fn new(bytes: u64) -> Arc<Counted> {
+        Arc::new(Counted {
+            store: RamStore::new(bytes),
+            flushes: crate::core::sync::AtomicU32::new(0),
+        })
+    }
+
+    fn flushes(&self) -> u32 {
+        self.flushes.load(crate::core::sync::Ordering::Relaxed)
+    }
+}
+
+impl Medium for Counted {
+    fn capacity(&self) -> u64 {
+        self.store.len()
+    }
+
+    fn read_at(&self, offset: u64, dst: &mut [u8]) -> crate::core::space::MemResult {
+        self.store.read_at(offset, dst)
+    }
+
+    fn write_at(&self, offset: u64, src: &[u8]) -> crate::core::space::MemResult {
+        self.store.write_at(offset, src)
+    }
+
+    fn flush(&self) -> crate::core::space::MemResult {
+        self.flushes
+            .fetch_add(1, crate::core::sync::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[test]
+fn the_end_of_a_run_flushes_the_medium_behind_a_drive_card() {
+    // `Device::flush` is the machine saying the run is over. A card on a
+    // `--drive` is a host image, and one that is never flushed is a qcow2
+    // whose guest writes are not found again.
+    let medium = Counted::new(HIGH_CAPACITY_UNIT);
+    let hosts = alloc::sync::Arc::new(crate::core::hosts::HostObjects::new());
+    assert!(
+        medium::install(&hosts, "card0", Arc::clone(&medium) as Arc<dyn Medium>).unwrap(),
+        "the slot was empty"
+    );
+    let props = Props::new()
+        .with("drive", Value::Str(String::from("card0")))
+        .with("slot", Value::Str(String::from("sd0")))
+        .with_hosts(alloc::sync::Arc::clone(&hosts));
+    let device = CardDevice::new(&props).expect("a card on the supplied medium");
+    bring_up(device.card());
+    short(device.card().command(cmd::WRITE_BLOCK, 1));
+    let _ = device.card().write_data(&[0x5au8; BLOCK as usize]);
+    assert_eq!(medium.flushes(), 0, "nothing has asked yet");
+
+    Device::flush(&device).expect("the medium flushes");
+    assert_eq!(
+        medium.flushes(),
+        1,
+        "the machine's flush reached the medium"
+    );
+}
+
+#[test]
+fn a_drive_card_snapshot_flushes_the_medium_it_refers_to() {
+    // The chunk holds a reference, not the bytes, so the bytes have to be on
+    // the host by the time it is written.
+    let medium = Counted::new(HIGH_CAPACITY_UNIT);
+    let id = Identity::new(HIGH_CAPACITY_UNIT, true, false, text()).unwrap();
+    let card = SdCard::with_medium(id, BusMode::Sd, 1, Arc::clone(&medium) as Arc<dyn Medium>)
+        .expect("the medium fits");
+    let mut shape = MachineShape::new();
+    shape.add_device("card", CLASS_NAME).unwrap();
+    let mut writer = StateWriter::new(shape);
+    {
+        let mut chunk = writer.chunk("card", CLASS_NAME, STATE_VERSION).unwrap();
+        card.save(&mut chunk).unwrap();
+    }
+    assert_eq!(medium.flushes(), 1);
+}
+
+#[test]
+fn flushing_a_card_held_in_memory_is_not_an_error() {
+    let card = sdsc();
+    card.flush_media().expect("nothing to make durable");
+}
+
 // ---------------------------------------------------------------------------
 // Password locking (§4.3.7)
 // ---------------------------------------------------------------------------

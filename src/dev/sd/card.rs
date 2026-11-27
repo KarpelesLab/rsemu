@@ -605,6 +605,18 @@ impl Backing {
         }
     }
 
+    /// Make every write so far durable.
+    ///
+    /// Nothing to do for RAM. For a drive it is the medium's own `flush`,
+    /// which on an image file is what writes out the metadata that finds the
+    /// bytes a guest has written.
+    fn flush(&self) -> crate::core::space::MemResult {
+        match self {
+            Backing::Ram(_) => Ok(()),
+            Backing::Drive(m) => m.flush(),
+        }
+    }
+
     /// Set `len` bytes from `offset` to `value`.
     fn fill(&self, offset: u64, len: u64, value: u8) -> crate::core::space::MemResult {
         match self {
@@ -872,6 +884,20 @@ impl SdCard {
         self.media
             .read_at(offset, dst)
             .map_err(|_| Error::State(format!("{offset:#x} is outside this card")))
+    }
+
+    /// Make every write so far durable on the medium behind the card.
+    ///
+    /// A no-op for a card held in host memory. For one a run supplied
+    /// (`--drive sd0=card.qcow2`) it is the medium's own flush.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the host refused.
+    pub fn flush_media(&self) -> Result<()> {
+        self.media
+            .flush()
+            .map_err(|e| Error::State(format!("the card's medium could not be made durable: {e}")))
     }
 
     /// Write to the card's array, ignoring the protocol entirely.
@@ -1777,6 +1803,10 @@ impl SdCard {
         // into a snapshot would not be a snapshot anyone could take. No RAM
         // card is ever empty, so the two cannot be confused on load.
         if self.media.is_drive() {
+            // Flush *first*, as `ata.disk` does for a referenced medium: the
+            // reference is only worth anything if the file holds what the
+            // guest had written by the moment the snapshot was taken.
+            self.flush_media()?;
             w.write_bytes(&[])?;
         } else {
             w.write_bytes(&self.contents())?;
@@ -2489,6 +2519,14 @@ impl Device for CardDevice {
         // protocol state and leaves the contents alone — the same distinction
         // NOR flash draws, and for the same reason.
         self.socket.card.power_cycle();
+    }
+
+    fn flush(&self) -> Result<()> {
+        // The run is over and nothing else will write these bytes. A card on
+        // a `--drive` is a host image exactly as an `ata.disk` on one is, and
+        // on a qcow2 the metadata that finds a guest's writes is flushed with
+        // them or not at all (`Device::flush`).
+        self.socket.card.flush_media()
     }
 
     fn export(&self, which: ExportId) -> Option<Export> {
