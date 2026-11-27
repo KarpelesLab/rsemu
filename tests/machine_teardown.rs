@@ -8,23 +8,40 @@
 //! it tried were never freed, megabytes at a time. An embedder that lets a user
 //! switch machines — the browser demo does — keeps every one it ever built.
 //!
-//! So: realize every board this build ships, keep a `Weak` to each device and
-//! each address space, drop the machine, and see which of them are still
-//! alive.
+//! So: realize every board this build ships, keep a `Weak` to each device,
+//! each address space, each net and each handle a device exports, drop the
+//! machine, and see which of them are still alive.
 //!
-//! # What it found, and what it cannot see
+//! # What it found
 //!
 //! Every lazily-advanced device and its scheduler slot owned each other, so
 //! every board with a timer in it kept its devices for ever: 241 devices
 //! across the catalog, with the fix in `core::sched` (`Drop for Scheduler`)
-//! taken out. That is what this test pins.
+//! taken out.
 //!
-//! It sees a cycle that passes through the device's own `Arc` — the one the
-//! machine holds — and **not** one closed entirely *beneath* it. `st.i2c` is
-//! the example: its inner `Shared` owns the wire engine, which owns the slave
-//! face, which owns `Shared`. The `Arc<dyn Device>` dies on time and the state
-//! behind it never does. Only a leak checker sees that, and
-//! `machine_mmio`'s board table lists the boards where one still does.
+//! That cycle passes through the device's own `Arc` — the one the machine
+//! holds. Most do not. A device is usually a thin handle over an inner
+//! `Shared`, and the cycles LeakSanitizer went on to find were all closed
+//! *beneath* the handle: `st.i2c`'s state owned an engine that owned a slave
+//! face that owned the state; Agnus's state owned the custom bus that owned
+//! Agnus's register block; a pin kept in the state it points at. There the
+//! `Arc<dyn Device>` dies on time and the megabytes behind it never do.
+//!
+//! # Seeing beneath a device without a sanitizer
+//!
+//! The inner state is private, but what it *holds* is not. A device's state
+//! keeps the `WireSource` of every output pin it was connected to, and a
+//! `WireSource` owns its net; it keeps the handles it publishes through
+//! `Device::export`. So a net or an export that outlives the machine names a
+//! device whose state did, and both are reachable from outside. With the
+//! fixes taken out this reports every one of those cycles on the boards that
+//! have them — see [`Survivors::nets`].
+//!
+//! What it still cannot see is a leaked state that drives no connected pin
+//! and exports nothing. For that there is LeakSanitizer, which runs this very
+//! test (`RUSTFLAGS=-Zsanitizer=leak cargo +nightly test --test
+//! machine_teardown`) and `fuzz/fuzz_targets/machine_mmio.rs`, which builds
+//! and drops a board on every input.
 //!
 //! # The ledger
 //!
@@ -36,8 +53,9 @@
 
 use std::sync::{Arc, Weak};
 
-use rsemu::core::device::Device;
+use rsemu::core::device::{Device, Export, ExportId};
 use rsemu::core::space::AddressSpace;
+use rsemu::core::wire::Wire;
 use rsemu::machine::Machine;
 use rsemu::machine::catalog;
 
@@ -117,6 +135,55 @@ struct Survivors {
     devices: Vec<(String, &'static str)>,
     /// Names of the address spaces still alive.
     spaces: Vec<String>,
+    /// Nets still alive, each named by the pins that drive it.
+    ///
+    /// A net is owned by the machine and by the `WireSource` each driving
+    /// device was handed, which the device keeps in its inner state. So a net
+    /// that is still alive is being held by the state of one of the devices
+    /// named here, and that state is in a cycle of its own.
+    nets: Vec<String>,
+    /// `device path: export` for every exported handle still alive.
+    exports: Vec<String>,
+}
+
+impl Survivors {
+    /// Whether anything at all outlived the machine.
+    fn any(&self) -> bool {
+        !(self.devices.is_empty()
+            && self.spaces.is_empty()
+            && self.nets.is_empty()
+            && self.exports.is_empty())
+    }
+}
+
+/// How many export ids to ask each device for. `ExportId` is an open set, so
+/// this is "every id `core` names, with room": a class with a private id above
+/// it is simply not looked at.
+const EXPORT_IDS: u16 = 64;
+
+/// A weak reference to whatever a device publishes under `which`, erased to
+/// something that can only be asked whether it is still alive.
+fn export_probe(device: &Arc<dyn Device>, which: ExportId) -> Option<Box<dyn Fn() -> bool>> {
+    Some(match device.export(which)? {
+        Export::Cell(a) => {
+            let w = Arc::downgrade(&a);
+            Box::new(move || w.strong_count() != 0)
+        }
+        Export::Gate(a) => {
+            let w = Arc::downgrade(&a);
+            Box::new(move || w.strong_count() != 0)
+        }
+        Export::Counter(a) => {
+            let w = Arc::downgrade(&a);
+            Box::new(move || w.strong_count() != 0)
+        }
+        Export::Opaque(a) => {
+            let w = Arc::downgrade(&a);
+            Box::new(move || w.strong_count() != 0)
+        }
+        // A shape added later is not probed until somebody says how.
+        _ => return None,
+    })
 }
 
 fn drop_and_look(machine: Machine) -> Survivors {
@@ -136,8 +203,39 @@ fn drop_and_look(machine: Machine) -> Survivors {
         .iter()
         .map(|s| (s.name().to_string(), Arc::downgrade(s.space())))
         .collect();
+    let nets: Vec<(String, Weak<Wire>)> = machine
+        .nets()
+        .iter()
+        .map(|net| {
+            let drivers: Vec<String> = net
+                .sources()
+                .iter()
+                .map(|pin| format!("{}.{}", machine.devices()[pin.device].path(), pin.port))
+                .collect();
+            (drivers.join(" + "), Arc::downgrade(net.wire()))
+        })
+        .collect();
+    let mut exports: Vec<(String, Box<dyn Fn() -> bool>)> = Vec::new();
+    for d in machine.devices() {
+        for id in 0..EXPORT_IDS {
+            let which = ExportId(id);
+            if let Some(alive) = export_probe(d.device(), which) {
+                exports.push((format!("{}: {which}", d.path()), alive));
+            }
+        }
+    }
     drop(machine);
     Survivors {
+        nets: nets
+            .into_iter()
+            .filter(|(_, weak)| weak.strong_count() != 0)
+            .map(|(name, _)| name)
+            .collect(),
+        exports: exports
+            .into_iter()
+            .filter(|(_, alive)| alive())
+            .map(|(name, _)| name)
+            .collect(),
         devices: devices
             .into_iter()
             .filter(|(_, _, weak)| weak.strong_count() != 0)
@@ -191,6 +289,25 @@ fn every_shipped_machine_is_freed_when_it_is_dropped() {
                 "{}: address space(s) {:?} outlived every device",
                 entry.name, survivors.spaces
             ));
+        }
+        // Likewise a net or an export, when a device that is in the ledger
+        // survived. With every device gone, one of these is the only sign of
+        // a cycle closed beneath a device, and there is no ledger for those:
+        // the class that leaks is not known, only the pins it drives.
+        if survivors.devices.is_empty() && survivors.any() {
+            for net in &survivors.nets {
+                unexpected.push(format!(
+                    "{}: the net driven by {net} outlived the machine — the inner state \
+                     of a device driving it is in a cycle of its own",
+                    entry.name
+                ));
+            }
+            for export in &survivors.exports {
+                unexpected.push(format!(
+                    "{}: the handle exported as `{export}` outlived the machine",
+                    entry.name
+                ));
+            }
         }
     }
 
