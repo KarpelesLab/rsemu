@@ -2445,6 +2445,20 @@ impl medium::Removable for Socket {
                  the socket, and this model has no pin for it",
             )));
         }
+        if self.card.media.is_drive() {
+            // This door *copies* the new image into the card's array, which
+            // is right for a card held in host memory and destructive for
+            // one whose array is a host file the run supplied: the copy would
+            // land in that file, replacing the image the user started with
+            // by the bytes of the one they meant to switch to, and every
+            // later guest write would go there too rather than to the new
+            // image. Refusing is the answer that loses nothing.
+            return Err(config(String::from(
+                "the card in this socket is a host image the run supplied (`drive`); changing \
+                 it here would overwrite that file with the new image's bytes instead of \
+                 switching to it. Stop the run and start it with the other image",
+            )));
+        }
         let capacity = self.card.identity().capacity;
         let bytes = medium::slurp(name, &image)?;
         if bytes.len() as u64 > capacity {

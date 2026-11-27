@@ -1120,6 +1120,32 @@ fn a_drive_card_snapshot_flushes_the_medium_it_refers_to() {
 }
 
 #[test]
+fn changing_a_drive_backed_card_is_refused_rather_than_overwriting_its_file() {
+    // The socket's door copies an image into the card's array. For a card
+    // whose array is the user's own file, that copy would replace the file's
+    // contents with another image's.
+    let medium = Counted::new(HIGH_CAPACITY_UNIT);
+    medium.store.write_at(0, b"mine").unwrap();
+    let hosts = alloc::sync::Arc::new(crate::core::hosts::HostObjects::new());
+    assert!(medium::install(&hosts, "card0", Arc::clone(&medium) as Arc<dyn Medium>).unwrap());
+    let props = Props::new()
+        .with("drive", Value::Str(String::from("card0")))
+        .with("slot", Value::Str(String::from("sd0")))
+        .with_hosts(alloc::sync::Arc::clone(&hosts));
+    let device = CardDevice::new(&props).expect("a card on the supplied medium");
+
+    let other = alloc::vec![0xeeu8; HIGH_CAPACITY_UNIT as usize];
+    let err = device
+        .media()
+        .insert("card", medium::from_bytes(&other), false)
+        .expect_err("the file behind the card must not be overwritten");
+    assert!(err.to_string().contains("host image"), "{err}");
+    let mut back = [0u8; 4];
+    medium.store.read_at(0, &mut back).unwrap();
+    assert_eq!(&back, b"mine", "the user's image is untouched");
+}
+
+#[test]
 fn flushing_a_card_held_in_memory_is_not_an_error() {
     let card = sdsc();
     card.flush_media().expect("nothing to make durable");
