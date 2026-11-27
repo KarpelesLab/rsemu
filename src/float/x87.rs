@@ -311,8 +311,12 @@ pub(super) fn unpack(v: F80, env: Env) -> (Option<Parts>, Flags) {
     let Some(p) = decode(v) else {
         return (None, Flags::INVALID);
     };
-    let subnormal = p.class == Class::Finite && v.exp_field() == 0 && v.sig & INTEGER_BIT == 0;
-    if !subnormal {
+    // A pseudo-denormal is read as the normal value it encodes, but it is
+    // still *reported* as a denormal operand: measured on an x86 host (AMD
+    // Zen 5), `FADD` of 1.0 and `0000:8000000000000000` sets `DE`, exactly as
+    // a true subnormal does. So the report keys on the exponent field alone
+    // and the flush on the value actually being subnormal.
+    if p.class != Class::Finite || v.exp_field() != 0 {
         return (Some(p), Flags::NONE);
     }
     let flags = if env.subnormal_inputs.reports() {
@@ -320,7 +324,7 @@ pub(super) fn unpack(v: F80, env: Env) -> (Option<Parts>, Flags) {
     } else {
         Flags::NONE
     };
-    if env.subnormal_inputs.flushes() {
+    if env.subnormal_inputs.flushes() && v.sig & INTEGER_BIT == 0 {
         (Some(Parts::zero(p.sign)), flags)
     } else {
         (Some(p), flags)
@@ -378,10 +382,12 @@ fn binop(
     let (pa, fa) = unpack(a, env);
     let (pb, fb) = unpack(b, env);
     let (Some(pa), Some(pb)) = (pa, pb) else {
-        return (encode(Outcome::DefaultNan, env), Flags::INVALID | fa | fb);
+        let f = kernel::with_operand_flags(Flags::INVALID, fa | fb, true, env);
+        return (encode(Outcome::DefaultNan, env), f);
     };
     let (out, f) = op(pa, pb, spec, env);
-    (encode(out, env), f | fa | fb)
+    let f = kernel::with_operand_flags(f, fa | fb, out.is_nan(), env);
+    (encode(out, env), f)
 }
 
 /// `a + b` at the given precision control.
@@ -449,7 +455,8 @@ pub fn sqrt_to(a: F80, spec: Spec, env: Env) -> (F80, Flags) {
         return (encode(Outcome::DefaultNan, env), Flags::INVALID | fa);
     };
     let (out, f) = kernel::sqrt(pa, spec, env);
-    (encode(out, env), f | fa)
+    let f = kernel::with_operand_flags(f, fa, out.is_nan(), env);
+    (encode(out, env), f)
 }
 
 /// Round a value to `spec`, delivering it in the 80-bit format.
@@ -488,13 +495,12 @@ pub fn fma(a: F80, b: F80, c: F80, pc: Precision, env: Env) -> (F80, Flags) {
     let (pb, fb) = unpack(b, env);
     let (pc_parts, fc) = unpack(c, env);
     let (Some(pa), Some(pb), Some(pc_parts)) = (pa, pb, pc_parts) else {
-        return (
-            encode(Outcome::DefaultNan, env),
-            Flags::INVALID | fa | fb | fc,
-        );
+        let f = kernel::with_operand_flags(Flags::INVALID, fa | fb | fc, true, env);
+        return (encode(Outcome::DefaultNan, env), f);
     };
     let (out, f) = kernel::fma(pa, pb, pc_parts, pc.spec(), env);
-    (encode(out, env), f | fa | fb | fc)
+    let f = kernel::with_operand_flags(f, fa | fb | fc, out.is_nan(), env);
+    (encode(out, env), f)
 }
 
 /// Round to an integral value in the environment's direction, signalling
@@ -658,15 +664,22 @@ pub fn remainder(a: F80, b: F80, ieee: bool, env: Env) -> Remainder {
     };
     let (pa, fa) = unpack(a, env);
     let (pb, fb) = unpack(b, env);
+    // Every NaN result outranks the denormal-operand report on x86.
+    let nan = |o: Outcome, f: Flags| {
+        out(
+            encode(o, env),
+            kernel::with_operand_flags(f, fa | fb, true, env),
+        )
+    };
     let (Some(pa), Some(pb)) = (pa, pb) else {
-        return out(encode(Outcome::DefaultNan, env), Flags::INVALID | fa | fb);
+        return nan(Outcome::DefaultNan, Flags::INVALID);
     };
     if let Some((o, f)) = kernel::nan_result(&[pa, pb], env) {
-        return out(encode(o, env), f | fa | fb);
+        return nan(o, f);
     }
     // An infinite dividend, or a zero divisor, has no remainder at all.
     if pa.class == Class::Inf || pb.class == Class::Zero {
-        return out(encode(Outcome::DefaultNan, env), Flags::INVALID | fa | fb);
+        return nan(Outcome::DefaultNan, Flags::INVALID);
     }
     // A zero dividend, or an infinite divisor, leaves the dividend alone.
     if pa.class == Class::Zero || pb.class == Class::Inf {
@@ -808,6 +821,7 @@ pub fn from_binary<F: Format>(bits: u64, env: Env) -> (F80, Flags) {
 /// Narrow an extended value to binary32 or binary64, rounding once.
 pub fn to_binary<F: Format>(v: F80, env: Env) -> (u64, Flags) {
     let (p, fin) = unpack(v, env);
+    let fin = kernel::store_operand_flags(fin, env);
     let Some(p) = p else {
         let sign = if env.nan.default_sign { F::SIGN } else { 0 };
         return (sign | F::QUIET_NAN, Flags::INVALID);
@@ -841,6 +855,7 @@ pub fn to_binary<F: Format>(v: F80, env: Env) -> (u64, Flags) {
 /// Convert to a signed integer `bits` wide, as `FIST`/`FISTP` do.
 pub fn to_signed(v: F80, bits: u32, env: Env) -> (i64, Flags) {
     let (p, fin) = unpack(v, env);
+    let fin = kernel::store_operand_flags(fin, env);
     let max: u128 = (1u128 << (bits - 1)) - 1;
     let min_mag: u128 = 1u128 << (bits - 1);
     let indefinite = if bits >= 64 {
@@ -959,6 +974,7 @@ pub fn from_packed_bcd(bytes: [u8; 10]) -> F80 {
 /// value that rounds to zero is kept.
 pub fn to_packed_bcd(v: F80, env: Env) -> ([u8; 10], Flags) {
     let (p, fin) = unpack(v, env);
+    let fin = kernel::store_operand_flags(fin, env);
     let Some(p) = p else {
         return (BCD_INDEFINITE, Flags::INVALID);
     };

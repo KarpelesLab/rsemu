@@ -11,7 +11,7 @@
 //! Sources: IEEE 754-2019 §5 for the operations, §6.2 for NaNs, §7 for the
 //! exceptions.
 
-use super::{Env, Flags, MinMax, Propagate, Round, Spec, Tininess};
+use super::{Env, Flags, InputSubnormal, MinMax, Propagate, Round, Spec, Tininess};
 
 /// How many guard bits the rounding step keeps below the result's last place.
 ///
@@ -272,6 +272,66 @@ pub(super) fn nan_result(ops: &[Parts], env: Env) -> Option<(Outcome, Flags)> {
         }
     };
     Some((out, flags))
+}
+
+/// An operation's flags joined with what its operands raised on the way in —
+/// which is only ever the denormal-operand report.
+///
+/// On ARM that report is unconditional: `FPUnpack` raises `IDC` for an input
+/// it flushed before anything else looks at the operand. On x86 it is not.
+/// `#D` is one entry in a priority list (SDM Volume 1, §4.9.2,
+/// "Floating-Point Exception Priority") that puts it *below* an invalid
+/// operation, the handling of a QNaN operand, and a divide-by-zero, and the
+/// lower entry is not reported when a higher one applies. Measured on an x86
+/// host (AMD Zen 5), `MXCSR` and the x87 status word read back after one
+/// instruction with every exception masked:
+///
+/// | operation | flags |
+/// | --- | --- |
+/// | `ADDSD` QNaN, subnormal | none |
+/// | `ADDSD` SNaN, subnormal | `IE` |
+/// | `DIVSD` subnormal, 0 | `ZE` |
+/// | `SQRTSD` negative subnormal | `IE` |
+/// | `ADDSD` infinity, subnormal | `DE` |
+/// | `MULSD` subnormal, 0 | `DE` |
+///
+/// and `FADD`/`FDIV`/`FSQRT`/`FPREM` the same on the same operands. `nan` is
+/// whether the operation delivered a NaN, which covers the first two rows of
+/// the priority list at once.
+#[inline]
+pub(super) fn with_operand_flags(f: Flags, operands: Flags, nan: bool, env: Env) -> Flags {
+    if env.subnormal_inputs == InputSubnormal::Flagged
+        && (nan || f.contains(Flags::INVALID) || f.contains(Flags::DIV_BY_ZERO))
+    {
+        f
+    } else {
+        f | operands
+    }
+}
+
+/// What a conversion *out of* floating point reports for a subnormal operand.
+///
+/// x86 reports nothing: `CVTSD2SI` and its family list their exceptions as
+/// "Invalid, Precision." (SDM Volume 2, `CVTSD2SI`, "SIMD Floating-Point
+/// Exceptions"), with no Denormal, and the x87 stores are the same — measured
+/// on the same host, `CVTSD2SI`, `FISTP`, `FBSTP` and `FSTP m64` of a
+/// subnormal all leave `DE` clear. ARM's `IDC` is raised by the unpack, so it
+/// stays.
+#[inline]
+pub(super) fn store_operand_flags(operands: Flags, env: Env) -> Flags {
+    if env.subnormal_inputs == InputSubnormal::Flagged {
+        Flags::NONE
+    } else {
+        operands
+    }
+}
+
+impl Outcome {
+    /// Whether this is a NaN, propagated or default.
+    #[inline]
+    pub(super) fn is_nan(&self) -> bool {
+        matches!(self, Outcome::DefaultNan | Outcome::Nan { .. })
+    }
 }
 
 /// Whether a significand rounds up, given the [`EXTRA`] bits below its last

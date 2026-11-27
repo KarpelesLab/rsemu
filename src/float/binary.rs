@@ -237,7 +237,8 @@ pub fn add<F: Format>(a: u64, b: u64, env: Env) -> (u64, Flags) {
     let (pa, fa) = unpack::<F>(a, env);
     let (pb, fb) = unpack::<F>(b, env);
     let (out, f) = kernel::add(pa, pb, false, F::SPEC, env);
-    (encode_outcome::<F>(out, env), f | fa | fb)
+    let f = kernel::with_operand_flags(f, fa | fb, out.is_nan(), env);
+    (encode_outcome::<F>(out, env), f)
 }
 
 /// `a - b` (§5.4.1).
@@ -245,7 +246,8 @@ pub fn sub<F: Format>(a: u64, b: u64, env: Env) -> (u64, Flags) {
     let (pa, fa) = unpack::<F>(a, env);
     let (pb, fb) = unpack::<F>(b, env);
     let (out, f) = kernel::add(pa, pb, true, F::SPEC, env);
-    (encode_outcome::<F>(out, env), f | fa | fb)
+    let f = kernel::with_operand_flags(f, fa | fb, out.is_nan(), env);
+    (encode_outcome::<F>(out, env), f)
 }
 
 /// `a * b` (§5.4.1).
@@ -253,7 +255,8 @@ pub fn mul<F: Format>(a: u64, b: u64, env: Env) -> (u64, Flags) {
     let (pa, fa) = unpack::<F>(a, env);
     let (pb, fb) = unpack::<F>(b, env);
     let (out, f) = kernel::mul(pa, pb, F::SPEC, env);
-    (encode_outcome::<F>(out, env), f | fa | fb)
+    let f = kernel::with_operand_flags(f, fa | fb, out.is_nan(), env);
+    (encode_outcome::<F>(out, env), f)
 }
 
 /// `a / b` (§5.4.1).
@@ -261,14 +264,16 @@ pub fn div<F: Format>(a: u64, b: u64, env: Env) -> (u64, Flags) {
     let (pa, fa) = unpack::<F>(a, env);
     let (pb, fb) = unpack::<F>(b, env);
     let (out, f) = kernel::div(pa, pb, F::SPEC, env);
-    (encode_outcome::<F>(out, env), f | fa | fb)
+    let f = kernel::with_operand_flags(f, fa | fb, out.is_nan(), env);
+    (encode_outcome::<F>(out, env), f)
 }
 
 /// The square root of `a` (§5.4.1).
 pub fn sqrt<F: Format>(a: u64, env: Env) -> (u64, Flags) {
     let (pa, fa) = unpack::<F>(a, env);
     let (out, f) = kernel::sqrt(pa, F::SPEC, env);
-    (encode_outcome::<F>(out, env), f | fa)
+    let f = kernel::with_operand_flags(f, fa, out.is_nan(), env);
+    (encode_outcome::<F>(out, env), f)
 }
 
 /// Round `a` to an integral value **in the same format** (§5.9's
@@ -338,7 +343,8 @@ pub fn fma<F: Format>(a: u64, b: u64, c: u64, env: Env) -> (u64, Flags) {
     let (pb, fb) = unpack::<F>(b, env);
     let (pc, fc) = unpack::<F>(c, env);
     let (out, f) = kernel::fma(pa, pb, pc, F::SPEC, env);
-    (encode_outcome::<F>(out, env), f | fa | fb | fc)
+    let f = kernel::with_operand_flags(f, fa | fb | fc, out.is_nan(), env);
+    (encode_outcome::<F>(out, env), f)
 }
 
 /// The ordering of two values, or `None` when they are unordered because one
@@ -418,7 +424,10 @@ fn min_max<F: Format>(a: u64, b: u64, want_min: bool, env: Env) -> (u64, Flags) 
         }
         Err(out) => encode_outcome::<F>(out, env),
     };
-    (bits, f | fa | fb)
+    (
+        bits,
+        kernel::with_operand_flags(f, fa | fb, pick.is_err(), env),
+    )
 }
 
 /// Which of the ten classes a value belongs to (§5.7.2).
@@ -533,6 +542,7 @@ fn scaled(mut p: Parts, fbits: u32) -> Parts {
 /// `fbits == 0` this is [`to_signed`].
 pub fn to_signed_fixed<F: Format>(value: u64, bits: u32, fbits: u32, env: Env) -> (i64, Flags) {
     let (p, fin) = unpack::<F>(value, env);
+    let fin = kernel::store_operand_flags(fin, env);
     let p = scaled(p, fbits);
     let max: u128 = (1u128 << (bits - 1)) - 1;
     let min_mag: u128 = 1u128 << (bits - 1);
@@ -598,6 +608,7 @@ pub fn to_unsigned<F: Format>(value: u64, bits: u32, env: Env) -> (u64, Flags) {
 /// [`to_unsigned`].
 pub fn to_unsigned_fixed<F: Format>(value: u64, bits: u32, fbits: u32, env: Env) -> (u64, Flags) {
     let (p, fin) = unpack::<F>(value, env);
+    let fin = kernel::store_operand_flags(fin, env);
     let p = scaled(p, fbits);
     let max: u128 = if bits >= 64 {
         u128::from(u64::MAX)

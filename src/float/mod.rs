@@ -387,6 +387,11 @@ pub enum InputSubnormal {
     /// Used exactly and reported: x86 signals the denormal-operand exception
     /// (`#D`) for a subnormal source (SDM Volume 1, §4.9.1.2). SSE with
     /// `MXCSR.DAZ` clear, and x87.
+    ///
+    /// This is x86's rule in full, not merely "a flag per subnormal": an
+    /// invalid operation, a QNaN operand and a divide-by-zero each outrank
+    /// `#D` and suppress it, and a conversion to an integer or a store to a
+    /// narrower format never raises it.
     Flagged,
     /// Replaced by a zero of the same sign and **not** reported —
     /// `MXCSR.DAZ` suppresses the denormal-operand exception it would

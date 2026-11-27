@@ -527,6 +527,112 @@ fn flush_to_zero_is_a_mode_not_a_property_of_the_format() {
     assert_eq!(v, B64::SIGN);
 }
 
+/// x86's denormal-operand exception is not "an operand was subnormal". It is
+/// one entry in a priority list, below the invalid operation, the QNaN
+/// operand and the divide-by-zero, and whole families of instructions do not
+/// raise it at all. Every expectation here was read back from `MXCSR` or the
+/// x87 status word on an x86 host (AMD Zen 5) after executing the one
+/// instruction named, with all exceptions masked.
+#[test]
+fn x86_reports_a_denormal_operand_only_where_the_processor_does() {
+    let sse = Env::X86_SSE;
+    let sub = MIN_SUB64;
+    let qnan = B64::QUIET_NAN;
+    let snan = B64::INF | 1;
+    // ADDSD QNaN, subnormal: nothing.
+    assert_eq!(add::<B64>(qnan, sub, sse), (qnan, Flags::NONE));
+    assert_eq!(add::<B64>(sub, qnan, sse), (qnan, Flags::NONE));
+    // ADDSD SNaN, subnormal: IE alone.
+    assert_eq!(
+        add::<B64>(snan, sub, sse),
+        (snan | B64::QUIET, Flags::INVALID)
+    );
+    // DIVSD subnormal, 0: ZE alone.
+    assert_eq!(div::<B64>(sub, 0, sse), (B64::INF, Flags::DIV_BY_ZERO));
+    // SQRTSD of a negative subnormal: IE alone.
+    assert_eq!(
+        sqrt::<B64>(sub | B64::SIGN, sse),
+        (B64::QUIET_NAN | B64::SIGN, Flags::INVALID)
+    );
+    // Where nothing outranks it, it is reported — beside an exact infinity,
+    // an exact zero, and an ordinary rounding.
+    assert_eq!(add::<B64>(B64::INF, sub, sse), (B64::INF, Flags::DENORMAL));
+    assert_eq!(mul::<B64>(sub, 0, sse), (0, Flags::DENORMAL));
+    assert_eq!(
+        add::<B64>(d(1.0), sub, sse),
+        (d(1.0), Flags::DENORMAL | Flags::INEXACT)
+    );
+    assert_eq!(sqrt::<B64>(sub, sse).1, Flags::DENORMAL);
+    // CVTSD2SI of a subnormal: PE alone. CVTSD2SS: DE, UE and PE.
+    assert_eq!(to_signed::<B64>(sub, 64, sse), (0, Flags::INEXACT));
+    assert_eq!(
+        convert::<B64, B32>(sub, sse),
+        (0, Flags::DENORMAL | Flags::UNDERFLOW | Flags::INEXACT)
+    );
+    // MINSD of a number and a subnormal: DE.
+    assert_eq!(min::<B64>(d(1.0), sub, sse), (sub, Flags::DENORMAL));
+
+    // The x87 unit follows the same list.
+    let x = Env::X87;
+    let ext = Precision::Extended;
+    let den = F80::new(0, 1);
+    let one = e(d(1.0));
+    let q = F80::new(0x7fff, 0xc000_0000_0000_0000);
+    let sn = F80::new(0x7fff, 0x8000_0000_0000_0001);
+    let unnormal = F80::new(0x3fff, 1 << 62);
+    assert_eq!(x87::add(q, den, ext, x), (q, Flags::NONE));
+    assert_eq!(x87::add(sn, den, ext, x).1, Flags::INVALID);
+    assert_eq!(
+        x87::add(unnormal, den, ext, x),
+        (F80::INDEFINITE, Flags::INVALID)
+    );
+    assert_eq!(
+        x87::div(den, F80::ZERO, ext, x),
+        (F80::INFINITY, Flags::DIV_BY_ZERO)
+    );
+    assert_eq!(
+        x87::sqrt(F80::new(0x8000, 1), ext, x),
+        (F80::INDEFINITE, Flags::INVALID)
+    );
+    let r = x87::remainder(den, F80::ZERO, false, x);
+    assert_eq!((r.value, r.flags), (F80::INDEFINITE, Flags::INVALID));
+    assert_eq!(x87::remainder(one, den, false, x).flags, Flags::DENORMAL);
+    assert_eq!(x87::add(F80::INFINITY, den, ext, x).1, Flags::DENORMAL);
+    assert_eq!(x87::mul(den, F80::ZERO, ext, x).1, Flags::DENORMAL);
+    assert_eq!(
+        x87::add(one, den, ext, x),
+        (one, Flags::DENORMAL | Flags::INEXACT)
+    );
+    // FRNDINT reports it; the stores — FISTP, FBSTP, FSTP m64 — do not.
+    assert_eq!(
+        x87::round_to_integral(den, x),
+        (F80::ZERO, Flags::DENORMAL | Flags::INEXACT)
+    );
+    assert_eq!(x87::to_signed(den, 64, x), (0, Flags::INEXACT));
+    assert_eq!(x87::to_packed_bcd(den, x), ([0; 10], Flags::INEXACT));
+    assert_eq!(
+        x87::to_binary::<B64>(den, x),
+        (0, Flags::UNDERFLOW | Flags::INEXACT)
+    );
+    // FLD m64 of a subnormal does, and it is exact.
+    assert_eq!(x87::from_binary::<B64>(sub, x).1, Flags::DENORMAL);
+    // A pseudo-denormal is a denormal operand to the arithmetic and not to
+    // a store.
+    let pseudo = F80::new(0, 1 << 63);
+    assert_eq!(
+        x87::add(one, pseudo, ext, x),
+        (one, Flags::DENORMAL | Flags::INEXACT)
+    );
+    assert_eq!(x87::mul(pseudo, F80::ZERO, ext, x).1, Flags::DENORMAL);
+    assert_eq!(x87::to_signed(pseudo, 64, x), (0, Flags::INEXACT));
+
+    // None of it is ARM's rule: `IDC` is raised by the unpack, whatever the
+    // operation then does with the zero it was handed.
+    let fz = Env::ARM.flush(true);
+    assert_eq!(add::<B64>(qnan, sub, fz), (qnan, Flags::DENORMAL));
+    assert_eq!(to_signed::<B64>(sub, 64, fz), (0, Flags::DENORMAL));
+}
+
 #[test]
 fn the_default_nan_is_positive_on_riscv_and_negative_on_x86() {
     // RISC-V Volume I's canonical NaN, ARM's default NaN, and x86's "QNaN
@@ -969,7 +1075,9 @@ fn unsupported_encodings_are_invalid_operands() {
     );
     let (v, f) = x87::add(pseudo_denormal, F80::ZERO, Precision::Extended, X87);
     assert_eq!(v, F80::new(1, 1 << 63), "2^-16382, normally encoded");
-    assert_eq!(f, Flags::NONE);
+    // It is still reported as a denormal operand, which a real FPU does for
+    // the exponent field alone (measured: see `x87::unpack`).
+    assert_eq!(f, Flags::DENORMAL);
 }
 
 #[test]
