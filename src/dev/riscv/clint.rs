@@ -422,11 +422,39 @@ impl Registers {
         }
     }
 
-    /// Drive one software line. Never called with the state lock held.
-    fn drive_msip(&self, hart: usize, on: bool) {
+    /// Bring one software line level with its `msip` bit. Never called with
+    /// the state lock held.
+    ///
+    /// # Why this reads the bit instead of being told it
+    ///
+    /// The bit changes under the state lock and the wire is driven after the
+    /// lock is released (`ROADMAP.md` §4.7), so two harts writing one `msip` —
+    /// the sender of an inter-processor interrupt storing 1 while the target
+    /// stores 0 to acknowledge the previous one — can drive in the opposite
+    /// order to the one they changed the bit in. Told the value, the later
+    /// *drive* won and the later *change* lost: the register read 1, the line
+    /// stayed low, and since a store of the value `msip` already holds drives
+    /// nothing, no later write repaired it. Volume II, "Machine Interrupt
+    /// Registers": "MSIP is read-only in mip, and is written by accesses to
+    /// memory-mapped control registers" — the line is that bit.
+    ///
+    /// So each caller drives what the bit is *now* and then looks again. A
+    /// drive made stale by a concurrent change is seen to be stale by the
+    /// thread that made it, which goes round; the last drive to finish is
+    /// therefore always one that was checked against the final bit.
+    /// `tests/riscv_clint_msip_race.rs` is the instrument.
+    fn drive_msip(&self, hart: usize) {
         let source = self.outs.lock().msip.get(hart).and_then(Clone::clone);
-        if let Some(source) = source {
+        let Some(source) = source else {
+            return;
+        };
+        let bit = || self.state.lock().msip.get(hart).copied().unwrap_or(false);
+        loop {
+            let on = bit();
             source.set(Level::from_bool(on));
+            if bit() == on {
+                return;
+            }
         }
     }
 
@@ -558,7 +586,7 @@ impl MemOps for Registers {
                 }
             };
             if changed {
-                self.drive_msip(index, on);
+                self.drive_msip(index);
             }
             return Ok(());
         }
@@ -709,7 +737,7 @@ impl Device for Clint {
         };
         self.regs.drive_mtip(&pending);
         for hart in 0..self.regs.harts {
-            self.regs.drive_msip(hart, false);
+            self.regs.drive_msip(hart);
         }
     }
 
@@ -743,23 +771,19 @@ impl Device for Clint {
         let Some((kind, hart)) = split_pin(port) else {
             return;
         };
-        let state = self.regs.state.lock();
-        let level = match kind {
-            "mtip" => {
-                Registers::now(&state) >= state.mtimecmp.get(hart).copied().unwrap_or(u64::MAX)
-            }
-            "msip" => state.msip.get(hart).copied().unwrap_or(false),
-            _ => return,
-        };
-        drop(state);
         match kind {
             "mtip" => {
+                let level = {
+                    let state = self.regs.state.lock();
+                    Registers::now(&state) >= state.mtimecmp.get(hart).copied().unwrap_or(u64::MAX)
+                };
                 let source = self.regs.outs.lock().mtip.get(hart).and_then(Clone::clone);
                 if let Some(source) = source {
                     source.set(Level::from_bool(level));
                 }
             }
-            _ => self.regs.drive_msip(hart, level),
+            "msip" => self.regs.drive_msip(hart),
+            _ => {}
         }
     }
 
@@ -823,14 +847,14 @@ impl Device for Clint {
         }
         state.offset = r.read_u64()?;
         state.tick = r.read_u64()?;
-        let (pending, msip) = {
+        let pending = {
             let mut live = self.regs.state.lock();
             *live = state;
-            (self.regs.republish(&live), live.msip.clone())
+            self.regs.republish(&live)
         };
         self.regs.drive_mtip(&pending);
-        for (hart, on) in msip.iter().enumerate() {
-            self.regs.drive_msip(hart, *on);
+        for hart in 0..self.regs.harts {
+            self.regs.drive_msip(hart);
         }
         Ok(())
     }
