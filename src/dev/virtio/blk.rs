@@ -361,7 +361,7 @@ impl Backend for VirtioBlk {
         // The status byte is the last writable byte of the chain, wherever the
         // driver put it.
         let _ = q.write_chain(chain, writable - 1, &[status]);
-        (written + 1) as u32
+        used_len(written)
     }
 
     fn flush(&self) -> Result<()> {
@@ -432,6 +432,21 @@ impl Backend for VirtioBlk {
             ))),
         }
     }
+}
+
+/// The used-ring length for a request that put `written` payload bytes and a
+/// status byte into its chain.
+///
+/// The ring's `len` is 32 bits and a chain's writable descriptors can add up
+/// to more than that, so the count **saturates** rather than wraps: a read of
+/// exactly 4 GiB less one byte used to report a length of zero, which tells
+/// the driver not even the status byte arrived. Virtio 1.2 §2.7.8.2 allows
+/// the short answer and nothing allows a long one — "`len` is permitted to be
+/// an underestimate: that's preferable to the driver believing that
+/// uninitialized memory has been overwritten when it has not" — and the
+/// largest value the field holds is the closest underestimate there is.
+fn used_len(written: u64) -> u32 {
+    u32::try_from(written.saturating_add(1)).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

@@ -554,3 +554,17 @@ fn a_medium_that_refuses_to_be_snapshotted_fails_the_save_loudly() {
     let e = d.save(&mut chunk).expect_err("refused");
     assert!(alloc::format!("{e}").contains("refuses"), "{e}");
 }
+
+#[test]
+fn the_used_length_saturates_rather_than_wrapping_to_nothing() {
+    // The payload and its status byte, while that fits the ring's 32 bits.
+    assert_eq!(used_len(0), 1);
+    assert_eq!(used_len(512), 513);
+    assert_eq!(used_len(u64::from(u32::MAX) - 1), u32::MAX);
+    // One byte more is 2^32, which a cast turns into zero: "nothing was
+    // written, not even the status". The honest answer is the largest
+    // underestimate the field can hold (virtio 1.2 §2.7.8.2).
+    assert_eq!(used_len(u64::from(u32::MAX)), u32::MAX);
+    assert_eq!(used_len(5 << 30), u32::MAX);
+    assert_eq!(used_len(u64::MAX), u32::MAX);
+}
