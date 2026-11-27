@@ -1298,6 +1298,48 @@ fn wfi_stalls_until_an_interrupt_arrives() {
     assert!(!h.hart.is_waiting());
 }
 
+/// Volume II, "Wait for Interrupt": "If an enabled interrupt is present or
+/// later becomes present while the hart is stalled, the interrupt trap will be
+/// taken on the following instruction, i.e., execution resumes in the trap
+/// handler and mepc = pc + 4."
+#[test]
+fn a_trap_out_of_wfi_ends_the_wait_even_if_the_interrupt_then_goes_away() {
+    // Two harts asleep on one PLIC source is the case: both are notified, both
+    // take the trap, and the first to claim lowers the other's line before its
+    // handler has run an instruction. The handler still has to run — it is
+    // what finds out there is nothing to claim.
+    let handler = 0x40;
+    let mut program = vec![
+        addi(10, 0, status::MIE as i32),
+        csrrs(0, num::MSTATUS, 10),
+        addi(10, 0, irq::MTI as i32),
+        csrrs(0, num::MIE, 10),
+        WFI,
+    ];
+    program.resize(handler / 4, addi(0, 0, 0));
+    program.push(addi(12, 0, 42)); // the handler's first instruction
+    let h = Harness::rv64i(&program);
+    let mut csrs = h.hart.csrs();
+    csrs.mtvec = BASE + handler as u64;
+    h.hart.set_csrs(csrs);
+    h.steps(5);
+    assert!(h.hart.is_waiting());
+
+    h.hart.set_interrupt(irq::MTI, true);
+    h.steps(1);
+    assert_eq!(h.hart.pc(), BASE + handler as u64, "the trap was taken");
+    assert_eq!(h.hart.csrs().mepc, BASE + 20, "mepc = pc + 4");
+
+    // The line drops before the handler's first instruction.
+    h.hart.set_interrupt(irq::MTI, false);
+    h.steps(1);
+    assert!(
+        !h.hart.is_waiting(),
+        "a hart in its trap handler is not asleep"
+    );
+    assert_eq!(h.hart.x(12), 42, "and the handler runs");
+}
+
 // ---------------------------------------------------------------------------
 // Paging
 // ---------------------------------------------------------------------------

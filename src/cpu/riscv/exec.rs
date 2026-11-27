@@ -372,6 +372,14 @@ impl<'a> Exec<'a> {
     /// `WFI` charges one, so a scheduler always makes progress.
     pub(super) fn step(&mut self) -> u64 {
         if let Some(code) = self.pending_interrupt() {
+            // Taking the trap *is* the end of a `WFI`: Volume II, "Wait for
+            // Interrupt", "the interrupt trap will be taken on the following
+            // instruction, i.e., execution resumes in the trap handler". Left
+            // set, the stall was re-examined at the handler's first
+            // instruction — and a line that had dropped by then (two harts
+            // asleep on one PLIC source, and the other claimed it) put the
+            // hart back to sleep *inside its handler*.
+            self.st.wfi = false;
             self.enter_trap(Trap::bare(code), true);
             self.st.pc = self.next_pc;
             return self.used.max(1);
