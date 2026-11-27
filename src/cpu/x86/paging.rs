@@ -853,6 +853,19 @@ const fn reserved_set(t: Tables, entry: u64, level: u8, levels: u8) -> bool {
         return true;
     }
     // `PS` in the last level is the page-attribute-table bit, not a size.
+    //
+    // And in a **32-bit** page directory with `CR4.PSE` clear it is not a
+    // size either, nor reserved: it is ignored, and the entry names a page
+    // table like any other. *Intel SDM* volume 3A §5.3: "If CR4.PSE = 0 or
+    // the PDE's PS flag is 0, a 4-KByte naturally aligned page table is
+    // located at the physical address specified in bits 31:12 of the PDE",
+    // and Table 5-5's row for bit 7: "If CR4.PSE = 1, must be 0 (otherwise,
+    // this entry maps a 4-MByte page; see Table 5-4); otherwise, ignored".
+    // A 386 has no `CR4` at all, so on that part every directory entry is
+    // this case.
+    if matches!(t.mode, Mode::Legacy) {
+        return false;
+    }
     if entry & pte::PAGE_SIZE != 0 && level + 1 < levels && !large_allowed(t, level) {
         return true;
     }
@@ -1328,17 +1341,34 @@ mod tests {
         assert_eq!(w.depth, 1);
     }
 
+    /// *Intel SDM* volume 3A §5.3, Table 5-5, bit 7 of a 32-bit page-directory
+    /// entry: "If CR4.PSE = 1, must be 0 (otherwise, this entry maps a 4-MByte
+    /// page; see Table 5-4); otherwise, ignored". This used to be a
+    /// reserved-bit page fault, and a test here said so.
     #[test]
-    fn a_directory_entry_with_ps_and_no_cr4_pse_is_a_reserved_bit_fault() {
+    fn a_directory_entry_with_ps_and_no_cr4_pse_names_a_page_table() {
         let mut t = tables(Mode::Legacy, 0x1000);
         t.pse = false;
-        let err = walk_over(
+        let w = walk_over(
+            t,
+            0x0080_4123,
+            &[
+                (0x1000 + 2 * 4, 0x0080_0000 | pte::PRESENT | pte::PAGE_SIZE),
+                (0x0080_0000 + 4 * 4, 0x0123_4000 | pte::PRESENT),
+            ],
+        )
+        .expect("PS without CR4.PSE is ignored, and the walk goes on");
+        assert_eq!(w.phys, 0x0123_4123, "through the page table");
+        assert_eq!(w.depth, 2);
+        // With `CR4.PSE` set the same entry is the 4 MiB page it says it is.
+        t.pse = true;
+        let w = walk_over(
             t,
             0x0080_4123,
             &[(0x1000 + 2 * 4, 0x0080_0000 | pte::PRESENT | pte::PAGE_SIZE)],
         )
-        .expect_err("PS without CR4.PSE is reserved");
-        assert_eq!(err, WalkFail::Reserved);
+        .expect("a large page");
+        assert_eq!(w.depth, 1);
     }
 
     #[test]
