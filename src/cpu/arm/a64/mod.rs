@@ -795,8 +795,12 @@ impl Lines {
     }
 
     /// Take a latched reset request, clearing it.
+    ///
+    /// A relaxed load first, for the reason [`Lines::take_start`] gives: this
+    /// is asked once per interpreted instruction, the answer is nearly always
+    /// "no", and a `swap` is a locked operation even when nothing contends.
     pub fn take_reset_request(&self) -> bool {
-        self.reset.swap(false, Ordering::Relaxed)
+        self.reset.load(Ordering::Relaxed) && self.reset.swap(false, Ordering::Relaxed)
     }
 
     /// Record what a PSCI call asked the board to do.
@@ -811,7 +815,13 @@ impl Lines {
     }
 
     /// Take a pending power request, clearing it.
+    ///
+    /// Load-then-swap, like [`Lines::take_reset_request`] and for the same
+    /// reason.
     pub fn take_power_request(&self) -> Option<PowerRequest> {
+        if self.power.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
         match self.power.swap(0, Ordering::Relaxed) {
             1 => Some(PowerRequest::Poweroff),
             2 => Some(PowerRequest::Reboot),
@@ -1448,13 +1458,16 @@ impl Cpu {
                 #[cfg(all(feature = "cpu-arm-a64-lift", feature = "jit"))]
                     jit: _jit,
             } = &mut *session;
-            let Some(space) = space.clone() else {
+            // Borrowed, not cloned: the session lock is held for the whole
+            // of this block, so the `Arc` cannot go away under it, and a
+            // clone is two locked operations per interpreted instruction.
+            let Some(space) = space.as_deref() else {
                 return (0, None);
             };
             let mut exec = Exec::new(
                 state,
                 tlb,
-                &space,
+                space,
                 &cfg,
                 &self.lines,
                 exits,

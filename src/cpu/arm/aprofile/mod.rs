@@ -762,13 +762,20 @@ impl Lines {
     }
 
     /// Consume the latch, reporting whether one was owed.
+    ///
+    /// A load before the read-modify-write, here and in
+    /// [`Lines::take_event`]: both are asked once per instruction, the answer
+    /// is nearly always "no", and a `swap` is a locked operation on the hosts
+    /// that have one even when nothing contends. A request that lands between
+    /// the two is taken by the next step, which is where it would have landed
+    /// had it arrived a moment later.
     fn take_reset_request(&self) -> bool {
-        self.reset.swap(false, Ordering::AcqRel)
+        self.reset.load(Ordering::Acquire) && self.reset.swap(false, Ordering::AcqRel)
     }
 
     /// Consume a pending event, reporting whether one was sent.
     fn take_event(&self) -> bool {
-        self.event.swap(false, Ordering::AcqRel)
+        self.event.load(Ordering::Acquire) && self.event.swap(false, Ordering::AcqRel)
     }
 
     /// Hold or release the core. A release latches a reset, so the core
@@ -1549,20 +1556,21 @@ impl Arm {
             tlb.flush();
         }
         state.event |= event;
-        let Some(space) = space.clone() else {
+        // All three borrowed rather than cloned: the session lock is held
+        // until the step returns, so none of them can go away, and each
+        // `Arc` clone is two locked operations per instruction.
+        let Some(space) = space.as_deref() else {
             return 0;
         };
-        let mmu = Arc::clone(mmu);
-        let global = global_monitor.clone();
         let resetting = state.reset_pending;
         let used = Exec::new(
             state,
-            &space,
+            space,
             mmu.as_ref(),
             tlb,
             coprocessors,
             &cfg,
-            global.as_deref(),
+            global_monitor.as_deref(),
         )
         .step(irq, fiq);
         if resetting {

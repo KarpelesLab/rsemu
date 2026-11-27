@@ -1047,8 +1047,15 @@ impl Lines {
     }
 
     /// Take the latched reset request, if there is one.
+    ///
+    /// A load before the read-modify-write: this is asked once per
+    /// instruction, the answer is nearly always "no", and a `swap` is a
+    /// locked operation on the hosts that have one even when nothing
+    /// contends. A request that lands between the two is taken by the next
+    /// step, which is where it would have landed had it arrived a moment
+    /// later.
     fn take_reset(&self) -> bool {
-        self.reset.swap(false, Ordering::AcqRel)
+        self.reset.load(Ordering::Acquire) && self.reset.swap(false, Ordering::AcqRel)
     }
 
     fn set(&self, irq: u16, asserted: bool) {
@@ -1716,11 +1723,14 @@ impl ArmV7m {
             // (DDI 0403 B3.2.5; Armv8-M takes the value from the SoC).
             state.sys.vtor = *reset_vtor;
         }
-        let Some(space) = space.clone() else {
+        // Borrowed rather than cloned: the session lock is held until the
+        // step returns, so the `Arc` cannot go away, and a clone is two
+        // locked operations per instruction.
+        let Some(space) = space.as_deref() else {
             return 0;
         };
         let live = cursor.as_ref().zip(*live_offset);
-        Exec::new(state, &space, &self.cfg, spin)
+        Exec::new(state, space, &self.cfg, spin)
             .with_live(live)
             .step(&external, nmi)
     }
