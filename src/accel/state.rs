@@ -650,9 +650,17 @@ pub fn fpu_to_kvm(x87: &X87, sse: &Sse) -> KvmFpu {
         mxcsr: sse.mxcsr,
         ..KvmFpu::default()
     };
-    for i in 0..8 {
-        fpu.fpr[i][..10].copy_from_slice(&x87.regs[i].to_bytes());
-        if Tag::from_bits(x87.tag >> (2 * i)) != Tag::Empty {
+    for i in 0..8u8 {
+        // Two different indexings in one structure, as in the `FXSAVE` image
+        // it is: the data registers are in **stack** order — `fpr[0]` is
+        // `ST(0)`, wherever `TOP` has put it — while the abridged tag word is
+        // one bit per **physical** register. The interpreter keeps both by
+        // physical register, so the data moves through `TOP` and the tags do
+        // not. `the_x87_stack_crosses_in_stack_order_when_top_is_not_zero`
+        // reads both facts back from a vCPU.
+        let st = &x87.regs[x87.phys(i) as usize];
+        fpu.fpr[i as usize][..10].copy_from_slice(&st.to_bytes());
+        if Tag::from_bits(x87.tag >> (2 * u32::from(i))) != Tag::Empty {
             fpu.ftwx |= 1 << i;
         }
     }
@@ -681,20 +689,25 @@ pub fn fpu_from_kvm(kvm: &KvmFpu, base: &X87) -> (X87, Sse) {
         last_ds: base.last_ds,
         last_op: kvm.last_opcode & 0x7ff,
     };
-    for i in 0..8 {
+    // `fpr[i]` is `ST(i)`: the data registers travel in stack order, and
+    // `TOP` — already in `x87.status` — says which physical register that is.
+    for i in 0..8u8 {
         let mut bytes = [0u8; 10];
-        bytes.copy_from_slice(&kvm.fpr[i][..10]);
-        x87.regs[i] = F80::from_bytes(bytes);
-        // The abridged word says only *empty or not*. A register that is not
-        // empty gets its full tag recomputed from its own encoding, which is
-        // what `FXRSTOR` does; one that is empty keeps the encoding it had, as
-        // hardware does — an empty register still holds bits.
-        let tag = if kvm.ftwx & (1 << i) == 0 {
+        bytes.copy_from_slice(&kvm.fpr[i as usize][..10]);
+        x87.regs[x87.phys(i) as usize] = F80::from_bytes(bytes);
+    }
+    for p in 0..8 {
+        // The abridged word is by physical register, and says only *empty or
+        // not*. A register that is not empty gets its full tag recomputed from
+        // its own encoding, which is what `FXRSTOR` does; one that is empty
+        // keeps the encoding it had, as hardware does — an empty register
+        // still holds bits.
+        let tag = if kvm.ftwx & (1 << p) == 0 {
             Tag::Empty
         } else {
-            Tag::of(x87.regs[i])
+            Tag::of(x87.regs[p])
         };
-        x87.tag |= tag.bits() << (2 * i);
+        x87.tag |= tag.bits() << (2 * p);
     }
     // The `YMM` upper halves are not in `kvm_fpu` — they travel in the
     // XSAVE area, which this transfer does not carry — so they come back

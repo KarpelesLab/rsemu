@@ -939,6 +939,64 @@ fn the_syscall_msrs_the_debug_registers_and_the_fpu_survive_hardware() {
     );
 }
 
+/// `kvm_fpu.fpr` holds the x87 registers in **stack** order — `fpr[0]` is
+/// `ST(0)` — and the abridged tag word beside it is indexed by *physical*
+/// register. The interpreter indexes both by physical register, so the two
+/// agree only while `TOP` is zero, which is to say only while the stack is
+/// empty or full.
+///
+/// Asserted against hardware rather than against the other direction, because
+/// a transfer that is wrong the same way both ways round-trips perfectly: the
+/// guest pushes two values and the interpreter must find them in `ST(0)` and
+/// `ST(1)`.
+#[cfg(feature = "cpu-x86")]
+#[test]
+fn the_x87_stack_crosses_in_stack_order_when_top_is_not_zero() {
+    use crate::accel::state;
+    use crate::cpu::x86::{Config, X86};
+    use crate::float::x87::F80;
+
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    let one = F80::new(0x3fff, 1 << 63);
+    let pi = F80::new(0x4000, 0xc90f_daa2_2168_c235);
+
+    //   fninit             db e3
+    //   fld1               d9 e8
+    //   fldpi              d9 eb
+    //   hlt                f4
+    let vcpu = guest.vcpu_at(&[0xdb, 0xe3, 0xd9, 0xe8, 0xd9, 0xeb, 0xf4]);
+    let run = vcpu.run_until_exit(8).expect("the guest runs");
+    assert_eq!(run.exit.expect("the guest halted").reason, ExitReason::HALT);
+
+    // What the kernel hands back, before this crate interprets any of it.
+    let raw = vcpu.fpu().expect("KVM_GET_FPU");
+    assert_eq!((raw.fsw >> 11) & 7, 6, "two pushes leave TOP at 6");
+    assert_eq!(raw.fpr[0][..10], pi.to_bytes(), "fpr[0] is ST(0)");
+    assert_eq!(raw.fpr[1][..10], one.to_bytes(), "fpr[1] is ST(1)");
+    assert_eq!(
+        raw.ftwx, 0xc0,
+        "the tag bits are physical registers 6 and 7"
+    );
+
+    let cpu = X86::new(Config::I80486);
+    cpu.attach_space(Arc::clone(&guest.mem));
+    cpu.attach_io_space(Arc::clone(&guest.io));
+    cpu.step();
+    state::store_from_vcpu(&vcpu, &cpu).expect("KVM to the interpreter");
+    let x87 = cpu.x87();
+    assert_eq!(x87.top(), 6);
+    assert_eq!(x87.raw(0), pi, "the interpreter's ST(0)");
+    assert_eq!(x87.raw(1), one, "the interpreter's ST(1)");
+    assert!(x87.occupied(0) && x87.occupied(1));
+    assert!(!x87.occupied(2), "only two registers were pushed");
+
+    // And the translation back produces the image the kernel gave.
+    let back = state::fpu_to_kvm(&x87, &cpu.sse());
+    assert_eq!(back.fpr, raw.fpr);
+    assert_eq!(back.ftwx, raw.ftwx);
+}
+
 /// The counter crosses in **both** directions, and is a value rather than an
 /// offset.
 ///

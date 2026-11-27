@@ -455,14 +455,16 @@ const _: () = assert!(size_of::<KvmInterrupt>() == 4);
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvmFpu {
-    /// The eight data registers, in physical order, each a 10-byte extended
-    /// value in the low bytes of a 16-byte slot.
+    /// The eight data registers in **stack** order — `fpr[0]` is `ST(0)` —
+    /// each a 10-byte extended value in the low bytes of a 16-byte slot.
     pub fpr: [[u8; 16]; 8],
     /// The control word.
     pub fcw: u16,
     /// The status word.
     pub fsw: u16,
-    /// The abridged tag word: bit `i` set means register `i` is not empty.
+    /// The abridged tag word: bit `i` set means **physical** register `i` is
+    /// not empty. Not the same index as [`fpr`](KvmFpu::fpr)'s unless `TOP`
+    /// is zero.
     pub ftwx: u8,
     /// Padding.
     pub pad1: u8,
