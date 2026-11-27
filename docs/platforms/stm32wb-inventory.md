@@ -228,7 +228,7 @@ ever an executing core.
 | 22, 23 | I2C1, I2C3 wakeup | direct | — |
 | 24, 25 | USART1, LPUART1 wakeup | direct | — |
 | 26, 27 | reserved | | |
-| 28 | USB wakeup | direct | — |
+| 28 | USB wakeup | direct | `usb.wakeup` (`ISTR.WKUP`) |
 | 29, 30 | LPTIM1, LPTIM2 | direct | — |
 | 31 | PVM1 | configurable | no |
 | 32 | reserved | | |

@@ -112,8 +112,16 @@
 //! matched to an endpoint register by its `EA` field — not by the register's
 //! position — exactly as the token's address field is matched on silicon. The
 //! device signals **full speed** and answers at `DADDR`'s address. It is on the
-//! bus while it is clocked, out of `PDWN` and `FRES`, its `DPPU` pull-up is
-//! set and `BCDEN` is clear.
+//! bus while it is clocked, out of `PDWN`, its `DPPU` pull-up is set and
+//! `BCDEN` is clear; held in `FRES` it stays on the bus and answers nothing.
+//!
+//! # Time: the frame timer
+//!
+//! `SOF`/`ESOF`, `FNR.LSOF`/`LCK` and suspend detection are about time, and
+//! the scheduler owns time: the block is lazily advanced on its `clock`, which
+//! a board must give it and which is its 48 MHz USB clock ([`FRAME_TICKS`] to a
+//! frame), and the frame timer is a deadline it reports. It never reads a
+//! clock of its own.
 //!
 //! # The clock, the interrupt, the inputs
 //!
@@ -125,7 +133,8 @@
 //! the low-priority USB interrupt — level, the OR of the enabled `ISTR` flags
 //! under `CNTR`'s mask — and the board wires it to its core's USB vector;
 //! `irq_hp` carries the high-priority one (see [`pin::IRQ_HP`] for what feeds
-//! it and how each family wires it).
+//! it and how each family wires it). The `wakeup` output is `USB_WAKEUP`, the
+//! level of `ISTR.WKUP`, for a wake-up unit (a WB's EXTI line 28).
 //!
 //! # Sources
 //!
@@ -144,15 +153,17 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::bus::usb::{
-    Completion, DataPid, DeviceAddress, SetupPacket, Speed, Status, UsbBus, UsbDevice, buses,
+    Completion, DataPid, DeviceAddress, LpmAttributes, LpmResponse, SetupPacket, Speed, Status,
+    UsbBus, UsbDevice, buses,
 };
 use crate::core::device::{Device, DeviceClass, PropertySpec, RealizeCtx, ResetKind, SinkPin};
 use crate::core::error::{BusError, Error, Result};
 use crate::core::props::{Props, ValueKind};
+use crate::core::sched::{AccessKind, LazyHandle};
 use crate::core::space::{AccessConstraints, MemAttrs, MemOps, MemResult, Region, RegionRef};
 use crate::core::state::{ChunkReader, ChunkWriter, Sink, Source};
 use crate::core::sync::AtomicBool;
-use crate::core::sync::{AtomicU32, LockRank, Mutex, Ordering};
+use crate::core::sync::{AtomicU32, AtomicU64, LockRank, Mutex, Ordering};
 use crate::core::value::{Endian, Width};
 use crate::core::wire::{FanIn, Level, Resolve, WireId, WireSink, WireSource};
 use crate::dev::stm32::gate::{self, ClockGate, Gated};
@@ -163,7 +174,7 @@ use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 const CLASS_NAME: &str = "st.usbfs";
 
 /// The snapshot chunk version. Bump it with the encoding, never on its own.
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// How many endpoint registers the block has. Fixed on this peripheral.
 const ENDPOINTS: usize = 8;
@@ -225,6 +236,13 @@ const CNTR_IRQ_MASK: u16 = 0xff80;
 /// `CNTR`'s implemented bits: all but bit 6, "Reserved, must be kept at reset
 /// value" (RM0434 §40.6.1).
 const CNTR_WRITABLE: u16 = 0xffbf;
+/// "The microcontroller can set this bit to send a LPM L1 Resume signal to
+/// the host. After the signaling ends, this bit is cleared by hardware."
+const CNTR_L1RESUME: u16 = 1 << 5;
+/// "The microcontroller can set this bit to send a Resume signal to the host."
+const CNTR_RESUME: u16 = 1 << 4;
+const CNTR_FSUSP: u16 = 1 << 3;
+const CNTR_LP_MODE: u16 = 1 << 2;
 const CNTR_PDWN: u16 = 1 << 1;
 const CNTR_FRES: u16 = 1 << 0;
 /// `CNTR`'s reset value: powered down and held in reset (RM0091 §30.6.1).
@@ -232,11 +250,58 @@ const CNTR_RESET: u16 = CNTR_PDWN | CNTR_FRES;
 
 // --- ISTR bits ---
 const ISTR_CTR: u16 = 1 << 15;
+const ISTR_WKUP: u16 = 1 << 12;
+const ISTR_SUSP: u16 = 1 << 11;
 const ISTR_RESET: u16 = 1 << 10;
+const ISTR_SOF: u16 = 1 << 9;
+const ISTR_ESOF: u16 = 1 << 8;
+const ISTR_L1REQ: u16 = 1 << 7;
 const ISTR_DIR: u16 = 1 << 4;
 /// The latched, `rc_w0`-writable flags: `PMAOVR` (14) down through `L1REQ` (7).
 /// `CTR`, `DIR` and `EP_ID` are read-only and computed.
+///
+/// Two of them this model never sets, because what sets them cannot happen
+/// here, and faking them would be inventing failures:
+///
+/// * `PMAOVR` (14): "set if the microcontroller has not been able to respond
+///   in time to an USB memory request" — the arbiter losing a race between
+///   APB1 and the USB side for the packet memory. Here a transaction reads or
+///   writes the packet memory in one step under the device's lock, so there
+///   is no latency to miss.
+/// * `ERR` (13): "set whenever one of the errors listed below has occurred:
+///   NANS … CRC … BST … FVIO" — no answer, a bad CRC, a bit-stuffing error, a
+///   framing violation. All four are wire-level, and the fabric carries
+///   transactions, not bits.
+///
+/// Both are still writable to clear — "This bit is read/write but only ‘0 can
+/// be written and writing ‘1 has no effect" — which the `rc_w0` rule over this
+/// mask gives them, so a driver's `ISTR = ~ERR` is harmless.
 const ISTR_FLAG_MASK: u16 = 0x7f80;
+
+// --- FNR ---
+const FNR_LCK: u16 = 1 << 13;
+const FNR_LSOF_SHIFT: u16 = 11;
+const FNR_FN: u16 = 0x07ff;
+/// `[RXDP, RXDM]` line states (RM0434 Table 257, "Resume event detection"):
+/// `10` is the idle (J) bus, `00` a reset (SE0), `01` a resume (K).
+const LINE_IDLE: u16 = 0b10;
+const LINE_SE0: u16 = 0b00;
+const LINE_K: u16 = 0b01;
+
+// --- The frame timer ---
+/// One frame of the block's own clock. "The USB peripheral logic uses a
+/// dedicated clock. The frequency of this dedicated clock is fixed by the
+/// requirements of the USB standard at 48 MHz" (RM0434 §40.4.2), and a
+/// full-speed frame is 1 ms (USB 2.0 §8.4.3.1): so a board puts this block on
+/// a 48 MHz domain and a frame is 48 000 of its ticks.
+pub const FRAME_TICKS: u64 = 48_000;
+/// How late a `SOF` may be before it is missing. RM0434 does not give the
+/// suspend timer's window; USB 2.0 §7.1.12 allows a full-speed frame period of
+/// 1.000 ms ± 500 ppm, so this is 500 ppm of a frame, and a host on time
+/// never trips it.
+const FRAME_SLACK: u64 = FRAME_TICKS / 2000;
+/// "Nothing scheduled."
+const NO_DEADLINE: u64 = u64::MAX;
 
 // --- DADDR / BTABLE / LPMCSR / BCDR ---
 const DADDR_ADD: u16 = 0x007f;
@@ -251,6 +316,10 @@ const LPMCSR_WRITABLE: u16 = 0x0003;
 /// `DADDR.EF` (7): "If this bit is at '0 no transactions are handled,
 /// irrespective of the settings of USB_EPnR registers." (RM0434 §40.6.1)
 const DADDR_EF: u16 = 1 << 7;
+const LPMCSR_LPMEN: u16 = 1 << 0;
+const LPMCSR_LPMACK: u16 = 1 << 1;
+const LPMCSR_REMWAKE: u16 = 1 << 3;
+const LPMCSR_BESL_SHIFT: u16 = 4;
 const BCDR_DPPU: u16 = 1 << 15;
 const BCDR_PS2DET: u16 = 1 << 7;
 const BCDR_SDET: u16 = 1 << 6;
@@ -386,6 +455,32 @@ struct State {
     /// transactions addressed to this endpoint until DBL_BUF remain set"
     /// (RM0434 §40.5.3). Hidden hardware state, so it is in the snapshot.
     dbl_live: u8,
+
+    // -- the frame timer and the line ------------------------------------
+    /// `FNR.FN`: the frame number the last `SOF` carried.
+    fnum: u16,
+    /// `FNR.LSOF`: consecutive `SOF`s lost, saturating at the field's three.
+    lsof: u16,
+    /// `FNR.LCK`.
+    lck: bool,
+    /// Consecutive `SOF`s since the last reset, resume or missed frame —
+    /// what `LCK` waits for two of. Saturates at two.
+    sof_run: u16,
+    /// `ESOF`s since the last bus traffic of any kind, saturating at three —
+    /// the third is `SUSP`.
+    idle_esofs: u16,
+    /// `[RXDP, RXDM]`.
+    line: u16,
+    /// In LPM's L1 (Sleep), entered by an ACKed `LPM` token.
+    l1: bool,
+    /// A remote wakeup to signal on the bus once the lock is dropped. Never
+    /// saved: it lives for one register write.
+    wakeup_due: bool,
+    /// Where the block has advanced to in its own (48 MHz) clock domain.
+    tick: u64,
+    /// When the frame timer next declares a `SOF` missing; [`NO_DEADLINE`]
+    /// while it is not running.
+    esof_at: u64,
 }
 
 impl State {
@@ -401,7 +496,150 @@ impl State {
             pma: vec![0; PMA_BYTES as usize],
             usb_pma_len: PMA_BYTES as usize,
             dbl_live: 0,
+            fnum: 0,
+            lsof: 0,
+            lck: false,
+            sof_run: 0,
+            idle_esofs: 0,
+            line: LINE_SE0,
+            l1: false,
+            wakeup_due: false,
+            tick: 0,
+            esof_at: NO_DEADLINE,
         }
+    }
+
+    /// `FNR` as a read answers it.
+    fn fnr_value(&self) -> u16 {
+        (self.line << 14)
+            | if self.lck { FNR_LCK } else { 0 }
+            | (self.lsof << FNR_LSOF_SHIFT)
+            | (self.fnum & FNR_FN)
+    }
+
+    /// Whether the block takes part in a transaction at all.
+    ///
+    /// Not while `FRES` holds it — "The USB peripheral is held in RESET state
+    /// until software clears this bit" — and not while a reset is unserviced:
+    /// "Reception and transmission are disabled until the RESET bit is
+    /// cleared" (RM0434 §40.6.1, `ISTR.RESET`). Either way the host hears
+    /// nothing, as it would from a device not answering.
+    fn accepting(&self) -> bool {
+        self.cntr & CNTR_FRES == 0 && self.istr & ISTR_RESET == 0
+    }
+
+    /// Whether the block is asleep: suspended (`FSUSP`) or in L1.
+    fn asleep(&self) -> bool {
+        self.cntr & CNTR_FSUSP != 0 || self.l1
+    }
+
+    /// Bus activity reached a sleeping block: `WKUP` is "set to 1 by the
+    /// hardware when, during suspend mode, activity is detected that wakes up
+    /// the USB peripheral. This event asynchronously clears the LP_MODE bit".
+    ///
+    /// L1 is treated the same way. RM0434 describes `WKUP` only for suspend
+    /// and says nothing of how an L1 exit is reported; `WKUP` is the only
+    /// wake-up flag the block has, so this model uses it for both.
+    fn wake(&mut self) {
+        if self.asleep() {
+            self.istr |= ISTR_WKUP;
+            self.cntr &= !CNTR_LP_MODE;
+            self.l1 = false;
+        }
+    }
+
+    /// Something went past on the bus — a `SOF`, a transaction, an LPM token —
+    /// so the bus is not idle and the line is back to J.
+    fn traffic(&mut self) {
+        self.idle_esofs = 0;
+        self.line = LINE_IDLE;
+        self.wake();
+    }
+
+    /// (Re)start the frame timer from now: the next `SOF` is due a frame away.
+    fn arm_frame_timer(&mut self) {
+        self.esof_at = self.tick.saturating_add(FRAME_TICKS + FRAME_SLACK);
+    }
+
+    /// A `SOF` packet arrived.
+    fn sof(&mut self, frame: u16) {
+        self.traffic();
+        // "FN … contains the 11-bits frame number contained in the last
+        // received SOF packet … updated on the generation of an SOF
+        // interrupt"; "At the reception of an SOF packet, these bits [LSOF]
+        // are cleared."
+        self.fnum = frame & FNR_FN;
+        self.istr |= ISTR_SOF;
+        self.lsof = 0;
+        // "LCK: set by the hardware when at least two consecutive SOF packets
+        // have been received after the end of an USB reset condition or after
+        // the end of an USB resume sequence."
+        self.sof_run = (self.sof_run + 1).min(2);
+        if self.sof_run >= 2 {
+            self.lck = true;
+        }
+        self.arm_frame_timer();
+    }
+
+    /// The frame timer ran out: a `SOF` was due and did not come.
+    fn esof(&mut self) {
+        // "ESOF: set by the hardware when an SOF packet is expected but not
+        // received … This bit is set even when the missing SOF packets occur
+        // while the Suspend Timer is not yet locked."
+        self.istr |= ISTR_ESOF;
+        // "LSOF: written by the hardware when an ESOF interrupt is generated,
+        // counting the number of consecutive SOF packets lost."
+        self.lsof = (self.lsof + 1).min(3);
+        self.sof_run = 0;
+        let idle = self.idle_esofs;
+        self.idle_esofs = (idle + 1).min(3);
+        // "If three consecutive ESOF interrupts are generated (i.e. three SOF
+        // packets are lost) without any traffic occurring in between, a SUSP
+        // interrupt is generated." The check "is disabled by the hardware when
+        // the suspend mode is active (FSUSP=1)". Raised once per idle stretch:
+        // the manual does not say it repeats, so a driver that cleared it
+        // without suspending is not asked again until the bus has been busy.
+        if idle == 2 && self.cntr & CNTR_FSUSP == 0 {
+            self.istr |= ISTR_SUSP;
+            // "Once locked, the frame timer remains in this state until an USB
+            // reset or USB suspend event occurs."
+            self.lck = false;
+        }
+        // The timer keeps its rhythm — "ESOF interrupts, occurring with a 1 ms
+        // period" (§40.5.5), which is how a driver times its RESUME pulse.
+        self.esof_at = self.esof_at.saturating_add(FRAME_TICKS);
+    }
+
+    /// A USB reset, from the bus or forced by `FRES`.
+    ///
+    /// What it resets, in the manual's words: "The function address and
+    /// endpoint registers are reset by an USB reset event" (`ISTR.RESET`);
+    /// the `EPnR` "are also reset when an USB reset is received from the USB
+    /// bus or forced through bit FRES in the CTLR register, except the CTR_RX
+    /// and CTR_TX bits, which are kept unchanged to avoid missing a correct
+    /// packet notification immediately followed by an USB reset event"; and
+    /// nothing else — "All configuration registers do not reset: the
+    /// microcontroller must explicitly clear these registers". So `DADDR`
+    /// returns to its reset value `0x0000`, `EF` included, which is why the
+    /// RESET handler of §40.5.2 sets `EF` again; `CNTR`, `BTABLE`, `LPMCSR` and
+    /// `BCDR` keep what firmware wrote.
+    fn usb_reset(&mut self) {
+        for ep in &mut self.ep {
+            *ep &= EP_CTR_RX | EP_CTR_TX;
+        }
+        // The double-buffer "first transaction" latch belongs to a `DBL_BUF`
+        // the reset has just cleared (it is an `EPnR`'s `EP_KIND`), so it goes
+        // with it: the next `DBL_BUF` starts afresh.
+        self.dbl_live = 0;
+        self.daddr = 0;
+        self.istr |= ISTR_RESET;
+        // "The suspend condition check is enabled immediately after any USB
+        // reset", and the lock is lost (`FNR.LCK`).
+        self.lck = false;
+        self.sof_run = 0;
+        self.idle_esofs = 0;
+        self.l1 = false;
+        self.arm_frame_timer();
     }
 
     fn stat_rx(&self, n: usize) -> u16 {
@@ -739,6 +977,16 @@ pub struct Usbfs {
     irq: Mutex<Option<WireSource>>,
     /// The `irq_hp` output (`USB_HP`), connected at realize time.
     irq_hp: Mutex<Option<WireSource>>,
+    /// The `wakeup` output: `USB_WAKEUP`, to the wake-up unit.
+    wakeup: Mutex<Option<WireSource>>,
+    /// The catch-up handle the access paths sync through (`ROADMAP.md` §4.2).
+    lazy: Mutex<Option<LazyHandle>>,
+    /// [`State::tick`], republished on every change: the scheduler asks
+    /// [`Device::current_tick`] with its slot lock held, so that call may not
+    /// take a lock.
+    tick: AtomicU64,
+    /// [`State::esof_at`] when it is in the future, else [`NO_DEADLINE`].
+    next_event: AtomicU64,
     /// The bus this device plugs into when its pull-up is attached.
     bus: Arc<UsbBus>,
     /// Which port of [`bus`](Usbfs::bus) it plugs into.
@@ -785,6 +1033,10 @@ impl Usbfs {
             gate: ClockGate::new(),
             irq: Mutex::with_rank(LockRank::WIRE, None),
             irq_hp: Mutex::with_rank(LockRank::WIRE, None),
+            wakeup: Mutex::with_rank(LockRank::WIRE, None),
+            lazy: Mutex::with_rank(LockRank::LEAF, None),
+            tick: AtomicU64::new(0),
+            next_event: AtomicU64::new(NO_DEADLINE),
             bus,
             port,
             attached: AtomicU32::new(0),
@@ -829,6 +1081,75 @@ impl Usbfs {
         self.state.lock().istr_value()
     }
 
+    /// `FNR` as the guest would read it.
+    #[must_use]
+    pub fn frame_number(&self) -> u16 {
+        self.state.lock().fnr_value()
+    }
+
+    /// The level the `wakeup` output is being driven to.
+    #[must_use]
+    pub fn wakeup_level(&self) -> Level {
+        Level::from_bool(self.state.lock().istr & ISTR_WKUP != 0)
+    }
+
+    /// Where the block has advanced to, in its own domain.
+    #[must_use]
+    pub fn tick(&self) -> u64 {
+        self.tick.load(Ordering::Relaxed)
+    }
+
+    /// Republish what the lock-free lazy surface reads. Called from inside
+    /// every critical section that moves the tick or the frame timer.
+    fn publish(&self, state: &State) {
+        self.tick.store(state.tick, Ordering::Relaxed);
+        let next = if state.esof_at > state.tick {
+            state.esof_at
+        } else {
+            NO_DEADLINE
+        };
+        self.next_event.store(next, Ordering::Relaxed);
+    }
+
+    /// Catch the block up before anything reaches it — a guest access or a
+    /// bus event — so the frame timer has run out exactly where it should
+    /// have. **No lock of ours may be held.**
+    fn sync(&self) {
+        let handle = self.lazy.lock().clone();
+        if let Some(handle) = handle {
+            // A refusal means catch-up is already running further up the
+            // stack; the event is then handled from where the block stands.
+            let _ = handle.sync(AccessKind::Guest);
+        }
+    }
+
+    /// Advance to `target` ticks of the block's own 48 MHz domain, running
+    /// the frame timer through every deadline on the way.
+    pub fn advance_to(&self, target: u64) {
+        {
+            let mut state = self.state.lock();
+            while state.tick < target {
+                // The timer counts the USB clock of a block that is clocked
+                // and out of `FRES`; otherwise the deadline slides with the
+                // cursor, so the block resumes where it stopped rather than
+                // owing every frame it slept through.
+                let counting = self.gate.live() && state.cntr & CNTR_FRES == 0;
+                if !counting || state.esof_at > target {
+                    if !counting && state.esof_at != NO_DEADLINE {
+                        let slide = target - state.tick;
+                        state.esof_at = state.esof_at.saturating_add(slide);
+                    }
+                    state.tick = target;
+                    break;
+                }
+                state.tick = state.tick.max(state.esof_at);
+                state.esof();
+            }
+            self.publish(&state);
+        }
+        self.refresh_irq();
+    }
+
     /// What the cable is plugged into.
     #[must_use]
     pub fn port_type(&self) -> PortType {
@@ -860,27 +1181,50 @@ impl Usbfs {
     /// field that follows a wire rather than the guest.
     fn set_state(&self, mut state: State) {
         state.usb_pma_len = Usbfs::usb_pma_len(self.can.load(Ordering::Relaxed));
-        *self.state.lock() = state;
+        let mut slot = self.state.lock();
+        *slot = state;
+        self.publish(&slot);
     }
 
-    /// Whether the device is electrically on the bus: clocked, powered, out of
-    /// reset, its `DPPU` pull-up attached, and the PHY not lent to the charger
-    /// detector — "When enabled, the USB PHY is fully controlled by BCD and
-    /// cannot be used for normal communication" (`BCDR.BCDEN`, RM0434 §40.6.1).
+    /// Whether the device is electrically on the bus: clocked, powered, its
+    /// `DPPU` pull-up attached, and the PHY not lent to the charger detector —
+    /// "When enabled, the USB PHY is fully controlled by BCD and cannot be used
+    /// for normal communication" (`BCDR.BCDEN`, RM0434 §40.6.1).
+    ///
+    /// `FRES` is not in it. It resets the block "exactly like a RESET
+    /// signaling on the USB" — the protocol engine, not the transceiver — and
+    /// what tells the host a device is there is the pull-up ("Clearing it to
+    /// ‘0’ can be used to signalize disconnect to the host"). A block held in
+    /// `FRES` is on the bus and answers nothing ([`State::accepting`]).
     fn connected(state: &State, gate: &ClockGate) -> bool {
         gate.live()
             && state.bcdr & BCDR_DPPU != 0
             && state.bcdr & BCDR_BCDEN == 0
             && state.cntr & CNTR_PDWN == 0
-            && state.cntr & CNTR_FRES == 0
     }
 
     /// Put the gadget on the bus, or take it off, to match the pull-up and
     /// power bits. **No lock of ours is held** — this reaches the fabric.
     pub fn settle(&self) {
         let want = {
-            let state = self.state.lock();
-            Usbfs::connected(&state, &self.gate)
+            let mut state = self.state.lock();
+            let want = Usbfs::connected(&state, &self.gate);
+            // The frame timer runs while the block is on the bus: it starts
+            // counting the moment the pull-up goes on, and a block off the bus
+            // has no `SOF` to miss.
+            //
+            // The line state follows too. `FNR`'s reset value has `RXDP`,
+            // `RXDM` at zero; on the bus, with the pull-up on `D+` and nothing
+            // driving, it reads J — "10 … the Idle bus state".
+            if !want {
+                state.esof_at = NO_DEADLINE;
+                state.line = LINE_SE0;
+            } else if state.esof_at == NO_DEADLINE {
+                state.arm_frame_timer();
+                state.line = LINE_IDLE;
+            }
+            self.publish(&state);
+            want
         };
         if want {
             if self
@@ -925,11 +1269,22 @@ impl Usbfs {
         self.refresh_irq();
     }
 
-    /// Republish both interrupt lines. Called with **no lock held**.
+    /// Republish both interrupt lines and the wakeup line. Called with **no
+    /// lock held**.
+    ///
+    /// `wakeup` is `ISTR.WKUP` itself, unmasked: the flag "activates the
+    /// USB_WAKEUP line, which can be used to notify the rest of the device
+    /// (e.g. wake-up unit) about the start of the resume process", and the
+    /// manual ties the line to no mask bit. It falls when firmware clears the
+    /// flag; a WB's EXTI line 28 is a direct line, which takes the rising edge.
     pub fn refresh_irq(&self) {
-        let (lp, hp) = {
+        let (lp, hp, wakeup) = {
             let state = self.state.lock();
-            (state.irq_asserted(), state.irq_hp_asserted())
+            (
+                state.irq_asserted(),
+                state.irq_hp_asserted(),
+                state.istr & ISTR_WKUP != 0,
+            )
         };
         let source = self.irq.lock().clone();
         if let Some(source) = source {
@@ -939,10 +1294,34 @@ impl Usbfs {
         if let Some(source) = source {
             source.set(Level::from_bool(hp));
         }
+        let source = self.wakeup.lock().clone();
+        if let Some(source) = source {
+            source.set(Level::from_bool(wakeup));
+        }
+    }
+
+    /// Connect the wakeup output.
+    pub fn connect_wakeup(&self, source: WireSource) {
+        *self.wakeup.lock() = Some(source);
+        self.refresh_irq();
+    }
+
+    /// Signal remote wakeup on the bus if a register write asked for it.
+    /// Called with **no lock held**: it reaches the fabric.
+    fn flush_wakeup(&self) {
+        let due = core::mem::replace(&mut self.state.lock().wakeup_due, false);
+        if due && self.is_attached() {
+            self.bus.signal_remote_wakeup(self.port);
+        }
     }
 
     fn do_reset(&self) {
-        self.set_state(State::reset());
+        // The tick survives: it is this block's cursor in a clock domain that
+        // does not rewind because a block on it was reset.
+        let tick = self.state.lock().tick;
+        let mut state = State::reset();
+        state.tick = tick;
+        self.set_state(state);
     }
 
     // -- register file --------------------------------------------------
@@ -955,7 +1334,7 @@ impl Usbfs {
             o if o < 0x20 => state.ep[(o / 4) as usize],
             OFF_CNTR => state.cntr,
             OFF_ISTR => state.istr_value(),
-            OFF_FNR => 0,
+            OFF_FNR => state.fnr_value(),
             OFF_DADDR => state.daddr,
             OFF_BTABLE => state.btable,
             OFF_LPMCSR => state.lpmcsr,
@@ -978,7 +1357,7 @@ impl Usbfs {
                     state.dbl_live &= !(1 << n);
                 }
             }
-            OFF_CNTR => state.cntr = value & CNTR_WRITABLE,
+            OFF_CNTR => write_cntr(&mut state, value),
             OFF_ISTR => state.istr &= value & ISTR_FLAG_MASK,
             // Every bit is `r`; the write decodes and changes nothing.
             OFF_FNR => {}
@@ -1031,6 +1410,12 @@ impl Usbfs {
     ///   at 0, an `OUT` data stage would be a toggle mismatch.)
     fn do_setup(&self, endpoint: u8, packet: &SetupPacket) -> Status {
         let mut state = self.state.lock();
+        if state.cntr & CNTR_FRES == 0 {
+            state.traffic();
+        }
+        if !state.accepting() {
+            return Status::NoDevice;
+        }
         if state.daddr & DADDR_EF == 0 {
             return Status::NoDevice;
         }
@@ -1073,6 +1458,12 @@ impl Usbfs {
     /// previously listed actions take place".
     fn do_out(&self, endpoint: u8, src: &[u8], pid: Option<DataPid>) -> Completion {
         let mut state = self.state.lock();
+        if state.cntr & CNTR_FRES == 0 {
+            state.traffic();
+        }
+        if !state.accepting() {
+            return Completion::absent();
+        }
         if state.daddr & DADDR_EF == 0 {
             return Completion::absent();
         }
@@ -1155,6 +1546,13 @@ impl Usbfs {
     /// and isochronous paths pick the buffer by `DTOG_TX` (Tables 255/256).
     fn do_in(&self, endpoint: u8, dst: &mut [u8], commit: bool) -> (Completion, Option<DataPid>) {
         let mut state = self.state.lock();
+        // A peek is the debugger's, not the host's: it is not bus traffic.
+        if commit && state.cntr & CNTR_FRES == 0 {
+            state.traffic();
+        }
+        if !state.accepting() {
+            return (Completion::absent(), None);
+        }
         if state.daddr & DADDR_EF == 0 {
             return (Completion::absent(), None);
         }
@@ -1212,12 +1610,147 @@ impl Usbfs {
         (Completion::ack(len as u64), Some(pid))
     }
 
+    /// The host reset the port (USB 2.0 §7.1.7.5).
     fn do_bus_reset(&self) {
         let mut state = self.state.lock();
-        // Back to the Default state: the function answers address zero again.
-        // Hardware raises the reset interrupt; firmware's handler re-arms EP0.
-        state.daddr &= !DADDR_ADD;
-        state.istr |= ISTR_RESET;
+        if state.cntr & CNTR_FRES != 0 {
+            // Already held in reset by software: nothing further to reset,
+            // and no protocol engine running to raise a flag.
+            return;
+        }
+        // "The suspended USB peripheral must be anyway able to detect a RESET
+        // sequence, reacting to this event as a normal USB reset event", and
+        // "The start of a resume or reset sequence, while the USB peripheral
+        // is suspended, clears the LP_MODE bit" — the wake-up first, then the
+        // reset.
+        state.wake();
+        state.usb_reset();
+        // Table 257: `[RXDP, RXDM]` = `00` is a root reset. It reads that way
+        // until the host's next packet, which is when the line is J again.
+        state.line = LINE_SE0;
+        self.publish(&state);
+    }
+
+    /// A `SOF` token went past.
+    fn do_sof(&self, frame: u16) {
+        let mut state = self.state.lock();
+        if state.cntr & CNTR_FRES != 0 {
+            return;
+        }
+        state.sof(frame);
+        self.publish(&state);
+    }
+
+    /// The host drove resume signalling (USB 2.0 §7.1.7.7).
+    fn do_resume(&self) {
+        let mut state = self.state.lock();
+        if state.cntr & CNTR_FRES != 0 {
+            return;
+        }
+        state.wake();
+        // Table 257: `01` is "Root resume", needing no software action; a
+        // driver's resume routine reads this to tell a real wake-up (`01`)
+        // from noise (`10`, "Go back in Suspend mode"). The line stays K until
+        // the host's next packet ends the resume.
+        state.line = LINE_K;
+        state.idle_esofs = 0;
+        // `LCK` waits for two `SOF`s "after the end of an USB resume
+        // sequence".
+        state.sof_run = 0;
+    }
+
+    /// An LPM transaction (RM0434 §40.6.1, `USB_LPMCSR`).
+    fn do_lpm(&self, attributes: LpmAttributes) -> LpmResponse {
+        let mut state = self.state.lock();
+        if state.cntr & CNTR_FRES != 0 {
+            return LpmResponse::Timeout;
+        }
+        state.traffic();
+        // `EF`: "If this bit is at ‘0 no transactions are handled"; `LPMEN`:
+        // "If this bit is at ‘0 no LPM transactions are handled." Unhandled is
+        // no handshake.
+        if !state.accepting() || state.daddr & DADDR_EF == 0 || state.lpmcsr & LPMCSR_LPMEN == 0 {
+            return LpmResponse::Timeout;
+        }
+        // "The NYET/ACK is returned only on a successful LPM transaction: No
+        // errors in both the EXT token and the LPM token (else ERROR) / A
+        // valid bLinkState = 0001B (L1) is received (else STALL)". A token
+        // error cannot reach this model (see `ISTR_FLAG_MASK`).
+        if attributes.link_state != LpmAttributes::L1 {
+            return LpmResponse::Stall;
+        }
+        // "LPMACK: 0: the valid LPM Token is NYET. 1: the valid LPM Token is
+        // ACK."
+        if state.lpmcsr & LPMCSR_LPMACK == 0 {
+            return LpmResponse::Nyet;
+        }
+        // "BESL … received with last ACKed LPM Token"; "REMWAKE: bRemoteWake
+        // value received with last ACKed LPM Token"; and `L1REQ` "is set by
+        // the hardware when LPM command to enter the L1 state is successfully
+        // received and acknowledged."
+        let remwake = if attributes.remote_wake {
+            LPMCSR_REMWAKE
+        } else {
+            0
+        };
+        state.lpmcsr = (state.lpmcsr & LPMCSR_WRITABLE)
+            | (u16::from(attributes.besl & 0xf) << LPMCSR_BESL_SHIFT)
+            | remwake;
+        state.istr |= ISTR_L1REQ;
+        state.l1 = true;
+        LpmResponse::Ack
+    }
+}
+
+/// Apply a guest write of `value` to `CNTR`.
+///
+/// Most of `CNTR` is storage the rest of the model reads. The bits that *do*
+/// something on the write:
+///
+/// * `FRES` rising: "Force a reset of the USB peripheral, exactly like a RESET
+///   signaling on the USB. The USB peripheral is held in RESET state until
+///   software clears this bit. A “USB-RESET” interrupt is generated, if
+///   enabled." — the same reset a host's gets ([`State::usb_reset`]), once, at
+///   the edge; holding it is [`State::accepting`]'s business. Falling, the
+///   frame timer starts afresh, since the suspend check "is enabled
+///   immediately after any USB reset".
+/// * `RESUME` rising: the device starts driving resume (K) upstream, which on
+///   the bus is a remote-wakeup request. "It must be activated … for no less
+///   than 1 ms and no more than 15 ms after which the Host PC is ready to drive
+///   the resume sequence up to its end"; the timing is the driver's, and the
+///   host's answer is [`UsbBus::resume_port`]. The manual adds "The RESUME bit
+///   must be anyway used only after the USB peripheral has been put in suspend
+///   mode" without saying what the block does otherwise, so this model
+///   signals regardless and leaves it to the host to ignore.
+/// * `L1RESUME`: "send a LPM L1 Resume signal to the host. After the signaling
+///   ends, this bit is cleared by hardware" — signalled (in L1; outside it
+///   there is nothing to resume from) and cleared at once, since signalling on
+///   this bus takes no time.
+/// * `FSUSP` rising: "As soon as the suspend mode is activated, the check on
+///   SOF reception is disabled", and `LCK` holds "until an USB reset or USB
+///   suspend event occurs" — so the lock goes.
+fn write_cntr(state: &mut State, value: u16) {
+    let old = state.cntr;
+    let new = value & CNTR_WRITABLE & !CNTR_L1RESUME;
+    state.cntr = new;
+    let rose = new & !old;
+    if rose & CNTR_FRES != 0 {
+        state.usb_reset();
+    }
+    if old & !new & CNTR_FRES != 0 {
+        state.arm_frame_timer();
+    }
+    if rose & CNTR_FSUSP != 0 {
+        state.lck = false;
+        state.sof_run = 0;
+    }
+    if rose & CNTR_RESUME != 0 {
+        state.line = LINE_K;
+        state.wakeup_due = true;
+    }
+    if value & CNTR_L1RESUME != 0 && state.l1 {
+        state.line = LINE_K;
+        state.wakeup_due = true;
     }
 }
 
@@ -1295,6 +1828,7 @@ impl Gadget {
         let Some(core) = self.core.upgrade() else {
             return Completion::absent();
         };
+        core.sync();
         let c = core.do_out(endpoint, src, pid);
         core.refresh_irq();
         c
@@ -1317,14 +1851,46 @@ impl UsbDevice for Gadget {
         let Some(core) = self.core.upgrade() else {
             return;
         };
+        core.sync();
         core.do_bus_reset();
         core.refresh_irq();
+    }
+
+    fn start_of_frame(&self, frame: u16) {
+        let Some(core) = self.core.upgrade() else {
+            return;
+        };
+        // Caught up first, so a frame the timer already gave up on is an
+        // `ESOF` before this `SOF` re-locks it, not after.
+        core.sync();
+        core.do_sof(frame);
+        core.refresh_irq();
+    }
+
+    fn resume(&self) {
+        let Some(core) = self.core.upgrade() else {
+            return;
+        };
+        core.sync();
+        core.do_resume();
+        core.refresh_irq();
+    }
+
+    fn lpm(&self, attributes: LpmAttributes) -> LpmResponse {
+        let Some(core) = self.core.upgrade() else {
+            return LpmResponse::Timeout;
+        };
+        core.sync();
+        let answer = core.do_lpm(attributes);
+        core.refresh_irq();
+        answer
     }
 
     fn setup(&self, endpoint: u8, packet: SetupPacket) -> Status {
         let Some(core) = self.core.upgrade() else {
             return Status::NoDevice;
         };
+        core.sync();
         let status = core.do_setup(endpoint, &packet);
         core.refresh_irq();
         status
@@ -1338,6 +1904,7 @@ impl UsbDevice for Gadget {
         let Some(core) = self.core.upgrade() else {
             return (Completion::absent(), None);
         };
+        core.sync();
         let c = core.do_in(endpoint, dst, true);
         core.refresh_irq();
         c
@@ -1375,7 +1942,7 @@ impl fmt::Debug for Regs {
 }
 
 impl MemOps for Regs {
-    fn read(&self, offset: u64, dst: &mut [u8], _attrs: MemAttrs) -> MemResult {
+    fn read(&self, offset: u64, dst: &mut [u8], attrs: MemAttrs) -> MemResult {
         if offset >= REGISTER_BYTES {
             return Err(BusError::BadAccess);
         }
@@ -1385,6 +1952,10 @@ impl MemOps for Regs {
         }
         // Gated off: the whole block reads as zero ([`gate`]).
         let value = if self.core.gate.live() {
+            // A debug read advances nothing (`ROADMAP.md` §15).
+            if !attrs.debug {
+                self.core.sync();
+            }
             self.core
                 .read_reg(offset & !0x3)
                 .ok_or(BusError::BadAccess)?
@@ -1429,6 +2000,7 @@ impl MemOps for Regs {
         let mut raw = [0u8; 2];
         raw[lane..lane + src.len()].copy_from_slice(src);
         let value = u16::from_le_bytes(raw);
+        self.core.sync();
         let (ok, settle) = self.core.write_reg(offset & !0x3, value);
         if !ok {
             return Err(BusError::BadAccess);
@@ -1436,6 +2008,7 @@ impl MemOps for Regs {
         if settle {
             self.core.settle();
         }
+        self.core.flush_wakeup();
         self.core.refresh_irq();
         Ok(())
     }
@@ -1532,6 +2105,11 @@ pub mod pin {
     /// endpoint-dedicated condition reaches that vector when `CTRM` is clear,
     /// and this leaves it not reaching it.
     pub const IRQ_HP: &str = "irq_hp";
+    /// Output: `USB_WAKEUP`, the level of `ISTR.WKUP` — "activates the
+    /// USB_WAKEUP line, which can be used to notify the rest of the device
+    /// (e.g. wake-up unit) about the start of the resume process". On a WB it
+    /// is EXTI line 28, "USB wake-up" (RM0434 Table 74).
+    pub const WAKEUP: &str = "wakeup";
 }
 
 impl UsbfsPeripheral {
@@ -1544,6 +2122,8 @@ impl UsbfsPeripheral {
     /// * `port-type` — what the cable is plugged into, for `BCDR`'s battery
     ///   charging detection: `sdp` (a standard host port, the default), `cdp`,
     ///   `dcp`, `ps2` or `none`. See [`PortType`].
+    /// * `clock` — the machine's, and required by it: the block's 48 MHz USB
+    ///   clock domain, which its frame timer counts ([module docs](self)).
     ///
     /// # Errors
     ///
@@ -1554,6 +2134,7 @@ impl UsbfsPeripheral {
         let bus_name = String::from(r.require_str("bus")?);
         let port = r.or_range("port", 0u64, 0..=u64::from(u8::MAX))?;
         let port_type_name = r.or_str("port-type", "sdp")?;
+        r.touch("clock");
         r.finish()?;
         let Some(port_type) = PortType::from_name(port_type_name) else {
             return Err(Error::Config {
@@ -1642,7 +2223,19 @@ impl Device for UsbfsPeripheral {
         w.write_u16(state.lpmcsr)?;
         w.write_u16(state.bcdr)?;
         w.write_bytes(&state.pma)?;
-        w.write_u8(state.dbl_live)
+        w.write_u8(state.dbl_live)?;
+        // Version 3: the frame timer and the line. The tick is this block's
+        // cursor in its clock domain, which the scheduler restores; without it
+        // the two would disagree and a pending `ESOF` would land elsewhere.
+        w.write_u16(state.fnum)?;
+        w.write_u16(state.lsof)?;
+        w.write_bool(state.lck)?;
+        w.write_u16(state.sof_run)?;
+        w.write_u16(state.idle_esofs)?;
+        w.write_u16(state.line)?;
+        w.write_bool(state.l1)?;
+        w.write_u64(state.tick)?;
+        w.write_u64(state.esof_at)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -1666,7 +2259,23 @@ impl Device for UsbfsPeripheral {
         }
         state.pma.copy_from_slice(pma);
         state.dbl_live = r.read_u8()?;
+        state.fnum = r.read_u16()? & FNR_FN;
+        state.lsof = r.read_u16()?.min(3);
+        state.lck = r.read_bool()?;
+        state.sof_run = r.read_u16()?.min(2);
+        state.idle_esofs = r.read_u16()?.min(3);
+        state.line = r.read_u16()? & 0b11;
+        state.l1 = r.read_bool()?;
+        state.tick = r.read_u64()?;
+        state.esof_at = r.read_u64()?;
+        if state.esof_at != NO_DEADLINE && state.esof_at <= state.tick {
+            return Err(Error::State(format!(
+                "snapshot has a USB frame deadline at tick {} on a block already at {}",
+                state.esof_at, state.tick
+            )));
+        }
         self.core.set_state(state);
+        self.core.refresh_irq();
         Ok(())
     }
 
@@ -1698,13 +2307,15 @@ impl Device for UsbfsPeripheral {
         match port {
             pin::IRQ => self.core.connect_irq(source),
             pin::IRQ_HP => self.core.connect_irq_hp(source),
+            pin::WAKEUP => self.core.connect_wakeup(source),
             _ => {
                 return Err(Error::Config {
                     at: String::from(port),
                     message: format!(
-                        "a USB device peripheral drives `{}` and `{}` and nothing else",
+                        "a USB device peripheral drives `{}`, `{}` and `{}` and nothing else",
                         pin::IRQ,
-                        pin::IRQ_HP
+                        pin::IRQ_HP,
+                        pin::WAKEUP,
                     ),
                 });
             }
@@ -1714,6 +2325,32 @@ impl Device for UsbfsPeripheral {
 
     fn announce(&self, _port: &str) {
         self.core.refresh_irq();
+    }
+
+    fn is_lazy(&self) -> bool {
+        // The frame timer counts time, and the scheduler owns it: the block
+        // reports its next `ESOF` and is caught up before anything reaches
+        // it. So a board gives it a `clock`, and realize refuses one without.
+        true
+    }
+
+    fn current_tick(&self) -> u64 {
+        self.core.tick.load(Ordering::Relaxed)
+    }
+
+    fn advance_to(&self, tick: u64) {
+        self.core.advance_to(tick);
+    }
+
+    fn next_event_tick(&self) -> Option<u64> {
+        match self.core.next_event.load(Ordering::Relaxed) {
+            NO_DEADLINE => None,
+            at => Some(at),
+        }
+    }
+
+    fn attach_lazy(&self, handle: LazyHandle) {
+        *self.core.lazy.lock() = Some(handle);
     }
 }
 
@@ -1776,6 +2413,7 @@ pub fn schema() -> ClassSchema {
         .prop(PropSchema::new("port", ValueKind::Uint).range(0, u64::from(u8::MAX)))
         .prop(PropSchema::new("port-type", ValueKind::Str).values(&PortType::NAMES))
         .port(pin::IRQ, PortDir::Out)
+        .port(pin::WAKEUP, PortDir::Out)
         .port(pin::CAN_ENABLE, PortDir::In)
         .port(pin::IRQ_HP, PortDir::Out)
         .region("")

@@ -192,7 +192,10 @@ machine "stm32wb35" {
   # linear 1 KiB packet memory. It plugs into the named USB bus `usb`; a
   # host — a test harness, or anything that opens that bus — enumerates
   # the guest's device stack through it. Nothing else is on the bus.
-  object usb "st.usbfs" { bus = "usb" }
+  # Its clock is the 48 MHz USB clock its frame timer counts ("fixed by
+  # the requirements of the USB standard at 48 MHz", §40.4.2); which
+  # source CLK48SEL picks is not modelled, so it is an exact ratio of HSE.
+  object usb "st.usbfs" { bus = "usb", clock = hse * 3 / 2 }
 
   # DMA1/DMA2, seven channels each, routed by DMAMUX1's fourteen channels
   # (RM0434 §13–14).
@@ -322,6 +325,8 @@ machine "stm32wb35" {
   wire rtc.alarm  -> exti.line17
   wire rtc.stamp  -> exti.line18
   wire rtc.wakeup -> exti.line19
+  # USB_WAKEUP is direct line 28, "USB wake-up" (RM0434 Table 74).
+  wire usb.wakeup -> exti.line28
 
   # The GPIO mux: every pin into SYSCFG, EXTICR picks one port per line.
   for n in 0..16 { wire gpioa.p${n} -> syscfg.pa${n} }

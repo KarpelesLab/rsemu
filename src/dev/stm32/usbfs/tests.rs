@@ -116,19 +116,25 @@ impl Fixture {
 
     /// Program EP0's buffer-descriptor-table entry (table at offset 0):
     /// `ADDR_TX = 0x20`, `ADDR_RX = 0x40`, then arm it and attach the pull-up.
+    ///
+    /// In the order a driver meets it: power up and attach, the host resets
+    /// the port, and the RESET handler (RM0434 §40.5.2) clears the flag, sets
+    /// `EF` and re-arms EP0 — a USB reset leaves every endpoint disabled and
+    /// `DADDR` zero, so arming before it would be undone by it.
     fn enumerate_ready(&self) {
-        self.pma_write(0x00, &0x20u16.to_le_bytes()); // ADDR_TX
-        self.pma_write(0x02, &0u16.to_le_bytes()); // COUNT_TX
-        self.pma_write(0x04, &0x40u16.to_le_bytes()); // ADDR_RX
-        self.pma_write(0x06, &0x8400u16.to_le_bytes()); // COUNT_RX: block size, count 0
-        self.arm(0, 0, STAT_VALID, STAT_NAK);
-        self.wr(OFF_DADDR, 0x80); // function enabled, address 0
         self.wr(OFF_CNTR, CNTR_CTRM | CNTR_RESETM); // powers up (clears PDWN/FRES)
         self.wr(OFF_BCDR, BCDR_DPPU); // attach the pull-up -> on the bus
         // The host resets and enables the port, as a controller does before it
         // addresses a freshly connected device.
         self.bus.reset_port(0);
         self.bus.set_enabled(0, true);
+        self.wr(OFF_ISTR, !ISTR_RESET);
+        self.pma_write(0x00, &0x20u16.to_le_bytes()); // ADDR_TX
+        self.pma_write(0x02, &0u16.to_le_bytes()); // COUNT_TX
+        self.pma_write(0x04, &0x40u16.to_le_bytes()); // ADDR_RX
+        self.pma_write(0x06, &0x8400u16.to_le_bytes()); // COUNT_RX: block size, count 0
+        self.arm(0, 0, STAT_VALID, STAT_NAK);
+        self.wr(OFF_DADDR, 0x80); // function enabled, address 0
     }
 }
 
@@ -1011,6 +1017,16 @@ fn a_snapshot_round_trips() {
     two_buffers(&f, DBL_OUT | EP_DTOG_TX);
     f.bus.write(DeviceAddress::DEFAULT, 1, &[1]);
     assert_eq!(f.core().state.lock().dbl_live, 1 << 1);
+    // Frame-timer state that differs from reset: a SOF, a missed frame, and
+    // an LPM-latched BESL.
+    f.bus.start_of_frame(0x155);
+    f.core().advance_to(FRAME_TICKS + FRAME_SLACK + 7);
+    f.wr(OFF_LPMCSR, LPMCSR_LPMEN | LPMCSR_LPMACK);
+    assert_eq!(
+        f.bus
+            .lpm(DeviceAddress::DEFAULT, LpmAttributes::sleep(9, true)),
+        LpmResponse::Ack
+    );
 
     let mut shape = MachineShape::new();
     shape.add_device("usb", CLASS_NAME).unwrap();
@@ -1028,9 +1044,24 @@ fn a_snapshot_round_trips() {
         .unwrap();
     Device::load(&restored.dev, &mut chunk.reader()).unwrap();
 
-    for off in [0x00u64, OFF_CNTR, OFF_ISTR, OFF_DADDR, OFF_BTABLE, OFF_BCDR] {
+    for off in [
+        0x00u64, OFF_CNTR, OFF_ISTR, OFF_FNR, OFF_DADDR, OFF_BTABLE, OFF_LPMCSR, OFF_BCDR,
+    ] {
         assert_eq!(restored.rd(off), f.rd(off), "register {off:#x}");
     }
+    assert_eq!(restored.core().tick(), f.core().tick(), "the cursor");
+    assert_eq!(
+        Device::next_event_tick(&restored.dev),
+        Device::next_event_tick(&f.dev),
+        "the next ESOF is the same distance away"
+    );
+    assert!(Device::next_event_tick(&f.dev).is_some());
+    let s = restored.core().state.lock().clone();
+    let t = f.core().state.lock().clone();
+    assert_eq!(
+        (s.sof_run, s.idle_esofs, s.l1, s.line),
+        (t.sof_run, t.idle_esofs, t.l1, t.line)
+    );
     assert_eq!(restored.pma_read(0x80, 32), marker);
     assert_eq!(restored.ep(1), f.ep(1));
     assert_eq!(
@@ -1071,6 +1102,7 @@ fn the_schema_and_the_device_agree_about_regions_and_pins() {
     }
     assert!(Device::region(&f.dev, "nope").is_none());
     assert!(schema.port_named(pin::IRQ).is_some());
+    assert!(schema.port_named(pin::WAKEUP).is_some());
     assert!(schema.port_named(gate::ENABLE_PIN).is_some());
     assert!(schema.port_named(gate::RESET_PIN).is_some());
 }
@@ -1096,9 +1128,10 @@ fn every_register_comes_out_of_reset_at_the_tables_value() {
 #[test]
 fn reserved_and_read_only_bits_do_not_take_a_write() {
     let f = fixture();
-    // CNTR bit 6: "Reserved, must be kept at reset value".
+    // CNTR bit 6: "Reserved, must be kept at reset value"; and L1RESUME (5)
+    // "is cleared by hardware" once its signalling ends, which is at once.
     f.wr(OFF_CNTR, 0xffff);
-    assert_eq!(f.rd(OFF_CNTR), 0xffbf);
+    assert_eq!(f.rd(OFF_CNTR), 0xff9f);
     // DADDR 15:8 reserved; EF and ADD[6:0] are rw.
     f.wr(OFF_DADDR, 0xffff);
     assert_eq!(f.rd(OFF_DADDR), 0x00ff);
@@ -1312,4 +1345,419 @@ fn a_reception_buffer_running_into_the_can_share_writes_nothing_there() {
         &[0xaa; 4],
         "the CAN bytes are untouched"
     );
+}
+
+// ---------------------------------------------------------------------------
+// USB reset: what it clears, FRES, and the RESET flag holding transfers off
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_usb_reset_clears_the_endpoints_and_daddr_but_keeps_ctr_and_configuration() {
+    let f = fixture();
+    f.enumerate_ready();
+    // A double-buffered endpoint past its first transaction.
+    two_buffers(&f, DBL_OUT | EP_DTOG_TX);
+    f.bus.write(DeviceAddress::DEFAULT, 1, &[1]);
+    assert_eq!(f.core().state.lock().dbl_live, 1 << 1);
+    f.wr(OFF_DADDR, 0x80 | 0x17);
+    f.wr(OFF_BTABLE, 0x0100);
+    f.wr(OFF_LPMCSR, LPMCSR_LPMEN);
+    f.core().state.lock().ep[0] |= EP_CTR_RX;
+    // EA 1, both STATs set, both DTOGs set.
+    f.core().state.lock().ep[3] = 0x3231 | EP_DTOG_RX | EP_DTOG_TX;
+    f.bus.reset_port(0);
+    assert_eq!(
+        f.core().state.lock().dbl_live,
+        0,
+        "the first-transaction latch goes with the DBL_BUF the reset cleared"
+    );
+    // "except the CTR_RX and CTR_TX bits, which are kept unchanged"
+    assert_eq!(f.ep(0), EP_CTR_RX, "EP0R: only CTR_RX survives");
+    assert_eq!(f.ep(3), 0, "EP3R: everything goes, the DTOGs included");
+    assert_eq!(f.ep(1) & !(EP_CTR_RX | EP_CTR_TX), 0, "EP1R too");
+    assert_eq!(f.rd(OFF_DADDR), 0, "DADDR, EF included");
+    assert_eq!(
+        f.rd(OFF_BTABLE),
+        0x0100,
+        "configuration registers do not reset"
+    );
+    assert_eq!(f.rd(OFF_LPMCSR), LPMCSR_LPMEN);
+    assert_eq!(f.rd(OFF_CNTR), CNTR_CTRM | CNTR_RESETM);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_RESET, ISTR_RESET);
+    assert_eq!(
+        f.rd(OFF_FNR) >> 14,
+        LINE_SE0,
+        "Table 257: 00 is a root reset"
+    );
+}
+
+#[test]
+fn reception_and_transmission_wait_for_the_reset_flag_to_clear() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.bus.reset_port(0);
+    f.bus.set_enabled(0, true);
+    f.arm(0, 0, STAT_VALID, STAT_NAK);
+    f.wr(OFF_DADDR, 0x80);
+    let setup = host::get_descriptor(1, 0, 18);
+    assert_eq!(
+        f.bus.setup(DeviceAddress::DEFAULT, 0, setup),
+        Status::NoDevice,
+        "RESET still set: nothing answers"
+    );
+    // The PID-carrying entry points are held off the same way.
+    f.arm(1, 1, STAT_VALID, STAT_VALID);
+    assert_eq!(
+        f.bus
+            .write_pid(DeviceAddress::DEFAULT, 1, &[1], DataPid::Data0)
+            .status,
+        Status::NoDevice
+    );
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        f.bus.read_pid(DeviceAddress::DEFAULT, 1, &mut buf),
+        (Completion::absent(), None)
+    );
+    f.wr(OFF_ISTR, !ISTR_RESET);
+    assert_eq!(f.bus.setup(DeviceAddress::DEFAULT, 0, setup), Status::Ack);
+}
+
+#[test]
+fn fres_is_a_usb_reset_that_holds_the_block_until_cleared() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.wr(OFF_DADDR, 0x80 | 0x22);
+    f.core().state.lock().ep[0] |= EP_CTR_TX;
+    // "Force a reset of the USB peripheral, exactly like a RESET signaling on
+    // the USB."
+    f.wr(OFF_CNTR, CNTR_CTRM | CNTR_RESETM | CNTR_FRES);
+    assert_eq!(
+        f.rd(OFF_ISTR) & ISTR_RESET,
+        ISTR_RESET,
+        "a USB-RESET interrupt"
+    );
+    assert_eq!(f.core().irq_level(), Level::High, "RESETM is set");
+    assert_eq!(f.rd(OFF_DADDR), 0);
+    assert_eq!(f.ep(0), EP_CTR_TX, "CTR_TX kept");
+    assert!(f.core().is_attached(), "FRES does not drop the pull-up");
+    // "held in RESET state until software clears this bit"
+    f.wr(OFF_ISTR, !ISTR_RESET);
+    f.arm(0, 0, STAT_VALID, STAT_NAK);
+    f.wr(OFF_DADDR, 0x80);
+    let setup = host::get_descriptor(1, 0, 18);
+    assert_eq!(
+        f.bus.setup(DeviceAddress::DEFAULT, 0, setup),
+        Status::NoDevice
+    );
+    // A second write with FRES still set is not a second reset.
+    f.wr(OFF_CNTR, CNTR_CTRM | CNTR_RESETM | CNTR_FRES);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_RESET, 0);
+    f.wr(OFF_CNTR, CNTR_CTRM | CNTR_RESETM);
+    assert_eq!(f.bus.setup(DeviceAddress::DEFAULT, 0, setup), Status::Ack);
+}
+
+#[test]
+fn pmaovr_and_err_are_never_raised_and_clear_by_writing_zero() {
+    let f = fixture();
+    f.enumerate_ready();
+    // Nothing in a whole control transfer sets either.
+    f.bus
+        .setup(DeviceAddress::DEFAULT, 0, host::get_descriptor(1, 0, 18));
+    assert_eq!(f.rd(OFF_ISTR) & (ISTR_PMAOVR | ISTR_ERR), 0);
+    f.core().state.lock().istr |= ISTR_PMAOVR | ISTR_ERR;
+    f.wr(OFF_ISTR, !ISTR_ERR);
+    assert_eq!(f.rd(OFF_ISTR) & (ISTR_PMAOVR | ISTR_ERR), ISTR_PMAOVR);
+    f.wr(OFF_ISTR, 0xffff);
+    assert_eq!(
+        f.rd(OFF_ISTR) & ISTR_PMAOVR,
+        ISTR_PMAOVR,
+        "a one changes nothing"
+    );
+    f.wr(OFF_ISTR, !ISTR_PMAOVR);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_PMAOVR, 0);
+}
+
+// ---------------------------------------------------------------------------
+// SOF and the frame timer
+// ---------------------------------------------------------------------------
+
+const ISTR_PMAOVR: u16 = 1 << 14;
+const ISTR_ERR: u16 = 1 << 13;
+const CNTR_SUSPM: u16 = 1 << 11;
+const CNTR_WKUPM: u16 = 1 << 12;
+
+fn lsof(f: &Fixture) -> u16 {
+    (f.rd(OFF_FNR) >> FNR_LSOF_SHIFT) & 0b11
+}
+
+#[test]
+fn a_sof_sets_the_flag_and_the_frame_number_and_two_lock_the_timer() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.bus.start_of_frame(0x123);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_SOF, ISTR_SOF);
+    let fnr = f.rd(OFF_FNR);
+    assert_eq!(fnr & FNR_FN, 0x123, "FN is the token's frame number");
+    assert_eq!(fnr & FNR_LCK, 0, "one SOF does not lock");
+    assert_eq!(fnr >> 14, LINE_IDLE, "an idle bus reads [RXDP,RXDM] = 10");
+    f.bus.start_of_frame(0x124);
+    assert_eq!(f.rd(OFF_FNR) & FNR_LCK, FNR_LCK, "two consecutive do");
+    // A frame lost in between is not "consecutive".
+    f.bus.reset_port(0);
+    assert_eq!(f.rd(OFF_FNR) & FNR_LCK, 0, "a reset unlocks");
+    f.bus.start_of_frame(1);
+    f.core().advance_to(FRAME_TICKS * 2);
+    f.bus.start_of_frame(3);
+    assert_eq!(f.rd(OFF_FNR) & FNR_LCK, 0);
+}
+
+#[test]
+fn a_missing_sof_is_an_esof_and_lsof_counts_them() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.bus.start_of_frame(7);
+    f.wr(OFF_ISTR, !ISTR_SOF);
+    let due = FRAME_TICKS + FRAME_SLACK;
+    f.core().advance_to(due - 1);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_ESOF, 0, "not late yet");
+    f.core().advance_to(due);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_ESOF, ISTR_ESOF);
+    assert_eq!(lsof(&f), 1);
+    f.core().advance_to(due + FRAME_TICKS);
+    assert_eq!(lsof(&f), 2, "every millisecond after");
+    f.core().advance_to(due + 5 * FRAME_TICKS);
+    assert_eq!(lsof(&f), 3, "a two-bit field saturates");
+    f.bus.start_of_frame(8);
+    assert_eq!(lsof(&f), 0, "a SOF clears it");
+    assert_eq!(f.rd(OFF_FNR) & FNR_FN, 8);
+}
+
+#[test]
+fn a_host_on_time_never_trips_the_timer() {
+    let f = fixture();
+    f.enumerate_ready();
+    for frame in 0..20u64 {
+        f.core().advance_to(frame * FRAME_TICKS);
+        f.bus.start_of_frame(frame as u16);
+    }
+    assert_eq!(f.rd(OFF_ISTR) & (ISTR_ESOF | ISTR_SUSP), 0);
+    assert_eq!(f.rd(OFF_FNR) & FNR_LCK, FNR_LCK);
+}
+
+#[test]
+fn three_idle_frames_are_a_suspend_request_and_traffic_holds_it_off() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.wr(OFF_CNTR, CNTR_CTRM | CNTR_RESETM | CNTR_SUSPM);
+    f.bus.start_of_frame(0);
+    f.bus.start_of_frame(1);
+    let due = FRAME_TICKS + FRAME_SLACK;
+    // Traffic every two frames: ESOFs, but never three without traffic.
+    let mut buf = [0u8; 64];
+    for k in 0..4 {
+        f.core().advance_to(due + (2 * k + 1) * FRAME_TICKS);
+        let _ = f.bus.read(DeviceAddress::DEFAULT, 0, &mut buf);
+    }
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_ESOF, ISTR_ESOF);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_SUSP, 0, "the bus was not idle 3 ms");
+    let now = f.core().tick();
+    f.core().advance_to(now + 3 * FRAME_TICKS);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_SUSP, ISTR_SUSP, "three silent frames");
+    assert_eq!(f.core().irq_level(), Level::High, "SUSPM is set");
+    assert_eq!(f.rd(OFF_FNR) & FNR_LCK, 0, "a suspend event unlocks");
+    // Once per idle stretch.
+    f.wr(OFF_ISTR, !ISTR_SUSP);
+    f.core().advance_to(now + 10 * FRAME_TICKS);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_SUSP, 0);
+}
+
+#[test]
+fn fsusp_turns_the_suspend_check_off_but_esof_keeps_ticking() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.wr(OFF_CNTR, CNTR_SUSPM | CNTR_FSUSP);
+    f.core().advance_to(10 * FRAME_TICKS);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_SUSP, 0, "no SUSP while suspended");
+    assert_eq!(
+        f.rd(OFF_ISTR) & ISTR_ESOF,
+        ISTR_ESOF,
+        "ESOF still times a RESUME pulse"
+    );
+}
+
+#[test]
+fn the_timer_runs_only_while_the_block_is_on_the_bus() {
+    let f = fixture();
+    assert_eq!(Device::next_event_tick(&f.dev), None, "off the bus");
+    f.enumerate_ready();
+    assert_eq!(
+        Device::next_event_tick(&f.dev),
+        Some(FRAME_TICKS + FRAME_SLACK)
+    );
+    f.wr(OFF_BCDR, 0);
+    assert_eq!(Device::next_event_tick(&f.dev), None, "pull-up dropped");
+    f.core().advance_to(20 * FRAME_TICKS);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_ESOF, 0);
+}
+
+#[test]
+fn the_block_is_lazily_advanced_and_its_clock_is_the_machines() {
+    let dev = UsbfsPeripheral::new(&Props::new().with("bus", Value::from("u"))).unwrap();
+    assert!(
+        Device::is_lazy(&dev),
+        "the scheduler owns the frame timer's time"
+    );
+    // `clock` belongs to the machine and is accepted without complaint.
+    assert!(
+        UsbfsPeripheral::new(
+            &Props::new()
+                .with("bus", Value::from("u"))
+                .with("clock", Value::Uint(48_000_000)),
+        )
+        .is_ok()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Suspend, resume, remote wakeup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_host_resume_wakes_a_suspended_block_and_reads_as_a_root_resume() {
+    let f = fixture();
+    f.enumerate_ready();
+    let id = WireId::new(9);
+    let net = crate::core::wire::Wire::builder().source(id).build_shared();
+    Device::connect(&f.dev, pin::WAKEUP, WireSource::new(Arc::clone(&net), id)).unwrap();
+    f.wr(OFF_CNTR, CNTR_WKUPM | CNTR_FSUSP | CNTR_LP_MODE);
+    assert_eq!(f.core().wakeup_level(), Level::Low);
+    f.bus.resume_port(0);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_WKUP, ISTR_WKUP);
+    assert_eq!(
+        f.rd(OFF_CNTR) & CNTR_LP_MODE,
+        0,
+        "LP_MODE cleared by hardware"
+    );
+    assert_eq!(
+        f.rd(OFF_CNTR) & CNTR_FSUSP,
+        CNTR_FSUSP,
+        "FSUSP is the driver's"
+    );
+    assert_eq!(
+        f.rd(OFF_FNR) >> 14,
+        LINE_K,
+        "Table 257: 01 is a root resume"
+    );
+    assert_eq!(f.core().irq_level(), Level::High);
+    assert_eq!(f.core().wakeup_level(), Level::High, "USB_WAKEUP");
+    assert_eq!(net.level_of(id), Some(Level::High), "and on the wire");
+    // The host's next packet ends the resume: the line is J again.
+    f.bus.start_of_frame(4);
+    assert_eq!(f.rd(OFF_FNR) >> 14, LINE_IDLE);
+    f.wr(OFF_CNTR, CNTR_WKUPM);
+    f.wr(OFF_ISTR, !ISTR_WKUP);
+    assert_eq!(net.level_of(id), Some(Level::Low), "it follows the flag");
+}
+
+#[test]
+fn a_resume_or_traffic_to_an_awake_block_is_not_a_wakeup() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.bus.resume_port(0);
+    f.bus.start_of_frame(0);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_WKUP, 0);
+}
+
+#[test]
+fn a_reset_while_suspended_wakes_and_then_resets() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.wr(OFF_CNTR, CNTR_FSUSP | CNTR_LP_MODE);
+    f.bus.reset_port(0);
+    let istr = f.rd(OFF_ISTR);
+    assert_eq!(istr & (ISTR_WKUP | ISTR_RESET), ISTR_WKUP | ISTR_RESET);
+    assert_eq!(f.rd(OFF_CNTR) & CNTR_LP_MODE, 0);
+}
+
+#[test]
+fn the_resume_bit_is_a_remote_wakeup_the_host_finishes() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.wr(OFF_CNTR, CNTR_FSUSP);
+    assert!(!f.bus.any_remote_wakeup());
+    f.wr(OFF_CNTR, CNTR_FSUSP | CNTR_RESUME);
+    assert!(f.bus.take_remote_wakeup(0), "the device drives K upstream");
+    assert_eq!(f.rd(OFF_FNR) >> 14, LINE_K);
+    assert_eq!(
+        f.rd(OFF_CNTR) & CNTR_RESUME,
+        CNTR_RESUME,
+        "RESUME is software's to clear"
+    );
+    // Holding it is not a second request.
+    f.wr(OFF_CNTR, CNTR_FSUSP | CNTR_RESUME | CNTR_LP_MODE);
+    assert!(!f.bus.any_remote_wakeup());
+    f.wr(OFF_CNTR, CNTR_FSUSP);
+    f.bus.resume_port(0);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_WKUP, ISTR_WKUP);
+}
+
+// ---------------------------------------------------------------------------
+// LPM
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lpm_is_silent_until_enabled_then_nyet_then_ack() {
+    let f = fixture();
+    f.enumerate_ready();
+    let ask = LpmAttributes::sleep(0xb, true);
+    assert_eq!(
+        f.bus.lpm(DeviceAddress::DEFAULT, ask),
+        LpmResponse::Timeout,
+        "LPMEN clear: no LPM transactions are handled"
+    );
+    f.wr(OFF_LPMCSR, LPMCSR_LPMEN);
+    assert_eq!(f.bus.lpm(DeviceAddress::DEFAULT, ask), LpmResponse::Nyet);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_L1REQ, 0, "a NYET is not an L1 entry");
+    assert_eq!(f.rd(OFF_LPMCSR), LPMCSR_LPMEN, "nor latches BESL");
+    let not_l1 = LpmAttributes {
+        link_state: 2,
+        ..ask
+    };
+    assert_eq!(
+        f.bus.lpm(DeviceAddress::DEFAULT, not_l1),
+        LpmResponse::Stall
+    );
+    f.wr(OFF_LPMCSR, LPMCSR_LPMEN | LPMCSR_LPMACK);
+    assert_eq!(f.bus.lpm(DeviceAddress::DEFAULT, ask), LpmResponse::Ack);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_L1REQ, ISTR_L1REQ);
+    assert_eq!(
+        f.rd(OFF_LPMCSR),
+        LPMCSR_LPMEN | LPMCSR_LPMACK | LPMCSR_REMWAKE | (0xb << LPMCSR_BESL_SHIFT),
+        "BESL and REMWAKE from the ACKed token"
+    );
+    // With EF clear, no transaction is handled, LPM included.
+    f.wr(OFF_DADDR, 0);
+    assert_eq!(f.bus.lpm(DeviceAddress::DEFAULT, ask), LpmResponse::Timeout);
+}
+
+#[test]
+fn l1resume_signals_and_clears_itself_and_the_host_resume_wakes_from_l1() {
+    let f = fixture();
+    f.enumerate_ready();
+    f.wr(OFF_LPMCSR, LPMCSR_LPMEN | LPMCSR_LPMACK);
+    let cntr = CNTR_CTRM | CNTR_RESETM;
+    // Outside L1 there is nothing to resume from.
+    f.wr(OFF_CNTR, cntr | CNTR_L1RESUME);
+    assert!(!f.bus.any_remote_wakeup());
+    assert_eq!(
+        f.bus
+            .lpm(DeviceAddress::DEFAULT, LpmAttributes::sleep(1, true)),
+        LpmResponse::Ack
+    );
+    f.wr(OFF_CNTR, cntr | CNTR_L1RESUME);
+    assert!(f.bus.take_remote_wakeup(0));
+    assert_eq!(f.rd(OFF_CNTR) & CNTR_L1RESUME, 0, "cleared by hardware");
+    f.bus.resume_port(0);
+    assert_eq!(f.rd(OFF_ISTR) & ISTR_WKUP, ISTR_WKUP, "out of L1");
+    assert!(!f.core().state.lock().l1);
 }

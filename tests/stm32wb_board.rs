@@ -383,3 +383,50 @@ fn the_usb_device_comes_onto_the_named_bus_and_hears_a_reset() {
         assert_ne!(rd(&m, ISTR) & 1 << 10, 0, "{board}: ISTR.RESET");
     }
 }
+
+#[test]
+fn the_usb_frame_timer_runs_on_machine_time_and_a_host_resume_wakes_it() {
+    use rsemu::bus::usb::buses;
+    const APB1ENR1: u64 = 0x5800_0058;
+    const USB: u64 = 0x4000_6800;
+    const CNTR: u64 = USB + 0x40;
+    const ISTR: u64 = USB + 0x44;
+    const FNR: u64 = USB + 0x48;
+    const BCDR: u64 = USB + 0x58;
+    const ESOF: u64 = 1 << 8;
+    const SUSP: u64 = 1 << 11;
+    const WKUP: u64 = 1 << 12;
+    for board in ["stm32wb55", "stm32wb35"] {
+        let entry = catalog::machine(board).expect("this build ships the board");
+        let mut options = catalog::build_options().expect("the catalog agrees with itself");
+        options.realize.media.insert("firmware", IDLE.to_vec());
+        let registry = catalog::registry().expect("a registry");
+        let mut m = rsemu::machine::build(entry.name, entry.source, &registry, &options)
+            .unwrap_or_else(|e| panic!("{board} does not realize: {e}"));
+        let bus = buses::get(&options.realize.hosts, "usb")
+            .expect("the host table")
+            .expect("the board opened the `usb` bus");
+        wr(&m, APB1ENR1, rd(&m, APB1ENR1) | 1 << 26);
+        wr(&m, CNTR, 0);
+        wr(&m, BCDR, 1 << 15);
+        bus.reset_port(0);
+        bus.start_of_frame(0x40);
+        wr(&m, ISTR, 0);
+        // No host sends SOFs: after a little over three milliseconds of
+        // machine time the frame timer has missed three, and the bus is idle.
+        run_ms(&mut m, 4);
+        let istr = rd(&m, ISTR);
+        assert_ne!(istr & ESOF, 0, "{board}: ESOF");
+        assert_ne!(istr & SUSP, 0, "{board}: SUSP after 3 ms idle");
+        assert_eq!(rd(&m, FNR) & 0x7ff, 0x40, "{board}: FN from the last SOF");
+        assert_eq!(rd(&m, FNR) >> 11 & 3, 3, "{board}: LSOF counted three");
+        // The driver suspends; the host resumes: WKUP. (USB_WAKEUP is wired to
+        // EXTI line 28, a direct line with no pending bit to read back; that
+        // the wire exists is what building the board checks.)
+        wr(&m, CNTR, 1 << 3 | 1 << 2); // FSUSP, LP_MODE
+        bus.resume_port(0);
+        assert_ne!(rd(&m, ISTR) & WKUP, 0, "{board}: WKUP");
+        assert_eq!(rd(&m, CNTR) & 1 << 2, 0, "{board}: LP_MODE cleared");
+        assert_eq!(rd(&m, FNR) >> 14, 0b01, "{board}: a root resume");
+    }
+}
