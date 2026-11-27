@@ -83,7 +83,7 @@
 //! not of the chip, so they come from the `port-type` property: `sdp` (the
 //! default — a standard host port, which is what every board written before
 //! the property assumed), `cdp`, `dcp`, `ps2` or `none`. RM0434 §40.6.1 gives
-//! the bits and no sequence beyond them; [`bcd_status`] has the table and the
+//! the bits and no sequence beyond them; `bcd_status` has the table and the
 //! line conditions from USB Battery Charging 1.2 that decide each result.
 //! While `BCDEN` is set the block is off the bus: "the USB PHY is fully
 //! controlled by BCD and cannot be used for normal communication".
@@ -618,7 +618,7 @@ impl State {
 /// 1.2 classifies the far end — the one thing `BCDR`'s detection results
 /// depend on, and a fact about the attachment rather than the chip.
 ///
-/// A closed set on purpose: [`bcd_status`] matches it exhaustively, and a new
+/// A closed set on purpose: `bcd_status` matches it exhaustively, and a new
 /// kind of port is a new row of that table, not a value a board can invent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PortType {
