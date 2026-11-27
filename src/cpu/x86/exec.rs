@@ -95,7 +95,7 @@ use alloc::vec::Vec;
 
 use crate::core::exec::{Access as ExitAccess, Exit, ExitReason};
 use crate::core::sched::TickCursor;
-use crate::core::space::{AddressSpace, MemAttrs};
+use crate::core::space::{AddressSpace, DirectSpan, MemAttrs, Perms};
 use crate::core::value::Width;
 
 use super::fpu::{Sse, X87};
@@ -369,6 +369,9 @@ pub(super) struct State {
     pub int_shadow: bool,
     /// The bus interface unit's queue.
     pub queue: Queue,
+    /// Where the instruction stream was last fetched from. Derived state:
+    /// never serialized.
+    pub fetch: FetchWindow,
     /// The last value driven on the data bus.
     ///
     /// An 8086 has no bus-error input: an access nothing answers leaves the
@@ -396,7 +399,118 @@ pub(super) struct State {
     pub break_resume: Option<u64>,
 }
 
+/// The physical page the instruction stream was last fetched from, resolved
+/// to the store behind it.
+///
+/// # What it replaces
+///
+/// Every instruction byte used to be its own [`AddressSpace::read`]: the
+/// topology read guard, the dispatch table, the flat entry, the permission and
+/// constraint checks, and then one byte out of a store. A real x86-64 Linux
+/// boot makes 3.9 fetches per instruction and that path was 193 host
+/// instructions each — a quarter of the interpreter. The bytes of one
+/// instruction are nearly always in one page and so are the next
+/// instruction's, so the *resolution* is kept and only the byte is read again.
+///
+/// # What it does not replace
+///
+/// Anything architectural. The segment-limit or canonical check, the
+/// translation, the clock charge and the open-bus latch are all still made per
+/// byte by [`Exec::fetch_at`], in the order they always were; this caches only
+/// the part of the bus read that is a property of the *machine's memory map*
+/// and is the same for every byte of a page.
+///
+/// # Why it cannot go stale
+///
+/// * It holds no bytes. The store is read live, with the same relaxed loads
+///   the address space makes, so self-modifying code is seen exactly as it was
+///   before — there is no copy to invalidate.
+/// * It is keyed on the **physical** page after the A20 gate, so a `CR3`
+///   reload, an `INVLPG`, a mode switch and a toggled gate all simply produce
+///   a different key.
+/// * A retopology moves [`AddressSpace::generation`], which is compared on
+///   every use. A bank switch does not — and [`DirectSpan`] refuses a rebasable
+///   mapping for exactly that reason, so such a page is remembered as *slow*
+///   and every byte of it takes the call.
+///
+/// Derived state (`CLAUDE.md`, *Devices*): never serialized, and a restored
+/// machine refills it on its first fetch.
+#[derive(Debug, Clone)]
+pub(super) struct FetchWindow {
+    /// The physical address of the page, or `u64::MAX` when nothing is cached
+    /// — which no page address equals, since its low twelve bits are set.
+    page: u64,
+    /// The topology generation the resolution was taken under.
+    generation: u64,
+    /// The permission the reads were resolved for.
+    need: Perms,
+    /// The store behind the page, or `None` for a page that has to keep
+    /// taking the address space: a device, a hole, a banked window.
+    span: Option<DirectSpan>,
+}
+
+impl FetchWindow {
+    /// The granule: a 4 KiB page, the smallest any paging mode maps, so one
+    /// translation always covers the whole window.
+    const PAGE: u64 = 0x1000;
+
+    const fn new() -> FetchWindow {
+        FetchWindow {
+            page: u64::MAX,
+            generation: 0,
+            need: Perms::NONE,
+            span: None,
+        }
+    }
+
+    /// Whether the page last fetched from was resolved to a store, for the
+    /// tests that have to know which of the two paths they exercised.
+    #[cfg(test)]
+    pub(super) fn is_direct(&self) -> bool {
+        self.span.is_some()
+    }
+
+    /// The byte at physical `addr`, if this window resolves it directly.
+    ///
+    /// Refilled first when it describes another page, another topology or
+    /// another permission, so a miss costs one probe per *page* rather than
+    /// one per byte — a page of MMIO included.
+    #[inline]
+    fn read(&mut self, mem: &AddressSpace, addr: u64, need: Perms) -> Option<u8> {
+        let page = addr & !(Self::PAGE - 1);
+        let generation = mem.generation();
+        if self.page != page || self.generation != generation || self.need != need {
+            self.fill(mem, page, generation, need);
+        }
+        self.span.as_ref()?.read_u8(addr & (Self::PAGE - 1))
+    }
+
+    fn fill(&mut self, mem: &AddressSpace, page: u64, generation: u64, need: Perms) {
+        self.span = mem.direct_span(page, Self::PAGE, need);
+        self.page = page;
+        self.need = need;
+        // The span's own generation where there is one: it was read under the
+        // guard that walked the map. Otherwise the one read before the probe,
+        // which is the older of the two a racing retopology could leave and so
+        // the one that makes the next use probe again.
+        self.generation = self
+            .span
+            .as_ref()
+            .map_or(generation, DirectSpan::generation);
+    }
+}
+
 impl State {
+    /// Drop everything resolved against the memory space, because the core is
+    /// being attached to another one.
+    ///
+    /// A resolution is valid for a topology generation, and that is a counter
+    /// each space keeps for itself: the new space may well stand at the number
+    /// the old one did, and would then be read through the old one's stores.
+    pub(super) fn forget_memory(&mut self) {
+        self.fetch = FetchWindow::new();
+    }
+
     /// The time-stamp counter as the guest reads it (`RDTSC`, `RDMSR`
     /// `IA32_TIME_STAMP_COUNTER`): **where this processor stands in its clock
     /// domain**, which is what the *Intel SDM* volume 3B §17.17.1 calls an
@@ -465,6 +579,7 @@ impl State {
             wait_for_sipi: false,
             int_shadow: false,
             queue: Queue::new(variant),
+            fetch: FetchWindow::new(),
             open_bus: 0,
             faults: 0,
             last_fault: 0,
@@ -1667,14 +1782,60 @@ impl<'a> Exec<'a> {
             }
             prot::linear32(cs.base, offset)
         };
-        let user = self.cpl() == 3;
         if !self.state.sys.paging() {
-            return Ok(self.fetch_read(lin, 1) as u8);
+            return Ok(self.fetch_code(lin));
         }
+        let user = self.cpl() == 3;
         // An instruction fetch is where the no-execute bit is consulted, and
         // the only place it is: a data read of the same page is fine.
-        let phys = self.translate_access(lin, paging::Access::fetch(user))?;
-        Ok(self.fetch_read(phys, 1) as u8)
+        let phys = match self.fetch_translation(lin, user) {
+            Some(phys) => phys,
+            None => self.translate_access(lin, paging::Access::fetch(user))?,
+        };
+        Ok(self.fetch_code(phys))
+    }
+
+    /// The physical address of a fetch the instruction buffer already holds a
+    /// translation for and permits — [`Exec::translate_access`]'s hit, and
+    /// nothing else of it.
+    ///
+    /// Every byte of an instruction is translated, because every byte can be
+    /// the one that crosses into a page that is not there; and for all but the
+    /// first in a page the answer is this one. `translate_access` reaches it
+    /// only after assembling the walk's inputs out of the control registers
+    /// (`Sys::tables`), which a hit barely reads — 106 host instructions a
+    /// byte on an x86-64 Linux boot.
+    ///
+    /// `None` is "ask `translate_access`", which then finds the same entry and
+    /// raises the fault, or finds none and walks: this decides nothing, it
+    /// only declines. The buffer is synchronised to the topology first exactly
+    /// as that function does, so the two cannot disagree about what is cached;
+    /// and a fetch never refreshes the compiled path's shadow, so there is no
+    /// third thing a hit there does.
+    #[inline]
+    fn fetch_translation(&mut self, lin: u64, user: bool) -> Option<u64> {
+        self.state.tlb.sync(self.mem.generation());
+        let entry = self.state.tlb.get(lin, true)?;
+        ((!user || entry.user) && !entry.no_execute).then_some(entry.frame | (lin & 0xfff))
+    }
+
+    /// One byte of the instruction stream at a physical address, on a part
+    /// whose fetches are not individually visible on the bus.
+    ///
+    /// [`Exec::fetch_read`] with the address-space lookup served from
+    /// [`FetchWindow`] where the page allows it: the same charge, the same A20
+    /// gate, the same open-bus latch, and the same byte, because the window
+    /// reads the store the space would have reached.
+    #[inline]
+    fn fetch_code(&mut self, addr: u64) -> u8 {
+        self.charge(self.variant().bus_clocks());
+        let masked = self.masked(addr);
+        let need = self.attrs.read_perm();
+        if let Some(byte) = self.state.fetch.read(self.mem, masked, need) {
+            self.state.open_bus = byte;
+            return byte;
+        }
+        self.bus_read(addr, 1) as u8
     }
 
     /// Top the prefetch queue up, as the bus interface unit does whenever the

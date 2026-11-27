@@ -2940,6 +2940,9 @@ impl X86 {
     pub fn attach_space(&self, space: Arc<AddressSpace>) {
         let mut session = self.session.lock();
         session.memory = Some(space);
+        // What the interpreter remembers of the old space is keyed on a
+        // topology generation, and two spaces' counters are not comparable.
+        session.state.forget_memory();
         // Every translation was lifted out of the space that is being
         // replaced, so none of them describes this one.
         #[cfg(all(feature = "cpu-x86-lift", feature = "jit"))]

@@ -13086,6 +13086,167 @@ mod v2 {
     }
 }
 
+/// The interpreter's fetch window (`exec::FetchWindow`): whatever it serves
+/// has to be what the address space would have served, charged the same.
+mod fetch_window {
+    use super::*;
+    use crate::core::space::RegionRef;
+
+    /// Where the test program sits: real mode, `0000:1000`.
+    const CODE: u64 = 0x1000;
+
+    /// A 386 in real mode over a megabyte of RAM holding `code` at [`CODE`].
+    ///
+    /// `direct` maps the RAM plainly, which is a page the window resolves.
+    /// Otherwise the same store is reached through an alias — a mapping whose
+    /// offset can slide without the topology generation moving, so the window
+    /// must refuse it and every byte takes `AddressSpace::read`. The two are
+    /// the same machine to the guest, which is the point.
+    fn build(direct: bool, code: &[u8]) -> (Arc<X86>, Arc<RamStore>, Arc<AddressSpace>) {
+        let ram = Arc::new(RamStore::new(0x10_0000));
+        for (i, byte) in code.iter().enumerate() {
+            ram.write_u8(CODE + i as u64, *byte).unwrap();
+        }
+        let mem = Arc::new(AddressSpace::new("mem", 32));
+        let region: RegionRef = Region::ram("ram", ram.clone()).into();
+        if direct {
+            mem.topology().map(region, 0).unwrap();
+        } else {
+            let window = Region::alias("window", region, 0, 0x10_0000).unwrap();
+            mem.topology().map(window, 0).unwrap();
+        }
+        let cpu = Arc::new(X86::new(Config::I80386));
+        cpu.attach_space(mem.clone());
+        aim(&cpu);
+        (cpu, ram, mem)
+    }
+
+    /// Point the core at [`CODE`], skipping reset.
+    fn aim(cpu: &X86) {
+        let mut regs = cpu.regs();
+        regs.cs = 0;
+        regs.rip = CODE;
+        cpu.set_regs(regs);
+        cpu.session.lock().state.reset_pending = false;
+    }
+
+    /// Everything a fetch can leave behind.
+    fn observe(cpu: &X86) -> (Regs, u64, u8, (u64, u64)) {
+        let open_bus = cpu.session.lock().state.open_bus;
+        (cpu.regs(), cpu.cycles(), open_bus, cpu.bus_faults())
+    }
+
+    /// A loop that rewrites the immediate of the instruction after the store,
+    /// in the page it is executing from, on every pass.
+    fn program() -> Vec<u8> {
+        alloc::vec![
+            0xb0, 0x01, // 1000: mov al, 1
+            0xfe, 0x06, 0x07, 0x10, // 1002: inc byte [0x1007]
+            0x04, 0x00, // 1006: add al, imm8 -- the immediate is what 1002 patches
+            0x43, // 1008: inc bx
+            0xeb, 0xf5, // 1009: jmp 1000
+        ]
+    }
+
+    #[test]
+    fn the_window_and_the_address_space_are_one_machine() {
+        let (fast, _, _) = build(true, &program());
+        let (slow, _, _) = build(false, &program());
+        for step in 0..60 {
+            assert_eq!(fast.step(), slow.step(), "clocks charged by step {step}");
+            assert_eq!(observe(&fast), observe(&slow), "after step {step}");
+        }
+        // Twelve passes, and the immediate grew by one on each: the stream
+        // changed underneath the window and the window read what was there.
+        assert_eq!(fast.regs().rbx & 0xffff, 12);
+        assert_eq!(fast.regs().rax & 0xff, 1 + 12);
+        assert!(
+            fast.session.lock().state.fetch.is_direct(),
+            "the plain mapping must have been served by the window"
+        );
+        assert!(
+            !slow.session.lock().state.fetch.is_direct(),
+            "an alias can slide without a generation: it must stay slow"
+        );
+    }
+
+    #[test]
+    fn a_store_into_the_page_being_executed_is_fetched_back() {
+        // mov byte [0x1006], 0x7f ; mov al, 0x11 -- the store rewrites the
+        // second instruction's immediate after the window was filled.
+        let code = [0xc6, 0x06, 0x06, 0x10, 0x7f, 0xb0, 0x11];
+        let (cpu, _, _) = build(true, &code);
+        cpu.step();
+        assert!(cpu.session.lock().state.fetch.is_direct());
+        cpu.step();
+        assert_eq!(cpu.regs().rax & 0xff, 0x7f);
+    }
+
+    #[test]
+    fn a_remap_under_the_core_is_fetched_from_the_new_mapping() {
+        let (cpu, _, mem) = build(true, &[0xb0, 0x11]);
+        cpu.step();
+        assert_eq!(cpu.regs().rax & 0xff, 0x11);
+        assert!(cpu.session.lock().state.fetch.is_direct());
+        // Another store over the same page, in front of the first.
+        let other = Arc::new(RamStore::new(0x1000));
+        other.write_u8(0, 0xb0).unwrap();
+        other.write_u8(1, 0x22).unwrap();
+        mem.topology()
+            .map_with_priority(Region::ram("other", other), CODE, 1)
+            .unwrap();
+        aim(&cpu);
+        cpu.step();
+        assert_eq!(
+            cpu.regs().rax & 0xff,
+            0x22,
+            "the window outlived the topology it was taken under"
+        );
+    }
+
+    #[test]
+    fn a_core_moved_to_another_space_fetches_from_that_space() {
+        // Two spaces built the same way stand at the same generation, so the
+        // generation alone cannot tell the window it has been moved.
+        let (cpu, _, first) = build(true, &[0xb0, 0x11]);
+        let (_, _, second) = build(true, &[0xb0, 0x22]);
+        assert_eq!(first.generation(), second.generation());
+        cpu.step();
+        assert_eq!(cpu.regs().rax & 0xff, 0x11);
+        cpu.attach_space(second);
+        aim(&cpu);
+        cpu.step();
+        assert_eq!(cpu.regs().rax & 0xff, 0x22);
+    }
+
+    #[test]
+    fn code_in_a_device_is_fetched_from_the_device_every_time() {
+        // Executing out of an aperture is rare and legal, and each byte is a
+        // call with side effects the device can count.
+        let log = Arc::new(BusLog::default());
+        log.clear();
+        {
+            let mut cells = log.cells.lock();
+            cells.0[0] = 0xb0; // mov al, 0x33
+            cells.0[1] = 0x33;
+            cells.0[2] = 0x40; // inc ax
+        }
+        let (cpu, _, mem) = build(true, &[]);
+        mem.topology()
+            .map_with_priority(Region::io("log", 0x10, log.clone()), CODE, 1)
+            .unwrap();
+        cpu.step();
+        cpu.step();
+        assert_eq!(cpu.regs().rax & 0xffff, 0x34);
+        assert_eq!(
+            log.entries(),
+            alloc::vec![(0u64, false), (1u64, false), (2u64, false)],
+            "one device read per instruction byte, in order"
+        );
+        assert!(!cpu.session.lock().state.fetch.is_direct());
+    }
+}
+
 /// AVX, in its own file: `tests/avx.rs`.
 mod avx;
 
