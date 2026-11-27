@@ -1252,6 +1252,25 @@ impl<'a> Compiler<'a> {
     /// never one [`Compiler::operand`] handed back — that one is some live
     /// temporary's home.
     fn write(&mut self, inst: &Inst, reg: Reg) -> Result<(), Refusal> {
+        let (dst, dst_ty) = self.dst(inst)?;
+        self.mask(reg, inst.ty);
+        if dst_ty != inst.ty {
+            self.mask(reg, dst_ty);
+        }
+        self.commit(dst, reg);
+        Ok(())
+    }
+
+    /// The instruction's destination and its type, refusing what
+    /// [`Compiler::write`] refuses.
+    ///
+    /// Split out for the lowerings that already know their result is
+    /// canonical — a `setcc` is zero or one, a bitfield was just cut to its
+    /// length — and so owe [`Compiler::commit`] and none of the masks. The
+    /// refusals are not theirs to skip: a destination wider than the
+    /// instruction is refused for every op, because that is the rule the rest
+    /// of this file is written against.
+    fn dst(&self, inst: &Inst) -> Result<(Temp, Type), Refusal> {
         let dst = inst
             .dst
             .ok_or(Refusal::Shape("this op must have a destination"))?;
@@ -1265,12 +1284,29 @@ impl<'a> Compiler<'a> {
                 "this op's destination is wider than the op's own type",
             ));
         }
-        self.mask(reg, inst.ty);
-        if dst_ty != inst.ty {
-            self.mask(reg, dst_ty);
+        Ok((dst, dst_ty))
+    }
+
+    /// Keep the low `bits` of `reg` and clear the rest, given that everything
+    /// from bit `known_zero` up is clear already.
+    ///
+    /// The cheapest instruction that does it: nothing when there is nothing
+    /// left to clear, a 32-bit `mov` at exactly 32 (which zero-extends), an
+    /// `and` with an immediate below that — the mask is at most 31 ones, so
+    /// it is a positive `imm32` and sign-extension adds nothing — and the
+    /// 64-bit mask through `rcx` only for the widths in between.
+    fn keep_low(&mut self, reg: Reg, bits: u32, known_zero: u32) {
+        if bits >= known_zero {
+            return;
         }
-        self.commit(dst, reg);
-        Ok(())
+        match bits {
+            32 => self.asm.mov_rr32(reg, reg),
+            0..=31 => self.asm.alu_ri(Alu::And, reg, ((1u32 << bits) - 1) as i32),
+            _ => {
+                self.asm.mov_ri(Reg::Rcx, (1u64 << bits) - 1);
+                self.asm.alu_rr(Alu::And, reg, Reg::Rcx);
+            }
+        }
     }
 
     fn src(&self, at: usize, i: usize) -> Result<Temp, Refusal> {
@@ -1421,10 +1457,22 @@ impl<'a> Compiler<'a> {
                 self.write(inst, acc)?;
             }
             Opcode::EXT_Z | Opcode::TRUNC => {
+                // Both are a mask to the destination's width, and the
+                // destination is never the wider of the two types (`dst`), so
+                // its width is the only one that takes anything off.
                 let s = self.src(at, 0)?;
+                let (dst, dst_ty) = self.dst(inst)?;
                 let acc = self.acc(inst, &[]);
-                self.load_temp(acc, s);
-                self.write(inst, acc)?;
+                if dst_ty == Type::I32 {
+                    // The copy and the truncation in one instruction: a
+                    // 32-bit `mov` clears the upper half of its destination.
+                    let from = self.operand(Reg::Rax, s);
+                    self.asm.mov_rr32(acc, from);
+                } else {
+                    self.load_temp(acc, s);
+                    self.mask(acc, dst_ty);
+                }
+                self.commit(dst, acc);
             }
             Opcode::BSWAP => {
                 let lane = match inst.imm {
@@ -1497,16 +1545,23 @@ impl<'a> Compiler<'a> {
             }
             Opcode::EXTRACT => {
                 let (pos, len) = bitfield_parts(inst.aux);
-                let field = field_mask(pos, len, w)
-                    .ok_or(Refusal::Shape("the bitfield leaves the type"))?;
+                field_mask(pos, len, w).ok_or(Refusal::Shape("the bitfield leaves the type"))?;
                 let s = self.src(at, 0)?;
-                self.load_temp(Reg::Rax, s);
-                self.asm.mov_ri(Reg::Rcx, field);
-                self.asm.alu_rr(Alu::And, Reg::Rax, Reg::Rcx);
+                let (dst, dst_ty) = self.dst(inst)?;
+                // Shift first and cut afterwards, where `ir::Interp` cuts and
+                // then shifts: the same bits either way, and this way round
+                // the mask starts at bit zero, so it is an immediate or no
+                // instruction at all instead of a 64-bit constant in a
+                // register. The cut is to the field's length or the
+                // destination's width, whichever is shorter — the two masks
+                // the interpreter applies, as one.
+                let acc = self.acc(inst, &[]);
+                self.load_temp(acc, s);
                 if pos > 0 {
-                    self.asm.shift_ri(Shift::Shr, Reg::Rax, pos as u8);
+                    self.asm.shift_ri(Shift::Shr, acc, pos as u8);
                 }
-                self.write(inst, Reg::Rax)?;
+                self.keep_low(acc, len.min(dst_ty.bits()), 64 - pos);
+                self.commit(dst, acc);
             }
             Opcode::ADD | Opcode::SUB | Opcode::AND | Opcode::OR | Opcode::XOR => {
                 let a = self.src(at, 0)?;
@@ -1618,9 +1673,12 @@ impl<'a> Compiler<'a> {
                 let cond = inst
                     .cond
                     .ok_or(Refusal::Shape("a comparison needs a condition"))?;
+                let (dst, _) = self.dst(inst)?;
                 let cc = self.compare(at, cond, w)?;
+                // `Asm::setcc` zero-extends, so this is a canonical zero or
+                // one at any width and there is nothing for a mask to remove.
                 self.asm.setcc(cc, Reg::Rax);
-                self.write(inst, Reg::Rax)?;
+                self.commit(dst, Reg::Rax);
             }
             Opcode::MOVCOND => self.movcond(at, inst, w)?,
             Opcode::BRCOND => self.brcond(at, inst, w)?,

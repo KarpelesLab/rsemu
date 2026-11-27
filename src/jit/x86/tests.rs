@@ -2792,3 +2792,103 @@ fn a_shift_by_a_constant_is_a_shift_and_not_a_compare_and_two_branches() {
         variable.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bitfields and truncations
+// ---------------------------------------------------------------------------
+
+/// One block of `extract`s over `fields`, at `ty`, each into every destination
+/// type that is not wider than the op.
+///
+/// `wide_source` reads the field out of an `i64` temporary whose upper half is
+/// set even when the op is `i32`. `verify` allows that — a bitfield is not one
+/// of the ops whose operand has to carry the instruction's type — and it is
+/// the case where "shift, then cut" and "cut, then shift" would differ if the
+/// cut were to the wrong width.
+fn bitfields(ty: Type, fields: &[(u32, u32)], wide_source: bool) -> Block {
+    let mut b = BlockBuilder::new(BASE, 0);
+    b.insn_start(InsnStart {
+        pc: BASE,
+        next_pc: BASE + 4,
+        ticks: 0,
+        live: Vec::new(),
+    });
+    b.charge(1);
+    let slot = b.get_slot(Type::I64, RegSlot(0));
+    let salt = b.imm(Type::I64, Const::Int(0xa5c3_96e1_7d2b_f04f));
+    let wide = b.binary(Opcode::XOR, Type::I64, slot, salt);
+    let x = if wide_source {
+        wide
+    } else {
+        b.unary(Opcode::TRUNC, ty, wide)
+    };
+    let narrower: &[Type] = if ty == Type::I64 {
+        &[Type::I64, Type::I32, Type::I1]
+    } else {
+        &[Type::I32, Type::I1]
+    };
+    let mut live: Vec<(RegSlot, Temp)> = Vec::new();
+    for &(pos, len) in fields {
+        for &dst_ty in narrower {
+            let dst = b.temp(dst_ty);
+            b.emit_raw(
+                Opcode::EXTRACT,
+                ty,
+                Some(dst),
+                None,
+                &[x],
+                None,
+                None,
+                bitfield_aux(pos, len),
+            );
+            live.push((RegSlot(1 + live.len() as u16), dst));
+        }
+    }
+    // The other ops that cut to a destination's width without a mask of
+    // their own: a truncation, a zero extension, and a comparison's one bit.
+    for &dst_ty in narrower {
+        for op in [Opcode::TRUNC, Opcode::EXT_Z, Opcode::EXT_S] {
+            let dst = b.temp(dst_ty);
+            b.emit_raw(op, ty, Some(dst), None, &[x], None, None, 0);
+            live.push((RegSlot(1 + live.len() as u16), dst));
+        }
+    }
+    let bit = b.setcond(Cond::LtS, ty, x, salt);
+    live.push((RegSlot(1 + live.len() as u16), bit));
+    b.insn_start(InsnStart {
+        pc: BASE + 4,
+        next_pc: BASE + 8,
+        ticks: 1,
+        live,
+    });
+    b.exit_tb();
+    b.finish()
+}
+
+#[test]
+fn every_bitfield_position_and_length_agrees_with_the_interpreter() {
+    // Exhaustive rather than sampled: 528 fields at 32 bits and 2 080 at 64,
+    // each into every destination width, from a source of the op's type and
+    // from a wider one. The lowering picks between four instructions on the
+    // field's length and where it ends, and a random corpus reaches the
+    // boundaries of that choice — a field of exactly 32 bits, one that ends
+    // at bit 63 — about as often as it reaches any other single field.
+    let mut blocks = 0;
+    for ty in [Type::I32, Type::I64] {
+        let w = ty.bits();
+        let mut fields: Vec<(u32, u32)> = Vec::new();
+        for len in 1..=w {
+            for pos in 0..=(w - len) {
+                fields.push((pos, len));
+            }
+        }
+        assert_eq!(fields.len() as u32, w * (w + 1) / 2);
+        for chunk in fields.chunks(24) {
+            for wide_source in [false, true] {
+                assert!(agree(&bitfields(ty, chunk, wide_source), true));
+                blocks += 1;
+            }
+        }
+    }
+    assert_eq!(blocks, 2 * (22 + 87));
+}
