@@ -345,13 +345,25 @@ fn a_resize_reaches_a_client_that_asked_for_desktop_size() {
     surface.fill([1, 2, 3]);
     client.request(true, 4, 2);
     let rects = client.update(&mut server, &surface);
-    assert_eq!(rects.len(), 2);
+    assert_eq!(
+        rects.len(),
+        1,
+        "§7.8.2: DesktopSize is the last rectangle in its update"
+    );
     assert_eq!(
         (rects[0].2, rects[0].3, rects[0].4),
         (8, 4, encoding::DESKTOP_SIZE),
         "§7.8.2 carries the new geometry"
     );
-    assert_eq!((rects[1].2, rects[1].3), (8, 4));
+
+    // The picture comes with the next request, whole, whatever was asked for.
+    client.request(true, 8, 4);
+    let rects = client.update(&mut server, &surface);
+    assert_eq!(rects.len(), 1);
+    assert_eq!(
+        (rects[0].0, rects[0].1, rects[0].2, rects[0].3, rects[0].4),
+        (0, 0, 8, 4, encoding::RAW)
+    );
 }
 
 #[test]

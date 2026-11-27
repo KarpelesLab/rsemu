@@ -20,7 +20,9 @@
 //! A guest changes video mode whenever it likes and the framebuffer changes
 //! shape underneath the connection. A client that asked for the DesktopSize
 //! pseudo-encoding (§7.8.2) is told, with a zero-data rectangle carrying the
-//! new geometry, and then given a full frame. A client that did not ask is
+//! new geometry — alone in its update, because §7.8.2 wants it last and no
+//! pixel in the new geometry can precede it — and is given a full frame by the
+//! update after that. A client that did not ask is
 //! **not** resized — the RFC gives no other way to say it — so it keeps seeing
 //! the geometry it was promised in ServerInit, with the new picture cropped
 //! into it and any uncovered area black. Wrong-looking, but honest and stable;
@@ -117,15 +119,27 @@ impl FrameEncoder {
             && surface.width() > 0
             && surface.height() > 0;
 
-        let mut rects: Vec<Vec<u8>> = Vec::new();
         if resized {
+            // §7.8.2: "The server changes the desktop size by sending a
+            // rectangle with the DesktopSize pseudo-encoding as the last
+            // rectangle in an update." Pixels in the new geometry cannot go
+            // *before* it — the client has not been told the geometry yet —
+            // so the announcement is an update of its own, and the picture
+            // follows in the next one: "the server must assume that the client
+            // no longer has the previous framebuffer contents. This will
+            // usually result in a complete update of the framebuffer at the
+            // next update."
             let (w, h) = (fits(surface.width()), fits(surface.height()));
-            rects.push(rect_header(0, 0, w, h, encoding::DESKTOP_SIZE).to_vec());
             self.announced = (w, h);
+            self.invalidate();
+            let mut out = update_header(1).to_vec();
+            out.extend_from_slice(&rect_header(0, 0, w, h, encoding::DESKTOP_SIZE));
+            return Some(out);
         }
 
+        let mut rects: Vec<Vec<u8>> = Vec::new();
         let (aw, ah) = self.announced;
-        if comparable && !resized {
+        if comparable {
             for (top, bottom) in self.damaged_bands(surface) {
                 // The bands are rows of the *surface*; the rectangles are rows
                 // of the framebuffer the client was promised. They differ for
@@ -332,15 +346,24 @@ mod tests {
         enc.set_encodings(&[encoding::RAW, encoding::DESKTOP_SIZE]);
         assert!(enc.resizable());
         enc.update(&surface(4, 2, [0, 0, 0]), false).expect("first");
-        let update = enc
-            .update(&surface(8, 4, [9, 9, 9]), true)
-            .expect("resized");
-        assert_eq!(&update[..4], update_header(2), "DesktopSize, then pixels");
+        let big = surface(8, 4, [9, 9, 9]);
+        let update = enc.update(&big, true).expect("resized");
+        // §7.8.2: DesktopSize is "the last rectangle in an update", and
+        // nothing in the new geometry can come before the client knows it.
+        assert_eq!(&update[..4], update_header(1), "DesktopSize, alone");
         assert_eq!(
             &update[4..16],
             rect_header(0, 0, 8, 4, encoding::DESKTOP_SIZE)
         );
+        assert_eq!(update.len(), 4 + 12, "no pixel data in this update");
         assert_eq!(enc.announced(), (8, 4));
+        // "...a complete update of the framebuffer at the next update", even
+        // though the surface has not changed since and incremental was asked.
+        let update = enc.update(&big, true).expect("the whole new frame");
+        assert_eq!(&update[..4], update_header(1));
+        assert_eq!(&update[4..16], rect_header(0, 0, 8, 4, encoding::RAW));
+        assert_eq!(update.len(), 4 + 12 + 8 * 4 * 4);
+        assert!(enc.update(&big, true).is_none(), "and then it is quiet");
 
         // Did not ask.
         let mut enc = FrameEncoder::new(PixelFormat::DEFAULT, 4, 2);
