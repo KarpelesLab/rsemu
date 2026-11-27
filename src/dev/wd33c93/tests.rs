@@ -573,6 +573,33 @@ fn a_queued_interrupt_arrives_without_anyone_reading_a_board_register() {
     );
 }
 
+#[test]
+fn a_register_write_through_the_window_closes_the_window_as_a_read_does() {
+    // The same gap, closed by the other kind of access. A host that answers
+    // the selection by loading registers for the transfer — which is what one
+    // does before it waits for the phase interrupt — has acted, and the
+    // interrupt queued behind the selection must arrive: on a board that maps
+    // the chip's two addresses directly this is the only path there is.
+    let r = rig();
+    let _ = r.interrupt();
+    r.set(DEST_ID, TARGET);
+    r.command(CMD_SELECT_ATN);
+    r.sasr(SCSI_STATUS);
+    assert_eq!(r.get(), INT_SELECT_DONE);
+    assert!(!r.intrq.high());
+
+    // Through the mapped window itself, not the port a board adapter holds.
+    r.poke(0, TARGET_LUN);
+    assert!(!r.intrq.high(), "aiming is not acting");
+    r.poke(1, 0);
+    assert!(r.intrq.high(), "the write was the host acting");
+    r.sasr(SCSI_STATUS);
+    assert_eq!(
+        r.get(),
+        INT_SERVICE | INT_MCI | Phase::MessageOut.mci().unwrap()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // the combination command
 // ---------------------------------------------------------------------------

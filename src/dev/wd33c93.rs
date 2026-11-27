@@ -1445,6 +1445,13 @@ impl MemOps for RegsWindow {
             self.0.write_address(src[0]);
         } else {
             self.0.write_indirect(src[0]);
+            // The host has acted, so whatever was queued behind the interrupt
+            // it took arrives — as `ControllerPort::write_register` does for a
+            // board adapter, and as a read of the same address does here. A
+            // mapped chip that settled on reads alone left a driver that loads
+            // its transfer registers and then waits for the phase interrupt
+            // waiting for good. See [`Chip::poll_pending`].
+            self.0.settle();
         }
         Ok(())
     }
