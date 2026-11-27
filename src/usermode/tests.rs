@@ -805,6 +805,29 @@ fn a_deadline_that_passes_while_another_thread_runs_still_wakes_its_sleeper() {
 }
 
 #[test]
+fn a_schedule_with_a_zero_quantum_is_refused() {
+    // `set_quantum` clamps to one tick because a zero quantum makes no
+    // progress; a snapshot must not be a way round that.
+    let threads = ThreadSet::new(Arc::new(GuestClock::new()));
+    threads.insert(Arc::new(Spinner::default()));
+    let mut bytes: Vec<u8> = Vec::new();
+    threads.save(&mut bytes).unwrap();
+    let mut good = crate::core::state::SliceSource::new(&bytes);
+    threads.load(&mut good).expect("its own snapshot loads");
+
+    // next_id: u32, cursor: u32, then the quantum.
+    assert_eq!(bytes[8..16], threads.quantum().to_le_bytes());
+    bytes[8..16].fill(0);
+    let mut forged = crate::core::state::SliceSource::new(&bytes);
+    assert!(threads.load(&mut forged).is_err());
+    assert_eq!(
+        threads.quantum(),
+        super::DEFAULT_QUANTUM,
+        "and nothing changed"
+    );
+}
+
+#[test]
 fn a_schedule_round_trips_through_a_snapshot() {
     let clock = Arc::new(GuestClock::new());
     let threads = ThreadSet::new(Arc::clone(&clock));

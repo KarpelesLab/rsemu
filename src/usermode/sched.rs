@@ -442,12 +442,20 @@ impl ThreadSet {
     ///
     /// # Errors
     ///
-    /// [`Error::State`] if the encoding is malformed, or names a thread that
-    /// has not been inserted.
+    /// [`Error::State`] if the encoding is malformed, has a zero quantum, or
+    /// names a thread that has not been inserted.
     pub fn load<'a, S: Source<'a> + ?Sized>(&self, source: &mut S) -> Result<()> {
         let next_id = source.read_u32()?;
         let cursor = source.read_u32()?;
         let quantum = source.read_u64()?;
+        if quantum == 0 {
+            // `set_quantum` never stores one, so `save` never writes one: a
+            // thread given no ticks makes no progress and `run_next` would
+            // hand the same thread back for ever.
+            return Err(Error::State(alloc::string::String::from(
+                "a schedule with a zero quantum, which no thread set can have",
+            )));
+        }
         let count = source.read_seq_len(5)?;
         let mut states = BTreeMap::new();
         for _ in 0..count {
