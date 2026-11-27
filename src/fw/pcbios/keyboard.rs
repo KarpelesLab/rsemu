@@ -19,18 +19,26 @@
 //!
 //! # What it does not decode
 //!
-//! Extended (`E0`-prefixed) codes are consumed and dropped: the arrow keys, the
-//! right-hand modifiers and the grey navigation block produce nothing. Decoding
-//! them needs a second table and a prefix state, and every key this firmware's
-//! own callers press is in the base set. Caps lock and num lock are not
-//! tracked either — releasing either shift key clears both shift bits, which is
-//! visible only if a program holds one shift down while releasing the other.
+//! The grey navigation block — the arrow keys, Insert, Delete, Home, End and
+//! the two page keys — produces nothing. Those keys arrive as an `E0` prefix
+//! and then the code of the keypad key they duplicate, so `INT 09h` remembers
+//! the prefix for one byte and drops a code in the keypad's range that follows
+//! it; reporting them needs the BIOS scan codes of their shifted forms, which
+//! is a table this firmware does not have. The *fake shifts* a keyboard
+//! brackets a navigation key with (`E0 2A`, `E0 36` and their breaks) are
+//! dropped the same way, because they are not the shift keys. Every other
+//! extended key is the key it shares a code with: the right-hand Ctrl and Alt
+//! are Ctrl and Alt, and the keypad's Enter and `/` type what they say.
+//!
+//! Caps lock and num lock are not tracked either — releasing either shift key
+//! clears both shift bits, which is visible only if a program holds one shift
+//! down while releasing the other.
 
 use super::{
-    BDA_KBBUF_END, BDA_KBBUF_START, BDA_KBFLAG, BDA_KBHEAD, BDA_KBTAIL, F_AX, F_FLAGS, FLAG_ZF,
-    Labels, ds_bda, enter, leave,
+    BDA_KBBUF_END, BDA_KBBUF_START, BDA_KBFLAG, BDA_KBHEAD, BDA_KBTAIL, EBDA_KB_PREFIX,
+    EBDA_SEGMENT, F_AX, F_FLAGS, FLAG_ZF, Labels, ds_bda, enter, leave, load_seg,
 };
-use crate::fw::asm16::{AH, AL, AX, Alu, Asm, BH, BL, BX, CS, Cc, DI, DL, DS, DX, Mem, SI};
+use crate::fw::asm16::{AH, AL, AX, Alu, Asm, BH, BL, BX, CS, Cc, DI, DL, DS, DX, ES, Mem, SI};
 
 /// How many make codes the tables cover: 0x00 through 0x58, which is every key
 /// on the base AT keyboard.
@@ -85,12 +93,15 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // the ring, and there is nothing here slow enough to need it.
     a.bind(l.int09);
     a.pushs(DS);
+    a.pushs(ES);
     a.push(AX);
     a.push(BX);
     a.push(DX);
     a.push(SI);
     a.cld();
     ds_bda(a);
+    // `ES` on the EBDA, for the one byte of state this handler keeps there.
+    load_seg(a, ES, EBDA_SEGMENT, BX);
 
     let eoi = a.label();
     let modifier = a.label();
@@ -100,12 +111,31 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     let alt_key = a.label();
     let translate = a.label();
 
+    let prefix = a.label();
+    let base = a.label();
     a.in_al(0x60);
-    // The extended prefix, and the key that follows it, are both dropped.
     a.alui8(Alu::CMP, AL, 0xe0);
-    a.jcc(Cc::E, eoi);
+    a.jcc(Cc::E, prefix);
     a.mov8(AH, AL);
     a.alui8(Alu::AND, AH, 0x7f);
+    // The byte after an `E0` is an extended key, and two kinds of those are
+    // not the base key their code names: a fake shift (2Ah, 36h) is not a
+    // shift key, and the navigation block (47h-53h) is not the keypad. The
+    // prefix byte alone used to be dropped and the code after it decoded as
+    // the base key, so the up arrow typed `8` and a fake shift's break
+    // released a shift key that was still held.
+    a.alui8(Alu::CMP, Mem::abs(EBDA_KB_PREFIX).seg(ES), 0);
+    a.jcc(Cc::E, base);
+    a.movmi8(Mem::abs(EBDA_KB_PREFIX).seg(ES), 0);
+    a.alui8(Alu::CMP, AH, 0x2a);
+    a.jcc(Cc::E, eoi);
+    a.alui8(Alu::CMP, AH, 0x36);
+    a.jcc(Cc::E, eoi);
+    a.alui8(Alu::CMP, AH, 0x47);
+    a.jcc(Cc::B, base);
+    a.alui8(Alu::CMP, AH, 0x53);
+    a.jcc(Cc::BE, eoi);
+    a.bind(base);
     a.alui8(Alu::CMP, AH, 0x2a);
     a.jcc(Cc::E, shift_key);
     a.alui8(Alu::CMP, AH, 0x36);
@@ -136,6 +166,11 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.bind(mod_up);
     a.not8(BL);
     a.aluto8(Alu::AND, Mem::abs(BDA_KBFLAG), BL);
+    a.jmp(eoi);
+
+    // The prefix itself: remembered for exactly one byte.
+    a.bind(prefix);
+    a.movmi8(Mem::abs(EBDA_KB_PREFIX).seg(ES), 1);
     a.jmp(eoi);
 
     // The make code is in AH. BH keeps it while AX is used to index the table,
@@ -177,6 +212,7 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.pop(DX);
     a.pop(BX);
     a.pop(AX);
+    a.pops(ES);
     a.pops(DS);
     a.iret();
 

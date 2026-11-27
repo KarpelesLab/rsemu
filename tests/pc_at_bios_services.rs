@@ -478,3 +478,74 @@ fn ah_13h_leaves_the_cursor_alone_unless_bit_0_of_al_is_set() {
         "mode 1 must leave the cursor after the string"
     );
 }
+
+/// Feed set-2 scan codes to the keyboard and let the guest's `INT 09h` run.
+fn type_codes(m: &mut Machine, hosts: &Arc<HostObjects>, codes: &[u8]) {
+    let port = rsemu::host::chardev::ports::get(hosts, "keyboard")
+        .expect("the keyboard port")
+        .expect("the board opened one");
+    port.feed(codes);
+    m.run_for(GlobalTime::from_nanos(40_000_000))
+        .expect("the machine runs");
+}
+
+/// Every entry in the BIOS Data Area's type-ahead ring, oldest first: the scan
+/// code in the high byte and the character in the low one.
+fn typed(m: &Machine) -> Vec<u16> {
+    const HEAD: u16 = 0x41a;
+    const TAIL: u16 = 0x41c;
+    const FIRST: u16 = 0x1e;
+    const LAST: u16 = 0x3e;
+    let tail = peek16(m, TAIL);
+    let mut at = peek16(m, HEAD);
+    let mut out = Vec::new();
+    while at != tail && out.len() < 16 {
+        out.push(peek16(m, 0x400 + at));
+        at = if at + 2 >= LAST { FIRST } else { at + 2 };
+    }
+    out
+}
+
+/// An `E0`-prefixed key is not the base key with the same code.
+///
+/// The module says what it does with them — "Extended (`E0`-prefixed) codes
+/// are consumed and dropped: the arrow keys, the right-hand modifiers and the
+/// grey navigation block produce nothing" — and `INT 09h` dropped only the
+/// prefix byte. The code after it was decoded as a base key, so the up arrow
+/// (`E0 48`) typed the keypad's `8`, and the *fake shift* a keyboard brackets
+/// a navigation key with (`E0 2A`, `E0 AA`) set and cleared the real shift
+/// state underneath a held shift key.
+#[test]
+fn an_extended_key_does_not_type_the_keypad_digit_it_shares_a_code_with() {
+    let (mut m, hosts) = run("extended keys", |_| {});
+
+    // Set 2, which the 8042 translates: up arrow down and up, then `a`.
+    type_codes(&mut m, &hosts, &[0xe0, 0x75, 0xe0, 0xf0, 0x75]);
+    type_codes(&mut m, &hosts, &[0x1c, 0xf0, 0x1c]);
+    assert_eq!(
+        typed(&m),
+        [0x1e61],
+        "the up arrow typed something, or `a` did not arrive"
+    );
+
+    // Left shift held, then the fake-shift break and make a keyboard sends
+    // round a navigation key, then `b`: still shifted.
+    type_codes(&mut m, &hosts, &[0x12]);
+    type_codes(&mut m, &hosts, &[0xe0, 0xf0, 0x12, 0xe0, 0x74]);
+    type_codes(&mut m, &hosts, &[0xe0, 0xf0, 0x74, 0xe0, 0x12]);
+    type_codes(&mut m, &hosts, &[0x32, 0xf0, 0x32, 0xf0, 0x12]);
+    assert_eq!(
+        typed(&m),
+        [0x1e61, 0x3042],
+        "a fake shift changed the real shift state"
+    );
+
+    // And once the real shift is released, a fake make does not press it.
+    type_codes(&mut m, &hosts, &[0xe0, 0x12]);
+    type_codes(&mut m, &hosts, &[0x21, 0xf0, 0x21, 0xe0, 0xf0, 0x12]);
+    assert_eq!(typed(&m), [0x1e61, 0x3042, 0x2e63]);
+
+    // The keypad's own Enter is `E0 1C` and still types a carriage return.
+    type_codes(&mut m, &hosts, &[0xe0, 0x5a, 0xe0, 0xf0, 0x5a]);
+    assert_eq!(typed(&m), [0x1e61, 0x3042, 0x2e63, 0x1c0d]);
+}

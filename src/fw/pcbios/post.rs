@@ -10,8 +10,8 @@ use super::{
     BDA_EBDA, BDA_EQUIPMENT, BDA_HD_COUNT, BDA_KBBUF, BDA_KBBUF_END, BDA_KBBUF_START, BDA_KBHEAD,
     BDA_KBTAIL, BDA_MEMSIZE, BDA_MODE_SELECT, BDA_PAGE_OFFSET, BDA_PAGE_SIZE, BDA_ROWS,
     BDA_VIDEO_MODE, E820_ENTRY, EBDA_E820, EBDA_E820_COUNT, EBDA_HD_CAPACITY, EBDA_HD_CYLINDERS,
-    EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS, EBDA_SEGMENT, EBDA_SIZE, IDENTIFY_BUFFER,
-    KBBUF_BYTES, Labels, POST_STACK, SEGMENT, ds_bda,
+    EBDA_HD_FLAGS, EBDA_HD_HEADS, EBDA_HD_SECTORS, EBDA_KB_PREFIX, EBDA_SEGMENT, EBDA_SIZE,
+    IDENTIFY_BUFFER, KBBUF_BYTES, Labels, POST_STACK, SEGMENT, ds_bda,
 };
 use crate::fw::asm16::{
     AH, AL, AX, Alu, Asm, BH, BL, BX, CH, CL, CX, Cc, DI, DS, DX, ES, Label, Mem, SI, SP, SS, Shift,
@@ -204,6 +204,8 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.movi(AX, EBDA_SEGMENT);
     a.movsr(ES, AX);
     a.movmi8(Mem::abs(EBDA_SIZE).seg(ES), 1);
+    // No scan code has arrived yet, so the last one was not a prefix.
+    a.movmi8(Mem::abs(EBDA_KB_PREFIX).seg(ES), 0);
 
     a.movi(AX, SEGMENT);
     a.movsr(DS, AX);

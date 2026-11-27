@@ -120,8 +120,9 @@
 //! * **No serial, parallel, or PS/2 mouse services** (`INT 14h`, `INT 17h`,
 //!   `INT 15h AH=C2h`): the board has none of those devices.
 //! * **The keyboard is US-layout and set 1**, decoded from the translated codes
-//!   the 8042 produces. Extended (`E0`-prefixed) keys are dropped rather than
-//!   half-decoded.
+//!   the 8042 produces. The `E0`-prefixed navigation block is dropped rather
+//!   than half-decoded (`pcbios/keyboard.rs` says which extended keys are
+//!   not).
 
 use alloc::vec::Vec;
 
@@ -382,6 +383,11 @@ const EBDA_CD_CAPACITY: u16 = EBDA_CD_DONE + 1;
 const EBDA_CD_SENSE: u16 = EBDA_CD_CAPACITY + 8;
 /// How many more times the spin-up loop will ask whether the drive is ready.
 const EBDA_CD_TRIES: u16 = EBDA_CD_SENSE + 18;
+
+/// Non-zero when the last byte `INT 09h` took from the keyboard was the `E0`
+/// prefix, so the byte after it is an extended key rather than the base key
+/// with the same code. POST clears it.
+const EBDA_KB_PREFIX: u16 = EBDA_CD_TRIES + 1;
 
 /// Where the El Torito bootstrap stages a 2048-byte logical block.
 ///
