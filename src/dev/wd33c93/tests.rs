@@ -80,6 +80,10 @@ impl DmaPort for Dma {
         dst.len()
     }
 
+    fn unfetch(&self, count: usize) {
+        self.at.fetch_sub(count as u32, Ordering::Relaxed);
+    }
+
     fn store(&self, src: &[u8]) -> usize {
         let at = u64::from(self.at.load(Ordering::Relaxed));
         if self.space.write_bytes(at, src, MemAttrs::DEFAULT).is_err() {
@@ -921,4 +925,49 @@ fn a_snapshot_with_an_impossible_phase_is_refused() {
     {
         assert!(Device::load(other.chip.as_ref(), &mut chunk.reader()).is_err());
     }
+}
+
+#[test]
+fn a_data_out_phase_shorter_than_the_count_takes_only_its_own_bytes_from_the_port() {
+    // A `WRITE(10)` of one block, with a Transfer Count of three. The target
+    // takes 512 bytes and changes phase; on the bus the other 1024 were never
+    // sent, so the DMA controller is still pointing at them. The chip used to
+    // fetch its whole burst, hand the target what it would take and drop the
+    // rest — bytes gone from the stream, and an address 1024 past where the
+    // transfer stopped.
+    let r = rig();
+    let _ = r.interrupt();
+    let dma = Arc::new(Dma {
+        space: Arc::clone(&r.space),
+        at: AtomicU32::new(DMA_AT),
+    });
+    r.chip
+        .port()
+        .attach_dma(Arc::clone(&dma) as Arc<dyn DmaPort>);
+    let payload: Vec<u8> = (0..3 * BLOCK).map(|i| (i / BLOCK) as u8 + 0xa0).collect();
+    r.space
+        .write_bytes(u64::from(DMA_AT), &payload, MemAttrs::DEFAULT)
+        .expect("mapped");
+
+    r.set(CONTROL, 0x80);
+    r.set(TARGET_LUN, 0);
+    r.set(DEST_ID, TARGET);
+    r.set(SOURCE_ID, SOURCE_ER);
+    r.set_count(3 * BLOCK as u32);
+    r.sasr(CDB1);
+    for byte in [0x2au8, 0, 0, 0, 0, 7, 0, 0, 1, 0] {
+        r.put(byte);
+    }
+    r.command(CMD_SELECT_ATN_TRANSFER);
+    assert!(r.interrupt().is_some(), "the command ends in an interrupt");
+
+    // §6.2.16: the Transfer Count is what was *not* transferred.
+    let left = (u32::from(r.reg(COUNT_MSB)) << 16) | (u32::from(r.get()) << 8) | u32::from(r.get());
+    assert_eq!(left, 2 * BLOCK as u32, "two blocks were never sent");
+    // And the DMA port agrees with the chip about where the transfer stopped.
+    assert_eq!(
+        dma.at.load(Ordering::Relaxed),
+        DMA_AT + BLOCK as u32,
+        "the port gave up bytes the target never took"
+    );
 }

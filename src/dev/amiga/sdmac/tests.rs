@@ -599,3 +599,50 @@ fn a_dropped_dmac_and_its_controller_are_freed() {
         "the controller's state outlived the controller, and kept its bus"
     );
 }
+
+#[test]
+fn a_short_data_out_phase_leaves_the_address_where_the_transfer_stopped() {
+    // A `WRITE(10)` of one block with a Transfer Count of three, memory to
+    // SCSI. The target takes one block and changes phase, and the address
+    // counter is what a driver reads to learn how far a transfer got: it has
+    // to say one block, not however much the controller fetched ahead.
+    let r = rig();
+    Device::reset(&r.sdmac, ResetKind::Cold);
+    let _ = r.interrupt();
+    let payload: Vec<u8> = (0..3 * BLOCK).map(|i| (i / BLOCK) as u8 + 0xa0).collect();
+    r.space
+        .write_bytes(RAM_AT, &payload, MemAttrs::DEFAULT)
+        .expect("mapped");
+
+    r.wl(SP_DMA, 0);
+    r.wl(ACR, RAM_AT as u32);
+    // DMA from memory to the SCSI bus: `DMADIR` high (§2.4.1).
+    r.wl(CONTR, INTENA | DMADIR);
+    r.wl(ST_DMA, 0);
+    r.sasr(wd33c93::CONTROL);
+    r.scmd(0x80);
+    r.sasr(wd33c93::TARGET_LUN);
+    r.scmd(0);
+    r.sasr(wd33c93::DEST_ID);
+    r.scmd(0);
+    r.sasr(wd33c93::SOURCE_ID);
+    r.scmd(wd33c93::SOURCE_ER);
+    let bytes = 3 * BLOCK as u32;
+    r.sasr(wd33c93::COUNT_MSB);
+    r.scmd(bytes.to_be_bytes()[1]);
+    r.scmd(bytes.to_be_bytes()[2]);
+    r.scmd(bytes.to_be_bytes()[3]);
+    r.sasr(wd33c93::CDB1);
+    for byte in [0x2au8, 0, 0, 0, 0, 9, 0, 0, 1, 0] {
+        r.scmd(byte);
+    }
+    r.sasr(wd33c93::COMMAND);
+    r.scmd(wd33c93::CMD_SELECT_ATN_TRANSFER);
+    assert!(r.interrupt().is_some(), "the command ends in an interrupt");
+
+    assert_eq!(
+        u64::from(r.rl(ACR)),
+        RAM_AT + BLOCK as u64,
+        "the address counter is past bytes that were never sent"
+    );
+}

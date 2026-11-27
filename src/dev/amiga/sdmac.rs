@@ -535,6 +535,18 @@ impl DmaPort for Port {
         dst.len()
     }
 
+    fn unfetch(&self, count: usize) {
+        // The address counter is the whole of this port's position, so
+        // handing bytes back is counting it down again. Wrapping, as
+        // `advance` is: it is the guest's 32-bit register. A DMAC that is
+        // gone gave out no bytes, so there is nothing to hand back to it.
+        let Some(chip) = self.0.upgrade() else {
+            return;
+        };
+        let mut regs = chip.regs.lock();
+        regs.acr = regs.acr.wrapping_sub(count as u32);
+    }
+
     fn store(&self, src: &[u8]) -> usize {
         let Some((chip, space, at, attrs)) = self.ready(false) else {
             return 0;

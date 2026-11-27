@@ -287,6 +287,22 @@ pub trait DmaPort: Send + Sync + fmt::Debug {
     /// what the chip does when `DRQ` is never answered.
     fn fetch(&self, dst: &mut [u8]) -> usize;
 
+    /// Take back the last `count` bytes [`fetch`](DmaPort::fetch) handed
+    /// over: the target did not want them.
+    ///
+    /// On the bus a byte leaves memory only when the target has asked for it —
+    /// the chip raises `DRQ` for a byte it is about to send, not for one it
+    /// might — so a `DATA OUT` phase that ends before the Transfer Count does
+    /// leaves the DMA controller's address exactly at the last byte sent. This
+    /// model fetches a burst ahead of the target, and this is how the part of
+    /// a burst the target did not take is un-fetched: the port puts its
+    /// address back, so the bytes are still in memory, still to be sent, for
+    /// whoever asks next.
+    ///
+    /// Required rather than defaulted. A default that did nothing is the
+    /// defect this exists to remove, and it would compile.
+    fn unfetch(&self, count: usize);
+
     /// Put `src` into memory, from a `DATA IN` phase. How many bytes landed.
     fn store(&self, src: &[u8]) -> usize;
 }
@@ -1115,7 +1131,15 @@ impl Chip {
                 if got == 0 {
                     break;
                 }
-                target.write(&buf[..got])
+                let took = target.write(&buf[..got]);
+                // The target ended the phase part way through the burst.
+                // What it did not take was never sent, so it goes back: left
+                // fetched, those bytes were gone from the DMA controller's
+                // stream and its address was past where the transfer stopped.
+                if took < got {
+                    port.unfetch(got - took);
+                }
+                took
             };
             if n == 0 {
                 break;
