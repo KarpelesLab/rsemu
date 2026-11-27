@@ -828,6 +828,21 @@ impl Device for VirtioMmio {
         }
         for q in &mut state.queues {
             q.layout.size = r.read_u32()?;
+            // Checked, not trusted: a snapshot is a file somebody handed us.
+            // The register write that sets this field clamps it to
+            // `QueueNumMax` and refuses anything but a power of two, and the
+            // bound on every chain walk *is* this number — so a chunk that
+            // says four billion would turn one notify into four billion
+            // descriptor reads.
+            if q.layout.size > QUEUE_SIZE_MAX
+                || (q.layout.size != 0 && !q.layout.size.is_power_of_two())
+            {
+                return Err(Error::State(format!(
+                    "snapshot has a virtqueue of {} entries, which is not a power of two of at \
+                     most {QUEUE_SIZE_MAX}",
+                    q.layout.size
+                )));
+            }
             q.layout.desc = r.read_u64()?;
             q.layout.avail = r.read_u64()?;
             q.layout.used = r.read_u64()?;
@@ -1321,5 +1336,50 @@ mod tests {
         restored.offer(1);
         restored.write(0x050, 0);
         assert_eq!(*restored.echo.calls.lock(), 0);
+    }
+
+    #[test]
+    fn a_snapshot_with_a_queue_size_no_driver_could_have_set_is_refused() {
+        use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+
+        // `QueueNum` is clamped to `QueueNumMax` and must be a power of two
+        // when a driver writes it; a snapshot has to meet the same bar,
+        // because the queue size is what bounds every walk of the rings.
+        for size in [0x8000_0000u32, QUEUE_SIZE_MAX * 2, 3] {
+            let mut shape = MachineShape::new();
+            shape.add_device("vio", ECHO_CLASS.name).unwrap();
+            let mut w = StateWriter::new(shape);
+            {
+                let mut chunk = w.chunk("vio", ECHO_CLASS.name, ECHO_CLASS.version).unwrap();
+                // The eight transport words, then one queue.
+                for _ in 0..8 {
+                    chunk.write_u32(0).unwrap();
+                }
+                chunk.write_seq_len(1).unwrap();
+                chunk.write_u32(size).unwrap();
+                chunk.write_u64(DESC).unwrap();
+                chunk.write_u64(AVAIL).unwrap();
+                chunk.write_u64(USED).unwrap();
+                chunk.write_bool(true).unwrap();
+                chunk.write_u16(0).unwrap();
+                chunk.write_u16(0).unwrap();
+            }
+            let bytes = w.to_vec().unwrap();
+
+            let f = Fixture::new();
+            let reader = StateReader::new(&bytes).unwrap();
+            let chunk = reader
+                .load(
+                    "vio",
+                    ECHO_CLASS.name,
+                    ECHO_CLASS.version,
+                    &Migrations::new(),
+                )
+                .unwrap();
+            assert!(
+                f.device.load(&mut chunk.reader()).is_err(),
+                "a queue of {size} entries was believed"
+            );
+        }
     }
 }
