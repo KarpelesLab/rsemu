@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/KarpelesLab/rsemu/compare/v0.0.11...v0.0.12) - 2026-11-27
+
+### Added
+
+- *(dev-stm32)* st.usbfs frame timer, suspend/resume, LPM, and a USB reset that resets what RM0434 says
+- *(bus-usb)* resume, remote wakeup and LPM on the fabric
+- *(machine)* wire the WB boards' USB_HP vector
+- *(bus-usb)* carry a data PID for devices that sequence toggles
+- *(dev-stm32)* st.usbfs battery charging detection, the F0x2 CAN share, and the register map's masks
+- *(machine)* the snes-ntsc and snes-pal boards
+- *(host)* a sixteen-bit pad mask, so a SNES pad gets all twelve buttons
+- *(dev-snes)* the 5A22's peripherals, and the SNES pad seam
+- *(cpu-65816)* a gdb register map for cpu.w65c816
+- *(cpu-65816)* the WDC W65C816S core, cpu.w65c816
+- *(machine)* a `fill` byte for the generic rom
+- *(dev-snes-apu)* the S-SMP, with a clean-room boot ROM
+- *(cpu-spc700)* the Sony SPC700 core, bus-trace exact against SingleStepTests
+- *(dev-snes-ppu)* show the S-PPU through the scanout seam
+- *(dev-snes-ppu)* the S-PPU, its registers, beam timing and renderer
+- *(dev-snes-dsp)* the S-DSP, on fullsnes's 32-slot sample timeline
+- *(dev-snes)* WRAM, with the WMDATA/WMADD port on the B-bus
+- *(dev-snes)* the SNES cartridge, LoROM/HiROM/ExHiROM with battery SRAM
+
+### Fixed
+
+- *(dev-stm32)* st.usbfs transactions follow RM0434 §40 / RM0091 §30
+- *(dev-stm32)* keep the WB_CPU2_TRACE seam out of the no_std build
+- *(machine)* place the WB boards' USB device, and name every class they use
+- *(dev-stm32)* st.usbfs takes a word write, as its constraints say
+- *(machine)* place the WB boards' OTP area, I2C1/I2C3 and SPI
+- *(dev-stm32)* st.usart raises IDLE, and hears itself in half-duplex
+
+### Other
+
+- *(bus-usb)* count the data PID and resume/LPM among the seam's additions
+- *(dev-stm32)* name bcd_status in plain code, not as a private link
+- the STM32WB USB rows name the PMA access widths and BCDR's port type
+- env-gated WB_CPU2_TRACE for the mailbox handshake
+- *(cpu-65816)* document the 65C816 core and its sources
+- *(cpu-65816)* run SingleStepTests/65816 in the conformance harness
+- the S-PPU's connection surface, timing and coverage
+
 ## [0.0.11](https://github.com/KarpelesLab/rsemu/compare/v0.0.10...v0.0.11) - 2026-11-26
 
 ### Added
