@@ -1519,27 +1519,31 @@ impl Cpu {
             return;
         }
         let levels = self.lines.timer_level();
+        // Only the pins this call will drive are taken out from under the
+        // lock. This runs after every instruction on a board that routes a
+        // timer, and it used to clone all four handles and drop them again —
+        // the two power pins for a request that arrives once in a boot.
         let pins = self.pins.lock();
-        let (cntp, cntv, poweroff, reboot) = (
-            pins.cntp.clone(),
-            pins.cntv.clone(),
-            pins.poweroff.clone(),
-            pins.reboot.clone(),
-        );
+        let cntp = (routed & Lines::TIMER_PHYS != 0)
+            .then(|| pins.cntp.clone())
+            .flatten();
+        let cntv = (routed & Lines::TIMER_VIRT != 0)
+            .then(|| pins.cntv.clone())
+            .flatten();
+        let pulse = match power {
+            Some(PowerRequest::Poweroff) => pins.poweroff.clone(),
+            Some(PowerRequest::Reboot) => pins.reboot.clone(),
+            None => None,
+        };
         drop(pins);
-        if let Some(out) = cntp.filter(|_| routed & Lines::TIMER_PHYS != 0) {
+        if let Some(out) = cntp {
             out.set(Level::from_bool(levels & Lines::TIMER_PHYS != 0));
         }
-        if let Some(out) = cntv.filter(|_| routed & Lines::TIMER_VIRT != 0) {
+        if let Some(out) = cntv {
             out.set(Level::from_bool(levels & Lines::TIMER_VIRT != 0));
         }
         // A pulse rather than a level: a request is an event, and the board's
         // end latches it.
-        let pulse = match power {
-            Some(PowerRequest::Poweroff) => poweroff,
-            Some(PowerRequest::Reboot) => reboot,
-            None => None,
-        };
         if let Some(out) = pulse {
             out.set(Level::High);
             out.set(Level::Low);
