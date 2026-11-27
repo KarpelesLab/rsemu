@@ -180,6 +180,16 @@ pub enum Index {
 }
 
 impl Index {
+    /// The index register a prefix byte selects, if `byte` is `$dd` or `$fd`.
+    #[must_use]
+    pub const fn from_prefix(byte: u8) -> Option<Index> {
+        match byte {
+            0xdd => Some(Index::Ix),
+            0xfd => Some(Index::Iy),
+            _ => None,
+        }
+    }
+
     /// The prefix byte that selects this index register.
     #[must_use]
     pub const fn prefix(self) -> u8 {

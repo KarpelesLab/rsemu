@@ -43,8 +43,30 @@
 //! instruction's last M-cycle, so the boundary between two steps is the same
 //! instant and [`Exec::step`] can test them at the top. `EI` defers acceptance
 //! by exactly one instruction — that is what makes `EI` / `RET` at the end of
-//! a handler work — and a `$dd`/`$fd`/`$cb`/`$ed` prefix defers it too, which
-//! comes for free because a prefixed instruction is one step here.
+//! a handler work — and a `$dd`/`$fd`/`$cb`/`$ed` prefix defers it too. For a
+//! prefix and the opcode it modifies that comes for free, because the pair is
+//! one step here.
+//!
+//! # Runs of index prefixes
+//!
+//! A run of `$dd`/`$fd` bytes is the exception, because its length is the
+//! guest's to choose: a 64 KiB space that reads `$dd` everywhere is one
+//! "instruction" that never ends. Sean Young, *The Undocumented Z80
+//! Documented* v0.91 §3.7: "FD or DD should be seen as prefix setting a flag
+//! which says 'use IX or IY in stead of HL', and not an instruction. In a
+//! large sequence of DD and FD bytes, it is the last one that counts." And
+//! §5 (interrupts): "If you test a large sequence of DDs or FDs, the same
+//! happens as with the EI instruction: no interrupts are accepted during the
+//! execution of these sequences."
+//!
+//! So that flag is state ([`State::prefix`]) rather than a local: a step that
+//! fetches an index prefix *after* another one ends there, with the flag set,
+//! and the next step resumes from it. Each prefix is still its own `M1` — four
+//! T-states and one `R` increment (§6.1: "Just a stray DD or FD increases the
+//! R by one") — and neither `INT` nor `NMI` is sampled while the flag is set,
+//! so the guest sees exactly what it saw when the run was one step. What
+//! changed is that the scheduler, the safe-point check and a debugger get the
+//! core back after at most two fetches.
 //!
 //! # Sources
 //!
@@ -107,6 +129,13 @@ pub(super) struct State {
     /// charged against the next budget instead. Architectural, because a
     /// restored machine that forgot its debt runs one instruction free.
     pub debt: u64,
+    /// An index prefix that has been fetched and whose opcode has not: the
+    /// "use IX or IY instead of HL" flag, carried from the step that ended in
+    /// the middle of a run of `$dd`/`$fd` bytes. See the module docs.
+    ///
+    /// While it is set no interrupt is accepted, so a snapshot that dropped it
+    /// would turn `DD DD 21 nn nn` into `LD HL,nn`.
+    pub prefix: Option<Index>,
 }
 
 impl State {
@@ -127,6 +156,7 @@ impl State {
             last_fault: 0,
             trace: CycleLog::new(),
             debt: 0,
+            prefix: None,
         }
     }
 }
@@ -203,7 +233,13 @@ impl<'a> Exec<'a> {
         }
         // Sampled here because "between two steps" is the same instant as
         // "the last T-state of the last M-cycle". A pending EI hides both
-        // lines for exactly one instruction.
+        // lines for exactly one instruction, and so does an index prefix
+        // whose opcode is still to come: the previous step ended inside an
+        // instruction, not after one.
+        if self.state.prefix.is_some() {
+            self.instruction();
+            return self.used;
+        }
         if !self.state.ei_pending {
             if self.lines.take_nmi_pending() {
                 self.nmi_sequence();
@@ -585,6 +621,7 @@ impl<'a> Exec<'a> {
         self.state.ei_pending = false;
         self.state.after_ld_ir = false;
         self.state.q = 0;
+        self.state.prefix = None;
         self.state.regs.pc = 0;
         self.state.regs.i = 0;
         self.state.regs.r = 0;
@@ -682,18 +719,22 @@ impl<'a> Exec<'a> {
     // Instruction dispatch
     // -----------------------------------------------------------------
 
+    /// One instruction — or, inside a run of index prefixes, the next part of
+    /// one.
+    ///
+    /// Bounded at two opcode fetches before something executes or the step
+    /// ends: a prefix and its opcode are one step, and a prefix that follows a
+    /// prefix ends the step with [`State::prefix`] set (see the module docs
+    /// for why the run cannot be one step, and for the sources).
     fn instruction(&mut self) {
         self.state.ei_pending = false;
         self.state.after_ld_ir = false;
-        let mut index: Option<Index> = None;
+        let mut index = self.state.prefix.take();
         loop {
             let opcode = self.fetch_opcode();
-            match opcode {
-                // A second index prefix replaces the first, and each one costs
-                // its own M1 cycle and its own R increment. `DD DD 00` is
-                // three fetches and a NOP.
-                0xdd => index = Some(Index::Ix),
-                0xfd => index = Some(Index::Iy),
+            let again = match opcode {
+                0xdd => Index::Ix,
+                0xfd => Index::Iy,
                 0xcb => {
                     match index {
                         Some(i) => self.exec_ddcb(i),
@@ -711,7 +752,16 @@ impl<'a> Exec<'a> {
                     self.exec_base(opcode, index);
                     return;
                 }
+            };
+            // A second index prefix replaces the first, and each one costs
+            // its own M1 cycle and its own R increment: `DD DD 00` is three
+            // fetches and a NOP. It also ends the step, because how many more
+            // follow is up to the guest.
+            if index.is_some() {
+                self.state.prefix = Some(again);
+                return;
             }
+            index = Some(again);
         }
     }
 

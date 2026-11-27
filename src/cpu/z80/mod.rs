@@ -937,7 +937,13 @@ impl Z80 {
 
     /// Overwrite the register file — a debugger, a test vector, a snapshot.
     pub fn set_regs(&self, regs: Regs) {
-        self.session.lock().state.regs = regs;
+        let mut session = self.session.lock();
+        if session.state.regs.pc != regs.pc {
+            // A prefix waits for the opcode at the old PC; it has nothing to
+            // say about the code a debugger just pointed the core at.
+            session.state.prefix = None;
+        }
+        session.state.regs = regs;
     }
 
     /// Read one register by name.
@@ -948,7 +954,24 @@ impl Z80 {
 
     /// Write one register by name.
     pub fn set_reg(&self, reg: Reg, value: u16) {
-        reg.set(&mut self.session.lock().state.regs, value);
+        let mut session = self.session.lock();
+        let pc = session.state.regs.pc;
+        reg.set(&mut session.state.regs, value);
+        if session.state.regs.pc != pc {
+            // As in `set_regs`: a pending prefix belongs to the old PC.
+            session.state.prefix = None;
+        }
+    }
+
+    /// The index prefix the core has fetched and not yet applied, if the last
+    /// step ended inside a run of `$dd`/`$fd` bytes.
+    ///
+    /// `PC` then points at the byte the prefix will modify, which a stateless
+    /// disassembly of that address cannot know — [`disassemble`](Z80::disassemble)
+    /// consults this for exactly that reason.
+    #[must_use]
+    pub fn pending_prefix(&self) -> Option<isa::Index> {
+        self.session.lock().state.prefix
     }
 
     /// T-states executed since power-on.
@@ -1096,6 +1119,12 @@ impl Z80 {
     /// Execute one reset sequence, interrupt sequence, halt cycle or
     /// instruction.
     ///
+    /// One step is a bounded amount of work whatever the guest's memory holds.
+    /// The one construct whose length the guest chooses, a run of `$dd`/`$fd`
+    /// prefixes, is split: a step ends at a prefix that follows a prefix, with
+    /// [`pending_prefix`](Z80::pending_prefix) set and interrupts held off
+    /// until the instruction the run leads to has executed.
+    ///
     /// Returns the T-states charged: zero only if no address space is
     /// attached, which the caller must treat as "stop", not "retry". A halted
     /// core still returns four, because it is still refreshing.
@@ -1192,7 +1221,14 @@ impl Z80 {
         let Some(space) = self.space() else {
             return Vec::new();
         };
-        disasm::disassemble_run(pc, count, |addr| {
+        // The one case a listing needs the core for: stopped inside a run of
+        // index prefixes, the instruction at PC is indexed by a byte that is
+        // behind PC.
+        let carried = {
+            let session = self.session.lock();
+            session.state.prefix.filter(|_| session.state.regs.pc == pc)
+        };
+        disasm::disassemble_run_from(pc, carried, count, |addr| {
             space
                 .read(u64::from(addr), Width::U8, MemAttrs::DEBUG)
                 .ok()
@@ -1206,7 +1242,8 @@ pub static CLASS: DeviceClass = DeviceClass {
     name: "cpu.z80",
     // 2: the chunk gained the scheduler debt, without which a restored core
     // runs one instruction free.
-    version: 2,
+    // 3: it gained the pending index prefix; see [`migrations`].
+    version: 3,
     summary: "Zilog Z80 8-bit CPU core, cycle-accurate interpreter",
     properties: &[
         PropertySpec {
@@ -1254,6 +1291,23 @@ pub static CLASS: DeviceClass = DeviceClass {
 /// If something already claimed the name.
 pub fn register(reg: &mut Registry) -> Result<()> {
     reg.add(&CLASS)
+}
+
+/// Carry a v2 `cpu.z80` chunk forward.
+///
+/// v3 appends one byte: the index prefix a step ended on, if it ended inside a
+/// run of `$dd`/`$fd` bytes. A v2 core ran such a run as one step, so a v2
+/// snapshot was never taken inside one and "none" is exactly what it meant.
+///
+/// # Errors
+///
+/// If the step is already registered.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS.name, 2, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        out.write_u8(0)
+    })
 }
 
 impl Device for Z80 {
@@ -1393,6 +1447,13 @@ impl Device for Z80 {
         w.write_bool(nmi_level)?;
         w.write_bool(nmi_latch)?;
         w.write_u8(vector)?;
+        // Last, so that every earlier offset — the ones the gdb register map
+        // was read off — is where v2 had it.
+        w.write_u8(match state.prefix {
+            None => 0,
+            Some(isa::Index::Ix) => 1,
+            Some(isa::Index::Iy) => 2,
+        })?;
         Ok(())
     }
 
@@ -1438,6 +1499,16 @@ impl Device for Z80 {
         let nmi_level = r.read_bool()?;
         let nmi_latch = r.read_bool()?;
         let vector = r.read_u8()?;
+        state.prefix = match r.read_u8()? {
+            0 => None,
+            1 => Some(isa::Index::Ix),
+            2 => Some(isa::Index::Iy),
+            other => {
+                return Err(Error::State(alloc::format!(
+                    "snapshot names pending index prefix {other}, which does not exist"
+                )));
+            }
+        };
         self.session.lock().state = state;
         self.lines.restore((int, nmi_level, nmi_latch, vector));
         Ok(())

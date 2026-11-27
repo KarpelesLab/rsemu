@@ -43,10 +43,10 @@ pub enum Page {
 
 /// How many bytes [`disassemble`] will look at.
 ///
-/// Four is the longest real Z80 instruction (`DD CB d op`). The extra room is
-/// for a run of redundant index prefixes, which is legal and which the CPU
-/// treats as part of the same instruction.
-pub const WINDOW: usize = 6;
+/// Four is the longest Z80 instruction (`DD CB d op`). A run of redundant
+/// index prefixes needs no extra room: every prefix but the last decodes as a
+/// one-byte unit of its own, which is also how the core steps through it.
+pub const WINDOW: usize = 4;
 
 /// One decoded instruction at a known address.
 ///
@@ -190,8 +190,26 @@ impl fmt::Display for Disassembled {
 /// holes decode as an undocumented `NOP` because that is what they do. A
 /// buffer too short for the operand yields a decode with zeroed operand bytes
 /// and [`Disassembled::truncated`] set.
+///
+/// An index prefix followed by another index prefix decodes as a one-byte
+/// [`Op::PREFIX`](super::isa::Op::PREFIX) on its own, and only the last of a
+/// run joins the instruction it modifies — Sean Young, *The Undocumented Z80
+/// Documented* v0.91 §3.7: "In a large sequence of DD and FD bytes, it is the
+/// last one that counts", with the listing `FD DD 00 21 00 10` → `NOP NOP NOP
+/// LD HL,1000h`. The executor ends a step at the same places.
 #[must_use]
 pub fn disassemble(pc: u16, bytes: &[u8]) -> Disassembled {
+    disassemble_from(pc, bytes, None)
+}
+
+/// [`disassemble`], for a core stopped inside a run of index prefixes.
+///
+/// `carried` is the prefix the core has already fetched
+/// ([`Z80::pending_prefix`](super::Z80::pending_prefix)): the byte at `pc` is
+/// then the opcode it applies to — or one more prefix, which replaces it and
+/// decodes exactly as it would with nothing carried.
+#[must_use]
+pub fn disassemble_from(pc: u16, bytes: &[u8], carried: Option<Index>) -> Disassembled {
     let mut at = 0usize;
     let mut truncated = false;
     let take = |at: &mut usize, truncated: &mut bool| -> u8 {
@@ -208,59 +226,52 @@ pub fn disassemble(pc: u16, bytes: &[u8]) -> Disassembled {
         }
     };
 
-    let mut index: Option<Index> = None;
+    let mut index = carried;
     let mut page = Page::Base;
-    let mut opcode;
-    let insn;
-    loop {
+    let mut opcode = take(&mut at, &mut truncated);
+    if let Some(i) = Index::from_prefix(opcode) {
+        // A prefix that is followed by another is a unit of its own: one
+        // `M1`, and the selection passes to the later byte.
+        let next_is_prefix = bytes
+            .get(at)
+            .is_some_and(|b| Index::from_prefix(*b).is_some());
+        if next_is_prefix {
+            return finish(pc, opcode, page, Some(i), decode(opcode), at, truncated);
+        }
+        index = Some(i);
         opcode = take(&mut at, &mut truncated);
-        match opcode {
-            0xdd if at < WINDOW => index = Some(Index::Ix),
-            0xfd if at < WINDOW => index = Some(Index::Iy),
-            0xcb => {
-                match index {
-                    Some(i) => {
-                        page = Page::IndexCb;
-                        let d = take(&mut at, &mut truncated);
-                        opcode = take(&mut at, &mut truncated);
-                        insn = decode_ddcb(opcode, i);
-                        let mut out = finish(pc, opcode, page, index, insn, at, truncated);
-                        out.displacement = d as i8;
-                        return out;
-                    }
-                    None => {
-                        page = Page::Cb;
-                        opcode = take(&mut at, &mut truncated);
-                        insn = decode_cb(opcode);
-                    }
-                }
-                break;
-            }
-            0xed => {
-                page = Page::Ed;
-                opcode = take(&mut at, &mut truncated);
-                insn = decode_ed(opcode);
-                break;
-            }
-            other => {
-                insn = match index {
-                    Some(i) => {
-                        page = Page::Index;
-                        index_substitute(decode(other), i)
-                    }
-                    None => decode(other),
-                };
-                break;
-            }
-        }
-        if at >= WINDOW {
-            // A run of index prefixes longer than the window: report what was
-            // read rather than looping, and say it was cut short.
-            insn = decode(opcode);
-            truncated = true;
-            break;
-        }
     }
+    let insn = match opcode {
+        0xcb => match index {
+            Some(i) => {
+                page = Page::IndexCb;
+                let d = take(&mut at, &mut truncated);
+                opcode = take(&mut at, &mut truncated);
+                let insn = decode_ddcb(opcode, i);
+                let mut out = finish(pc, opcode, page, index, insn, at, truncated);
+                out.displacement = d as i8;
+                return out;
+            }
+            None => {
+                page = Page::Cb;
+                opcode = take(&mut at, &mut truncated);
+                decode_cb(opcode)
+            }
+        },
+        // The ED page is not indexable: a prefix in front of it is discarded.
+        0xed => {
+            page = Page::Ed;
+            opcode = take(&mut at, &mut truncated);
+            decode_ed(opcode)
+        }
+        other => match index {
+            Some(i) => {
+                page = Page::Index;
+                index_substitute(decode(other), i)
+            }
+            None => decode(other),
+        },
+    };
 
     // The trailing operand bytes, in encoding order: an index displacement
     // comes before an immediate, which is why `LD (IX+d),n` reads `d` first.
@@ -318,10 +329,22 @@ fn finish(
 pub fn disassemble_run(
     pc: u16,
     count: usize,
+    fetch: impl FnMut(u16) -> Option<u8>,
+) -> alloc::vec::Vec<Disassembled> {
+    disassemble_run_from(pc, None, count, fetch)
+}
+
+/// [`disassemble_run`], with the index prefix the core has already fetched
+/// applied to the first instruction — see [`disassemble_from`].
+pub fn disassemble_run_from(
+    pc: u16,
+    carried: Option<Index>,
+    count: usize,
     mut fetch: impl FnMut(u16) -> Option<u8>,
 ) -> alloc::vec::Vec<Disassembled> {
     let mut out = alloc::vec::Vec::with_capacity(count);
     let mut at = pc;
+    let mut carried = carried;
     for _ in 0..count {
         let mut window = [0u8; WINDOW];
         let mut got = 0usize;
@@ -339,7 +362,8 @@ pub fn disassemble_run(
         if got == 0 {
             break;
         }
-        let d = disassemble(at, &window[..got]);
+        // Only the instruction at `pc` can have a prefix behind it.
+        let d = disassemble_from(at, &window[..got], carried.take());
         at = at.wrapping_add(u16::from(d.len));
         let stop = d.truncated;
         out.push(d);
@@ -487,6 +511,54 @@ mod tests {
 
         let d = disassemble(0x8000, &[0xdd, 0xcb]);
         assert!(d.truncated);
+    }
+
+    #[test]
+    fn a_run_of_index_prefixes_decodes_the_way_it_executes() {
+        // Sean Young, *The Undocumented Z80 Documented* v0.91 §3.7:
+        //     FD DD 00 21 00 10         NOP NOP NOP LD HL,1000h
+        // Each prefix that is followed by another is a unit of its own, and
+        // the last one binds to the opcode after it.
+        let code = [0xfdu8, 0xdd, 0xdd, 0x21, 0x00, 0x10];
+        let run = disassemble_run(0x8000, 3, |addr| {
+            code.get(addr.wrapping_sub(0x8000) as usize).copied()
+        });
+        let shape: Vec<(u16, u8, bool)> = run.iter().map(|d| (d.pc, d.len, d.truncated)).collect();
+        assert_eq!(
+            shape,
+            [(0x8000, 1, false), (0x8001, 1, false), (0x8002, 4, false)]
+        );
+        assert!(run[0].insn.is_prefix() && run[1].insn.is_prefix());
+        assert_eq!(format!("{}", run[2]), "LD IX,$1000");
+
+        // Any length: this was a `PREFIX` of length six with `truncated`
+        // clear, standing for a run the executor treated as one instruction.
+        let long = [0xddu8; 64];
+        let run = disassemble_run(0x8000, 64, |addr| {
+            long.get(addr.wrapping_sub(0x8000) as usize).copied()
+        });
+        assert_eq!(run.len(), 64);
+        assert!(run[..63].iter().all(|d| d.len == 1 && !d.truncated));
+        // The last one has nothing after it, and says so.
+        assert!(run[63].truncated);
+    }
+
+    #[test]
+    fn a_carried_prefix_indexes_the_first_instruction_only() {
+        // The core stopped with `DD` fetched and PC at `21 34 12`.
+        let d = disassemble_from(0x8000, &[0x21, 0x34, 0x12], Some(Index::Ix));
+        assert_eq!(format!("{d}"), "LD IX,$1234");
+        assert_eq!(d.len, 3, "the prefix is behind PC and not counted");
+        // One more prefix replaces the carried one.
+        let d = disassemble_from(0x8000, &[0xfd, 0x21, 0x34, 0x12], Some(Index::Ix));
+        assert_eq!(format!("{d}"), "LD IY,$1234");
+        assert_eq!(d.len, 4);
+        let code = [0x21u8, 0x34, 0x12, 0x21, 0x78, 0x56];
+        let run = disassemble_run_from(0x8000, Some(Index::Ix), 2, |addr| {
+            code.get(addr.wrapping_sub(0x8000) as usize).copied()
+        });
+        assert_eq!(format!("{}", run[0]), "LD IX,$1234");
+        assert_eq!(format!("{}", run[1]), "LD HL,$5678");
     }
 
     #[test]

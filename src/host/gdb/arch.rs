@@ -749,7 +749,9 @@ static Z80_REGS: &[RegDesc] = &[
 #[cfg(feature = "cpu-z80")]
 pub static Z80: Arch = Arch {
     class: &crate::cpu::z80::CLASS,
-    verified_version: 2,
+    // 3 appends the pending index prefix after everything else; the register
+    // offsets are those of 2.
+    verified_version: 3,
     features: &[Feature::whole("org.rsemu.z80")],
     architecture: None,
     regs: Z80_REGS,

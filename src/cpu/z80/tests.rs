@@ -14,7 +14,7 @@ use crate::core::device::{Deferred, Device, RealizeCtx, ResetKind};
 use crate::core::space::{
     AccessConstraints, AddressSpace, MemAttrs, MemOps, MemResult, RamStore, Region, RequesterId,
 };
-use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
+use crate::core::state::{MachineShape, Migrations, Sink, Source, StateReader, StateWriter};
 use crate::core::sync::{self, LockRank};
 
 use super::isa::{Index, decode, index_substitute};
@@ -179,18 +179,213 @@ fn r_counts_seven_bits_and_leaves_the_eighth_alone() {
 #[test]
 fn each_prefix_costs_its_own_fetch_and_its_own_refresh() {
     let m = Machine::new();
-    // DD DD DD 00: three redundant prefixes and a NOP, which is one
-    // instruction of four M1 cycles.
+    // DD DD DD 00: three redundant prefixes and a NOP — four M1 cycles, over
+    // however many steps the run is split into.
     m.load(0x0000, &[0xdd, 0xdd, 0xdd, 0x00]);
     m.start(0x0000);
     m.cpu.set_reg(Reg::R, 0x00);
-    let t = m.cpu.step();
+    let mut t = 0;
+    let mut fetches = 0;
+    while m.cpu.regs().pc != 0x0004 {
+        t += m.cpu.step();
+        let log = m.cpu.last_cycles();
+        assert!(log.cycles().iter().all(|c| c.kind == MCycle::Fetch));
+        fetches += log.cycles().len();
+    }
     assert_eq!(t, 16, "four fetches at four T-states each");
+    assert_eq!(fetches, 4);
     assert_eq!(m.cpu.reg(Reg::R), 0x04);
-    assert_eq!(m.cpu.regs().pc, 0x0004);
-    let log = m.cpu.last_cycles();
-    assert_eq!(log.cycles().len(), 4);
-    assert!(log.cycles().iter().all(|c| c.kind == MCycle::Fetch));
+    assert_eq!(m.cpu.pending_prefix(), None);
+}
+
+/// A memory that reads `$dd` everywhere: the open bus of a machine with a
+/// pull-up pattern, or simply a guest that filled its RAM with it.
+#[test]
+fn a_step_is_bounded_however_long_the_run_of_prefixes() {
+    let m = Machine::new();
+    for at in 0..0x1_0000u64 {
+        m.ram.write_u8(at, 0xdd).expect("fits");
+    }
+    m.start(0x0000);
+    // Before the run was split, this call never returned: `instruction`
+    // looped for as long as the fetch kept returning a prefix, with the
+    // scheduler, the safe-point check and Ctrl-C all waiting on it.
+    for _ in 0..1000 {
+        let t = m.cpu.step();
+        assert!(
+            (4..=8).contains(&t),
+            "a step is one or two fetches, got {t}"
+        );
+        assert_eq!(m.cpu.pending_prefix(), Some(Index::Ix));
+    }
+    // And `run_budget`, which is what the scheduler calls, hands the core back
+    // with its budget spent rather than never.
+    assert_eq!(m.cpu.run_budget(1000), 1000);
+}
+
+#[test]
+fn the_last_prefix_of_a_run_is_the_one_that_counts() {
+    // Sean Young, *The Undocumented Z80 Documented* v0.91 §3.7: "In a large
+    // sequence of DD and FD bytes, it is the last one that counts."
+    let m = Machine::new();
+    m.load(
+        0x1000,
+        &[0xdd, 0xfd, 0xdd, 0xfd, 0x21, 0x34, 0x12, 0x21, 0x78, 0x56],
+    );
+    m.start(0x1000);
+    let mut t = 0;
+    while m.cpu.regs().pc != 0x1007 {
+        t += m.cpu.step();
+    }
+    assert_eq!(t, 4 * 4 + 10, "four prefix fetches and LD rr,nn");
+    assert_eq!(m.cpu.regs().iy, 0x1234);
+    assert_eq!(m.cpu.regs().ix, 0);
+    assert_eq!(m.cpu.regs().hl(), 0);
+    // "Also any other byte (or instruction) resets this flag."
+    m.cpu.step();
+    assert_eq!(m.cpu.regs().hl(), 0x5678);
+}
+
+#[test]
+fn no_interrupt_is_accepted_inside_a_run_of_prefixes() {
+    // Sean Young, §5: "If you test a large sequence of DDs or FDs, the same
+    // happens as with the EI instruction: no interrupts are accepted during
+    // the execution of these sequences. [...] If an interrupt was accepted
+    // after DD or FD, this flag information would be lost, and DD 21 00 00
+    // (LD IX,0) could be interpreted as a simple LD HL,0".
+    for nmi in [false, true] {
+        let m = Machine::new();
+        m.load(0x1000, &[0xdd, 0xdd, 0xdd, 0x21, 0x34, 0x12]);
+        m.start(0x1000);
+        m.cpu.set_iff(true, true);
+        m.cpu.set_interrupt_mode(1).expect("mode 1 exists");
+        m.cpu.step();
+        assert_eq!(m.cpu.pending_prefix(), Some(Index::Ix), "stopped mid-run");
+        if nmi {
+            m.cpu.pulse_nmi();
+        } else {
+            m.cpu.set_int(true);
+        }
+        while m.cpu.pending_prefix().is_some() {
+            m.cpu.step();
+        }
+        assert_eq!(m.cpu.regs().pc, 0x1006, "the instruction ran first");
+        assert_eq!(m.cpu.regs().ix, 0x1234, "and it was LD IX, not LD HL");
+        m.cpu.step();
+        let vector = if nmi { 0x0066 } else { 0x0038 };
+        assert_eq!(m.cpu.regs().pc, vector, "then the interrupt is taken");
+        assert_eq!(m.peek(0xeffe), 0x06, "returning to the next instruction");
+        assert_eq!(m.peek(0xefff), 0x10);
+    }
+}
+
+#[test]
+fn a_listing_at_pc_knows_about_the_pending_prefix() {
+    let m = Machine::new();
+    m.load(0x1000, &[0xdd, 0xdd, 0x21, 0x34, 0x12]);
+    m.start(0x1000);
+    m.cpu.step();
+    assert_eq!(m.cpu.regs().pc, 0x1002);
+    let listing = m.cpu.disassemble(0x1002, 1);
+    assert_eq!(
+        alloc::format!("{}", listing[0]),
+        "LD IX,$1234",
+        "what the next step will execute"
+    );
+    // A reset drops the selection along with everything else in flight, and so
+    // does pointing the core somewhere else.
+    m.cpu.set_reg(Reg::Pc, 0x1002);
+    assert_eq!(m.cpu.pending_prefix(), Some(Index::Ix), "PC did not move");
+    m.cpu.set_reg(Reg::Pc, 0x2000);
+    assert_eq!(m.cpu.pending_prefix(), None);
+}
+
+/// Save `cpu`'s chunk at the class's current version.
+fn snapshot_of(cpu: &Z80) -> Vec<u8> {
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", super::CLASS.name).expect("fresh");
+    let mut w = StateWriter::new(shape);
+    {
+        let mut chunk = w
+            .chunk("cpu", super::CLASS.name, super::CLASS.version)
+            .expect("fresh");
+        cpu.save(&mut chunk).expect("save");
+    }
+    w.to_vec().expect("serialise")
+}
+
+#[test]
+fn a_pending_prefix_survives_a_snapshot() {
+    let m = Machine::new();
+    m.load(0x1000, &[0xfd, 0xfd, 0x21, 0x34, 0x12]);
+    m.start(0x1000);
+    m.cpu.step();
+    assert_eq!(m.cpu.pending_prefix(), Some(Index::Iy));
+    let bytes = snapshot_of(&m.cpu);
+
+    let restored = Machine::new();
+    restored.load(0x1000, &[0xfd, 0xfd, 0x21, 0x34, 0x12]);
+    let reader = StateReader::new(&bytes).expect("parse");
+    let chunk = reader
+        .load(
+            "cpu",
+            super::CLASS.name,
+            super::CLASS.version,
+            &Migrations::new(),
+        )
+        .expect("the chunk is there");
+    let mut cr = chunk.reader();
+    restored.cpu.load(&mut cr).expect("load");
+    cr.end().expect("every field read");
+    assert_eq!(restored.cpu.pending_prefix(), Some(Index::Iy));
+    assert_eq!(snapshot_of(&restored.cpu), bytes, "a fixed point");
+    restored.cpu.step();
+    assert_eq!(restored.cpu.regs().iy, 0x1234, "not LD HL,$1234");
+    assert_eq!(restored.cpu.regs().hl(), 0);
+}
+
+#[test]
+fn a_v2_snapshot_loads_with_no_prefix_pending() {
+    let m = Machine::new();
+    m.load(0x1000, &[0x21, 0x34, 0x12]);
+    m.start(0x1000);
+    m.cpu.step();
+    // A v2 chunk is today's without its last byte.
+    let mut shape = MachineShape::new();
+    shape.add_device("cpu", super::CLASS.name).expect("fresh");
+    let mut w = StateWriter::new(shape);
+    {
+        let mut whole = Vec::new();
+        let full = snapshot_of(&m.cpu);
+        let reader = StateReader::new(&full).expect("parse");
+        let chunk = reader
+            .load(
+                "cpu",
+                super::CLASS.name,
+                super::CLASS.version,
+                &Migrations::new(),
+            )
+            .expect("the chunk is there");
+        let mut cr = chunk.reader();
+        whole.extend_from_slice(cr.take(cr.remaining()).expect("the body"));
+        assert_eq!(whole.pop(), Some(0), "the prefix byte is last, and clear");
+        let mut chunk = w.chunk("cpu", super::CLASS.name, 2).expect("fresh");
+        chunk.write_all(&whole).expect("write");
+    }
+    let bytes = w.to_vec().expect("serialise");
+
+    let mut table = Migrations::new();
+    super::migrations(&mut table).expect("registers once");
+    let reader = StateReader::new(&bytes).expect("parse");
+    let chunk = reader
+        .load("cpu", super::CLASS.name, super::CLASS.version, &table)
+        .expect("v2 migrates to the shipping version");
+    let restored = Z80::new(Config::NMOS);
+    let mut cr = chunk.reader();
+    restored.load(&mut cr).expect("load");
+    cr.end().expect("every field read");
+    assert_eq!(restored.regs(), m.cpu.regs());
+    assert_eq!(restored.pending_prefix(), None);
 }
 
 // ---------------------------------------------------------------------------

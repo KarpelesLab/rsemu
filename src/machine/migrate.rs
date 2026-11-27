@@ -121,6 +121,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::cpu::mos6502::migrations(&mut migrations)?;
     #[cfg(feature = "cpu-w65c816")]
     crate::cpu::w65c816::migrations(&mut migrations)?;
+    #[cfg(feature = "cpu-z80")]
+    crate::cpu::z80::migrations(&mut migrations)?;
     #[cfg(feature = "dev-sgx")]
     crate::dev::sgx::migrations(&mut migrations)?;
     #[cfg(feature = "dev-amiga-akiko")]
@@ -160,6 +162,8 @@ mod tests {
         "cpu.mos6502",
         #[cfg(feature = "cpu-w65c816")]
         "cpu.w65c816",
+        #[cfg(feature = "cpu-z80")]
+        "cpu.z80",
     ];
 
     #[test]
