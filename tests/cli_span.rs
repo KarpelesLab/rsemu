@@ -74,3 +74,35 @@ fn a_console_session_runs_the_whole_span_it_was_given() {
         "--for 4s stopped at {reached} ns; the idle rule cut the run short"
     );
 }
+
+/// Twenty-five milliseconds asked for, twenty-five run — not thirty.
+///
+/// The console loop advances in ten-millisecond slices and used to take every
+/// one of them whole, so a span that was not a multiple of ten overshot to the
+/// next one: `--for 25ms` ran to 30 ms and `--for 1ms` to 10, while the same
+/// flag under `--headless` stopped where it was told. Every output a run
+/// delivers — the state hash, a screenshot, a recording — was therefore taken
+/// at a different instant depending on whether a terminal happened to be
+/// attached.
+///
+/// The bound below is the span itself; the one above it allows for the
+/// timeline's own rounding, which lands a nanosecond short (`--headless
+/// --for 1ms` reports 999999).
+#[cfg(feature = "machine-apple1")]
+#[test]
+fn a_console_session_stops_at_the_span_rather_than_at_the_next_slice() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rsemu"))
+        .args(["run", "apple1", "--for", "25ms"])
+        .output()
+        .expect("the binary this test was built alongside");
+    assert!(
+        out.status.success(),
+        "rsemu run apple1 --for 25ms failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reached = ran_to(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        (24_999_000..=25_000_000).contains(&reached),
+        "--for 25ms ran to {reached} ns; the console loop took a whole slice past the deadline"
+    );
+}

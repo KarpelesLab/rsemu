@@ -2607,7 +2607,14 @@ fn interact(
             break ExitCode::SUCCESS;
         }
         let mut moved = term.typed(typed) + term.printed(port);
-        if let Err(e) = machine.run_until(machine.now().saturating_add(SLICE)) {
+        // Never past the deadline: `--for 25ms` taken in whole ten-millisecond
+        // slices stopped at 30, and a screenshot or a state hash taken there is
+        // from a later point on the guest's timeline than the one asked for —
+        // and a different one from what `--headless` reaches with the same
+        // flag, which clamps its last slice the same way (`run_headless`).
+        let slice_end = machine.now().saturating_add(SLICE);
+        let slice_end = deadline.map_or(slice_end, |d| d.min(slice_end));
+        if let Err(e) = machine.run_until(slice_end) {
             eprintln!("\r\nrsemu: {e}");
             break ExitCode::FAILURE;
         }
