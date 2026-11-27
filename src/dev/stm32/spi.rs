@@ -1038,6 +1038,12 @@ pub struct Stm32Spi {
     shared: Arc<Shared>,
     pins: Arc<SlavePins>,
     region: RegionRef,
+    /// The MISO and NSS input pins, kept alive here because a net refers to
+    /// its sinks weakly (`core::device`, §4.3's weak edge).
+    ///
+    /// Here and not in [`Shared`]: a pin holds `Shared`, so keeping it there
+    /// would be a cycle that no drop of the device could reach.
+    sinks: Mutex<Vec<Arc<InputSink>>>,
 }
 
 /// The wire outputs, all optional until a machine description connects them.
@@ -1071,9 +1077,6 @@ struct Shared {
     pins: Mutex<Pins>,
     /// The interrupt output, connected at realize time.
     irq: Mutex<Option<WireSource>>,
-    /// Input pins handed out by [`Device::sink`], kept alive here because a net
-    /// refers to its sinks weakly (`core::device`, §4.3's weak edge).
-    sinks: Mutex<Vec<Arc<InputSink>>>,
     /// The catch-up handle the register block syncs through.
     lazy: Mutex<Option<LazyHandle>>,
     /// This instance's `RCC_xxENR` and `RCC_xxRSTR` bits, as a board's wires
@@ -1169,7 +1172,6 @@ impl Stm32Spi {
             irq_level: AtomicBool::new(false),
             pins: Mutex::with_rank(LockRank::WIRE, Pins::default()),
             irq: Mutex::with_rank(LockRank::WIRE, None),
-            sinks: Mutex::with_rank(LockRank::WIRE, Vec::new()),
             lazy: Mutex::with_rank(LockRank::WIRE, None),
             gate: ClockGate::new(),
         });
@@ -1187,6 +1189,7 @@ impl Stm32Spi {
             shared,
             pins,
             region,
+            sinks: Mutex::with_rank(LockRank::WIRE, Vec::new()),
         }
     }
 
@@ -2470,7 +2473,7 @@ impl Device for Stm32Spi {
             line,
         });
         // Kept, because a net refers to its sinks weakly.
-        self.shared.sinks.lock().push(Arc::clone(&sink));
+        self.sinks.lock().push(Arc::clone(&sink));
         Some(SinkPin {
             sink: sink as Arc<dyn WireSink>,
             line,

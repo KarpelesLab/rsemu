@@ -1485,3 +1485,30 @@ fn a_gated_slave_answers_nothing() {
     );
     assert_eq!(face.peek(), u32::MAX);
 }
+
+#[test]
+fn a_peripheral_whose_inputs_are_on_nets_is_freed_when_it_is_dropped() {
+    // The MISO and NSS input sinks are kept by the device, because a net
+    // holds them weakly. When they were kept inside the state they point at,
+    // a wired peripheral owned itself, its bus and every slave on that bus.
+    let h = harness(Link::Wired);
+    let src = WireId::new(1);
+    let pin = Device::sink(&h.spi, pin::MISO, &[src]).expect("a MISO input");
+    // Weakly, as a machine's nets hold every sink (`core::device`).
+    let miso = Wire::builder()
+        .source(src)
+        .sink_weak(Arc::downgrade(&pin.sink), pin.line)
+        .build();
+    drop(pin);
+    let _ = Device::sink(&h.spi, pin::NSS_IN, &[]).expect("an NSS input");
+
+    // While the peripheral lives the net reaches it.
+    miso.set(src, Level::High);
+    miso.set(src, Level::Low);
+    assert!(!h.spi.shared.miso.load(Ordering::Relaxed));
+
+    let shared = Arc::downgrade(&h.spi.shared);
+    drop(h);
+    assert_eq!(shared.strong_count(), 0, "the peripheral outlived itself");
+    miso.set(src, Level::High);
+}
