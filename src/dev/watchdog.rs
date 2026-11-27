@@ -181,7 +181,10 @@ impl PinWatchdog {
     /// this class does not know.
     pub fn new(props: &Props) -> Result<PinWatchdog> {
         let mut r = props.reader();
-        let timeout = r.or_range("timeout", 0u64, 1..=u64::MAX / 2)?;
+        // Required, and asked for as required: an `or_range` with a default of
+        // zero reported a forgotten `timeout` as "0 is out of range", naming a
+        // value the machine file never wrote.
+        let timeout = r.require_range("timeout", 1..=u64::MAX / 2)?;
         let scope = r.or_enum("scope", "pin", &["pin", "machine"])?;
         let log = r.optional_str("log")?.map(ToString::to_string);
         r.finish()?;
@@ -425,6 +428,22 @@ mod tests {
         w.shared.kick(true);
         w.shared.advance_to(100);
         assert_eq!(w.fired(), 1);
+    }
+
+    #[test]
+    fn a_forgotten_timeout_is_reported_as_missing_and_a_zero_one_as_out_of_range() {
+        use crate::core::props::Value;
+        let missing = PinWatchdog::new(&Props::new()).unwrap_err();
+        let text = alloc::format!("{missing}");
+        assert!(
+            text.contains("missing required property `timeout`"),
+            "{text}"
+        );
+        assert!(!text.contains("out of range"), "{text}");
+        let zero = PinWatchdog::new(&Props::new().with("timeout", Value::Uint(0))).unwrap_err();
+        let text = alloc::format!("{zero}");
+        assert!(text.contains("out of range"), "{text}");
+        assert!(PinWatchdog::new(&Props::new().with("timeout", Value::Uint(1))).is_ok());
     }
 
     #[test]
