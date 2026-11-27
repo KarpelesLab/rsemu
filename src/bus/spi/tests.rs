@@ -1188,3 +1188,33 @@ fn the_wired_front_end_is_one_bit_per_edge_and_says_so() {
     pins.drive(pin::CS, Level::High);
     assert_eq!(*log.seen.lock(), vec![(0xff, Lines::SINGLE)]);
 }
+
+#[test]
+fn pins_that_are_on_a_net_are_freed_when_they_are_dropped() {
+    // `SlavePins` keeps the strong half of every sink it hands out, because a
+    // net holds its sinks weakly. When the sink owned the pins in return, a
+    // slave that had ever been wired was a cycle of its own, and the part
+    // behind it — an ST77xx's whole frame memory — outlived the machine.
+    let format = Format::new(Mode::Mode0, 8, BitOrder::MsbFirst);
+    let echo = Echo::new(format, &[0x00]);
+    let pins = Arc::new(SlavePins::new(Arc::clone(&echo) as Arc<dyn SpiSlave>));
+    let src = WireId::new(1);
+    let cs = Wire::builder()
+        .source(src)
+        .sink(pins.sink(pin::CS), pin::CS)
+        .build();
+    let _ = pins.sink(pin::SCK);
+    let _ = pins.sink(pin::MOSI);
+
+    // While the pins live the net reaches them: the sink is still owned.
+    cs.set(src, Level::High);
+    cs.set(src, Level::Low);
+    assert_eq!(echo.take_log(), vec![Word::Select(true)]);
+
+    let (weak_pins, weak_slave) = (Arc::downgrade(&pins), Arc::downgrade(&echo));
+    drop((pins, echo));
+    assert_eq!(weak_pins.strong_count(), 0, "the pins outlived their owner");
+    assert_eq!(weak_slave.strong_count(), 0, "and so did the slave");
+    // A net that outlives them delivers to nobody, and says nothing.
+    cs.set(src, Level::High);
+}

@@ -99,7 +99,7 @@ pub mod controller;
 #[cfg(test)]
 mod tests;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -1454,7 +1454,7 @@ impl SlavePins {
     #[must_use]
     pub fn sink(self: &Arc<Self>, line: u32) -> Arc<dyn WireSink> {
         let pin = Arc::new(PinSink {
-            pins: Arc::clone(self),
+            pins: Arc::downgrade(self),
             line,
         });
         self.pins.lock().push(Arc::clone(&pin));
@@ -1486,8 +1486,13 @@ impl SlavePins {
 }
 
 /// One pin of a [`SlavePins`], as the wire graph sees it.
+///
+/// It holds the pins **weakly**. [`SlavePins`] keeps every sink it hands out
+/// (see its `pins` field), so a strong reference back would make a wired
+/// slave a cycle of its own that no drop of the device could reach. A sink
+/// whose pins are gone is a pad with nothing behind it: the edge is lost.
 struct PinSink {
-    pins: Arc<SlavePins>,
+    pins: Weak<SlavePins>,
     line: u32,
 }
 
@@ -1499,6 +1504,8 @@ impl fmt::Debug for PinSink {
 
 impl WireSink for PinSink {
     fn set_level(&self, _src: WireId, _line: u32, level: Level) {
-        self.pins.drive(self.line, level);
+        if let Some(pins) = self.pins.upgrade() {
+            pins.drive(self.line, level);
+        }
     }
 }
