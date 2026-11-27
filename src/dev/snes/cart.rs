@@ -352,12 +352,19 @@ fn decode(map: MapMode, addr: u32, rom_len: u64, sram_len: u64) -> Target {
     };
     match map {
         MapMode::LoRom => {
-            if (0x70..=0x7D).contains(&(bank & 0x7F)) && low < 0x8000 {
+            // Work RAM is banks $7E and $7F and nothing else. Their images in
+            // the upper half of the map, $FE and $FF, are the cartridge's like
+            // every other bank from $80 up: fullsnes, "SNES Cart LoROM
+            // Mapping", gives the ROM area as "00-7D,80-FF:8000-FFFF" and the
+            // SRAM area as "70-7D,F0-FF:0000-7FFF". So the exclusion is on the
+            // bank itself, not on the bank with A23 masked off.
+            let wram = bank == 0x7E || bank == 0x7F;
+            if !wram && (0x70..=0x7F).contains(&(bank & 0x7F)) && low < 0x8000 {
                 // Banks $70–$7D and $F0–$FF, the lower half: SRAM, 32 KiB
                 // a bank.
                 return sram(((b & 0x0F) << 15) | low);
             }
-            if low >= 0x8000 && bank & 0x7F != 0x7E && bank & 0x7F != 0x7F {
+            if low >= 0x8000 && !wram {
                 return Target::Rom(mirror(((b & 0x7F) << 15) | (low & 0x7FFF), rom_len));
             }
             // $40–$6F lower halves: the same ROM byte as the upper half
@@ -737,6 +744,26 @@ mod tests {
         assert_eq!(read(&cart, 0xF0_0000).unwrap(), 0x5A);
         Device::reset(&cart, ResetKind::Cold);
         assert_eq!(read(&cart, 0x70_0000).unwrap(), 0x5A, "battery-backed");
+    }
+
+    #[test]
+    fn lorom_decodes_banks_fe_and_ff_which_are_not_work_ram() {
+        // nocash, *fullsnes*, "SNES Cart LoROM Mapping", ROM area and SRAM area
+        // of an SHVC-1A3B-20: "00-7D,80-FF:8000-FFFF" and
+        // "70-7D,F0-FF:0000-7FFF". Work RAM occupies $7E and $7F only; their
+        // mirrors in the upper half of the map, $FE and $FF, belong to the
+        // cartridge like every other bank from $80 up.
+        let cart =
+            SnesCart::new(Image::parse(&marked(MapMode::LoRom, 0x40_0000, 2, 3), None).unwrap());
+        assert_eq!(read(&cart, 0xFD_8100).unwrap(), 0x7D);
+        assert_eq!(read(&cart, 0xFE_8100).unwrap(), 0x7E);
+        assert_eq!(read(&cart, 0xFF_8100).unwrap(), 0x7F);
+        write(&cart, 0xFE_0000, 0x5A).unwrap();
+        assert_eq!(read(&cart, 0xFF_0000).unwrap(), 0x5A, "8 KiB mirrors");
+        assert_eq!(read(&cart, 0x70_0000).unwrap(), 0x5A);
+        // $7E and $7F themselves are the console's, never the cartridge's.
+        assert_eq!(read(&cart, 0x7E_8100), Err(BusError::Unassigned));
+        assert_eq!(read(&cart, 0x7F_0000), Err(BusError::Unassigned));
     }
 
     #[test]
