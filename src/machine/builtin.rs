@@ -47,6 +47,10 @@ const ROM_CLASS_NAME: &str = "rom";
 /// And the one for a bare node in the clock forest.
 const CLOCK_CLASS_NAME: &str = "clock";
 
+/// What [`RamStore`] allocates beyond the bytes it was asked for: enough to
+/// place guest byte zero on a host page boundary.
+const HOST_PAGE_SLACK: usize = crate::core::space::HOST_PAGE as usize - 1;
+
 /// Read/write memory: `size` bytes, mapped wherever a `map` statement puts it.
 ///
 /// Not a device model — there is no chip called "RAM" — but it is a device as
@@ -72,6 +76,24 @@ impl Ram {
         if size == 0 {
             return Err(Error::Property(alloc::string::String::from(
                 "property `size`: a ram object with no bytes in it cannot be mapped",
+            )));
+        }
+        // `RamStore::new` allocates infallibly, so a size the host cannot
+        // back is an *abort* — "memory allocation of 1099511631871 bytes
+        // failed" and a core dump, from `-p ram=1024G` or one digit too many
+        // in a machine file. Ask the allocator first, with a reservation that
+        // touches no page and is given straight back, and turn its refusal
+        // into the error a mistyped property deserves. The padding is the
+        // store's own: it over-allocates by a host page to align guest byte
+        // zero. `checked_add` because `size` is the user's number and
+        // `u64::MAX` is one they can type.
+        let fits = usize::try_from(size)
+            .ok()
+            .and_then(|n| n.checked_add(HOST_PAGE_SLACK))
+            .is_some_and(|n| Vec::<u8>::new().try_reserve_exact(n).is_ok());
+        if !fits {
+            return Err(Error::Property(alloc::format!(
+                "property `size`: this host cannot allocate {size} bytes ({size:#x}) of guest RAM"
             )));
         }
         let store = Arc::new(RamStore::new(size));
@@ -481,6 +503,16 @@ mod tests {
     #[test]
     fn a_size_is_required_and_must_be_usable() {
         assert!(Ram::new(&Props::new()).is_err(), "no size at all");
+        // A size no host can back is a property error, not an abort. Both of
+        // these used to take the process down inside the allocator: the first
+        // overflows the store's own page padding, the second is a petabyte-
+        // scale request every allocator refuses.
+        for size in [u64::MAX, 1u64 << 60] {
+            let e = Ram::new(&Props::new().with("size", Value::Size(size)))
+                .expect_err("more RAM than any host has")
+                .to_string();
+            assert!(e.contains("cannot allocate"), "{e}");
+        }
         let e = Ram::new(&Props::new().with("size", Value::Size(0)))
             .expect_err("zero bytes")
             .to_string();
