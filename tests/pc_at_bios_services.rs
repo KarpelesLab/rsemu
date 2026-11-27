@@ -296,3 +296,46 @@ fn the_disk_and_video_services_preserve_the_upper_register_halves() {
     assert_eq!(peek32(&m, R + 32), 0x2222_0000, "EDX after AX=4F01h");
     assert_eq!(peek32(&m, R + 36), 0x4444_0e00, "EDI after AX=4F01h");
 }
+
+/// `INT 13h AH=08h` on a drive with more than 1024 cylinders.
+///
+/// The function answers with the *maximum cylinder number* in ten bits — `CH`
+/// and the top two bits of `CL` — so 1023 is the largest it can say. The
+/// firmware took `cylinders - 1` and kept its low ten bits, which is a wrap
+/// rather than a limit: a drive `IDENTIFY DEVICE` reports with 1025 cylinders
+/// came back as a drive with one.
+///
+/// The cylinder count is the firmware's own copy of `IDENTIFY DEVICE` word 1,
+/// in the Extended BIOS Data Area. The guest writes it there, because a disk
+/// image big enough to have 1025 real cylinders is half a gigabyte.
+#[test]
+fn ah_08h_limits_the_cylinder_count_instead_of_wrapping_it() {
+    use rsemu::fw::asm16::{AH, CX, DX};
+
+    /// The firmware's EBDA, and the fixed disk's cylinder count inside it.
+    const EBDA_SEGMENT: u16 = 0x9fc0;
+    const EBDA_HD_CYLINDERS: u16 = 0x02;
+
+    let cases: [(u16, u16); 4] = [(4, 3), (1024, 1023), (1025, 1023), (16383, 1023)];
+    let (m, _hosts) = run("cylinder limit", |a| {
+        for (slot, (cylinders, _)) in cases.into_iter().enumerate() {
+            a.movi(AX, EBDA_SEGMENT);
+            a.movsr(ES, AX);
+            a.movmi(Mem::abs(EBDA_HD_CYLINDERS).seg(ES), cylinders);
+            a.movi8(AH, 0x08);
+            a.movi(DX, 0x0080);
+            a.int(0x13);
+            a.movto(Mem::abs(R + 2 * slot as u16), CX);
+        }
+    });
+
+    for (slot, (cylinders, expected)) in cases.into_iter().enumerate() {
+        let cx = peek16(&m, R + 2 * slot as u16);
+        let reported = (cx >> 8) | ((cx & 0x00c0) << 2);
+        assert_eq!(
+            reported, expected,
+            "a drive with {cylinders} cylinders reports {reported} as its last one"
+        );
+        assert_eq!(cx & 0x3f, 63, "and the sectors per track are untouched");
+    }
+}

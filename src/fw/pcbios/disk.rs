@@ -421,9 +421,21 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // AH=08h, drive parameters. The cylinder count is one *less* than the
     // number of cylinders, and its top two bits ride in CL's top two — the
     // packing every `INT 13h` caller since 1983 unpacks.
+    //
+    // Ten bits, so 1023 is the largest cylinder number this function can
+    // name, and a drive with more is reported as having exactly that many —
+    // every cylinder the caller is then told about exists. The count used to
+    // be truncated to its low ten bits instead, which is a wrap and not a
+    // limit: `IDENTIFY DEVICE` word 1 of 1025 came back as a one-cylinder
+    // drive, and one of 8322 as a drive of 130.
     a.bind(params);
+    let representable = a.label();
     a.mov(AX, Mem::abs(EBDA_HD_CYLINDERS));
     a.dec(AX);
+    a.alui(Alu::CMP, AX, 1023);
+    a.jcc(Cc::BE, representable);
+    a.movi(AX, 1023);
+    a.bind(representable);
     a.mov8(CH, AL);
     a.mov8(CL, AH);
     a.shift8(Shift::SHL, CL, 6);
