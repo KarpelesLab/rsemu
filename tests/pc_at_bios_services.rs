@@ -643,3 +643,55 @@ fn the_vbe_controller_block_is_256_bytes_unless_vbe2_is_preset() {
         "a VBE 2.0 block is filled to its 512th byte"
     );
 }
+
+/// `AX=4F03h` answers with the mode `AX=4F02h` was given.
+///
+/// *VBE Core Functions Standard* 3.0, Function 03h: "The mode number returned
+/// must be the same mode number used in the VBE Function 02h mode set", with
+/// "D15 = 1 Memory not cleared at last mode set" and the note that "Unlike
+/// version 1.x VBE implementations, the memory clear flag will be returned."
+/// The firmware answered zero after a VGA mode had been set through Function
+/// 02h — which Function 02h accepts — and dropped bit 15 from a VBE one.
+#[test]
+fn the_vbe_mode_read_back_is_the_mode_that_was_set() {
+    use rsemu::fw::asm16::BX;
+
+    let (m, _hosts) = run("vbe current mode", |a| {
+        // Mode 13h, a VGA mode, through the VBE mode set.
+        a.movi(AX, 0x4f02);
+        a.movi(BX, 0x0013);
+        a.int(0x10);
+        a.movto(Mem::abs(R), AX);
+        a.movi(AX, 0x4f03);
+        a.movi(BX, 0xffff);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 2), AX);
+        a.movto(Mem::abs(R + 4), BX);
+        // Mode 112h with the linear framebuffer and without clearing memory.
+        a.movi(AX, 0x4f02);
+        a.movi(BX, 0xc112);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 6), AX);
+        a.movi(AX, 0x4f03);
+        a.movi(BX, 0xffff);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 8), AX);
+        a.movto(Mem::abs(R + 10), BX);
+        // And cleared, with the banked window: neither flag comes back.
+        a.movi(AX, 0x4f02);
+        a.movi(BX, 0x0101);
+        a.int(0x10);
+        a.movi(AX, 0x4f03);
+        a.movi(BX, 0xffff);
+        a.int(0x10);
+        a.movto(Mem::abs(R + 12), BX);
+    });
+
+    assert_eq!(peek16(&m, R), 0x004f, "setting mode 13h through 4F02h");
+    assert_eq!(peek16(&m, R + 2), 0x004f);
+    assert_eq!(peek16(&m, R + 4), 0x0013, "4F03h after a VGA mode set");
+    assert_eq!(peek16(&m, R + 6), 0x004f, "setting mode C112h");
+    assert_eq!(peek16(&m, R + 8), 0x004f);
+    assert_eq!(peek16(&m, R + 10), 0xc112, "4F03h after a VBE mode set");
+    assert_eq!(peek16(&m, R + 12), 0x0101);
+}

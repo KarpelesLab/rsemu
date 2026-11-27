@@ -1143,10 +1143,13 @@ pub(super) fn emit(a: &mut Asm, l: &Labels, v: &Vbe) {
     a.call(v.ext_write);
     a.bind(keep_memory);
 
-    // Remember it for AX=4F03h, and record a graphics mode in the BDA so that
-    // AH=0Fh answers something rather than the last text mode.
+    // Remember it for AX=4F03h, as it was asked for: the mode number, bit 14
+    // for the linear aperture and bit 15 for "memory not cleared", which a
+    // VBE 2.0 implementation hands back ("Unlike version 1.x VBE
+    // implementations, the memory clear flag will be returned", Function
+    // 03h).
     a.pop(AX);
-    a.alui(Alu::AND, AX, 0x41ff);
+    a.alui(Alu::AND, AX, 0xc1ff);
     a.movto(Mem::abs(super::BDA_VBE_MODE), AX);
     a.jmp(vbe_done);
 
@@ -1169,9 +1172,20 @@ pub(super) fn emit(a: &mut Asm, l: &Labels, v: &Vbe) {
     a.pop(AX);
     a.jmp(vbe_fail);
 
-    // AX=4F03h — the mode in force.
+    // AX=4F03h — the mode in force. "The mode number returned must be the
+    // same mode number used in the VBE Function 02h mode set" (*VBE Core
+    // Functions Standard* 3.0, Function 03h), and Function 02h takes VGA mode
+    // numbers too. Those leave no VBE mode recorded — `set_mode` clears it —
+    // so the answer for them is the BIOS Data Area's own mode byte, where it
+    // used to be zero.
     a.bind(f_get_mode);
+    let have_mode = a.label();
     a.mov(AX, Mem::abs(super::BDA_VBE_MODE));
+    a.alui(Alu::CMP, AX, 0);
+    a.jcc(Cc::NE, have_mode);
+    a.mov8(AL, Mem::abs(super::BDA_VIDEO_MODE));
+    a.movi8(AH, 0);
+    a.bind(have_mode);
     a.movto(Mem::bp(F_BX), AX);
     a.jmp(vbe_done);
 
