@@ -2568,6 +2568,61 @@ fn a_bit_tests_byte_offset_wraps_at_the_address_size() {
     );
 }
 
+/// `VERR` and `VERW` do not look at the present bit.
+///
+/// *Intel SDM* volume 2, `VERR/VERW`, lists what it takes "To set the ZF
+/// flag": "The segment selector is not NULL. The selector must denote a
+/// descriptor within the bounds of the descriptor table (GDT or LDT). The
+/// selector must denote the descriptor of a code or data segment (not that of
+/// a system segment or gate). For the VERR instruction, the segment must be
+/// readable. For the VERW instruction, the segment must be a writable data
+/// segment. If the segment is not a conforming code segment, the segment's
+/// DPL must be greater than or equal to ... both the CPL and the segment
+/// selector's RPL." Presence is not among them, and the "Operation" tests
+/// only the descriptor type, the privilege and the access. Measured on an x86
+/// host (AMD Zen 5, descriptors installed with `modify_ldt`): a not-present
+/// writable data segment verifies with `ZF` set for both, and a not-present
+/// readable code segment for `VERR` alone — exactly as their present twins.
+#[test]
+fn verr_and_verw_verify_a_segment_that_is_not_present() {
+    let run = |rights: u32| {
+        let pc = pc386();
+        pc.start_protected();
+        pc.gdt(3, descriptor(0, 0xfff, rights));
+        pc.write(
+            at::CODE0,
+            &[
+                0x66, 0xb8, 0x18, 0x00, // mov ax, 0x18
+                0x0f, 0x00, 0xe0, // verr ax
+                0x0f, 0x94, 0xc3, // setz bl
+                0x0f, 0x00, 0xe8, // verw ax
+                0x0f, 0x94, 0xc1, // setz cl
+                0xf4,
+            ],
+        );
+        let steps = pc.run(10);
+        assert!(steps < 10, "the program halted");
+        let regs = pc.regs();
+        (regs.rbx & 0xff, regs.rcx & 0xff)
+    };
+    assert_eq!(run(rights::DATA32), (1, 1), "a present data segment");
+    assert_eq!(
+        run(rights::DATA32 & !ar::PRESENT),
+        (1, 1),
+        "and the same one marked not present"
+    );
+    assert_eq!(
+        run(rights::CODE32 & !ar::PRESENT),
+        (1, 0),
+        "a not-present readable code segment: readable, never writable"
+    );
+    assert_eq!(
+        run((rights::DATA32 & !ar::S) | (u32::from(sys_type::TSS32_AVAIL) << 8)),
+        (0, 0),
+        "a system segment is still refused"
+    );
+}
+
 /// A part with the first 4 MiB identity-mapped, paging on, and a program that
 /// reads the same far linear address `reads` times before halting.
 ///

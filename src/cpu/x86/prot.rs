@@ -3272,7 +3272,14 @@ impl Exec<'_> {
             self.set_flag(flags::ZF, false);
             return Ok(());
         };
-        if !desc.is_app() || !desc.present() {
+        // Whether the segment is *present* is not asked. *Intel SDM* volume
+        // 2, `VERR/VERW`, "Operation": "IF SegmentDescriptor(DescriptorType)
+        // = 0 (* System segment *) or (SegmentDescriptor(Type) != conforming
+        // code segment) and (CPL > DPL) or (RPL > DPL) THEN ZF := 0; ELSE IF
+        // ((Instruction = VERR) and (Segment readable)) or ((Instruction =
+        // VERW) and (Segment writable)) THEN ZF := 1;" — and an x86 host
+        // verifies a not-present data segment with `ZF` set.
+        if !desc.is_app() {
             self.set_flag(flags::ZF, false);
             return Ok(());
         }
