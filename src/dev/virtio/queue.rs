@@ -129,7 +129,7 @@ impl<'a> Queue<'a> {
     ///
     /// Whatever the address space refuses.
     pub fn avail_idx(&self) -> MemResult<u16> {
-        self.read16(self.layout.avail + 2)
+        self.read16(self.layout.avail.wrapping_add(2))
     }
 
     /// The head descriptor of the `n`th available entry.
@@ -139,7 +139,7 @@ impl<'a> Queue<'a> {
     /// Whatever the address space refuses.
     pub fn avail_head(&self, n: u16) -> MemResult<u16> {
         let slot = u64::from(n % self.ring_len());
-        self.read16(self.layout.avail + 4 + slot * 2)
+        self.read16(self.layout.avail.wrapping_add(4 + slot * 2))
     }
 
     /// Read one descriptor by index. Out-of-range indices return `None` rather
@@ -152,17 +152,23 @@ impl<'a> Queue<'a> {
         if u32::from(index) >= self.layout.size {
             return Ok(None);
         }
-        let at = self.layout.desc + u64::from(index) * DESC_SIZE;
+        let at = self.layout.desc.wrapping_add(u64::from(index) * DESC_SIZE);
         self.read_descriptor(at).map(Some)
     }
 
     /// Read the sixteen bytes of one descriptor at `at`.
+    ///
+    /// Every address here is the guest's: a ring base comes from two 32-bit
+    /// register writes and an indirect table's from a descriptor, so either
+    /// may sit at the very top of the address space. The arithmetic wraps, as
+    /// the guest's own would, and the wrapped address is then simply one the
+    /// space resolves or refuses — never an overflow in the host.
     fn read_descriptor(&self, at: u64) -> MemResult<Descriptor> {
         Ok(Descriptor {
             addr: self.read64(at)?,
-            len: self.read32(at + 8)?,
-            flags: self.read16(at + 12)?,
-            next: self.read16(at + 14)?,
+            len: self.read32(at.wrapping_add(8))?,
+            flags: self.read16(at.wrapping_add(12))?,
+            next: self.read16(at.wrapping_add(14))?,
         })
     }
 
@@ -221,7 +227,7 @@ impl<'a> Queue<'a> {
             if out.len() >= limit {
                 return Ok(());
             }
-            let entry = self.read_descriptor(desc.addr + index * DESC_SIZE)?;
+            let entry = self.read_descriptor(desc.addr.wrapping_add(index * DESC_SIZE))?;
             if entry.flags & DESC_F_INDIRECT != 0 {
                 return Ok(());
             }
@@ -250,11 +256,11 @@ impl<'a> Queue<'a> {
     /// Whatever the address space refuses.
     pub fn publish(&self, used_idx: u16, head: u16, written: u32) -> MemResult<u16> {
         let slot = u64::from(used_idx % self.ring_len());
-        let at = self.layout.used + 4 + slot * 8;
+        let at = self.layout.used.wrapping_add(4 + slot * 8);
         self.write32(at, u32::from(head))?;
-        self.write32(at + 4, written)?;
+        self.write32(at.wrapping_add(4), written)?;
         let next = used_idx.wrapping_add(1);
-        self.write16(self.layout.used + 2, next)?;
+        self.write16(self.layout.used.wrapping_add(2), next)?;
         Ok(next)
     }
 
@@ -280,7 +286,7 @@ impl<'a> Queue<'a> {
                 break;
             }
             self.space.read_bytes(
-                desc.addr + skip,
+                desc.addr.wrapping_add(skip),
                 &mut dst[filled..filled + take],
                 self.attrs,
             )?;
@@ -314,8 +320,11 @@ impl<'a> Queue<'a> {
             if take == 0 {
                 break;
             }
-            self.space
-                .write_bytes(desc.addr + skip, &src[done..done + take], self.attrs)?;
+            self.space.write_bytes(
+                desc.addr.wrapping_add(skip),
+                &src[done..done + take],
+                self.attrs,
+            )?;
             done += take;
             skip = 0;
             if done == src.len() {
@@ -531,6 +540,58 @@ mod tests {
         );
         let chain = g.queue().chain(0).unwrap();
         assert_eq!(chain.len(), SIZE as usize, "in total, not per table");
+    }
+
+    #[test]
+    fn a_ring_at_the_top_of_the_address_space_is_refused_not_overflowed() {
+        // The three ring bases are 64 bits the driver wrote. One placed so
+        // that a field offset carries out of 64 bits must be an access the
+        // space refuses, not an arithmetic overflow in the host.
+        let g = Guest::new();
+        let top = Layout {
+            size: SIZE,
+            desc: u64::MAX - 15,
+            avail: u64::MAX - 1,
+            used: u64::MAX - 3,
+            ready: true,
+        };
+        let q = Queue::new(top, &g.space, RequesterId(1));
+        // `avail + 2` and `avail + 4 + slot * 2` wrap to low RAM, which reads.
+        assert!(q.avail_idx().is_ok());
+        assert!(q.avail_head(3).is_ok());
+        // Descriptor 1 starts at the wrapped address 0.
+        assert!(q.descriptor(1).is_ok());
+        let _ = q.publish(0, 0, 0);
+
+        // And one placed so that a field itself straddles the top: whatever
+        // the space answers, it is an answer.
+        let straddle = Layout {
+            avail: u64::MAX - 2,
+            used: u64::MAX - 4,
+            desc: u64::MAX - 17,
+            ..top
+        };
+        let q = Queue::new(straddle, &g.space, RequesterId(1));
+        let _ = q.avail_idx();
+        let _ = q.descriptor(1);
+        let _ = q.publish(0, 0, 0);
+
+        // A buffer whose address plus the skip carries out likewise.
+        let chain = [Descriptor {
+            addr: u64::MAX,
+            len: 8,
+            flags: DESC_F_WRITE,
+            next: 0,
+        }];
+        let _ = q.write_chain(&chain, 4, &[1, 2]);
+        let chain = [Descriptor {
+            addr: u64::MAX,
+            len: 8,
+            flags: 0,
+            next: 0,
+        }];
+        let mut two = [0u8; 2];
+        let _ = q.read_chain(&chain, 4, &mut two);
     }
 
     #[test]
