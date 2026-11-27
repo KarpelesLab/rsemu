@@ -122,6 +122,17 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// reassembled across four.
 const READ_CHUNK: usize = 8192;
 
+/// How many bytes of reply may be waiting for a client before the server stops
+/// taking requests from it.
+///
+/// A megabyte: several hundred times the largest reply the stub produces, so a
+/// debugger that is merely slow never notices. One that has stopped reading is
+/// another matter. Every request earns a reply, and a `-` earns a *copy of the
+/// last one* for a single byte, so a peer that writes and never reads could
+/// otherwise grow this process's heap at ninety times the rate it sent — and
+/// the far end of this socket is whoever reached the port.
+const MAX_PENDING: usize = 1024 * 1024;
+
 /// Wait up to [`IDLE_SLEEP`] for the client to say something.
 ///
 /// What a halted session does between packets, in place of an unconditional
@@ -176,6 +187,10 @@ struct Conn {
     stub: stub::Stub,
     /// Bytes written but not yet accepted by the socket.
     pending: Vec<u8>,
+    /// Bytes read from the socket and not yet acted on, because acting on them
+    /// would have taken `pending` past [`MAX_PENDING`]. Empty except while a
+    /// client is not reading its replies.
+    unread: Vec<u8>,
 }
 
 /// A GDB remote-protocol server listening on a TCP port.
@@ -272,28 +287,49 @@ impl GdbServer {
         let mut outcome = Outcome::Continue;
         let mut closed = false;
 
-        let mut buf = [0u8; READ_CHUNK];
-        match conn.stream.read(&mut buf) {
-            Ok(0) => closed = true,
-            Ok(n) => {
-                for byte in buf.get(..n).unwrap_or(&[]) {
-                    if let Some(event) = conn.framer.push(*byte) {
-                        match conn.stub.on_event(event, target, &mut out) {
-                            Outcome::Continue => {}
-                            other => outcome = other,
-                        }
-                    }
+        // Nothing new is read while requests already read are still waiting
+        // for room: what the client sends next stays in the kernel's buffer,
+        // where its own flow control pays for it.
+        if conn.unread.is_empty() && conn.pending.len() < MAX_PENDING {
+            let mut buf = [0u8; READ_CHUNK];
+            match conn.stream.read(&mut buf) {
+                Ok(0) => closed = true,
+                Ok(n) => conn.unread.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+                // `TimedOut` is how Windows spells a receive timeout, and one
+                // is armed on this socket by `wait_for_packet`.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::Interrupted | ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => closed = true,
+            }
+        }
+
+        // Act on what has been read, a byte at a time, for as long as there is
+        // room for the replies. The check is per byte rather than per read
+        // because one byte can be a whole request: a `-` asks for the last
+        // packet again.
+        let unread = std::mem::take(&mut conn.unread);
+        let mut taken = 0;
+        for byte in &unread {
+            if conn.pending.len().saturating_add(out.len()) >= MAX_PENDING {
+                break;
+            }
+            taken += 1;
+            if let Some(event) = conn.framer.push(*byte) {
+                match conn.stub.on_event(event, target, &mut out) {
+                    Outcome::Continue => {}
+                    other => outcome = other,
                 }
             }
-            // `TimedOut` is how Windows spells a receive timeout, and one is
-            // armed on this socket by `wait_for_packet`.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::Interrupted | ErrorKind::TimedOut
-                ) => {}
-            Err(_) => closed = true,
         }
+        conn.unread = unread;
+        conn.unread.drain(..taken);
+        // A client that is not reading is not waited *on* either: its next
+        // bytes are already in the socket, so a wait for them would return at
+        // once and the session would spin.
+        let throttled = !conn.unread.is_empty() || conn.pending.len() >= MAX_PENDING;
 
         if !closed && outcome == Outcome::Continue {
             // Whatever the packets just decided is what the machine is about
@@ -346,7 +382,11 @@ impl GdbServer {
         } else {
             // Nothing to do but wait for the next packet — and to wake when it
             // comes, rather than a tick later.
-            wait_for_packet(&conn.stream);
+            if throttled {
+                std::thread::sleep(IDLE_SLEEP);
+            } else {
+                wait_for_packet(&conn.stream);
+            }
             Ok(Progress::Halted)
         }
     }
@@ -369,6 +409,7 @@ impl GdbServer {
                     framer: packet::Framer::new(),
                     stub: stub::Stub::new(),
                     pending: Vec::new(),
+                    unread: Vec::new(),
                 });
                 Ok(())
             }
@@ -579,6 +620,67 @@ mod tests {
             client.read_exact(&mut reply).expect("the reply");
             assert_eq!(&reply, b"+$1#31");
         }
+    }
+
+    /// The far end of this socket is whoever reached the port, and it does not
+    /// have to read. Every request earns a reply and a `-` earns a copy of the
+    /// last one for a single byte, so without a bound a peer that only writes
+    /// grows this process at many times the rate it sends.
+    #[test]
+    fn a_client_that_never_reads_cannot_grow_the_reply_queue_without_bound() {
+        let mut server = GdbServer::bind(":0").expect("bind");
+        let mut target = Inert;
+        let mut client = attached(&mut server, &mut target);
+        client.set_nonblocking(true).expect("non-blocking");
+
+        // One real request, so there is a reply worth repeating — about ninety
+        // bytes of feature list — and then nothing but "say that again".
+        client.write_all(b"$qSupported#37").expect("write");
+        let naks = [packet::NAK; 16 * 1024];
+        let pending = |server: &GdbServer| server.conn.as_ref().map_or(0, |c| c.pending.len());
+        // One reply of slack: the check is made before a request is taken.
+        let most = MAX_PENDING + 4096;
+
+        let mut throttled = 0;
+        for _ in 0..20_000 {
+            // Whatever the socket will take; a full buffer is the point.
+            let _ = client.write(&naks);
+            server.poll(&mut target).expect("poll");
+            assert!(server.is_attached(), "not reading is not hanging up");
+            let queued = pending(&server);
+            assert!(queued <= most, "{queued} bytes of reply queued");
+            if queued >= MAX_PENDING {
+                throttled += 1;
+                if throttled >= 20 {
+                    break;
+                }
+            }
+        }
+        assert!(
+            throttled >= 20,
+            "the queue never filled: {}",
+            pending(&server)
+        );
+
+        // And it is back pressure rather than a hang-up: once the client reads,
+        // the queue drains and the requests held back are answered after all.
+        let mut received = 0usize;
+        let mut buf = [0u8; 65536];
+        for _ in 0..20_000 {
+            server.poll(&mut target).expect("poll");
+            match client.read(&mut buf) {
+                Ok(n) => received += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("read: {e}"),
+            }
+            if received > MAX_PENDING * 2 {
+                break;
+            }
+        }
+        assert!(
+            received > MAX_PENDING * 2,
+            "only {received} bytes ever arrived"
+        );
     }
 
     #[test]
