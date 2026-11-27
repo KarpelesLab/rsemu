@@ -1056,3 +1056,54 @@ fn the_pins_are_the_pins_and_nothing_else() {
     );
     assert_eq!(REGISTER_BYTES, 0xd0);
 }
+
+#[test]
+fn a_snapshot_with_a_wakeup_prescaler_past_its_division_is_refused() {
+    // A wakeup timer on RTCCLK/2 (`WUCKSEL = 011`), stopped one cycle into a
+    // division.
+    let rtc = fresh();
+    unlock(&rtc);
+    poke(&rtc, WUTR, 1000);
+    poke(&rtc, CR, CR_WUTE | 0b011);
+    tick(&rtc, 5);
+    let bytes = save(&rtc);
+
+    // Where the prescaler sits in the payload: two seven-byte calendars,
+    // eighteen register words, the backup registers, five one-byte flags and
+    // the wakeup counter itself.
+    const WUT_PRESCALE: usize = 14 + 18 * 4 + BKP_COUNT * 4 + 5 + 4;
+    let reader = StateReader::new(&bytes).unwrap();
+    let (_, _, payload) = reader.load_raw("rtc").unwrap();
+    let mut payload = payload.to_vec();
+    assert_eq!(
+        payload[WUT_PRESCALE..WUT_PRESCALE + 4],
+        1u32.to_le_bytes(),
+        "five cycles is two divisions by two and one cycle over"
+    );
+    let rebuilt = |payload: &[u8]| {
+        let mut shape = MachineShape::new();
+        shape.add_device("rtc", CLASS_NAME).unwrap();
+        let mut w = StateWriter::new(shape);
+        w.raw_chunk("rtc", CLASS_NAME, STATE_VERSION, payload)
+            .unwrap();
+        w.to_vec().unwrap()
+    };
+    let try_load = |bytes: &[u8]| {
+        let restored = fresh();
+        let reader = StateReader::new(bytes).unwrap();
+        let chunk = reader
+            .load("rtc", CLASS_NAME, STATE_VERSION, &Migrations::new())
+            .unwrap();
+        Device::load(&restored, &mut chunk.reader())?;
+        // What a believed snapshot does next: the scheduler asks when the
+        // wakeup timer fires, which is `period - prescale` cycles away.
+        tick(&restored, 3);
+        Ok::<(), Error>(())
+    };
+    try_load(&rebuilt(&payload)).expect("the honest snapshot loads and runs");
+
+    // Nine cycles into a division by two.
+    payload[WUT_PRESCALE..WUT_PRESCALE + 4].copy_from_slice(&9u32.to_le_bytes());
+    let e = try_load(&rebuilt(&payload)).expect_err("a phase outside the division");
+    assert!(format!("{e}").contains("wakeup prescaler"), "{e}");
+}

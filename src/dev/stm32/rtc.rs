@@ -1934,6 +1934,20 @@ impl Device for Rtc {
                 state.wpr_stage
             )));
         }
+        // The wakeup prescaler is the third divider, and it needs the check
+        // the other two get: a running one is always below its division —
+        // enabling `WUTE` zeroes it and `WUCKSEL` cannot change while `WUTE`
+        // is set — and the next-event computation subtracts it from that
+        // division without a guard.
+        if state.cr & CR_WUTE != 0
+            && let Some(period) = state.wut_period()
+            && u64::from(state.wut_prescale) >= period
+        {
+            return Err(Error::State(format!(
+                "snapshot has an RTC wakeup prescaler at {} of a division by {period}",
+                state.wut_prescale
+            )));
+        }
 
         let out = {
             let mut live = self.regs.state.lock();
