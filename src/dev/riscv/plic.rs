@@ -266,14 +266,23 @@ impl Plic {
 }
 
 impl Registers {
-    /// The highest-priority enabled pending source for `context`, or 0.
+    /// The highest-priority enabled pending source for `context` whose
+    /// priority is strictly above `floor`, or 0.
     ///
-    /// Ties break toward the lowest source number, which the specification
-    /// leaves to the implementation and which every guest expects because it
-    /// is the only stable answer.
-    fn best(state: &State, context: usize) -> u32 {
+    /// `floor` is the context's threshold when the question is whether to
+    /// *notify* the hart, and zero when the hart is *claiming* — the
+    /// specification's "Interrupt Claim Process": "The PLIC can perform a
+    /// claim at any time and the claim operation is not affected by the
+    /// setting of the priority threshold register." Zero rather than nothing,
+    /// because priority 0 is "never interrupt" and switches the source off
+    /// for a claim too.
+    ///
+    /// Ties break toward the lowest source number, which is the
+    /// specification's rule: "interrupts with the lowest ID have the highest
+    /// effective priority".
+    fn best(state: &State, context: usize, floor: u32) -> u32 {
         let mut best = 0u32;
-        let mut best_priority = state.threshold[context];
+        let mut best_priority = floor;
         for source in 1..state.pending.len() {
             if !state.pending[source] || !state.enable[context][source] {
                 continue;
@@ -290,7 +299,7 @@ impl Registers {
     /// Which contexts should now have their external line asserted.
     fn evaluate(state: &State) -> Vec<bool> {
         (0..state.threshold.len())
-            .map(|c| Self::best(state, c) != 0)
+            .map(|c| Self::best(state, c, state.threshold[c]) != 0)
             .collect()
     }
 
@@ -333,7 +342,9 @@ impl Registers {
     fn claim(&self, context: usize) -> u32 {
         let (source, levels) = {
             let mut state = self.state.lock();
-            let source = Self::best(&state, context);
+            // Not masked by the threshold: a hart that has raised it to stop
+            // being notified may still poll with a claim.
+            let source = Self::best(&state, context, 0);
             if source != 0 {
                 state.pending[source as usize] = false;
                 state.claimed[source as usize] = true;
@@ -664,7 +675,7 @@ impl Device for Plic {
         };
         let level = {
             let state = self.regs.state.lock();
-            Registers::best(&state, context) != 0
+            Registers::best(&state, context, state.threshold[context]) != 0
         };
         let out = self.regs.outs.lock()[context].clone();
         if let Some(out) = out {
@@ -925,6 +936,37 @@ mod tests {
         assert_eq!(read(&plic, claim(0)), 5, "priority 3 beats priority 1");
         assert_eq!(read(&plic, claim(0)), 10);
         assert_eq!(read(&plic, claim(0)), 0, "and then there are none");
+    }
+
+    /// PLIC specification, "Interrupt Claim Process": "The PLIC can perform a
+    /// claim at any time and the claim operation is not affected by the
+    /// setting of the priority threshold register."
+    #[test]
+    fn a_claim_is_not_affected_by_the_threshold() {
+        // The polling arrangement the same section describes: "a hart could
+        // set the threshold value to maximum to disable interrupt
+        // notifications and instead poll for active interrupts using periodic
+        // claim requests".
+        let (plic, probe) = armed();
+        write(&plic, threshold(0), PRIORITY_MASK);
+        plic.set_source(10, true);
+        assert!(!probe.high(), "the threshold masks the notification");
+        assert_eq!(read(&plic, claim(0)), 10, "and not the claim");
+        assert!(
+            !plic.is_pending(10),
+            "which clears the pending bit as usual"
+        );
+        assert_eq!(read(&plic, claim(0)), 0);
+        write(&plic, claim(0), 10);
+        assert!(
+            plic.is_pending(10),
+            "still asserted, so the gateway re-raises"
+        );
+
+        // Priority zero is "never interrupt" for a claim as well: it is the
+        // source that is switched off, not the notification.
+        write(&plic, priority(10), 0);
+        assert_eq!(read(&plic, claim(0)), 0);
     }
 
     #[test]
