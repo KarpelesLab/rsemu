@@ -2473,6 +2473,36 @@ fn compare_operand<F: crate::float::Format>(v: u64, env: Env) -> (u64, Flags) {
     }
 }
 
+/// The denormal-operand report of a comparison, given whether either
+/// operand is a NaN. `operands` is what [`compare_operand`] returned for the
+/// two of them.
+///
+/// `#D` is not "an operand was subnormal": it sits below the invalid
+/// operation and the QNaN operand in the SDM's priority list (volume 1,
+/// §4.9.2, "Floating-Point Exception Priority": "1. Invalid-operation
+/// exception ... 2. QNaN operand. Though this is not an exception, the
+/// handling of a QNaN operand has precedence over lower-priority exceptions
+/// ... 4. Denormal-operand exception"), and the lower entry is not reported
+/// when a higher one applies. A comparison with a NaN operand is one of the
+/// first two whichever kind of NaN it is and whichever predicate asked.
+/// Read back from `MXCSR` on an x86 host (AMD Zen 5) after the one
+/// instruction, every exception masked:
+///
+/// | operation | flags |
+/// | --- | --- |
+/// | `UCOMISD` QNaN, subnormal (either order) | none |
+/// | `UCOMISD` SNaN, subnormal | `IE` |
+/// | `COMISD` QNaN, subnormal | `IE` |
+/// | `CMPEQSD`, `CMPUNORDSD` QNaN, subnormal | none |
+/// | `CMPLTSD` QNaN or SNaN, subnormal | `IE` |
+/// | `UCOMISD`, `COMISD`, `CMPEQSD` 1.0, subnormal | `DE` |
+///
+/// and `UCOMISS`/`CMPEQSS` the same. This is the rule `float`'s arithmetic
+/// applies in `kernel::with_operand_flags`; a comparison never reaches it.
+fn operand_flags(operands: Flags, unordered: bool) -> Flags {
+    if unordered { Flags::NONE } else { operands }
+}
+
 /// The comparison behind `COMISS`/`UCOMISS`, at one format.
 fn ordered_pair<F: crate::float::Format>(
     a: u64,
@@ -2490,7 +2520,7 @@ fn ordered_pair<F: crate::float::Format>(
     let (ka, kb) = (kind(a), kind(b));
     let any = ka.is_some() || kb.is_some();
     let snan = ka == Some(true) || kb == Some(true);
-    let mut flags = fa | fb;
+    let mut flags = operand_flags(fa | fb, any);
     if snan || (signalling && any) {
         flags |= Flags::INVALID;
     }
@@ -2556,7 +2586,7 @@ pub(super) fn predicate<F: crate::float::Format>(
         _ => (true, true, false),       // TRUE_UQ
     };
     let signals = signals != (which & 16 != 0);
-    let mut flags = fa | fb;
+    let mut flags = operand_flags(fa | fb, unordered);
     if snan(a) || snan(b) || (signals && unordered) {
         flags |= Flags::INVALID;
     }
@@ -3503,5 +3533,39 @@ pub(super) fn packed(op: Op, dst: [u64; 2], src: [u64; 2], imm: u8) -> [u64; 2] 
             }
             of_words(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every row was read back from `MXCSR` on an x86 host after the one
+    /// instruction named, all exceptions masked — see [`operand_flags`].
+    #[test]
+    fn a_comparison_with_a_nan_does_not_report_a_denormal_operand() {
+        let env = Env::X86_SSE;
+        let den = 1u64;
+        let one = 0x3ff0_0000_0000_0000u64;
+        let qnan = 0x7ff8_0000_0000_0000u64;
+        let snan = 0x7ff0_0000_0000_0001u64;
+        let (none, ie, de) = (Flags::NONE, Flags::INVALID, Flags::DENORMAL);
+        // UCOMISD
+        assert_eq!(ordered_pair::<B64>(qnan, den, false, env).1, none);
+        assert_eq!(ordered_pair::<B64>(den, qnan, false, env).1, none);
+        assert_eq!(ordered_pair::<B64>(snan, den, false, env).1, ie);
+        assert_eq!(ordered_pair::<B64>(one, den, false, env).1, de);
+        // COMISD
+        assert_eq!(ordered_pair::<B64>(qnan, den, true, env).1, ie);
+        assert_eq!(ordered_pair::<B64>(one, den, true, env).1, de);
+        // CMPEQSD, CMPLTSD, CMPUNORDSD
+        assert_eq!(predicate::<B64>(qnan, den, 0, env), (false, none));
+        assert_eq!(predicate::<B64>(qnan, den, 1, env), (false, ie));
+        assert_eq!(predicate::<B64>(snan, den, 1, env), (false, ie));
+        assert_eq!(predicate::<B64>(den, qnan, 3, env), (true, none));
+        assert_eq!(predicate::<B64>(one, den, 0, env), (false, de));
+        // UCOMISS, CMPEQSS
+        assert_eq!(ordered_pair::<B32>(0x7fc0_0000, 1, false, env).1, none);
+        assert_eq!(predicate::<B32>(0x7fc0_0000, 1, 0, env), (false, none));
     }
 }
