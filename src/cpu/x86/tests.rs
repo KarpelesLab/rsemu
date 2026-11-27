@@ -3888,6 +3888,60 @@ fn an_interrupt_onto_a_sixteen_bit_stack_moves_the_pointer_in_sixteen_bits() {
     );
 }
 
+/// `STR` and `SLDT` to a register write the whole register, zero-extended,
+/// and to memory write sixteen bits whatever the operand size.
+///
+/// *Intel SDM* volume 2, `STR`: "When the destination operand is a 32-bit
+/// register, the 16-bit segment selector is copied into the lower 16 bits of
+/// the register and the upper 16 bits of the register are cleared. When the
+/// destination operand is a memory location, the segment selector is written
+/// to memory as a 16-bit quantity, regardless of operand size."
+#[test]
+fn str_and_sldt_zero_extend_into_a_register_and_store_a_word_to_memory() {
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(
+        5,
+        descriptor(
+            at::TSS,
+            0x67,
+            ar::PRESENT | (u32::from(sys_type::TSS32_AVAIL) << 8),
+        ),
+    );
+    pc.gdt(
+        6,
+        descriptor(0x9800, 0xff, ar::PRESENT | (u32::from(sys_type::LDT) << 8)),
+    );
+    pc.write32(at::MARK, 0xffff_ffff);
+    pc.write32(at::MARK + 4, 0xffff_ffff);
+    let mut code = alloc::vec![
+        0xb8, 0x28, 0x00, 0x00, 0x00, // mov eax, 0x28
+        0x0f, 0x00, 0xd8, // ltr ax
+        0xb8, 0x30, 0x00, 0x00, 0x00, // mov eax, 0x30
+        0x0f, 0x00, 0xd0, // lldt ax
+        0xb9, 0xff, 0xff, 0xff, 0xff, // mov ecx, -1
+        0xba, 0xff, 0xff, 0xff, 0xff, // mov edx, -1
+        0xbb, 0xff, 0xff, 0xff, 0xff, // mov ebx, -1
+        0x0f, 0x00, 0xc1, // sldt ecx
+        0x0f, 0x00, 0xca, // str edx
+        0x66, 0x0f, 0x00, 0xcb, // str bx — sixteen bits, the rest kept
+        0x0f, 0x00, 0x0d, // str [MARK]
+    ];
+    code.extend_from_slice(&(at::MARK as u32).to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x00, 0x05]); // sldt [MARK + 4]
+    code.extend_from_slice(&((at::MARK + 4) as u32).to_le_bytes());
+    code.push(0xf4);
+    pc.write(at::CODE0, &code);
+    let steps = pc.run(16);
+    assert!(steps < 16);
+    let regs = pc.regs();
+    assert_eq!(regs.rcx, 0x30, "sldt ecx cleared the upper half");
+    assert_eq!(regs.rdx, 0x28, "str edx cleared the upper half");
+    assert_eq!(regs.rbx, 0xffff_0028, "a 16-bit operand keeps it");
+    assert_eq!(pc.read32(at::MARK), 0xffff_0028, "memory gets a word");
+    assert_eq!(pc.read32(at::MARK + 4), 0xffff_0030, "from sldt too");
+}
+
 #[test]
 fn smsw_sldt_and_str_read_back_what_was_loaded() {
     let pc = pc386();

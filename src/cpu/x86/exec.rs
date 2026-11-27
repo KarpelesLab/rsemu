@@ -2950,7 +2950,23 @@ impl<'a> Exec<'a> {
                     self.state.sys.task.selector
                 };
                 self.require_protected()?;
-                self.write_arg(f, insn.dst, 2, u64::from(selector))?;
+                // Sixteen bits to memory whatever the operand size, and the
+                // whole register — zero-extended — to a register: the same
+                // split `MOV r/m, Sreg` has. *Intel SDM* volume 2, `STR`:
+                // "When the destination operand is a 32-bit register, the
+                // 16-bit segment selector is copied into the lower 16 bits of
+                // the register and the upper 16 bits of the register are
+                // cleared. When the destination operand is a memory location,
+                // the segment selector is written to memory as a 16-bit
+                // quantity, regardless of operand size." `SLDT` says the same
+                // of every part from the P6 on and of compatibility mode, and
+                // calls the upper half undefined on the 386 and the 486 —
+                // where clearing it is as good an answer as any.
+                if f.rm_is_register() {
+                    self.write_arg(f, insn.dst, f.opsize, u64::from(selector))?;
+                } else {
+                    self.write_arg(f, insn.dst, 2, u64::from(selector))?;
+                }
             }
             Op::SMSW => {
                 // A register destination gets all thirty-two bits on a 386,
