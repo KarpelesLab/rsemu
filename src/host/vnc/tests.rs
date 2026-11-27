@@ -529,6 +529,60 @@ fn a_client_that_never_finishes_a_message_is_hung_up_on() {
     assert_eq!(server.clients(), 0, "the server stopped buffering");
 }
 
+/// A peer that writes faster than one turn reads must not be able to hold the
+/// turn open, or make the server buffer whatever it cares to send: every
+/// message here is *valid*, so the inbox limit that hangs up on a message
+/// nobody finishes never saw it. One turn takes a bounded bite and leaves the
+/// rest in the kernel's buffer, where the peer's own flow control pays for it.
+#[test]
+fn a_flood_of_valid_messages_is_taken_a_bounded_bite_at_a_time() {
+    const EVENTS: usize = 300_000;
+    let mut server = a_server();
+    let surface = a_picture();
+    let mut client = Client::connect(&server);
+    client.handshake(&mut server, &surface);
+
+    // 1.8 MB of PointerEvents (§7.5.5), from a thread of its own because it
+    // is more than a socket buffer holds and the write has to block.
+    let mut writer = client.stream.try_clone().expect("clone");
+    writer.set_nonblocking(false).expect("blocking");
+    let flood = std::thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(EVENTS * 6);
+        for i in 0..EVENTS {
+            let x = (i % 4) as u16;
+            bytes.extend_from_slice(&[client_msg::POINTER_EVENT, 0]);
+            bytes.extend_from_slice(&x.to_be_bytes());
+            bytes.extend_from_slice(&[0, 1]);
+        }
+        writer.write_all(&bytes).expect("the flood");
+        // The clone shares the socket's flags, and the reader wants them back.
+        writer.set_nonblocking(true).expect("non-blocking");
+    });
+    // Let the kernel's buffers fill, so the first turn has more waiting for it
+    // than it is allowed to take.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let most = (super::MAX_INBOX + 4096) / 6 + 1;
+    let mut seen = 0usize;
+    let deadline = Instant::now() + PATIENCE * 4;
+    while seen < EVENTS && Instant::now() < deadline {
+        let events = server.poll(&surface).expect("poll");
+        assert!(
+            events.len() <= most,
+            "one turn delivered {} events; the bite is {most}",
+            events.len()
+        );
+        seen += events.len();
+        assert_eq!(
+            server.clients(),
+            1,
+            "a flood of valid messages is not an error"
+        );
+    }
+    flood.join().expect("the writer");
+    assert_eq!(seen, EVENTS, "bounded, but nothing lost");
+}
+
 #[test]
 fn a_message_split_across_two_packets_is_reassembled() {
     let mut server = a_server();

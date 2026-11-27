@@ -360,7 +360,13 @@ impl VncServer {
         events: &mut Vec<InputEvent>,
     ) -> bool {
         let mut buf = [0u8; 4096];
-        loop {
+        // Bounded by the inbox limit rather than by the socket running dry. A
+        // peer that writes as fast as this reads would otherwise hold the turn
+        // — and the machine behind it — for as long as it liked, with the
+        // inbox growing the whole time: `MAX_INBOX` is only checked once the
+        // reading stops. What is left stays in the kernel's buffer, where the
+        // peer's own flow control pays for it, and is read next turn.
+        while conn.inbox.len() <= MAX_INBOX {
             match conn.stream.read(&mut buf) {
                 Ok(0) => return false,
                 Ok(n) => {
@@ -393,16 +399,36 @@ impl VncServer {
     /// Parse everything whole in the inbox. Returns false on a fatal protocol
     /// error.
     fn consume(conn: &mut Conn, name: &str, events: &mut Vec<InputEvent>) -> bool {
+        // The consumed prefix is cut off once, here, rather than after every
+        // message: a `drain` from the front moves everything behind it, so
+        // doing it per message is quadratic in what a peer chose to send. Ten
+        // thousand six-byte PointerEvents in one turn is ordinary; moving
+        // sixty kilobytes ten thousand times to parse them is not.
+        let mut used = 0;
+        let keep = Self::consume_from(conn, &mut used, name, events);
+        conn.inbox.drain(..used);
+        keep
+    }
+
+    /// [`consume`](Self::consume)'s loop, reading from `inbox[*used..]` and
+    /// advancing `used` past each whole message.
+    fn consume_from(
+        conn: &mut Conn,
+        used: &mut usize,
+        name: &str,
+        events: &mut Vec<InputEvent>,
+    ) -> bool {
         loop {
+            let inbox = conn.inbox.get(*used..).unwrap_or(&[]);
             match conn.phase {
                 Phase::Version => {
-                    if conn.inbox.len() < proto::VERSION_LEN {
+                    if inbox.len() < proto::VERSION_LEN {
                         return true;
                     }
-                    let Some(version) = Version::parse(&conn.inbox[..proto::VERSION_LEN]) else {
+                    let Some(version) = Version::parse(&inbox[..proto::VERSION_LEN]) else {
                         return false;
                     };
-                    conn.inbox.drain(..proto::VERSION_LEN);
+                    *used += proto::VERSION_LEN;
                     conn.version = version;
                     if version >= Version::V3_7 {
                         // §7.1.2: offer the list, wait for a choice.
@@ -416,10 +442,10 @@ impl VncServer {
                     }
                 }
                 Phase::Security => {
-                    let Some(&choice) = conn.inbox.first() else {
+                    let Some(&choice) = inbox.first() else {
                         return true;
                     };
-                    conn.inbox.drain(..1);
+                    *used += 1;
                     if choice != proto::SECURITY_NONE {
                         if conn.version >= Version::V3_8 {
                             conn.pending
@@ -438,10 +464,10 @@ impl VncServer {
                     conn.phase = Phase::Init;
                 }
                 Phase::Init => {
-                    let Some(&shared) = conn.inbox.first() else {
+                    let Some(&shared) = inbox.first() else {
                         return true;
                     };
-                    conn.inbox.drain(..1);
+                    *used += 1;
                     conn.shared = shared != 0;
                     let (width, height) = conn.encoder.announced();
                     conn.pending.extend_from_slice(&proto::server_init(
@@ -452,15 +478,15 @@ impl VncServer {
                     ));
                     conn.phase = Phase::Ready;
                 }
-                Phase::Ready => match proto::parse_client(&conn.inbox) {
+                Phase::Ready => match proto::parse_client(inbox) {
                     Parsed::Incomplete => return true,
                     // Both fatal: RFB has no way for a server to answer a
                     // client message with an error, so a stream it cannot
                     // resynchronise and a message the RFC does not permit both
                     // end the connection. See `Parsed`.
                     Parsed::Unknown(_) | Parsed::Malformed => return false,
-                    Parsed::Message(message, used) => {
-                        conn.inbox.drain(..used);
+                    Parsed::Message(message, len) => {
+                        *used += len;
                         Self::apply(conn, message, events);
                     }
                 },
