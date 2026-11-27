@@ -512,3 +512,26 @@ fn a_wired_master_writes_and_reads_the_same_bytes_a_transactional_one_does() {
     assert_eq!(wired.contents(), by_call);
     assert_eq!(wired.byte(0x0b), Some(0x0d));
 }
+
+#[test]
+fn a_read_clocked_inside_a_page_write_does_not_move_the_address_counter() {
+    // `I2cBus::read` does not ask which way the transfer was addressed. A read
+    // in the middle of a write returns the pulled-up line, and used to step
+    // the counter across the whole array as a real read does — here from the
+    // last byte of the last page round to zero, below the page being written,
+    // where the next data byte's `word - page_base` underflowed.
+    let (eeprom, bus) = at24c02();
+    assert_eq!(bus.start(Address::Seven(0x50), Direction::Write), Ack::Ack);
+    assert_eq!(bus.write(0xff), Ack::Ack);
+    assert_eq!(bus.read(Ack::Ack), 0xff, "nothing drives SDA");
+    assert_eq!(eeprom.word_address(), 0xff, "and nothing was accessed");
+    assert_eq!(bus.write(0x5a), Ack::Ack);
+    bus.stop();
+    eeprom.advance_to(DEFAULT_WRITE_TICKS);
+    assert_eq!(
+        eeprom.byte(0xff),
+        Some(0x5a),
+        "the write landed where it was aimed"
+    );
+    assert_eq!(eeprom.byte(0x00), Some(0xff));
+}

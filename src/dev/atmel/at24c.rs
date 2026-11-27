@@ -587,6 +587,15 @@ impl I2cSlave for Shared {
 
     fn read_ack(&self, ack: Ack) {
         let mut state = self.state.lock();
+        if state.phase != Phase::Reading {
+            // No byte went out, so there is nothing to count: [`Self::read`]
+            // answered `0xff` for the pulled-up line. And it must not count —
+            // [`I2cBus::read`] does not check which way the transfer was
+            // addressed, and a read clocked in the middle of a page write
+            // would walk `word` out of the page `page_base` names, which is
+            // the one thing `write` assumes cannot happen.
+            return;
+        }
         // The counter moves on either way: §6.1 defines it as "the last address
         // accessed during the last Read or Write operation, incremented by
         // one", and the byte *was* accessed — it went out on the wire. What the
