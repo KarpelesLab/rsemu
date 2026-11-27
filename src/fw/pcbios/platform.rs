@@ -558,6 +558,12 @@ impl<'a> Survey<'a> {
             return None;
         }
         let index: u8 = port.strip_prefix("ir")?.parse().ok()?;
+        // Eight inputs a chip. A description is resolved before any class has
+        // seen its pin names, so this is the first thing to look at the
+        // number — and `index + 8` below is arithmetic on it.
+        if index > 7 {
+            return None;
+        }
         let slave = pic.props.get("mode").and_then(|v| v.as_str()) == Some("slave");
         Some(if slave { index + 8 } else { index })
     }
@@ -737,6 +743,30 @@ mod tests {
                 .interrupts
                 .contains(&IsaInterrupt { irq: 8, gsi: 8 })
         );
+    }
+
+    /// A description is user input, and the survey reads it before anything
+    /// has checked a pin name against the class that owns it: `ir250` on the
+    /// slave used to be `250 + 8` in a `u8`, which is a panic in a debug build
+    /// and IRQ 2 in a release one. An 8259A has eight inputs; anything else
+    /// is not an ISA interrupt and is not published.
+    #[test]
+    #[cfg(feature = "dev-pc")]
+    fn a_pin_that_is_not_one_of_an_8259as_eight_inputs_is_not_an_isa_interrupt() {
+        const RTC: &str = "wire cmos.irq    -> pic2.ir0 ";
+        assert!(crate::dev::pc::PC_AT.contains(RTC), "the RTC's wire moved");
+        for pin in ["ir250", "ir8"] {
+            let text = crate::dev::pc::PC_AT.replace(RTC, &format!("wire cmos.irq -> pic2.{pin} "));
+            // Whether the description resolves at all is the resolver's
+            // business; what must not happen is a panic or an invented IRQ.
+            if let Ok(derived) = Platform::from_machine("pc-at.machine", &text) {
+                assert!(
+                    derived.interrupts.iter().all(|i| i.irq != 8 && i.irq < 16),
+                    "{pin} was published as an ISA interrupt: {:?}",
+                    derived.interrupts
+                );
+            }
+        }
     }
 
     #[test]
