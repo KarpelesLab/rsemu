@@ -793,3 +793,22 @@ fn a_snapshot_round_trips_with_a_disk_and_without_one() {
         assert_eq!(first, w.to_vec().unwrap(), "present = {present}");
     }
 }
+
+#[test]
+fn a_dropped_drive_and_its_paula_are_freed() {
+    // Paula keeps the drives on its read line and a drive tells Paula when it
+    // starts or stops presenting data. When each owned the other, neither
+    // was freed with the machine — nor the disk in the drive, nor the
+    // scheduler slots both hold.
+    let rig = Rig::new();
+    let drive = Arc::downgrade(&rig.drive.shared);
+    let port = rig.paula.port().downgrade();
+    assert!(port.upgrade().is_some(), "Paula is alive while the rig is");
+    drop(rig);
+    assert_eq!(
+        drive.strong_count(),
+        0,
+        "the drive's state outlived the drive"
+    );
+    assert!(port.upgrade().is_none(), "Paula's state outlived Paula");
+}

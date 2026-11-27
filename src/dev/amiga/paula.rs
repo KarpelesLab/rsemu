@@ -262,7 +262,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
@@ -1674,7 +1674,34 @@ pub struct PaulaPort {
     shared: Arc<Shared>,
 }
 
+/// A [`PaulaPort`] that does not keep Paula alive.
+///
+/// What a part Paula itself holds has to keep instead of the port: a drive is
+/// on Paula's list ([`PaulaPort::attach_drive`]) and reports back through the
+/// port, and two strong references would be a cycle that frees neither chip
+/// when the machine is dropped.
+#[derive(Debug, Clone)]
+pub struct WeakPaulaPort {
+    shared: Weak<Shared>,
+}
+
+impl WeakPaulaPort {
+    /// The port, while Paula exists.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<PaulaPort> {
+        self.shared.upgrade().map(|shared| PaulaPort { shared })
+    }
+}
+
 impl PaulaPort {
+    /// This port without its hold on Paula; see [`WeakPaulaPort`].
+    #[must_use]
+    pub fn downgrade(&self) -> WeakPaulaPort {
+        WeakPaulaPort {
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+
     /// The tick Paula has simulated up to.
     #[must_use]
     pub fn tick(&self) -> u64 {

@@ -133,7 +133,7 @@ use crate::machine::realize::{BindCtx, Instance};
 use crate::machine::validate::{ClassSchema, PortDir, PropSchema};
 
 use super::adf;
-use super::paula::{DiskDrive, FAST_CELL_TICKS, PaulaPort};
+use super::paula::{DiskDrive, FAST_CELL_TICKS, PaulaPort, WeakPaulaPort};
 
 /// The class name a machine file writes.
 pub const CLASS_NAME: &str = "amiga.floppy";
@@ -553,7 +553,10 @@ struct Shared {
     next_event: AtomicU64,
     out: Mutex<Outputs>,
     lazy: Mutex<Option<LazyHandle>>,
-    paula: Mutex<Option<PaulaPort>>,
+    /// The controller, held **weakly**: Paula holds this drive on its read
+    /// line, so a strong reference back would be a cycle that frees neither.
+    /// A drive whose Paula is gone has nobody to report to.
+    paula: Mutex<Option<WeakPaulaPort>>,
     /// The medium the disk in the drive *is*, when the run installed one. Not
     /// part of the snapshot: it is host state.
     medium: Mutex<Option<Arc<dyn Medium>>>,
@@ -600,7 +603,7 @@ impl Shared {
                 src.drive(if low { Drive::Low } else { Drive::HiZ });
             }
         }
-        let paula = self.paula.lock().clone();
+        let paula = self.paula.lock().as_ref().and_then(WeakPaulaPort::upgrade);
         if let Some(paula) = paula {
             paula.drive_changed();
         }
@@ -901,7 +904,7 @@ impl Floppy {
     /// Attach to a controller by hand, as `bind` does from a machine file.
     pub fn attach(&self, paula: PaulaPort) {
         paula.attach_drive(Arc::clone(&self.shared) as Arc<dyn DiskDrive>);
-        *self.shared.paula.lock() = Some(paula);
+        *self.shared.paula.lock() = Some(paula.downgrade());
     }
 
     /// Run the drive until `target` colour clocks have passed in total.
