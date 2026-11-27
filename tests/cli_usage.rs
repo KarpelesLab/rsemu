@@ -466,3 +466,32 @@ fn a_mistyped_parameter_points_at_the_one_that_was_meant() {
     );
     assert!(!stderr.contains("param basemem"), "{stderr}");
 }
+
+/// A property a device refuses is reported with the object and the line.
+///
+/// A device's constructor is handed its properties and nothing else, so its
+/// refusal named neither the object nor the file: `rsemu: this host cannot
+/// allocate … bytes`, on a board with four things that have a size.
+#[test]
+fn a_refused_property_names_its_object_and_its_line() {
+    let file = scratch("toobig.machine");
+    std::fs::write(
+        &file,
+        "machine \"toobig\" {\n  space bus { width = 16, unassigned = open-bus }\n  \
+         object small \"ram\" { size = 4K }\n  \
+         object huge \"ram\" {\n    size = 0xffffffffffffffff\n  }\n}\n",
+    )
+    .expect("a scratch machine file");
+    let path = file.to_str().expect("a UTF-8 temp dir");
+    let (code, _, stderr) = run(&["run", path, "--headless", "--for", "1ms"]);
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("object `huge` (class `ram`): property `size`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cannot allocate"), "{stderr}");
+    // Under the property, on the line it was written.
+    assert!(stderr.contains(&format!("{path}:5:5")), "{stderr}");
+    assert!(stderr.contains("size = 0xffffffffffffffff"), "{stderr}");
+}

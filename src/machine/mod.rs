@@ -275,5 +275,31 @@ pub fn build(
             return Err(map.to_error(&Diagnostic::new(object.class_span, message)));
         }
     }
-    realize_with(&resolved, registry, &options.bindings, &options.realize)
+    realize::realize_located(&resolved, registry, &options.bindings, &options.realize).map_err(
+        |(e, object)| match (e, object.and_then(|i| resolved.objects.get(i))) {
+            // A property a device's own constructor refused. The validator
+            // catches a wrong *kind* with a caret; a wrong *value* — a size
+            // the host cannot allocate, a geometry the part does not come in
+            // — is only known to the device, which has no spans. This
+            // function has both, so the refusal gets the location §5
+            // promises every config error: under the property when the
+            // device named one that was written, and otherwise under the
+            // object.
+            (crate::core::Error::Property(message), Some(object)) => {
+                let span = named_property(&message)
+                    .and_then(|name| object.prop_spans.get(name))
+                    .unwrap_or(object.name_span);
+                map.to_error(&Diagnostic::new(span, message))
+            }
+            (e, _) => e,
+        },
+    )
+}
+
+/// The property a device's refusal is about, if it said: the name inside
+/// the first ``property `…` `` of the message, which is how every reader in
+/// `core::props` and every hand-written check spells it.
+fn named_property(message: &str) -> Option<&str> {
+    let rest = message.split_once("property `")?.1;
+    Some(rest.split_once('`')?.0)
 }

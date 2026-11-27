@@ -872,7 +872,48 @@ pub fn realize_with(
     bindings: &Bindings,
     options: &RealizeOptions,
 ) -> Result<Machine> {
-    Realizer::new(machine, registry, bindings, options).run()
+    realize_located(machine, registry, bindings, options).map_err(|(e, _)| e)
+}
+
+/// [`realize_with`], also saying which object a failed construction was of.
+///
+/// The index is into [`Resolved::objects`], and it is there only when a
+/// device's own constructor refused its properties. That is the one failure
+/// here that belongs to a line of the description — the caller that still
+/// holds the source ([`crate::machine::build`]) puts the caret under it; this
+/// layer has only the names, which it has already written into the error.
+pub(crate) fn realize_located(
+    machine: &Resolved,
+    registry: &Registry,
+    bindings: &Bindings,
+    options: &RealizeOptions,
+) -> core::result::Result<Machine, (Error, Option<usize>)> {
+    let failed = core::cell::Cell::new(None);
+    Realizer::new(machine, registry, bindings, options, &failed)
+        .run()
+        .map_err(|e| (e, failed.get()))
+}
+
+/// Say whose constructor an error came out of.
+///
+/// A device is handed its properties and nothing else, so what it says about
+/// a bad one — "this host cannot allocate 1099511627776 bytes" — names
+/// neither the object nor the class, and a board with four drives on it left
+/// the reader to guess which. The machine layer is the one that knows.
+fn in_object(object: &crate::machine::resolver::Object, e: Error) -> Error {
+    match e {
+        Error::Property(message) => Error::Property(format!(
+            "object `{}` (class `{}`): {message}",
+            object.name, object.class
+        )),
+        // A device that builds its own `Config` has, by convention, put its
+        // class in `at`; the object is the half that is missing.
+        Error::Config { at, message } => Error::Config {
+            at,
+            message: format!("object `{}`: {message}", object.name),
+        },
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +948,9 @@ struct Realizer<'a> {
     realized: usize,
     shape: MachineShape,
     deferred: Deferred,
+    /// Set to the index of the object whose constructor failed, for
+    /// [`realize_located`].
+    failed: &'a core::cell::Cell<Option<usize>>,
 }
 
 impl<'a> Realizer<'a> {
@@ -915,8 +959,10 @@ impl<'a> Realizer<'a> {
         registry: &'a Registry,
         bindings: &'a Bindings,
         options: &'a RealizeOptions,
+        failed: &'a core::cell::Cell<Option<usize>>,
     ) -> Realizer<'a> {
         Realizer {
+            failed,
             machine,
             registry,
             bindings,
@@ -1177,14 +1223,20 @@ impl<'a> Realizer<'a> {
                 .with_hosts(Arc::clone(&self.options.hosts));
             let (device, instance) = match self.bindings.get(&object.class) {
                 Some(ctor) => {
-                    let instance = ctor(&props)?;
+                    let instance = ctor(&props).map_err(|e| {
+                        self.failed.set(Some(i));
+                        in_object(object, e)
+                    })?;
                     check_class(&object.name, class.name, instance.class().name)?;
                     let device: Arc<dyn Device> = instance.clone();
                     (device, Some(instance))
                 }
                 None => {
                     let device: Arc<dyn Device> =
-                        Arc::from(self.registry.create(&object.class, &props)?);
+                        Arc::from(self.registry.create(&object.class, &props).map_err(|e| {
+                            self.failed.set(Some(i));
+                            in_object(object, e)
+                        })?);
                     check_class(&object.name, class.name, device.class().name)?;
                     (device, None)
                 }
