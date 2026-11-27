@@ -530,6 +530,147 @@ fn a_device_that_does_not_care_about_frames_says_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Resume, remote wakeup and LPM
+// ---------------------------------------------------------------------------
+
+/// A device that counts resumes and answers LPM with a fixed handshake.
+#[derive(Debug)]
+struct Sleeper {
+    address: u8,
+    answer: LpmResponse,
+    resumes: Mutex<u32>,
+    lpm_seen: Mutex<Vec<LpmAttributes>>,
+}
+
+impl Sleeper {
+    fn new(address: u8, answer: LpmResponse) -> Arc<Sleeper> {
+        Arc::new(Sleeper {
+            address,
+            answer,
+            resumes: Mutex::with_rank(LockRank::DEVICE, 0),
+            lpm_seen: Mutex::with_rank(LockRank::DEVICE, Vec::new()),
+        })
+    }
+}
+
+impl UsbDevice for Sleeper {
+    fn speed(&self) -> Speed {
+        Speed::Full
+    }
+    fn address(&self) -> DeviceAddress {
+        DeviceAddress(self.address)
+    }
+    fn bus_reset(&self) {}
+    fn resume(&self) {
+        *self.resumes.lock() += 1;
+    }
+    fn lpm(&self, attributes: LpmAttributes) -> LpmResponse {
+        self.lpm_seen.lock().push(attributes);
+        self.answer
+    }
+    fn setup(&self, _endpoint: u8, _packet: SetupPacket) -> Status {
+        Status::Ack
+    }
+    fn transfer_in(&self, _endpoint: u8, _dst: &mut [u8]) -> Completion {
+        Completion::nak()
+    }
+    fn transfer_out(&self, _endpoint: u8, _src: &[u8]) -> Completion {
+        Completion::nak()
+    }
+}
+
+#[test]
+fn lpm_attributes_survive_the_wire() {
+    let sleep = LpmAttributes::sleep(0xa, true);
+    // LPM ECN Table 2-3: bLinkState 3:0, BESL 7:4, bRemoteWake 8.
+    assert_eq!(sleep.encode(), 0x01a1);
+    assert_eq!(LpmAttributes::decode(0x01a1), sleep);
+    assert_eq!(
+        LpmAttributes::decode(0x0632),
+        LpmAttributes {
+            link_state: 2,
+            besl: 3,
+            remote_wake: false
+        },
+        "reserved bits 10:9 are dropped"
+    );
+}
+
+#[test]
+fn resume_reaches_the_device_in_that_port_and_no_other() {
+    let bus = UsbBus::new(2);
+    let a = Sleeper::new(1, LpmResponse::Ack);
+    let b = Sleeper::new(2, LpmResponse::Ack);
+    bus.attach(0, Arc::clone(&a) as Arc<dyn UsbDevice>).unwrap();
+    bus.attach(1, Arc::clone(&b) as Arc<dyn UsbDevice>).unwrap();
+    bus.resume_port(1);
+    assert_eq!(*a.resumes.lock(), 0);
+    assert_eq!(*b.resumes.lock(), 1);
+    // An empty or nonexistent port is not an error.
+    bus.detach(0);
+    bus.resume_port(0);
+    bus.resume_port(14);
+}
+
+#[test]
+fn a_remote_wakeup_waits_for_the_controller_and_resume_answers_it() {
+    let bus = UsbBus::new(3);
+    let dev = Sleeper::new(1, LpmResponse::Ack);
+    bus.attach(1, Arc::clone(&dev) as Arc<dyn UsbDevice>)
+        .unwrap();
+    assert!(!bus.any_remote_wakeup());
+    bus.signal_remote_wakeup(1);
+    assert!(bus.any_remote_wakeup(), "published lock-free");
+    assert!(bus.take_remote_wakeup(1));
+    assert!(!bus.take_remote_wakeup(1), "taking it clears it");
+    assert!(!bus.any_remote_wakeup());
+
+    // Resuming the port answers a pending request; so does a reset.
+    bus.signal_remote_wakeup(1);
+    bus.resume_port(1);
+    assert!(!bus.any_remote_wakeup());
+    assert_eq!(*dev.resumes.lock(), 1);
+    bus.signal_remote_wakeup(1);
+    bus.reset_port(1);
+    assert!(!bus.take_remote_wakeup(1));
+
+    // An empty port has nobody to signal, and unplugging drops the request.
+    bus.signal_remote_wakeup(0);
+    assert!(!bus.any_remote_wakeup());
+    bus.signal_remote_wakeup(1);
+    bus.detach(1);
+    assert!(!bus.any_remote_wakeup());
+    bus.signal_remote_wakeup(200); // no such port
+    assert!(!bus.take_remote_wakeup(200));
+}
+
+#[test]
+fn lpm_is_routed_by_address_and_silence_is_the_default() {
+    let bus = UsbBus::new(2);
+    let sleeper = Sleeper::new(5, LpmResponse::Nyet);
+    bus.attach(0, Arc::clone(&sleeper) as Arc<dyn UsbDevice>)
+        .unwrap();
+    bus.attach(1, Stub::new(Speed::Full, 6) as Arc<dyn UsbDevice>)
+        .unwrap();
+    let ask = LpmAttributes::sleep(4, false);
+    assert_eq!(
+        bus.lpm(DeviceAddress(5), ask),
+        LpmResponse::Timeout,
+        "a port the host has not enabled is not reachable"
+    );
+    bus.set_enabled(0, true);
+    bus.set_enabled(1, true);
+    assert_eq!(bus.lpm(DeviceAddress(5), ask), LpmResponse::Nyet);
+    assert_eq!(*sleeper.lpm_seen.lock(), alloc::vec![ask]);
+    assert_eq!(
+        bus.lpm(DeviceAddress(6), ask),
+        LpmResponse::Timeout,
+        "a device that predates the ECN says nothing"
+    );
+    assert_eq!(bus.lpm(DeviceAddress(9), ask), LpmResponse::Timeout);
+}
+
+// ---------------------------------------------------------------------------
 // The host-side transfer composer
 // ---------------------------------------------------------------------------
 

@@ -80,6 +80,16 @@
 //!   `CLEAR_FEATURE`. A [`Function`] had no way to hear about that request,
 //!   because [`Endpoint0`] answers it. Additive and defaulted, like the last
 //!   two, so nothing else changed.
+//! * **Resume, remote wakeup and LPM** — [`UsbDevice::resume`],
+//!   [`UsbBus::resume_port`], [`UsbBus::signal_remote_wakeup`] and
+//!   [`UsbBus::lpm`]. Like `SOF`, these are wire events a modelled peripheral
+//!   never needed and a guest acting as a device does: the STM32 `USB_FS`
+//!   block has a `WKUP` flag for the host's resume, a `RESUME` bit that drives
+//!   remote wakeup, and an `LPMCSR` that answers the LPM token. All defaulted,
+//!   so nothing else changed. **Suspend itself has no call**, on purpose: USB
+//!   2.0 §7.1.7.6 defines it as the *absence* of bus activity for 3 ms, so a
+//!   host suspends a device by not sending it `SOF`s, and the device notices
+//!   with a timer of its own — which is the scheduler's, not the fabric's.
 //! * The correction is [`UsbDevice::speed`]'s own documentation, just below: it
 //!   promised a device's speed was fixed for its lifetime, which is true of a
 //!   mouse and false of a gadget whose firmware writes `DCFG.DSPD`. No code
@@ -584,6 +594,82 @@ impl Completion {
 }
 
 // ---------------------------------------------------------------------------
+// Link Power Management
+// ---------------------------------------------------------------------------
+
+/// What the `LPM` token asks for: the eleven-bit `bmAttributes` field of USB
+/// 2.0 LPM ECN Table 2-3, decoded.
+///
+/// | Bits | Field |
+/// | --- | --- |
+/// | 3:0 | `bLinkState` — `0001b` is L1 (Sleep), every other value is reserved |
+/// | 7:4 | `BESL` (the ECN's `HIRD`, renamed by its errata) |
+/// | 8 | `bRemoteWake` — whether the device may signal resume from L1 |
+/// | 10:9 | reserved |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LpmAttributes {
+    /// `bLinkState`, four bits.
+    pub link_state: u8,
+    /// `BESL`, four bits.
+    pub besl: u8,
+    /// `bRemoteWake`.
+    pub remote_wake: bool,
+}
+
+impl LpmAttributes {
+    /// The one `bLinkState` the ECN defines: L1, Sleep.
+    pub const L1: u8 = 0b0001;
+
+    /// A request to enter L1 with the given `BESL` and remote-wake permission.
+    #[must_use]
+    pub const fn sleep(besl: u8, remote_wake: bool) -> LpmAttributes {
+        LpmAttributes {
+            link_state: LpmAttributes::L1,
+            besl: besl & 0xf,
+            remote_wake,
+        }
+    }
+
+    /// Decode the eleven bits off the wire.
+    #[must_use]
+    pub const fn decode(bits: u16) -> LpmAttributes {
+        LpmAttributes {
+            link_state: (bits & 0xf) as u8,
+            besl: ((bits >> 4) & 0xf) as u8,
+            remote_wake: bits & (1 << 8) != 0,
+        }
+    }
+
+    /// Encode back to the eleven bits on the wire.
+    #[must_use]
+    pub const fn encode(&self) -> u16 {
+        (self.link_state as u16 & 0xf)
+            | ((self.besl as u16 & 0xf) << 4)
+            | if self.remote_wake { 1 << 8 } else { 0 }
+    }
+}
+
+/// How a device answers an LPM transaction (USB 2.0 LPM ECN §2.2.1).
+///
+/// Its own type rather than more [`Status`] variants, because `NYET` means
+/// something different here — "not now", with the link left in L0 — and
+/// because adding a variant to `Status` would break every exhaustive match a
+/// controller already has over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LpmResponse {
+    /// Accepted: the device enters the requested state.
+    Ack,
+    /// Understood, but declined for now; the link stays in L0.
+    Nyet,
+    /// The request is not one the device supports (a reserved `bLinkState`).
+    Stall,
+    /// No handshake at all: the device does not do LPM, or nothing answered
+    /// at that address.
+    #[default]
+    Timeout,
+}
+
+// ---------------------------------------------------------------------------
 // The setup packet
 // ---------------------------------------------------------------------------
 
@@ -799,6 +885,31 @@ pub trait UsbDevice: Send + Sync + fmt::Debug {
         let _ = frame;
     }
 
+    /// The host drove resume signalling on this device's port (USB 2.0
+    /// §7.1.7.7): a `K` state for at least 20 ms, ended by a low-speed `EOP`.
+    ///
+    /// The other non-transaction event a *suspended* device sees, and the end
+    /// of a remote wakeup the device itself started with
+    /// [`UsbBus::signal_remote_wakeup`] — "the resume sequence … is always
+    /// terminated by the host" (RM0434 §40.5.5). Called once, when the
+    /// signalling ends; a model has no use for the 20 ms in between. Defaults to
+    /// nothing, which is right for every device that does not model suspend.
+    fn resume(&self) {}
+
+    /// A Link Power Management transaction: an `EXT` token, then an `LPM`
+    /// token carrying `attributes` (USB 2.0 LPM ECN §2.2.1).
+    ///
+    /// Addressed like any other transaction — to the device's address, on
+    /// endpoint zero — and answered with one of the four outcomes
+    /// [`LpmResponse`] names. The default is [`LpmResponse::Timeout`]: a device
+    /// built before the ECN does not recognise the `EXT` PID and stays silent,
+    /// which is precisely what the ECN chose that PID for, and what a host takes
+    /// as "this device does not do LPM".
+    fn lpm(&self, attributes: LpmAttributes) -> LpmResponse {
+        let _ = attributes;
+        LpmResponse::Timeout
+    }
+
     /// A `SETUP` transaction on a control endpoint.
     ///
     /// Returns the handshake. A device that does not understand the request
@@ -928,6 +1039,9 @@ struct Slot {
     /// Whether something has plugged or unplugged since the controller last
     /// looked.
     changed: bool,
+    /// Whether the device in this port has signalled remote wakeup since the
+    /// controller last looked ([`UsbBus::signal_remote_wakeup`]).
+    wakeup: bool,
 }
 
 /// One USB bus: a set of ports, each with at most one device.
@@ -942,6 +1056,9 @@ pub struct UsbBus {
     /// lock-free so a controller can ask on every microframe without taking
     /// the fabric lock when nothing has happened.
     changes: AtomicU32,
+    /// One bit per port with an unread remote-wakeup request, for the same
+    /// reason.
+    wakeups: AtomicU32,
 }
 
 impl fmt::Debug for UsbBus {
@@ -973,6 +1090,7 @@ impl UsbBus {
         UsbBus {
             ports: Mutex::with_rank(FABRIC_RANK, alloc::vec![Slot::default(); count]),
             changes: AtomicU32::new(0),
+            wakeups: AtomicU32::new(0),
         }
     }
 
@@ -1024,10 +1142,13 @@ impl UsbBus {
         }
         let had = ports[index].device.take().is_some();
         ports[index].enabled = false;
+        // A request from a device that is no longer there is nobody's.
+        ports[index].wakeup = false;
         if had {
             ports[index].changed = true;
         }
         drop(ports);
+        self.wakeups.fetch_and(!(1u32 << port), Ordering::Relaxed);
         if had {
             self.changes.fetch_or(1u32 << port, Ordering::Relaxed);
         }
@@ -1106,10 +1227,92 @@ impl UsbBus {
     /// instead.
     pub fn reset_port(&self, port: u8) {
         self.set_enabled(port, false);
+        // A reset ends a suspend as surely as a resume does (USB 2.0
+        // §7.1.7.5), so a wakeup request still pending is answered by it.
+        self.clear_wakeup(port);
         // Outside the lock: a device may reach further from its own reset.
         if let Some(device) = self.device(port) {
             device.bus_reset();
         }
+    }
+
+    /// Drive resume signalling into whatever is in `port` (USB 2.0 §7.1.7.7).
+    ///
+    /// The host's half of waking a suspended device — or of finishing a remote
+    /// wakeup the device started, which is the same signalling: "the resume
+    /// sequence … can be started from the host PC or directly from the
+    /// peripheral itself, but it is always terminated by the host PC" (RM0434
+    /// §40.5.5). Answers any pending [`signal_remote_wakeup`] for the port.
+    ///
+    /// Root port only: a hub propagating resume to its downstream ports is the
+    /// hub's port state machine, and [`crate::dev::usb::hub`] does not model
+    /// suspend yet.
+    ///
+    /// [`signal_remote_wakeup`]: UsbBus::signal_remote_wakeup
+    pub fn resume_port(&self, port: u8) {
+        self.clear_wakeup(port);
+        // Outside the lock: a device may reach further from its own resume.
+        if let Some(device) = self.device(port) {
+            device.resume();
+        }
+    }
+
+    /// The device in `port` is driving resume signalling upstream: a remote
+    /// wakeup (USB 2.0 §7.1.7.7), or an L1 exit it started (LPM ECN §4.1).
+    ///
+    /// Recorded for the controller to find, exactly as a connect change is,
+    /// because what happens next is the host's decision: a controller whose
+    /// port is suspended reports it and answers with
+    /// [`resume_port`](UsbBus::resume_port); one whose port is not, or whose
+    /// driver never enabled `DEVICE_REMOTE_WAKEUP`, may ignore it.
+    pub fn signal_remote_wakeup(&self, port: u8) {
+        let index = usize::from(port);
+        let mut ports = self.ports.lock();
+        let Some(slot) = ports.get_mut(index) else {
+            return;
+        };
+        if slot.device.is_none() {
+            return;
+        }
+        slot.wakeup = true;
+        drop(ports);
+        self.wakeups.fetch_or(1u32 << port, Ordering::Relaxed);
+    }
+
+    /// Whether the device in `port` has signalled remote wakeup since this was
+    /// last asked, clearing the request.
+    ///
+    /// The controller's poll, like [`take_change`](UsbBus::take_change): an
+    /// EHCI would turn a `true` here into `PORTSC.Force Port Resume` and a
+    /// port-change interrupt.
+    pub fn take_remote_wakeup(&self, port: u8) -> bool {
+        let index = usize::from(port);
+        let mut ports = self.ports.lock();
+        let Some(slot) = ports.get_mut(index) else {
+            return false;
+        };
+        let wakeup = core::mem::replace(&mut slot.wakeup, false);
+        drop(ports);
+        self.wakeups.fetch_and(!(1u32 << port), Ordering::Relaxed);
+        wakeup
+    }
+
+    /// Whether *any* port has an unread remote-wakeup request. Lock-free.
+    #[must_use]
+    pub fn any_remote_wakeup(&self) -> bool {
+        self.wakeups.load(Ordering::Relaxed) != 0
+    }
+
+    fn clear_wakeup(&self, port: u8) {
+        let index = usize::from(port);
+        let mut ports = self.ports.lock();
+        let Some(slot) = ports.get_mut(index) else {
+            // No such port, and so no bit to clear (and none past bit 31).
+            return;
+        };
+        slot.wakeup = false;
+        drop(ports);
+        self.wakeups.fetch_and(!(1u32 << port), Ordering::Relaxed);
     }
 
     /// Broadcast a start-of-frame to everything plugged into this bus, and to
@@ -1282,6 +1485,19 @@ impl UsbBus {
         match self.find(address) {
             Some(device) => device.transfer_out_pid(endpoint, src, pid),
             None => Completion::absent(),
+        }
+    }
+
+    /// An LPM transaction to `address` (USB 2.0 LPM ECN §2.2.1).
+    ///
+    /// Routed like every other transaction, so a device on a port the host has
+    /// not enabled, or at an address nothing answers, is
+    /// [`LpmResponse::Timeout`] — the silence a host also gets from a device
+    /// that predates the ECN.
+    pub fn lpm(&self, address: DeviceAddress, attributes: LpmAttributes) -> LpmResponse {
+        match self.find(address) {
+            Some(device) => device.lpm(attributes),
+            None => LpmResponse::Timeout,
         }
     }
 
