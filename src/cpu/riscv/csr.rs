@@ -847,12 +847,18 @@ impl Csrs {
 
     /// Whether a counter is readable from the current privilege.
     ///
-    /// `mcounteren` gates S-mode and, together with `scounteren`, U-mode.
+    /// `mcounteren` gates S-mode and, together with `scounteren`, U-mode —
+    /// where there is an S-mode. On a hart without one `scounteren` does not
+    /// exist and `mcounteren` speaks for U-mode directly: "When one of these
+    /// bits is set, access to the corresponding register is permitted in the
+    /// next implemented privilege mode (S-mode if implemented, otherwise
+    /// U-mode)" (Volume II, "Machine Counter-Enable Register").
     fn counter_enabled(&self, bit: u32) -> bool {
+        let m = self.mcounteren & (1 << bit) != 0;
         match self.priv_mode {
             Priv::Machine => true,
-            Priv::Supervisor => self.mcounteren & (1 << bit) != 0,
-            Priv::User => self.mcounteren & (1 << bit) != 0 && self.scounteren & (1 << bit) != 0,
+            Priv::Supervisor => m,
+            Priv::User => m && (!self.ext.s || self.scounteren & (1 << bit) != 0),
         }
     }
 
@@ -1018,7 +1024,33 @@ impl Csrs {
             // The hardware performance monitors are architecturally required
             // to exist and are allowed to be hard-wired to zero. Linux reads
             // them; refusing would be a spurious trap.
-            0xb03..=0xb1f | 0xb83..=0xb9f | 0x323..=0x33f | 0xc03..=0xc1f | 0xc83..=0xc9f => 0,
+            0xb03..=0xb1f | 0x323..=0x33f => 0,
+            // The high halves exist only where a register is too narrow for
+            // the counter, exactly as `mcycleh` does above.
+            0xb83..=0xb9f => {
+                if self.xlen != Xlen::Rv32 {
+                    return None;
+                }
+                0
+            }
+            // The unprivileged shadows are counters like `cycle` and are
+            // gated like it: "When the CY, TM, IR, or HPMn bit in the
+            // mcounteren register is clear, attempts to read the cycle, time,
+            // instret, or hpmcountern register while executing in S-mode or
+            // U-mode will cause an illegal-instruction exception" (Volume
+            // II, "Machine Counter-Enable Register"). Bit `n` is counter `n`.
+            0xc03..=0xc1f => {
+                if !self.counter_enabled(num - num::CYCLE) {
+                    return None;
+                }
+                0
+            }
+            0xc83..=0xc9f => {
+                if self.xlen != Xlen::Rv32 || !self.counter_enabled(num - num::CYCLEH) {
+                    return None;
+                }
+                0
+            }
 
             _ => return None,
         };
@@ -1558,6 +1590,62 @@ mod tests {
         c.priv_mode = Priv::Supervisor;
         assert!(c.read(num::CYCLE, 0).is_some());
         assert!(c.read(num::TIME, 0).is_none());
+    }
+
+    /// Volume II, "Machine Counter-Enable Register": "When the CY, TM, IR, or
+    /// HPMn bit in the mcounteren register is clear, attempts to read the
+    /// cycle, time, instret, or hpmcountern register while executing in S-mode
+    /// or U-mode will cause an illegal-instruction exception."
+    #[test]
+    fn the_hpm_counter_shadows_are_gated_like_the_other_counters() {
+        const HPMCOUNTER3: u32 = 0xc03;
+        const HPMCOUNTER31: u32 = 0xc1f;
+        let mut c = csrs();
+        assert_eq!(c.read(HPMCOUNTER3, 0), Some(0), "M-mode is never gated");
+        c.priv_mode = Priv::Supervisor;
+        assert!(c.read(HPMCOUNTER3, 0).is_none(), "HPM3 is clear");
+        c.priv_mode = Priv::Machine;
+        c.write(num::MCOUNTEREN, 1 << 3).unwrap();
+        c.priv_mode = Priv::Supervisor;
+        assert_eq!(c.read(HPMCOUNTER3, 0), Some(0));
+        assert!(c.read(HPMCOUNTER31, 0).is_none(), "one bit per counter");
+        // And U-mode needs scounteren as well.
+        c.priv_mode = Priv::User;
+        assert!(c.read(HPMCOUNTER3, 0).is_none());
+        c.priv_mode = Priv::Supervisor;
+        c.write(num::SCOUNTEREN, 1 << 3).unwrap();
+        c.priv_mode = Priv::User;
+        assert_eq!(c.read(HPMCOUNTER3, 0), Some(0));
+        // The high halves are RV32 registers.
+        c.priv_mode = Priv::Machine;
+        assert!(c.read(0xc83, 0).is_none());
+        assert!(c.read(0xb83, 0).is_none());
+        let mut c = Csrs::new(Xlen::Rv32, Extensions::GC, 0, 0);
+        assert_eq!(c.read(0xb83, 0), Some(0));
+        assert_eq!(c.read(0xc83, 0), Some(0));
+        c.priv_mode = Priv::Supervisor;
+        assert!(c.read(0xc83, 0).is_none(), "and gated the same way");
+    }
+
+    /// Volume II, "Machine Counter-Enable Register": "When one of these bits
+    /// is set, access to the corresponding register is permitted in the next
+    /// implemented privilege mode (S-mode if implemented, otherwise U-mode)."
+    #[test]
+    fn mcounteren_alone_gates_user_mode_on_a_hart_with_no_supervisor() {
+        let mut mu = Extensions::I;
+        mu.u = true;
+        let mut c = Csrs::new(Xlen::Rv64, mu, 0, 0);
+        c.priv_mode = Priv::User;
+        assert!(c.read(num::CYCLE, 0).is_none());
+        assert!(c.read(num::TIME, 0).is_none());
+        c.priv_mode = Priv::Machine;
+        // There is no scounteren to set: the register does not exist here.
+        assert!(c.write(num::SCOUNTEREN, 7).is_none());
+        c.write(num::MCOUNTEREN, 0b011).unwrap();
+        c.priv_mode = Priv::User;
+        assert!(c.read(num::CYCLE, 0).is_some());
+        assert!(c.read(num::TIME, 0).is_some());
+        assert!(c.read(num::INSTRET, 0).is_none(), "IR is still clear");
     }
 
     #[test]
