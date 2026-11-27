@@ -2505,6 +2505,69 @@ fn a_store_from_a_segment_register_that_does_not_exist_is_invalid_opcode() {
     }
 }
 
+/// The byte offset a register bit number adds to `BT`'s memory operand is
+/// part of the effective address, and wraps at the address size like the rest
+/// of it.
+///
+/// *Intel SDM* volume 1 §3.3.7: "Address calculations are first truncated to
+/// the effective address size of the current mode ..., as overridden by any
+/// address-size prefix." Measured on an x86 host as well (AMD Zen 5): `67 0F
+/// A3 18` — `bt [eax], ebx` — with `EAX` 0 and `EBX` -1 reads the doubleword
+/// at `0xfffffffc` and sets `CF` from its top bit, where the same instruction
+/// without the prefix faults on `0xffff_ffff_ffff_fffc`. The offset was added
+/// in sixty-four bits and never truncated, so a negative bit number below a
+/// small base left every segment and was `#GP`.
+#[test]
+fn a_bit_tests_byte_offset_wraps_at_the_address_size() {
+    // Thirty-two-bit addressing: bit -1 from address 0 is bit 31 of the
+    // doubleword at 0xfffffffc, the last four bytes of the address space.
+    let pc = pc386();
+    pc.start_protected();
+    pc.rom(0xfffc, &[0x00, 0x00, 0x00, 0x80]);
+    pc.write(
+        at::CODE0,
+        &[
+            0x31, 0xc0, // xor eax, eax
+            0xbb, 0xff, 0xff, 0xff, 0xff, // mov ebx, -1
+            0x0f, 0xa3, 0x18, // bt [eax], ebx
+            0x0f, 0x92, 0xc1, // setc cl
+            0xf4,
+        ],
+    );
+    let steps = pc.run(10);
+    assert!(steps < 10, "the program halted");
+    assert_eq!(
+        pc.regs().rip,
+        at::CODE0 + 14,
+        "at its own hlt, not a fault's"
+    );
+    assert_eq!(pc.regs().rcx & 0xff, 1, "CF came from the top of the space");
+
+    // Sixteen-bit addressing: bit -1 from `[bx]` with `BX` 0 is bit 15 of the
+    // word at offset 0xfffe of the same segment.
+    let pc = pc386();
+    pc.write(0xfffe, &[0x00, 0x80]);
+    pc.write(
+        0x1000,
+        &[
+            0x31, 0xdb, // xor bx, bx
+            0xb8, 0xff, 0xff, // mov ax, -1
+            0x0f, 0xa3, 0x07, // bt [bx], ax
+            0x0f, 0x92, 0xc1, // setc cl
+            0xf4,
+        ],
+    );
+    pc.start_real(0, 0x1000);
+    let steps = pc.run(10);
+    assert!(steps < 10, "the program halted");
+    assert_eq!(pc.regs().rip, 0x1000 + 12, "at its own hlt");
+    assert_eq!(
+        pc.regs().rcx & 0xff,
+        1,
+        "CF came from the top of the segment"
+    );
+}
+
 /// A part with the first 4 MiB identity-mapped, paging on, and a program that
 /// reads the same far linear address `reads` times before halting.
 ///

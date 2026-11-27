@@ -3701,6 +3701,15 @@ impl<'a> Exec<'a> {
     /// byte past the operand, and with `EBX` of -1 addresses the byte before
     /// it. That is the architecture, and it is why the address is recomputed
     /// here rather than reusing the effective address as-is.
+    ///
+    /// The byte offset is a term of the effective address like any other,
+    /// so the sum wraps at the **address size** — *Intel SDM* volume 1
+    /// §3.3.7: "Address calculations are first truncated to the effective
+    /// address size of the current mode ..., as overridden by any
+    /// address-size prefix.", and §3.6: "When the 16-bit address-size
+    /// attribute is in force, segment offsets and displacements are 16
+    /// bits." Bit -1 of `[bx]` with `BX` zero is in the word at offset
+    /// `0xfffe`, not sixty-four bits below the segment.
     fn bit_test(&mut self, f: &Fields, size: u8) -> Ex<()> {
         let insn = f.insn;
         let bits = u64::from(size) * 8;
@@ -3723,7 +3732,7 @@ impl<'a> Exec<'a> {
             self.read_arg(f, insn.dst, size)?
         } else {
             let (sr, off) = self.ea();
-            let off = off.wrapping_add(offset_bytes as u64);
+            let off = off.wrapping_add(offset_bytes as u64) & Self::mask(f.addrsize);
             self.read_mem(sr, off, size)?
         };
         let bit = (value >> index) & 1;
@@ -3738,7 +3747,7 @@ impl<'a> Exec<'a> {
             self.write_arg(f, insn.dst, size, updated)?;
         } else {
             let (sr, off) = self.ea();
-            let off = off.wrapping_add(offset_bytes as u64);
+            let off = off.wrapping_add(offset_bytes as u64) & Self::mask(f.addrsize);
             self.write_mem(sr, off, size, updated)?;
         }
         Ok(())
