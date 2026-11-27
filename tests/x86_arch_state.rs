@@ -814,7 +814,8 @@ struct ShadowGuest {
 /// still owed. The same sequence with an MMIO access, or with any instruction
 /// between the `STI` and the exit, comes back with the shadow already spent.
 /// So this shape parks the processor exactly where the defect lives, on every
-/// slice, with no timing luck involved.
+/// raw entry, with no timing luck involved — see `park_in_the_shadow` for why
+/// it is a raw entry and not a slice.
 ///
 /// # What each outcome means
 ///
@@ -951,17 +952,43 @@ fn shadow_system() -> Sys {
     sys
 }
 
-/// Run until the guest has been round its loop and the processor is stopped on
-/// the shadowed instruction.
+/// Run until the guest has been round its loop, then stop the processor **on**
+/// the shadowed instruction and make the shell say so.
+///
+/// A slice never ends there by itself any more: `Vcpu::run_until_exit_with`
+/// finishes a port access it has answered before it returns, because a
+/// register file read with the access half done replays it (`api.rst` on
+/// `KVM_EXIT_IO`). So the board is run normally until the loop is turning, and
+/// then the vCPU is entered **once, raw** — `Vcpu::run_once` reports the exit
+/// without routing it — which comes back at the `OUT` with the port write not
+/// yet performed by anything and the shadow still owed. `store_from_vcpu` is
+/// then the same call a slice boundary makes. The snapshot that follows is of
+/// a processor that has not executed the `OUT`, on a board whose port has not
+/// seen it, which is the only state in which resuming *at* the `OUT` is right.
 ///
 /// The predicate is `RIP`, deliberately, rather than anything either engine
 /// reports about its own interruptibility: a test whose *gate* is the field
 /// under test cannot fail when that field is missing, it can only skip.
-fn park_in_the_shadow(m: &mut Machine, rip_of: &dyn Fn() -> u64, at: u64) -> bool {
+fn park_in_the_shadow(m: &mut Machine, cpu: &rsemu::accel::cpu::AccelCpu, at: u64) -> bool {
+    let mut turning = false;
     for _ in 0..400 {
         m.run_for(GlobalTime::from_nanos(200_000))
             .expect("the board runs");
-        if peek(m, sh::TICK) > 0 && rip_of() == at {
+        if peek(m, sh::TICK) > 0 {
+            turning = true;
+            break;
+        }
+    }
+    if !turning {
+        return false;
+    }
+    let vcpu = cpu.vcpu().expect("a bound processor has a vCPU");
+    // One entry is one turn of the loop; a few, in case a host signal cuts
+    // one short.
+    for _ in 0..16 {
+        vcpu.run_once().expect("KVM_RUN");
+        rsemu::accel::state::store_from_vcpu(&vcpu, cpu.shell()).expect("the vCPU reads back");
+        if cpu.shell().regs().rip == at {
             return true;
         }
     }
@@ -1005,13 +1032,8 @@ fn a_shadowed_hardware_snapshot_restores_under(engine: &str) {
         return;
     };
     let cpu = accel.cpus()[0].clone();
-    let shell = cpu.clone();
     assert!(
-        park_in_the_shadow(
-            &mut hardware,
-            &move || shell.shell().regs().rip,
-            g.shadowed_at
-        ),
+        park_in_the_shadow(&mut hardware, &cpu, g.shadowed_at),
         "the accelerated guest never stopped on the shadowed instruction at {:#x}",
         g.shadowed_at
     );

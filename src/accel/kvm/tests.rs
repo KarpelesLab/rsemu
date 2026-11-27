@@ -476,6 +476,87 @@ fn what_the_guest_writes_to_ram_is_visible_through_the_address_space() {
 
 /// The signal-free half of the stop-the-world protocol: a raised
 /// [`ExitFlag`] keeps the guest from being entered at all.
+/// A run that ends *on* a port read has to end with the read taken.
+///
+/// `KVM_EXIT_IO` for an `IN` leaves the instruction half done: the answer is
+/// in the shared page and the kernel moves it into `AL` — and moves `RIP` past
+/// the instruction — only on the next `KVM_RUN`. A caller whose allowance was
+/// exactly that one entry reads the register file next, and must not find the
+/// `IN` still ahead of it with the device's answer already consumed.
+#[test]
+fn an_allowance_that_ends_on_a_port_read_still_completes_it() {
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    if !guest.vm.has_immediate_exit() {
+        // Without the capability there is no way to finish an access without
+        // running the guest on, and the loop documents that it does not try.
+        return;
+    }
+    let port = Arc::new(Recorder::default());
+    *port.answer.lock() = 0x5a;
+    guest
+        .io
+        .topology()
+        .map(port.region("kbd", 1), 0x60)
+        .expect("map the port");
+
+    //   in al, 0x60        e4 60
+    //   hlt                f4
+    let vcpu = guest.vcpu_at(&[0xe4, 0x60, 0xf4]);
+    let mut regs = vcpu.regs().expect("KVM_GET_REGS");
+    regs.rax = 0;
+    vcpu.set_regs(&regs).expect("KVM_SET_REGS");
+
+    // One entry: the guest leaves at the `IN` and the allowance is spent.
+    let run = vcpu.run_until_exit(1).expect("the guest runs");
+    assert!(
+        run.exit.is_none(),
+        "an allowance running out is not an exit"
+    );
+    assert_eq!(
+        run.consumed.ticks, 1,
+        "the finishing entry is not a guest entry"
+    );
+    assert_eq!(vcpu.stats().pio, 1);
+    assert_eq!(vcpu.stats().declined, 0, "nothing asked this vCPU to stop");
+
+    let regs = vcpu.regs().expect("KVM_GET_REGS");
+    assert_eq!(regs.rax & 0xff, 0x5a, "the answer never reached AL");
+    assert_eq!(regs.rip, CODE + 2, "RIP still names the IN");
+
+    // And the guest goes on from there rather than asking the device again.
+    let run = vcpu.run_until_exit(8).expect("the guest runs");
+    assert_eq!(run.exit.expect("the guest halted").reason, ExitReason::HALT);
+    assert_eq!(vcpu.stats().pio, 1, "the IN was executed twice");
+}
+
+/// The same for a read of a device register through memory.
+#[test]
+fn an_allowance_that_ends_on_an_mmio_read_still_completes_it() {
+    let Some(kvm) = kvm() else { return };
+    let guest = Guest::new(kvm);
+    if !guest.vm.has_immediate_exit() {
+        return;
+    }
+    let dev = Arc::new(Recorder::default());
+    *dev.answer.lock() = 0xa5;
+    guest
+        .mem
+        .topology()
+        .map(dev.region("dev", 0x1000), MMIO_BASE)
+        .expect("map the window");
+
+    //   mov al, [0x8000]   a0 00 80
+    //   hlt                f4
+    let vcpu = guest.vcpu_at(&[0xa0, 0x00, 0x80, 0xf4]);
+    let run = vcpu.run_until_exit(1).expect("the guest runs");
+    assert!(run.exit.is_none());
+    assert_eq!(vcpu.stats().mmio, 1);
+    let regs = vcpu.regs().expect("KVM_GET_REGS");
+    assert_eq!(regs.rax & 0xff, 0xa5, "the answer never reached AL");
+    assert_eq!(regs.rip, CODE + 3, "RIP still names the load");
+}
+
 #[test]
 fn a_raised_exit_flag_declines_to_enter_the_guest() {
     let Some(kvm) = kvm() else { return };

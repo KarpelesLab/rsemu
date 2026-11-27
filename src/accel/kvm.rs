@@ -1941,13 +1941,19 @@ impl Vcpu {
     /// interrupted.
     pub fn run_once(&self) -> AccelResult<RawExit> {
         let inner = self.inner.lock();
-        self.enter(&inner)
+        self.enter(&inner, false)
     }
 
     /// One `KVM_RUN`, with the stop flag written through to `immediate_exit`
     /// first.
-    fn enter(&self, inner: &Inner) -> AccelResult<RawExit> {
-        let stopping = self.exit_flag.raised();
+    ///
+    /// `finish` asks for an entry that runs **no guest instruction**: it sets
+    /// `immediate_exit` whatever the stop flag says, so that the kernel
+    /// completes the port or MMIO access the previous exit left half done and
+    /// comes straight back. Only meaningful with `KVM_CAP_IMMEDIATE_EXIT`, and
+    /// the caller checks for it.
+    fn enter(&self, inner: &Inner, finish: bool) -> AccelResult<RawExit> {
+        let stopping = finish || self.exit_flag.raised();
         // The signal-free half of the safe-point protocol: the kernel re-reads
         // this byte with interrupts disabled immediately before entering the
         // guest, so setting it here cannot lose a race against a stop request
@@ -1969,7 +1975,11 @@ impl Vcpu {
         match result {
             Ok(_) => {}
             Err(Errno::EINTR) => {
-                self.stats.lock().declined += 1;
+                // A finishing entry was never going to run the guest, so it
+                // is not a stop request that kept it out.
+                if !finish {
+                    self.stats.lock().declined += 1;
+                }
                 return Ok(RawExit::Interrupted);
             }
             Err(errno) => {
@@ -2128,16 +2138,36 @@ impl Vcpu {
         // its own now has one taken for it.
         let _bound = self.preempt.hold();
         let mut entries = 0u64;
+        // Whether the last exit was a port or MMIO access this loop answered
+        // in the shared page and the kernel has not yet *taken*. `api.rst`,
+        // on `KVM_EXIT_IO` and `KVM_EXIT_MMIO`: the operation is complete, and
+        // the guest's state consistent, only after userspace has re-entered
+        // the kernel with `KVM_RUN` — until then an `IN` has not written its
+        // register and `RIP` still names the instruction. The same note says
+        // how to finish one without running anything further: re-enter "with
+        // the immediate_exit field set".
+        //
+        // So an allowance that runs out on such an exit is not returned from
+        // as it stands. Every caller reads the register file next — a slice
+        // boundary stores it into the interpreter shell, which is what a
+        // snapshot saves and what the other engine resumes from — and a
+        // register file that still has the `IN` ahead of it replays an access
+        // the device has already answered.
+        let mut owed = false;
         loop {
-            if entries >= max_entries {
+            let finishing = entries >= max_entries;
+            if finishing && !(owed && self.immediate_exit) {
                 return Ok(Run::completed(Consumed::new(entries)));
             }
-            if let Some(source) = intr {
-                self.offer_interrupt(source)?;
+            if !finishing {
+                if let Some(source) = intr {
+                    self.offer_interrupt(source)?;
+                }
+                entries += 1;
             }
             let inner = self.inner.lock();
-            entries += 1;
-            let raw = self.enter(&inner)?;
+            let raw = self.enter(&inner, finishing)?;
+            owed = false;
             let reason = match raw {
                 // A stop request, honoured. Not an exit: nothing happened to
                 // the guest and resuming is unconditional, which is exactly
@@ -2147,8 +2177,14 @@ impl Vcpu {
             };
             let pc = self.rip(&inner);
             match reason {
-                exit::IO => self.service_pio(&inner)?,
-                exit::MMIO => self.service_mmio(&inner)?,
+                exit::IO => {
+                    self.service_pio(&inner)?;
+                    owed = true;
+                }
+                exit::MMIO => {
+                    self.service_mmio(&inner)?;
+                    owed = true;
+                }
                 // Nothing to do and nothing to report: the guest was let out so
                 // an interrupt could be injected, and the next entry does it.
                 exit::IRQ_WINDOW_OPEN => {}
