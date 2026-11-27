@@ -265,7 +265,13 @@ RUN OPTIONS:
                         guest's own console is not attached to it -- one
                         keyboard, one reader; use --capture to watch what the
                         guest writes. Needs a build with `monitor`
-    -q, --quiet         Only print the summary
+    -q, --quiet         Print less. A headless run prints only its summary --
+                        virtual time reached, clock ticks, the state hash --
+                        and not the description of the machine before it. A
+                        session with a console, a debugger, the monitor or a
+                        display attached prints neither, so that what is on
+                        stdout is what the guest wrote and nothing else.
+                        Warnings and errors are never silenced
 
 OPTIONS:
     -h, --help          Print this help
