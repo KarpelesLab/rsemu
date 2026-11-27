@@ -1262,8 +1262,31 @@ impl Csrs {
                 if !held.is_some_and(|mode| self.implements(mode)) {
                     self.mstatus |= status::MPP;
                 }
+                // A field that only a missing mode would read is read-only
+                // zero, each in the specification's own words (Volume II,
+                // "Machine Status Registers (mstatus and mstatush)"): "MXR is
+                // read-only 0 if S-mode is not supported", "SUM is read-only
+                // 0 if S-mode is not supported", "TVM is read-only 0 when
+                // S-mode is not supported", "TSR is read-only 0 when S-mode
+                // is not supported"; "MPRV is read-only 0 if U-mode is not
+                // supported", "If U-mode is not supported, UBE is read-only
+                // 0", "TW is read-only 0 when there are no modes less
+                // privileged than M"; and "If neither the F extension nor
+                // S-mode is implemented, then FS is read-only zero".
                 if !self.ext.s {
-                    self.mstatus &= !(status::SPP | status::SIE | status::SPIE | status::TVM);
+                    self.mstatus &= !(status::SPP
+                        | status::SIE
+                        | status::SPIE
+                        | status::TVM
+                        | status::TSR
+                        | status::SUM
+                        | status::MXR);
+                }
+                if !self.ext.u {
+                    self.mstatus &= !(status::MPRV | status::TW | status::UBE);
+                }
+                if !self.ext.f && !self.ext.s {
+                    self.mstatus &= !status::FS;
                 }
                 self.bump_translation();
             }
@@ -1498,6 +1521,59 @@ mod tests {
     /// Volume II, "Privilege and Global Interrupt-Enable Stack in mstatus
     /// register": "xPP fields are WARL fields that can hold only privilege
     /// mode x and any implemented privilege mode lower than x."
+    /// The `mstatus` fields that only mean something to a mode the hart does
+    /// not have are read-only zero.
+    ///
+    /// Volume II (20240411), "Machine Status Registers (mstatus and
+    /// mstatush)", field by field: "MPRV is read-only 0 if U-mode is not
+    /// supported."; "MXR is read-only 0 if S-mode is not supported."; "SUM is
+    /// read-only 0 if S-mode is not supported or if satp.MODE is read-only
+    /// 0."; "If U-mode is not supported, UBE is read-only 0."; "TVM is
+    /// read-only 0 when S-mode is not supported."; "TW is read-only 0 when
+    /// there are no modes less privileged than M."; "TSR is read-only 0 when
+    /// S-mode is not supported."; and "If neither the F extension nor S-mode
+    /// is implemented, then FS is read-only zero."
+    ///
+    /// They were all writable, so M-mode software probing what the hart has
+    /// by writing ones and reading back was told it had every one of them.
+    #[test]
+    fn mstatus_fields_of_an_absent_mode_are_read_only_zero() {
+        let all = status::M_WRITABLE;
+        let probe = |ext: Extensions| {
+            let mut c = Csrs::new(Xlen::Rv64, ext, 0, 0);
+            c.write(num::MSTATUS, all).unwrap();
+            c.read(num::MSTATUS, 0).unwrap()
+        };
+        let s_only = status::SUM | status::MXR | status::TVM | status::TSR;
+        let s_only = s_only | status::SIE | status::SPIE | status::SPP;
+        let u_only = status::MPRV | status::TW | status::UBE;
+
+        // Machine mode alone, no F: nothing but MIE, MPIE and MPP.
+        let v = probe(Extensions::I);
+        assert_eq!(v & (s_only | u_only | status::FS), 0, "{v:#x}");
+        assert_eq!(v & (status::MIE | status::MPIE), status::MIE | status::MPIE);
+
+        // M and U: the U-mode fields appear, the S-mode ones do not, and FS
+        // is still nobody's.
+        let mut mu = Extensions::I;
+        mu.u = true;
+        let v = probe(mu);
+        assert_eq!(v & u_only, u_only, "{v:#x}");
+        assert_eq!(v & (s_only | status::FS), 0, "{v:#x}");
+
+        // F without S: FS "shall not be read-only zero".
+        let mut mf = Extensions::I;
+        mf.f = true;
+        assert_eq!(probe(mf) & status::FS, status::FS);
+
+        // Everything: every field is there.
+        let v = probe(Extensions::GC);
+        assert_eq!(
+            v & (s_only | u_only | status::FS),
+            s_only | u_only | status::FS
+        );
+    }
+
     #[test]
     fn mpp_holds_only_a_privilege_mode_the_hart_implements() {
         let mpp = |c: &Csrs| (c.read(num::MSTATUS, 0).unwrap() & status::MPP) >> status::MPP_SHIFT;
