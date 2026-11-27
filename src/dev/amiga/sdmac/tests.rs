@@ -581,3 +581,21 @@ fn a_named_bus_is_how_the_controller_and_the_target_meet() {
     assert_eq!(scsi::names(&hosts), vec![String::from("scsi0")]);
     drop(disk);
 }
+
+#[test]
+fn a_dropped_dmac_and_its_controller_are_freed() {
+    // The DMAC holds the controller, to ask it for `INTRQ`, and the
+    // controller holds the DMAC's data path, to move bytes. When both were
+    // strong neither chip was freed with the machine, nor the SCSI bus the
+    // controller owns, nor the drives on it.
+    let rig = rig();
+    let dmac = Arc::downgrade(&rig.sdmac.chip);
+    let bus = Arc::downgrade(&rig.chip.bus());
+    drop(rig);
+    assert_eq!(dmac.strong_count(), 0, "the DMAC's state outlived the DMAC");
+    assert_eq!(
+        bus.strong_count(),
+        0,
+        "the controller's state outlived the controller, and kept its bus"
+    );
+}

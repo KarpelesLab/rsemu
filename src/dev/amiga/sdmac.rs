@@ -477,15 +477,25 @@ impl Chip {
 }
 
 /// The DMAC as the controller's data path.
+///
+/// It holds the DMAC **weakly**: the controller keeps this, and the DMAC
+/// keeps the controller's port to ask it for `INTRQ`, so a strong reference
+/// here would be a cycle that frees neither chip. A port whose DMAC is gone
+/// moves nothing — a DMA controller that never answers `DRQ`.
 #[derive(Debug)]
-struct Port(Arc<Chip>);
+struct Port(Weak<Chip>);
+
+/// A transfer that can go ahead: the chip, the space, the address, and the
+/// attributes to make the access with.
+type Ready = (Arc<Chip>, Arc<AddressSpace>, u64, MemAttrs);
 
 impl Port {
     /// The space and the address a transfer is at, if DMA is running in the
     /// direction asked for.
-    fn ready(&self, memory_to_scsi: bool) -> Option<(Arc<AddressSpace>, u64, MemAttrs)> {
+    fn ready(&self, memory_to_scsi: bool) -> Option<Ready> {
+        let chip = self.0.upgrade()?;
         let (contr, acr) = {
-            let regs = self.0.regs.lock();
+            let regs = chip.regs.lock();
             (regs.contr, regs.acr)
         };
         if contr & DMAENA == 0 {
@@ -494,42 +504,45 @@ impl Port {
         if (contr & DMADIR != 0) != memory_to_scsi {
             return None;
         }
-        let space = self.0.space.lock().clone()?.upgrade()?;
-        let requester = *self.0.requester.lock();
+        let space = chip.space.lock().clone()?.upgrade()?;
+        let requester = *chip.requester.lock();
         Some((
+            chip,
             space,
             u64::from(acr),
             MemAttrs::DEFAULT.with_requester(requester),
         ))
     }
+}
 
-    /// Move the address on by `n`.
+impl Chip {
+    /// Move the address on by `n`. Wrapping: `ACR` is a 32-bit counter.
     fn advance(&self, n: usize) {
-        let mut regs = self.0.regs.lock();
+        let mut regs = self.regs.lock();
         regs.acr = regs.acr.wrapping_add(n as u32);
     }
 }
 
 impl DmaPort for Port {
     fn fetch(&self, dst: &mut [u8]) -> usize {
-        let Some((space, at, attrs)) = self.ready(true) else {
+        let Some((chip, space, at, attrs)) = self.ready(true) else {
             return 0;
         };
         if space.read_bytes(at, dst, attrs).is_err() {
             return 0;
         }
-        self.advance(dst.len());
+        chip.advance(dst.len());
         dst.len()
     }
 
     fn store(&self, src: &[u8]) -> usize {
-        let Some((space, at, attrs)) = self.ready(false) else {
+        let Some((chip, space, at, attrs)) = self.ready(false) else {
             return 0;
         };
         if space.write_bytes(at, src, attrs).is_err() {
             return 0;
         }
-        self.advance(src.len());
+        chip.advance(src.len());
         src.len()
     }
 }
@@ -666,7 +679,7 @@ impl Sdmac {
     /// Give the chip its controller, and give the controller this chip's data
     /// path — what `bind` does with the `scsi` link.
     pub fn attach_scsi(&self, port: ControllerPort) {
-        port.attach_dma(Arc::new(Port(Arc::clone(&self.chip))) as Arc<dyn DmaPort>);
+        port.attach_dma(Arc::new(Port(Arc::downgrade(&self.chip))) as Arc<dyn DmaPort>);
         *self.chip.scsi.lock() = Some(port);
     }
 
