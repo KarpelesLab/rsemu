@@ -428,10 +428,14 @@ impl Engine {
         let m3 = self.regs[1] & 0x08 != 0;
         let m4 = self.regs[0] & 0x04 != 0;
         if m4 {
-            // The tall variants need two more bits set, and which two decides
-            // which height. Anything else is 192 lines.
+            // The tall variants need M2 and exactly one more bit, and which
+            // one decides the height: "D4 - (M1) Selects 224-line screen for
+            // Mode 4 if M2=1, else has no effect", "D3 - (M3) Selects 240-line
+            // screen for Mode 4 if M2=1, else has no effect" (Charles
+            // MacDonald, *Sega Master System VDP documentation*, register
+            // $01). His mode table has all three set as plain Mode 4.
             let height = match (m1, m2, m3) {
-                (true, false, true) => 224,
+                (true, true, false) => 224,
                 (false, true, true) => 240,
                 _ => 192,
             };

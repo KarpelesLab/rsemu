@@ -263,13 +263,20 @@ fn a_line_interrupt_stays_asserted_until_the_status_register_is_read() {
 #[test]
 fn the_frame_flag_is_raised_at_the_first_blanked_line_of_each_mode() {
     // The four mode bits are M1 = R1 bit 4, M2 = R0 bit 1, M3 = R1 bit 3 and
-    // M4 = R0 bit 2, and the tall variants need *two* of them beyond M4:
-    // 224 lines is M1 and M3, 240 lines is M2 and M3. Spelling them out is the
-    // point of the test — a table read in bit order gets both wrong.
+    // M4 = R0 bit 2, and the tall variants need M2 and exactly one more:
+    // 224 lines is M2 and M1, 240 lines is M2 and M3. Charles MacDonald's VDP
+    // document lists them as `M4 M3 M2 M1` — "1 0 1 1  Mode 4 (224-line
+    // display)", "1 1 1 0  Mode 4 (240-line display)", "1 1 1 1  Mode 4" —
+    // and says of register $01: "D4 - (M1) Selects 224-line screen for Mode 4
+    // if M2=1, else has no effect." The rows after the first three are the
+    // "else": M1 and M3 without M2, and all three at once, are 192 lines.
     for (r0, r1, height) in [
         (0x04u8, 0x60u8, 192u16),
-        (0x04, 0x78, 224),
+        (0x06, 0x70, 224),
         (0x06, 0x68, 240),
+        (0x04, 0x78, 192),
+        (0x06, 0x78, 192),
+        (0x06, 0x60, 192),
     ] {
         let vdp = SmsVdp::new(TvRegion::Pal);
         vdp.write_port(1, r0);
