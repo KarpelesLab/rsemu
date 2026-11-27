@@ -57,9 +57,9 @@
 //! [`Peripheral`] deliberately is *not*, since `Peripheral` answers USB 2.0 §9.4
 //! inside the emulator.
 //!
-//! Three things had to be *added* here over time, and one promise had to be
+//! Five things had to be *added* here over time, and one promise had to be
 //! corrected. They are worth naming because two of them are the whole difference
-//! between the two directions and the third is what a real device class asked
+//! between the two directions and the rest are what real device models asked
 //! for — the transaction seam itself has never moved:
 //!
 //! * [`UsbDevice::start_of_frame`] — a `SOF` is the one thing on the wire that
@@ -90,6 +90,11 @@
 //!   2.0 §7.1.7.6 defines it as the *absence* of bus activity for 3 ms, so a
 //!   host suspends a device by not sending it `SOF`s, and the device notices
 //!   with a timer of its own — which is the scheduler's, not the fabric's.
+//! * **The data PID** — [`DataPid`], [`UsbDevice::transfer_in_pid`] and
+//!   [`UsbBus::read_pid`]/[`UsbBus::write_pid`]. A device that keeps its own
+//!   data toggles (the STM32 `USB_FS` block's `DTOG` bits) must see whether a
+//!   packet was `DATA0` or `DATA1` to ignore a retried one. Every other device
+//!   keeps the plain methods, which the `_pid` ones fall back to.
 //! * The correction is [`UsbDevice::speed`]'s own documentation, just below: it
 //!   promised a device's speed was fixed for its lifetime, which is true of a
 //!   mouse and false of a gadget whose firmware writes `DCFG.DSPD`. No code
