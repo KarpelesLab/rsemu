@@ -846,7 +846,7 @@ impl<'a> Exec<'a> {
             Access::Fetch => self.attrs.with_purpose(AccessPurpose::FETCH),
             _ => self.attrs,
         };
-        match self.space.read(phys, width, attrs) {
+        match self.tlb.read_phys(self.space, phys, width, attrs) {
             Ok(v) => Ok(v),
             Err(_) => {
                 // A refused access is a bus fault, which RISC-V *does* have a

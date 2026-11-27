@@ -25,6 +25,9 @@
 //! permission. One shared array would need the permission bits re-checked on
 //! every hit, which is most of the walk's cost back again.
 
+use crate::core::space::{AddressSpace, MemAttrs, MemResult, ReadCache};
+use crate::core::value::Width;
+
 use super::csr::{Csrs, Priv, status};
 use super::isa::Xlen;
 
@@ -732,6 +735,10 @@ pub struct Tlb {
     /// entries above; it is checked on every access, hit or miss, because a
     /// PMP region may be smaller than a page.
     pmp: PmpCache,
+    /// The physical pages this hart has read lately, resolved to the stores
+    /// behind them — the interpreter's half of what the shadow below is for
+    /// compiled code. See [`Tlb::read_phys`].
+    reads: ReadCache,
     /// The host half of the same answers, for a code generator that inlines a
     /// load. See [`Tlb::attach_shadow`].
     #[cfg(feature = "jit")]
@@ -753,9 +760,37 @@ impl Tlb {
             hits: 0,
             misses: 0,
             pmp: PmpCache::new(),
+            reads: ReadCache::new(),
             #[cfg(feature = "jit")]
             shadow: None,
         }
+    }
+
+    /// Read `width` bytes at a **physical** address: [`AddressSpace::read`],
+    /// served from a remembered store where the page is plain memory.
+    ///
+    /// Every fetch and every load the interpreter makes ends in one of these,
+    /// after the translation and the PMP check, and a fetch is two of them.
+    /// [`ReadCache`] makes the same read with the same errors; what it skips
+    /// is finding the page in the space again.
+    ///
+    /// It lives here for the reason the PMP memo does: it is per hart, it is
+    /// derived, and this is the object that is already replaced when the hart
+    /// is attached to another space — which a cache keyed on one space's
+    /// topology generation requires.
+    ///
+    /// # Errors
+    ///
+    /// Exactly those of [`AddressSpace::read`].
+    #[inline]
+    pub fn read_phys(
+        &mut self,
+        space: &AddressSpace,
+        phys: u64,
+        width: Width,
+        attrs: MemAttrs,
+    ) -> MemResult<u64> {
+        self.reads.read(space, phys, width, attrs)
     }
 
     /// Throw everything away.
@@ -771,6 +806,10 @@ impl Tlb {
         // that now means a different configuration. It goes with everything
         // else derived.
         self.pmp = PmpCache::new();
+        // Never stale within one space, but a flush is also what a restore and
+        // a reset do, and holding sixty-four stores alive across either would
+        // be keeping derived state for no reason.
+        self.reads.clear();
         // The shadow is only ever as live as this table is, so it goes with
         // it. Losing it costs a refill; keeping it after a flush would let a
         // compiled load skip a walk this table would have charged for.

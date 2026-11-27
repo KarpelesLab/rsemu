@@ -2142,3 +2142,95 @@ fn a_trap_ends_the_streak_on_a_hart_too() {
     h.hart.run(100_000);
     assert!(detector.events().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The read cache (`mmu::Tlb::read_phys`)
+// ---------------------------------------------------------------------------
+
+/// The same program on two harts whose RAM is the same store mapped two ways:
+/// plainly, which is a page the read cache serves, and through an alias, which
+/// it must refuse — an alias can slide without the topology generation moving
+/// — so every read takes `AddressSpace::read`. A guest cannot tell them apart,
+/// and neither may anything this core counts.
+fn cached_and_uncached(program: &[u32], data: &[(u64, u32)]) -> (Hart, Hart) {
+    let build = |direct: bool| {
+        let ram = Arc::new(RamStore::new(RAM_SIZE));
+        let put = |at: u64, word: u32| {
+            for (k, byte) in word.to_le_bytes().iter().enumerate() {
+                ram.write_u8(at + k as u64, *byte).unwrap();
+            }
+        };
+        for (n, word) in program.iter().enumerate() {
+            put(n as u64 * 4, *word);
+        }
+        for (at, word) in data {
+            put(*at, *word);
+        }
+        let space = AddressSpace::new("mem", 64);
+        let region: crate::core::space::RegionRef = Region::ram("ram", ram).into();
+        if direct {
+            space.topology().map(region, BASE).unwrap();
+        } else {
+            let window = Region::alias("window", region, 0, RAM_SIZE).unwrap();
+            space.topology().map(window, BASE).unwrap();
+        }
+        let hart = Hart::new(Config::rv64i().with_reset_vector(BASE));
+        hart.attach_space(Arc::new(space));
+        hart
+    };
+    (build(true), build(false))
+}
+
+/// Everything a read can leave behind.
+fn observed(hart: &Hart) -> ([u64; 32], u64, u64, u64) {
+    let mut x = [0u64; 32];
+    for (n, slot) in x.iter_mut().enumerate() {
+        *slot = hart.x(n as u32);
+    }
+    (x, hart.pc(), hart.cycles(), hart.bus_faults())
+}
+
+#[test]
+fn a_read_served_from_the_cache_is_the_read_the_space_makes() {
+    // A loop that loads an instruction out of its data, stores it over the
+    // instruction two ahead, executes that, and loads a word back -- so the
+    // page being fetched from is also being written, and the fetch has to see
+    // the store.
+    let program = [
+        lui(5, BASE as u32), // 00: x5 = BASE
+        lw(7, 5, 0x100),     // 04: x7 = the patch
+        sw(5, 7, 0x10),      // 08: over the instruction at 10
+        addi(10, 10, 1),     // 0c
+        addi(10, 10, 1),     // 10: becomes `addi x10, x10, 5`
+        lw(11, 5, 0x104),    // 14
+        add(12, 12, 11),     // 18
+        j(0, -0x18),         // 1c: back to 04
+    ];
+    let data = [(0x100, addi(10, 10, 5)), (0x104, 0x1234_5678)];
+    let (fast, slow) = cached_and_uncached(&program, &data);
+    for step in 0..64 {
+        assert_eq!(fast.step(), slow.step(), "accesses charged by step {step}");
+        assert_eq!(observed(&fast), observed(&slow), "after step {step}");
+    }
+    // Nine passes of seven instructions after the `lui`: the patched
+    // instruction was fetched as patched every time.
+    assert_eq!(fast.x(10), 9 * 6);
+    assert_eq!(fast.x(12), 9 * 0x1234_5678);
+}
+
+#[test]
+fn a_fetch_that_runs_off_the_end_of_ram_faults_the_same_way_cached() {
+    // The last instruction of RAM, then whatever is past it: an access fault
+    // on the fetch, taken through an `mtvec` of zero, which faults again.
+    let last = RAM_SIZE - 4;
+    let (fast, slow) = cached_and_uncached(&[], &[(last, addi(10, 10, 7))]);
+    for hart in [&fast, &slow] {
+        hart.set_pc(BASE + last);
+    }
+    for step in 0..6 {
+        assert_eq!(fast.step(), slow.step(), "accesses charged by step {step}");
+        assert_eq!(observed(&fast), observed(&slow), "after step {step}");
+    }
+    assert_eq!(fast.x(10), 7);
+    assert!(fast.bus_faults() > 0, "the fetch past the end was refused");
+}
