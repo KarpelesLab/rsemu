@@ -256,7 +256,7 @@ use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitMask};
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
 use crate::core::value::Width;
-use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, verify};
+use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, Stretch, verify};
 use crate::jit::{
     BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, MemPlan, PAGE_MASK, Stop,
     StoreLog, Translation,
@@ -1546,6 +1546,32 @@ impl IrHost for Host<'_, '_> {
     #[inline]
     fn spent(&self) -> bool {
         self.exec.used >= self.allowance || self.exec.st.cycles >= self.timer_edge
+    }
+
+    /// [`Host::spent`] as a distance: the smaller of what is left of the
+    /// allowance and what is left before the timer's comparator.
+    ///
+    /// The three promises [`IrHost::headroom`] asks for, each by construction.
+    /// Zero exactly when `spent` is `true`, because each term is the
+    /// saturating form of one of its two comparisons; lowered by a charge by
+    /// exactly the charge, because `Exec::charge_n` adds the same count to
+    /// `used` and to `cycles` and to nothing else. Charging is additive for
+    /// the same reason. And [`IrHost::insn_start`] keeps one pair of PCs.
+    #[inline]
+    fn headroom(&self) -> Option<u64> {
+        let ticks = self.allowance.saturating_sub(self.exec.used);
+        let timer = self.timer_edge.saturating_sub(self.exec.st.cycles);
+        Some(ticks.min(timer))
+    }
+
+    /// The default with what it would overwrite left out: one charge for the
+    /// two, since `Exec::charge_n` only adds, and the last boundary's pair of
+    /// PCs, since [`IrHost::insn_start`] keeps no other.
+    #[inline]
+    fn stretch(&mut self, stretch: &Stretch<'_>) {
+        self.exec
+            .charge_n(stretch.before.wrapping_add(stretch.after));
+        self.mark = Some((stretch.last.pc, stretch.last.next_pc));
     }
 }
 

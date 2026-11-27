@@ -31,7 +31,7 @@ use crate::core::space::{AddressSpace, MemAttrs, MemResult, RamStore, Region, Un
 use crate::core::value::Width;
 use crate::ir::{
     AccessKind, Block, BlockBuilder, Cond, Const, InsnStart, Interp, IrHost, MemOp, Opcode,
-    Outcome, RegSlot, Sign, Temp, Type, bitfield_aux, verify,
+    Outcome, RegSlot, Sign, Stretch, Temp, Type, bitfield_aux, verify,
 };
 use crate::jit::{Context, FastMem, MemPlan, Tlb};
 
@@ -103,6 +103,21 @@ struct Scratch {
     /// under differential test: with one set the two engines must leave at the
     /// *same* boundary and not merely produce the same answer at the end.
     allowance: Option<u64>,
+    /// Whether this host answers [`IrHost::headroom`], and so lets a backend
+    /// hand it a whole stretch of bookkeeping at once.
+    ///
+    /// Off is the host every engine is compared through event by event. On is
+    /// the same host making the three promises that method lists, and
+    /// `agree_under` runs every block against both: the two must agree about
+    /// everything a host that makes those promises can still tell apart,
+    /// which is [`Scratch::standing`].
+    batched: bool,
+    /// The last two boundaries announced, oldest first.
+    seen: [Option<u64>; 2],
+    /// [`Scratch::ticks`] when the last boundary was announced.
+    at_last: u64,
+    /// How many times [`IrHost::stretch`] was called.
+    stretches: u64,
 }
 
 impl Scratch {
@@ -136,7 +151,34 @@ impl Scratch {
             log: Vec::new(),
             inlined_stores: Vec::new(),
             allowance: None,
+            batched: false,
+            seen: [None, None],
+            at_last: 0,
+            stretches: 0,
         }
+    }
+
+    /// Everything about the boundaries and charges a host may still depend on
+    /// once it has promised what [`IrHost::headroom`] asks: the total, the
+    /// last two boundaries, and the total as of the last one.
+    ///
+    /// This is the real engines' boundary state, all four at once —
+    /// `cpu::arm::a64` and `cpu::riscv` keep the last boundary's PCs,
+    /// `cpu::x86` the last two instructions' ends, `cpu::m68k` the tick count
+    /// at the last one — so two runs that agree here are two runs none of
+    /// them could tell apart.
+    fn standing(&self) -> (u64, [Option<u64>; 2], u64) {
+        (self.ticks, self.seen, self.at_last)
+    }
+
+    /// The slots this host was asked to publish, in order — the part of the
+    /// log batching leaves exactly as it was.
+    fn published(&self) -> Vec<Event> {
+        self.log
+            .iter()
+            .filter(|e| matches!(e, Event::Publish(..)))
+            .cloned()
+            .collect()
     }
 
     /// The same host, leaving a block at the first boundary past `ticks`.
@@ -210,10 +252,39 @@ impl IrHost for Scratch {
 
     fn insn_start(&mut self, mark: &InsnStart) {
         self.log.push(Event::Boundary(mark.pc));
+        self.seen = [self.seen[1], Some(mark.pc)];
+        self.at_last = self.ticks;
     }
 
     fn spent(&self) -> bool {
         self.allowance.is_some_and(|a| self.ticks >= a)
+    }
+
+    fn headroom(&self) -> Option<u64> {
+        // `spent` exactly when this is zero, and lowered by a charge by
+        // exactly the charge — the first of the three promises. A host with
+        // no allowance is never spent, so it has all the room there is.
+        self.batched.then(|| match self.allowance {
+            Some(a) => a.saturating_sub(self.ticks),
+            None => u64::MAX,
+        })
+    }
+
+    fn stretch(&mut self, stretch: &Stretch<'_>) {
+        // The default, spelled out so the call can be counted: a test that a
+        // batched run agrees with an unbatched one says nothing unless
+        // something was batched.
+        self.stretches += 1;
+        if stretch.before != 0 {
+            self.charge(stretch.before);
+        }
+        if let Some(prev) = stretch.prev {
+            self.insn_start(prev);
+        }
+        self.insn_start(stretch.last);
+        if stretch.after != 0 {
+            self.charge(stretch.after);
+        }
     }
 }
 
@@ -470,6 +541,63 @@ fn agree_under(block: &Block, inline: bool, regs: Regs, allowance: Option<u64>) 
         host.inlined_stores, other.inlined_stores,
         "the inlined stores moved with the frame\n{block}"
     );
+
+    // ---- and none of it depended on being told one event at a time --------
+    //
+    // The same code again, against a host that answers `IrHost::headroom`, so
+    // every flush range `plan` summarised is handed over in one
+    // `IrHost::stretch` call wherever the allowance leaves room for it. That
+    // is the path every engine in `cpu/` runs on, and this is what says it is
+    // the same replay: the same outcome at the same boundary with the same
+    // ticks charged, the same slots published in the same order, and the same
+    // `Scratch::standing` — which is all a host that made that method's three
+    // promises has left to tell the two apart by.
+    let (ticks, boundaries, mark) = (engine.ticks(), engine.boundaries(), engine.mark());
+    let mut batched = Scratch {
+        batched: true,
+        ..scratch(inline)
+    };
+    let stretched = engine
+        .run(block, code, &mut batched)
+        .expect("the code was compiled in this generation");
+    match (&again, &stretched) {
+        (Ok(a), Ok(b)) => assert_eq!(a, b, "the outcome moved with batching\n{block}"),
+        (Err(a), Err(b)) => assert_eq!(
+            alloc::format!("{a}"),
+            alloc::format!("{b}"),
+            "the error moved with batching\n{block}"
+        ),
+        _ => panic!("batching decided whether the block failed\n{block}"),
+    }
+    assert_eq!(
+        other.slots, batched.slots,
+        "guest state moved with batching\n{block}"
+    );
+    assert_eq!(
+        other.standing(),
+        batched.standing(),
+        "the ticks, or the boundary the host is standing at, moved with batching\n{block}"
+    );
+    assert_eq!(
+        other.published(),
+        batched.published(),
+        "different slots were published, or in a different order\n{block}"
+    );
+    assert_eq!(
+        other.bytes(),
+        batched.bytes(),
+        "guest memory moved with batching\n{block}"
+    );
+    assert_eq!(
+        other.inlined_stores, batched.inlined_stores,
+        "the inlined stores moved with batching\n{block}"
+    );
+    assert_eq!(
+        (ticks, boundaries, mark),
+        (engine.ticks(), engine.boundaries(), engine.mark()),
+        "the charged column, the retired count or the boundary moved with batching\n{block}"
+    );
+
     for (t, was) in kept.iter().enumerate() {
         let temp = Temp(t as u32);
         match (was, engine.temp_value(temp)) {
@@ -1186,7 +1314,26 @@ fn events_of(block: &Block) -> Vec<super::rt::Event> {
         scan.events(),
         "the two policies planned different bookkeeping\n{block}"
     );
-    frame.events().to_vec()
+    // The guest's own events. A range's summary is a description of them
+    // rather than one of them, and `summaries_of` is where it is read.
+    frame
+        .events()
+        .iter()
+        .copied()
+        .filter(|e| !matches!(e, super::rt::Event::Head { .. }))
+        .collect()
+}
+
+/// The summary `plan` put ahead of each flush range of `block`, in order.
+fn summaries_of(block: &Block) -> Vec<super::rt::Event> {
+    use super::rt::Event;
+    let compiled = super::compile::compile_with(block, Regs::Scan).expect("compiles");
+    compiled
+        .events()
+        .iter()
+        .copied()
+        .filter(|e| matches!(e, Event::Head { .. }))
+        .collect()
 }
 
 /// A block of `n` guest instructions, each `insn_start` then `charge(ticks)`.
@@ -1249,6 +1396,88 @@ fn a_charge_is_fused_into_the_boundary_it_follows() {
         "{block}"
     );
     assert!(agree(&block, true), "{block}");
+}
+
+#[test]
+fn a_flush_range_is_headed_by_what_replaying_all_of_it_charges() {
+    use super::rt::Event;
+
+    // Three guest instructions at two ticks each and the exit boundary, in
+    // one range. The last boundary a run may leave at is the third, which has
+    // four ticks ahead of it, so a host with five to spare is spent at none
+    // of them; the last boundary of all is the exit one, with six ahead of it
+    // and nothing after.
+    let block = charged(3, 2);
+    assert_eq!(
+        summaries_of(&block),
+        [Event::Head {
+            need: 5,
+            before: 6,
+            after: 0,
+            count: 4,
+            last: 3,
+        }],
+        "{block}"
+    );
+
+    // A `charge(0)` moves no tick and still marks the instruction as having
+    // committed, which a summary cannot say, so its range has none and is
+    // replayed event by event.
+    let block = charged(2, 0);
+    assert_eq!(summaries_of(&block), [] as [Event; 0], "{block}");
+}
+
+#[test]
+fn a_host_with_headroom_is_handed_a_range_whole_and_one_without_is_not() {
+    let block = charged(3, 2);
+    let mut engine = Engine::with_capacity(1 << 18).expect("a code buffer");
+    let code = engine.compile(&block).expect("compiles");
+    let run = |engine: &mut Engine, allowance: Option<u64>| {
+        let mut host = Scratch {
+            batched: true,
+            allowance,
+            ..Scratch::new(true)
+        };
+        let outcome = engine
+            .run(&block, code, &mut host)
+            .expect("live")
+            .expect("runs");
+        (outcome, host)
+    };
+
+    // No allowance at all: one call for the whole block, in place of four
+    // boundaries and three charges.
+    let (outcome, host) = run(&mut engine, None);
+    assert_eq!(outcome, Outcome::Exit);
+    assert_eq!(host.stretches, 1);
+    assert_eq!(
+        host.log,
+        [
+            Event::Charge(6),
+            Event::Boundary(BASE + 8),
+            Event::Boundary(BASE + 12),
+        ],
+        "the ticks ahead of the last boundary, then the last two boundaries"
+    );
+    assert_eq!(host.standing(), (6, [Some(BASE + 8), Some(BASE + 12)], 6));
+
+    // Exactly enough: the third boundary is asked with one tick left.
+    let (outcome, host) = run(&mut engine, Some(5));
+    assert_eq!(outcome, Outcome::Exit);
+    assert_eq!(host.stretches, 1);
+
+    // One short of it: the third boundary is where the block leaves, so the
+    // range is walked, and the walk stops where the interpreter stops.
+    let (outcome, host) = run(&mut engine, Some(4));
+    assert_eq!(outcome, Outcome::Spent { pc: BASE + 8 });
+    assert_eq!(host.stretches, 0);
+    assert_eq!(host.standing(), (4, [Some(BASE + 4), Some(BASE + 8)], 4));
+    let mut oracle = Scratch::within(true, 4);
+    assert_eq!(
+        Interp::new().run(&block, &mut oracle).expect("runs"),
+        outcome
+    );
+    assert_eq!(oracle.standing(), host.standing());
 }
 
 #[test]

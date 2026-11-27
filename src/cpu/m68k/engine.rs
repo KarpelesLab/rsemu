@@ -1203,6 +1203,36 @@ impl IrHost for Host<'_> {
         // see `Lines::interrupt_pending`.
         self.used >= self.allowance || self.smc || self.lines.interrupt_pending(self.ipl_mask)
     }
+
+    /// [`Host::spent`] as a distance: nothing at all once the store guard has
+    /// latched or an interrupt is pending, and what is left of the allowance
+    /// otherwise.
+    ///
+    /// The three promises [`IrHost::headroom`] asks for. Zero exactly when
+    /// `spent` is `true`, term for term. Lowered by a charge by exactly the
+    /// charge, and additive, because `charge` is two additions of its count.
+    /// And [`IrHost::insn_start`] keeps no boundary at all — it records the
+    /// tick count current when it is called, which is the one a stretch
+    /// announces its last boundary at.
+    ///
+    /// *Nothing else inside a stretch moves it* is the one that needs an
+    /// argument on this core, because two of the three terms are not ticks.
+    /// `smc` is set by [`IrHost::store`], and a stretch contains no access.
+    /// The interrupt lines are driven by devices, which under the
+    /// deterministic scheduler run on this thread — inside an access, or
+    /// between runs — so they cannot move inside a stretch either. Under
+    /// `ThreadingMode::Parallel` another thread can raise one between two
+    /// boundaries of a stretch, and it is then seen at the stretch's end
+    /// rather than at the boundary after the raise; both are *a* boundary
+    /// after an event that was not ordered against this core's instructions
+    /// to begin with.
+    #[inline]
+    fn headroom(&self) -> Option<u64> {
+        if self.smc || self.lines.interrupt_pending(self.ipl_mask) {
+            return Some(0);
+        }
+        Some(self.allowance.saturating_sub(self.used))
+    }
 }
 
 impl StoreLog for Host<'_> {

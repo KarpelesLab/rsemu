@@ -125,6 +125,27 @@ use crate::ir::types::{Temp, Type};
 use alloc::format;
 use alloc::vec::Vec;
 
+/// A run of guest instruction boundaries and the charges between them, as
+/// [`IrHost::stretch`] is handed one.
+///
+/// What a backend that defers its bookkeeping knows statically about the
+/// events between two points the host can observe: at least one boundary,
+/// nothing but charges around them. See [`IrHost::headroom`] for when one is
+/// used and what a host promises by accepting it.
+#[derive(Debug, Clone, Copy)]
+pub struct Stretch<'a> {
+    /// The ticks charged ahead of [`Stretch::last`], summed.
+    pub before: u64,
+    /// The boundary announced immediately ahead of [`Stretch::last`], when the
+    /// stretch holds two or more.
+    pub prev: Option<&'a InsnStart>,
+    /// The last boundary of the stretch: the guest instruction the host is
+    /// standing in when the stretch ends.
+    pub last: &'a InsnStart,
+    /// The ticks charged after [`Stretch::last`], summed.
+    pub after: u64,
+}
+
 /// Everything the IR cannot do for itself.
 ///
 /// Deliberately small: the guest register file, guest memory, the tick
@@ -184,6 +205,11 @@ pub trait IrHost {
     /// hashed output rather than a budget (module docs, decision 2), so a host
     /// that rounds or batches produces a different state hash from the
     /// interpreter for the same guest.
+    ///
+    /// A *backend* may sum the charges of several guest instructions into one
+    /// call, but only for a host that has said its counter can take it — see
+    /// [`IrHost::headroom`] — and never across a point where the host could
+    /// observe the difference.
     fn charge(&mut self, ticks: u64);
 
     /// A guest instruction boundary has been reached.
@@ -255,6 +281,71 @@ pub trait IrHost {
     #[inline]
     fn spent(&self) -> bool {
         false
+    }
+
+    /// How many more ticks this host can be charged before [`IrHost::spent`]
+    /// turns `true`, or `None` for a host that does not say.
+    ///
+    /// **The batched half of the boundary seam.** A backend that defers its
+    /// bookkeeping replays a *stretch* of it at a time — the boundaries and
+    /// charges of the guest instructions between two points where the host
+    /// could observe anything — and without this it has to ask
+    /// [`IrHost::spent`] after every one, because that is the only way to
+    /// learn where the allowance ran out. With it the question is asked once:
+    /// the charges of a stretch are static, so a stretch that needs fewer
+    /// ticks than the headroom cannot stop at any boundary inside it, and the
+    /// whole of it is handed over in one [`IrHost::stretch`] call. A stretch
+    /// that might stop is replayed event by event exactly as before, so where
+    /// a block leaves — and with what charged — does not depend on which path
+    /// was taken. `ir`'s module docs, decision 2, have what this is worth.
+    ///
+    /// The default is `None`, and a host that returns it is replayed one
+    /// event at a time: [`IrHost::charge`] once per [`Opcode::CHARGE`],
+    /// [`IrHost::insn_start`] once per boundary. That is still the contract
+    /// [`Interp`] runs every host under, which is why it stays the oracle.
+    ///
+    /// # What a host that answers `Some` promises
+    ///
+    /// Three things, none of which a backend can check:
+    ///
+    /// * **`spent()` is exactly `headroom() == Some(0)`**, and a
+    ///   `charge(n)` lowers the headroom by exactly `n`, saturating at zero.
+    ///   Nothing else that happens inside a stretch moves it — a stretch
+    ///   contains boundaries and charges and no access.
+    /// * **Charging is additive**: `charge(a)` then `charge(b)` leaves the
+    ///   host where `charge(a + b)` does, and `charge(0)` changes nothing.
+    /// * **[`IrHost::insn_start`] keeps nothing older than the last two
+    ///   boundaries**, and reads no tick count but the one current when the
+    ///   *last* of a run is announced. So a run of boundaries with only
+    ///   charges between them may be announced as its last two.
+    ///
+    /// All four engines in `cpu/` satisfy these by construction — a tick
+    /// counter that only adds, and a boundary record that is one or two PCs —
+    /// and each says so where it overrides this.
+    #[inline]
+    fn headroom(&self) -> Option<u64> {
+        None
+    }
+
+    /// Take a whole [`Stretch`] of deferred bookkeeping in one call.
+    ///
+    /// Called only on a host whose [`IrHost::headroom`] answered `Some` and
+    /// only for a stretch that fits inside it, so no boundary in it could
+    /// have stopped the block. The default is the stretch spelled out through
+    /// the per-event methods, under exactly the equivalences that method's
+    /// documentation promises; a host overrides it only to do less.
+    #[inline]
+    fn stretch(&mut self, stretch: &Stretch<'_>) {
+        if stretch.before != 0 {
+            self.charge(stretch.before);
+        }
+        if let Some(prev) = stretch.prev {
+            self.insn_start(prev);
+        }
+        self.insn_start(stretch.last);
+        if stretch.after != 0 {
+            self.charge(stretch.after);
+        }
     }
 
     /// Perform an atomic read-modify-write, returning the value the location

@@ -349,7 +349,7 @@ use crate::core::error::{BusError, Result};
 use crate::core::exec::{Exit, ExitReason};
 use crate::core::space::{AddressSpace, MemAttrs, MemResult};
 use crate::core::value::Width;
-use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, verify};
+use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, Stretch, verify};
 use crate::jit::{
     BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, PAGE_MASK, Stop, StoreLog,
     Translation,
@@ -1889,18 +1889,73 @@ impl IrHost for Host<'_, '_> {
         self.exec.used >= self.allowance
     }
 
+    /// [`Host::spent`] as a distance.
+    ///
+    /// The three promises [`IrHost::headroom`] asks for, each by construction:
+    /// zero exactly when `spent` is `true`; lowered by a charge by exactly the
+    /// charge and additive, because `Exec::charge` is two additions of its
+    /// count; and [`IrHost::insn_start`] below keeps the ends of the last
+    /// **two** instructions and nothing older — which is why a stretch names
+    /// two boundaries rather than one. `cur_access`, the one other thing it
+    /// reads, is written by an access, and a stretch contains none.
+    #[inline]
+    fn headroom(&self) -> Option<u64> {
+        Some(self.allowance.saturating_sub(self.exec.used))
+    }
+
     fn insn_start(&mut self, mark: &InsnStart) {
         // The instruction whose boundary was open has just finished.
         self.end = self.cur_end;
         self.end_access = self.cur_access;
         self.cur_access = false;
-        // An **exit** boundary begins no guest instruction and says so by
-        // carrying `next_pc == pc`; every instruction boundary carries its own
-        // successor, taken branch or not, so the difference is the encoding
-        // length (`lift::Lifter::insn`).
-        let len = mark.next_pc.wrapping_sub(mark.pc);
-        self.cur_end = (len != 0).then(|| mark.pc.wrapping_add(len - 1));
+        self.cur_end = end_of(mark);
     }
+
+    /// A run of boundaries with only charges between them, as the two
+    /// [`IrHost::insn_start`] calls it collapses to.
+    ///
+    /// Not the default, which makes those two calls and lets the second undo
+    /// most of the first: announcing `prev` and then `last` leaves `end` at
+    /// `prev`'s last byte with no access after it, whatever was open before,
+    /// so that is written once. With no `prev` it is `insn_start(last)`
+    /// exactly. The two charges are one addition each and stay two, because
+    /// `Exec::charge` takes a `u32` and a sum is not promised to fit one.
+    ///
+    /// `inline(always)`, which this crate otherwise avoids, because the plain
+    /// hint was measured and declined: left as a call it was 2.35 G host
+    /// instructions over twenty guest seconds of a `pc64` boot — thirty per
+    /// flush, most of them building the argument and saving registers around
+    /// a body of a dozen stores.
+    #[inline(always)]
+    fn stretch(&mut self, stretch: &Stretch<'_>) {
+        match stretch.prev {
+            Some(prev) => {
+                self.end = end_of(prev);
+                self.end_access = false;
+            }
+            None => {
+                self.end = self.cur_end;
+                self.end_access = self.cur_access;
+            }
+        }
+        self.cur_access = false;
+        self.cur_end = end_of(stretch.last);
+        self.exec.charge(stretch.before as u32);
+        self.exec.charge(stretch.after as u32);
+    }
+}
+
+/// The address of the last byte of the guest instruction `mark` begins, or
+/// `None` for a boundary that begins none.
+///
+/// An **exit** boundary begins no guest instruction and says so by carrying
+/// `next_pc == pc`; every instruction boundary carries its own successor,
+/// taken branch or not, so the difference is the encoding length
+/// (`lift::Lifter::insn`).
+#[inline]
+fn end_of(mark: &InsnStart) -> Option<u64> {
+    let len = mark.next_pc.wrapping_sub(mark.pc);
+    (len != 0).then(|| mark.pc.wrapping_add(len - 1))
 }
 
 impl StoreLog for Host<'_, '_> {

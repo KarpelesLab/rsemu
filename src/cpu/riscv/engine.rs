@@ -290,7 +290,7 @@ use crate::core::exec::{Exit, ExitMask};
 use crate::core::space::{AddressSpace, MemAttrs, MemResult, MonitorSlot};
 use crate::core::spin::Watch;
 use crate::core::value::Width;
-use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, verify};
+use crate::ir::{InsnStart, IrHost, MemOp, RegSlot, Stretch, verify};
 use crate::jit::{
     BlockCache, DirtyPages, Dispatcher, Entry, Epoch, FastMem, Frontend, MemPlan, PAGE_MASK, Stop,
     StoreLog, Translation,
@@ -1644,6 +1644,29 @@ impl IrHost for Host<'_, '_> {
     #[inline]
     fn spent(&self) -> bool {
         self.exec.used >= self.allowance
+    }
+
+    /// [`Host::spent`] as a distance.
+    ///
+    /// The three promises [`IrHost::headroom`] asks for, each by construction:
+    /// zero exactly when `spent` is `true`; lowered by a charge by exactly the
+    /// charge, because `Exec::charge_n` adds its count to `used`; additive,
+    /// because that function is three additions and reads `mcountinhibit`,
+    /// which no charge and no boundary writes; and [`IrHost::insn_start`]
+    /// keeps one pair of PCs.
+    #[inline]
+    fn headroom(&self) -> Option<u64> {
+        Some(self.allowance.saturating_sub(self.exec.used))
+    }
+
+    /// The default with what it would overwrite left out: one charge for the
+    /// two, since `Exec::charge_n` only adds, and the last boundary's pair of
+    /// PCs, since [`IrHost::insn_start`] keeps no other.
+    #[inline]
+    fn stretch(&mut self, stretch: &Stretch<'_>) {
+        self.exec
+            .charge_n(stretch.before.wrapping_add(stretch.after));
+        self.mark = Some((stretch.last.pc, stretch.last.next_pc));
     }
 
     fn insn_start(&mut self, mark: &InsnStart) {

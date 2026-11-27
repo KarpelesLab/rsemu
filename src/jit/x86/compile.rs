@@ -68,7 +68,9 @@
 //! pending and the fall-through arrives having replayed the range the branch
 //! skipped.
 //!
-//! Nothing is batched and nothing is reordered: the replay makes the same
+//! Nothing is reordered, and nothing is batched for a host that has not asked
+//! for it (`rt`'s module docs say which hosts have, and what they promised):
+//! the replay makes the same
 //! calls, with the same arguments, in the same order `ir::Interp` makes them,
 //! and it writes the same context fields — [`Ctx::ticks`](super::rt::Ctx),
 //! `retired`, `boundaries`, `boundary_pc`, `mark`, `committed`, `published`.
@@ -731,7 +733,96 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
     // One event per instruction at most, and `Compiler::new` has already
     // refused a block whose instruction count does not fit in an `i32`, so
     // every index a flush carries is a `u32` that fits.
-    Ok(Plan { events, at })
+    summarise(&events, at)
+}
+
+/// Put a one-event summary ahead of every flush range that can take one, and
+/// move the ranges to match.
+///
+/// The second half of [`plan`], kept apart from the first because the first
+/// is where the *meaning* of a range is decided and this only describes what
+/// was decided. A range is summarised when [`summary`] can say, in sixteen
+/// bits each, what replaying all of it would have charged; `flush_thunk` then
+/// takes such a range in one step whenever the host has the headroom for it,
+/// and walks it exactly as before when it has not. Either way the range
+/// generated code names begins at the summary, so nothing but two numbers
+/// changes in what is emitted.
+///
+/// # Errors
+///
+/// [`Refusal`] when the lengthened table no longer indexes in a `u32`, which
+/// takes a block of over a billion instructions.
+fn summarise(events: &[Event], mut at: Vec<Option<(u32, u32)>>) -> Result<Plan, Refusal> {
+    let too_long = |_| Refusal::Shape("the block is too long");
+    let mut out: Vec<Event> = Vec::with_capacity(events.len() + events.len() / 2);
+    // Ranges are handed out in instruction order and never overlap — each
+    // starts where the one before it ended, or later — so one pass moves all
+    // of them.
+    let mut copied = 0usize;
+    for slot in &mut at {
+        let Some((lo, hi)) = *slot else { continue };
+        let (lo, hi) = (lo as usize, hi as usize);
+        out.extend_from_slice(&events[copied..lo]);
+        let start = u32::try_from(out.len()).map_err(too_long)?;
+        if let Some(head) = summary(&events[lo..hi]) {
+            out.push(head);
+        }
+        out.extend_from_slice(&events[lo..hi]);
+        copied = hi;
+        *slot = Some((start, u32::try_from(out.len()).map_err(too_long)?));
+    }
+    out.extend_from_slice(&events[copied..]);
+    Ok(Plan { events: out, at })
+}
+
+/// What replaying the whole of `range` charges, as the event that says so —
+/// or `None` for a range that is replayed event by event only.
+///
+/// `None` for a range with no boundary in it (there is nothing to batch: the
+/// replay is the charges), for one whose counts do not fit the summary's
+/// sixteen bits, for one whose marks are not consecutive records — the
+/// summary names the last and leaves the one before it to be found beside
+/// it — and for one holding a `charge(0)`. The last is not
+/// squeamishness: a `charge(0)` moves no tick and still sets
+/// `Ctx::committed`, so "a charge followed the last boundary" would stop
+/// being readable off the tick count, which is how the batched replay reads
+/// it.
+///
+/// `need` counts **every** boundary a run may leave at, the block's first
+/// among them, although the replay never asks at that one. That only ever
+/// sends a range to the event loop that could have been batched — a block
+/// entered with its allowance already gone — and never the reverse.
+fn summary(range: &[Event]) -> Option<Event> {
+    // Ticks charged by the events seen so far.
+    let mut total = 0u16;
+    let mut need = 0u16;
+    let mut before = 0u16;
+    let (mut count, mut last) = (0u16, 0u32);
+    for event in range {
+        match *event {
+            Event::Charge(0) | Event::Head { .. } => return None,
+            Event::Charge(ticks) => total = total.checked_add(u16::try_from(ticks).ok()?)?,
+            Event::Boundary { mark, exit, ticks } => {
+                if count != 0 && mark.checked_sub(1) != Some(last) {
+                    return None;
+                }
+                if !exit {
+                    need = total.checked_add(1)?;
+                }
+                before = total;
+                last = mark;
+                count = count.checked_add(1)?;
+                total = total.checked_add(u16::try_from(ticks).ok()?)?;
+            }
+        }
+    }
+    (count != 0).then_some(Event::Head {
+        need,
+        before,
+        after: total - before,
+        count,
+        last,
+    })
 }
 
 /// The `mem` table, collected before anything is emitted so its addresses are

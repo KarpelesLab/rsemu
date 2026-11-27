@@ -29,6 +29,9 @@
 //!   [`abi`](super::abi)'s `flush_thunk`, one call per *region*, and a region
 //!   is bounded so that a static range is exactly what ran. `plan` is that
 //!   rule, and it is the x86 backend's rule transcribed rather than a new one.
+//!   A host that answers `IrHost::headroom` is handed a range whole where no
+//!   boundary of it can stop the block — the x86 backend's rule again, and
+//!   `abi`'s tests execute this backend's copy of it on any host.
 //!
 //! Values are held **canonically masked to their type**, exactly as
 //! `ir::Interp` holds them: an `i32` temporary never carries bits above 32 and
@@ -540,7 +543,78 @@ fn plan(block: &Block) -> Result<Plan, Refusal> {
             _ => {}
         }
     }
-    Ok(Plan { events, at })
+    summarise(&events, at)
+}
+
+/// Put a one-event summary ahead of every flush range that can take one, and
+/// move the ranges to match.
+///
+/// `jit::x86::compile`'s `summarise`, which has the reasons: a summarised
+/// range is one `flush_thunk` can hand to the host whole when the host has
+/// the headroom for it, and the range generated code names begins at the
+/// summary, so nothing but two numbers changes in what is emitted.
+///
+/// # Errors
+///
+/// [`Refusal`] when the lengthened table no longer indexes in a `u32`.
+fn summarise(events: &[Event], mut at: Vec<Option<(u32, u32)>>) -> Result<Plan, Refusal> {
+    let too_long = |_| Refusal::Shape("the block is too long");
+    let mut out: Vec<Event> = Vec::with_capacity(events.len() + events.len() / 2);
+    // Ranges are handed out in instruction order and never overlap, so one
+    // pass moves all of them.
+    let mut copied = 0usize;
+    for slot in &mut at {
+        let Some((lo, hi)) = *slot else { continue };
+        let (lo, hi) = (lo as usize, hi as usize);
+        out.extend_from_slice(&events[copied..lo]);
+        let start = u32::try_from(out.len()).map_err(too_long)?;
+        if let Some(head) = summary(&events[lo..hi]) {
+            out.push(head);
+        }
+        out.extend_from_slice(&events[lo..hi]);
+        copied = hi;
+        *slot = Some((start, u32::try_from(out.len()).map_err(too_long)?));
+    }
+    out.extend_from_slice(&events[copied..]);
+    Ok(Plan { events: out, at })
+}
+
+/// What replaying the whole of `range` charges, as the event that says so —
+/// or `None` for a range that is replayed event by event only: one with no
+/// boundary in it, one whose counts do not fit sixteen bits, one whose marks
+/// are not consecutive, and one holding a `charge(0)`. `jit::x86::compile`'s
+/// `summary` says why each.
+fn summary(range: &[Event]) -> Option<Event> {
+    // Ticks charged by the events seen so far.
+    let mut total = 0u16;
+    let mut need = 0u16;
+    let mut before = 0u16;
+    let (mut count, mut last) = (0u16, 0u32);
+    for event in range {
+        match *event {
+            Event::Charge(0) | Event::Head { .. } => return None,
+            Event::Charge(ticks) => total = total.checked_add(u16::try_from(ticks).ok()?)?,
+            Event::Boundary { mark, exit, ticks } => {
+                if count != 0 && mark.checked_sub(1) != Some(last) {
+                    return None;
+                }
+                if !exit {
+                    need = total.checked_add(1)?;
+                }
+                before = total;
+                last = mark;
+                count = count.checked_add(1)?;
+                total = total.checked_add(u16::try_from(ticks).ok()?)?;
+            }
+        }
+    }
+    (count != 0).then_some(Event::Head {
+        need,
+        before,
+        after: total - before,
+        count,
+        last,
+    })
 }
 
 /// The `mem` table, collected before anything is emitted so its addresses are

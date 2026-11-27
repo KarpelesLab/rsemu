@@ -47,7 +47,7 @@
 use core::ffi::c_void;
 
 use crate::core::error::BusError;
-use crate::ir::{Block, InsnStart, IrHost, MemOp, RegSlot};
+use crate::ir::{Block, InsnStart, IrHost, MemOp, RegSlot, Stretch};
 use crate::jit::FastMem;
 
 /// Why a compiled block stopped, as generated code reports it in `x0`.
@@ -131,6 +131,23 @@ pub enum Event {
         /// boundary, or zero for none — `jit::x86::rt::Event` has the argument
         /// and the rule, and `plan` here is the same fusion.
         ticks: u64,
+    },
+    /// The event that heads a flush range `plan` could **summarise** —
+    /// `jit::x86::rt::Event::Head`, field for field, and that is where the
+    /// argument is.
+    Head {
+        /// One more than the ticks charged ahead of the range's last
+        /// boundary a run may leave at, or zero when it holds none.
+        need: u16,
+        /// The ticks charged ahead of the range's last boundary.
+        before: u16,
+        /// The ticks charged after it.
+        after: u16,
+        /// How many boundaries the range passes, which is at least one.
+        count: u16,
+        /// The last one's index into [`Block::marks`]; the one before it is
+        /// at `last - 1`.
+        last: u32,
     },
 }
 
@@ -403,6 +420,9 @@ fn shadowed(c: &Ctx, block: &Block, slot: RegSlot) -> bool {
 /// same order. Generated code contributes only the range, which it knows
 /// statically — see [`compile`](super::compile)'s "Deferred bookkeeping" for
 /// why a static range is exactly the set of instructions that ran.
+///
+/// That is `replay`, below; here is the range delivered whole, to a host
+/// that asked for it that way. `jit::x86::rt`'s flush has both arguments.
 unsafe extern "C" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo: u64, hi: u64) -> u64 {
     // SAFETY: `raw` is the context `Engine::run` entered generated code with,
     // `c.host` is the `&mut H` it was called with, `c.block` is the `&Block`
@@ -415,13 +435,126 @@ unsafe extern "C" fn flush_thunk<H: IrHost + FastMem>(raw: *mut c_void, lo: u64,
         let c = ctx_of(raw);
         let block = &*c.block;
         let all = core::slice::from_raw_parts(c.events, c.event_count as usize);
+        // The whole range in one step, where `plan` could summarise it and
+        // the host has the headroom for it. This is the event loop in
+        // `replay` with its `spent` question answered ahead of time, and
+        // nothing else: `need` is one more than the ticks charged ahead of
+        // the last boundary the loop could leave at, a charge lowers the
+        // headroom by exactly its own count and nothing else in a range
+        // moves it (`IrHost::headroom`), so with `room >= need` every one of
+        // those questions is asked with headroom left and answers `false`.
+        // The loop would therefore run to the end of the range, and what it
+        // leaves behind is what is written here — the context as of the
+        // last boundary, the count of boundaries passed, the ticks either
+        // side of it — with the host told the same thing through
+        // `IrHost::stretch`, whose contract is that equivalence.
+        //
+        // A range that might stop goes to the loop, so *where* a block
+        // leaves and what it has charged by then never depend on this path.
+        // `hi` is not read here: a summary describes the range `plan`
+        // handed out with it, so the one event at `lo` is the whole
+        // answer, and a corrupted `hi` could not make it a different one.
+        // `ir`'s decision 2 has what this is worth.
+        'whole: {
+            let Some(&Event::Head {
+                need,
+                before,
+                after,
+                count,
+                last,
+            }) = all.get(lo as usize)
+            else {
+                break 'whole;
+            };
+            let Some(room) = host_of::<H>(c).headroom() else {
+                break 'whole;
+            };
+            if room < u64::from(need) {
+                break 'whole;
+            }
+            // `plan` only names marks the block has, and only summarises a
+            // range whose marks are consecutive, so the lookup cannot fail
+            // and the boundary ahead of the last is the record ahead of it;
+            // a range it somehow could fail for is walked instead.
+            let marks = block.marks();
+            let at = last as usize;
+            let Some(mark) = marks.get(at) else {
+                break 'whole;
+            };
+            let earlier = if count > 1 {
+                let Some(earlier) = marks.get(at.wrapping_sub(1)) else {
+                    break 'whole;
+                };
+                Some(earlier)
+            } else {
+                None
+            };
+            let retired = c.ticks.wrapping_add(u64::from(before));
+            c.ticks = retired.wrapping_add(u64::from(after));
+            c.retired = retired;
+            c.boundaries = c.boundaries.wrapping_add(u64::from(count));
+            c.mark = i64::from(last);
+            c.published = 0;
+            c.boundary_pc = mark.pc;
+            // `plan` summarises no range holding a `charge(0)`, so a charge
+            // followed the last boundary exactly when ticks did.
+            c.committed = u64::from(after != 0);
+            host_of::<H>(c).stretch(&Stretch {
+                before: u64::from(before),
+                prev: earlier,
+                last: mark,
+                after: u64::from(after),
+            });
+            return 0;
+        }
+        replay::<H>(raw, lo, hi)
+    }
+}
+
+/// The event-by-event replay: every range a host is not handed whole.
+///
+/// Out of line, and deliberately. It is the half of a flush that needs a
+/// frame — an event cursor and a fused count live across calls into the host
+/// — and kept inline it bought `flush_thunk` that frame's pushes and pops on
+/// every call, including the ones that return from the path above having
+/// used none of it.
+///
+/// Handed the raw context rather than what `flush_thunk` had already taken
+/// out of it, and for the same reason: three more values kept alive for a
+/// call that is not usually made are three more registers saved on the path
+/// that does not make it.
+///
+/// # Safety
+///
+/// Exactly `flush_thunk`'s: `raw` is the context generated code was entered
+/// with, and nothing else holds a reference into it or into its host.
+#[inline(never)]
+unsafe fn replay<H: IrHost + FastMem>(raw: *mut c_void, lo: u64, hi: u64) -> u64 {
+    // SAFETY: the caller's obligation, stated above, which is `flush_thunk`'s
+    // own: the context, its host, its block and its event table are live and
+    // name four distinct objects. Every `host_of` below reconstitutes the
+    // one `&mut H` the context names, and none outlives its statement.
+    unsafe {
+        let c = ctx_of(raw);
+        let block = &*c.block;
+        let all = core::slice::from_raw_parts(c.events, c.event_count as usize);
         let hi = (hi as usize).min(all.len());
-        // Clamped to `hi`, not to the table, so a corrupted immediate cannot
-        // produce a backwards slice — the same two clamps, in the same order,
-        // as the x86 backend's, and for the reason written out there.
+        // Clamped to `hi`, not to the table. `compile` never emits a reversed
+        // range — `plan` only ever hands out `(region, here)` with
+        // `region < here` — so the two clamps are the same function on every
+        // input generated code can produce, and a mutation between them
+        // survives every test. Recorded rather than tuned away, because they
+        // are *not* the same function on a range that never happens: clamping
+        // to the table would leave `lo > hi` and index a backwards slice.
+        // This is the arm that answers a corrupted immediate with nothing
+        // rather than with a panic in generated-code territory.
         let lo = (lo as usize).min(hi);
-        for event in &all[lo..hi] {
+        let range = &all[lo..hi];
+        for event in range {
             match *event {
+                // A summary of what follows, which this loop is about to
+                // walk instead.
+                Event::Head { .. } => {}
                 Event::Charge(ticks) => {
                     c.ticks = c.ticks.wrapping_add(ticks);
                     c.committed = 1;
@@ -693,6 +826,199 @@ mod tests {
             core::mem::size_of::<crate::jit::x86::rt::Ctx>(),
             "one context, two declarations"
         );
+    }
+
+    /// A host that keeps what every engine in `cpu/` keeps at a boundary, and
+    /// answers [`IrHost::headroom`] or not.
+    struct Standing {
+        batched: bool,
+        allowance: u64,
+        ticks: u64,
+        /// The last two boundaries announced, oldest first.
+        seen: [Option<u64>; 2],
+        /// `ticks` when the last one was.
+        at_last: u64,
+        stretches: u64,
+    }
+
+    impl IrHost for Standing {
+        fn read_slot(&mut self, _: RegSlot) -> u128 {
+            0
+        }
+        fn write_slot(&mut self, _: RegSlot, _: u128) {}
+        fn load(&mut self, _: &MemOp, _: u64) -> crate::core::space::MemResult<u64> {
+            Err(BusError::Unassigned)
+        }
+        fn store(&mut self, _: &MemOp, _: u64, _: u64) -> crate::core::space::MemResult {
+            Err(BusError::Unassigned)
+        }
+        fn charge(&mut self, ticks: u64) {
+            self.ticks += ticks;
+        }
+        fn insn_start(&mut self, mark: &InsnStart) {
+            self.seen = [self.seen[1], Some(mark.pc)];
+            self.at_last = self.ticks;
+        }
+        fn spent(&self) -> bool {
+            self.ticks >= self.allowance
+        }
+        fn headroom(&self) -> Option<u64> {
+            self.batched
+                .then(|| self.allowance.saturating_sub(self.ticks))
+        }
+        fn stretch(&mut self, stretch: &Stretch<'_>) {
+            self.stretches += 1;
+            if stretch.before != 0 {
+                self.charge(stretch.before);
+            }
+            if let Some(prev) = stretch.prev {
+                self.insn_start(prev);
+            }
+            self.insn_start(stretch.last);
+            if stretch.after != 0 {
+                self.charge(stretch.after);
+            }
+        }
+    }
+
+    impl FastMem for Standing {}
+
+    /// The replay, **executed** — on whatever host is running the tests.
+    ///
+    /// Nothing else in this backend can be: its generated code needs an
+    /// aarch64 processor, and `tests::executed` is not compiled anywhere
+    /// else. But `flush_thunk` is Rust, and what it is handed is a context
+    /// and a range, so the half of the batched replay that is *not* machine
+    /// code runs here against the event-by-event one it has to equal: every
+    /// range of a block, under every allowance from nothing to more than the
+    /// block spends, must leave the context and the host where the unbatched
+    /// replay leaves them, and stop — or not — at the same boundary.
+    #[test]
+    fn a_range_taken_whole_leaves_what_walking_it_leaves() {
+        use crate::ir::{BlockBuilder, Const, Type};
+        use alloc::vec::Vec;
+
+        const BASE: u64 = 0x2000_0000;
+        // Three guest instructions with a slot read after the second, so the
+        // block has two flush ranges and the first is not the whole of it.
+        let mut b = BlockBuilder::new(BASE, 0);
+        let mut at = 0;
+        for i in 0..3u64 {
+            b.insn_start(InsnStart {
+                pc: BASE + i * 4,
+                next_pc: BASE + i * 4 + 4,
+                ticks: at,
+                live: Vec::new(),
+            });
+            b.charge(i + 1);
+            at += i + 1;
+            if i == 1 {
+                let _ = b.get_slot(Type::I64, RegSlot(0));
+            }
+        }
+        let t = b.imm(Type::I64, Const::Int(u128::from(BASE + 12)));
+        b.insn_start(InsnStart {
+            pc: BASE + 12,
+            next_pc: BASE + 12,
+            ticks: at,
+            live: alloc::vec![(RegSlot(0), t)],
+        });
+        b.exit_tb();
+        let block = b.finish();
+        let compiled = crate::jit::arm64::compile(&block).expect("compiles");
+        let events = compiled.events();
+        // The ranges, read back off the summaries that head them.
+        let heads: Vec<usize> = (0..events.len())
+            .filter(|&i| matches!(events[i], Event::Head { .. }))
+            .collect();
+        assert_eq!(heads.len(), 2, "two ranges, both summarised: {events:?}");
+        let ranges = [(heads[0], heads[1]), (heads[1], events.len())];
+
+        let run = |batched: bool, allowance: u64| {
+            let mut host = Standing {
+                batched,
+                allowance,
+                ticks: 0,
+                seen: [None, None],
+                at_last: 0,
+                stretches: 0,
+            };
+            let vt = Vtable::of::<Standing>();
+            let mut ctx = Ctx {
+                temps: core::ptr::null_mut(),
+                vt: &raw const vt,
+                host: core::ptr::from_mut(&mut host).cast::<c_void>(),
+                block: &raw const block,
+                tlb_base: core::ptr::null(),
+                tlb_mask: 0,
+                tag_bits: 0,
+                out_pc: 0,
+                ticks: 0,
+                retired: 0,
+                boundaries: 0,
+                boundary_pc: block.entry_pc,
+                mark: -1,
+                fault_at: 0,
+                fault_error: 0,
+                committed: 0,
+                published: 1,
+                fast_hits: 0,
+                st_base: core::ptr::null(),
+                st_mask: 0,
+                st_tag: 0,
+                fast_writes: 0,
+                events: events.as_ptr(),
+                event_count: events.len() as u64,
+                chain: 0,
+                chain_ctl: core::ptr::null_mut(),
+                out_status: 0,
+                blocks_run: 0,
+            };
+            let mut stopped = None;
+            for (i, &(lo, hi)) in ranges.iter().enumerate() {
+                // SAFETY: `ctx` is a live context whose `host`, `block` and
+                // `events` point at the three locals above, which outlive the
+                // call and which nothing else borrows while it runs — exactly
+                // what `flush_thunk` asks of `Engine::run`.
+                let spent = unsafe {
+                    (vt.flush)(
+                        core::ptr::from_mut(&mut ctx).cast::<c_void>(),
+                        lo as u64,
+                        hi as u64,
+                    )
+                };
+                if spent != 0 {
+                    stopped = Some(i);
+                    break;
+                }
+            }
+            (
+                stopped,
+                (ctx.ticks, ctx.retired, ctx.boundaries, ctx.boundary_pc),
+                (ctx.mark, ctx.committed, ctx.published),
+                (host.ticks, host.seen, host.at_last),
+                host.stretches,
+            )
+        };
+
+        let mut taken_whole = 0;
+        for allowance in 0..10 {
+            let walked = run(false, allowance);
+            let whole = run(true, allowance);
+            assert_eq!(walked.4, 0, "a host that does not say is never batched");
+            assert_eq!(
+                (walked.0, walked.1, walked.2, walked.3),
+                (whole.0, whole.1, whole.2, whole.3),
+                "allowance {allowance}"
+            );
+            taken_whole += whole.4;
+        }
+        // Non-vacuity, both ways: the block spends six ticks, so the larger
+        // allowances batch both ranges and the smaller ones stop inside one.
+        assert_eq!(run(true, 9).4, 2);
+        assert_eq!(run(true, 9).0, None);
+        assert_eq!(run(true, 1).0, Some(0));
+        assert!(taken_whole > 2);
     }
 
     /// And about what each status code means.

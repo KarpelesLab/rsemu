@@ -414,7 +414,14 @@ fn a_charge_is_fused_into_the_boundary_it_follows() {
             scan.events(),
             "the two policies planned different bookkeeping\n{block}"
         );
-        frame.events().to_vec()
+        // The guest's own events: a range's summary describes them and is
+        // not one of them. `abi`'s tests are where the summaries are read.
+        frame
+            .events()
+            .iter()
+            .copied()
+            .filter(|e| !matches!(e, Event::Head { .. }))
+            .collect()
     }
 
     fn charged(ticks: u64) -> Block {

@@ -48,6 +48,15 @@
 //! at the next point the host could observe anything. See
 //! [`compile`](mod@super::compile)'s "Deferred bookkeeping" for why the range a
 //! flush is handed is exactly the set of instructions that ran.
+//!
+//! **Unless the host asks for them batched**, which is the one way the first
+//! two bullets are not literally true and it is the host's own doing. A host
+//! that answers [`IrHost::headroom`] has promised that its tick counter only
+//! adds and that it keeps nothing older than the last two boundaries, and for
+//! that host a range no boundary of which can stop the block is delivered as
+//! one [`IrHost::stretch`] rather than walked. A host that does not answer —
+//! the default, and every host a differential compares event logs through —
+//! gets the bullets as written.
 
 #![allow(unsafe_code)]
 
@@ -55,7 +64,7 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 
 use crate::core::error::{BusError, Error, Result};
-use crate::ir::{Block, Fault, InsnStart, IrHost, MemOp, Opcode, Outcome, RegSlot};
+use crate::ir::{Block, Fault, InsnStart, IrHost, MemOp, Opcode, Outcome, RegSlot, Stretch};
 use crate::jit::dispatch::{Chain, Frontend, Step, StoreLog};
 use crate::jit::{BlockId, CodeRef, FastMem};
 
@@ -154,6 +163,38 @@ pub enum Event {
         /// stay an [`Event::Charge`] or a host counting calls would see one
         /// fewer.
         ticks: u64,
+    },
+    /// The event that heads a flush range `plan` could **summarise**: what the
+    /// whole range charges, which boundaries it passes, and how much headroom
+    /// a host needs for none of them to stop the block.
+    ///
+    /// Not something that happened in the guest — the event-by-event replay
+    /// steps over it. It is here, in the stream and ahead of the events it
+    /// describes, because that is the one place the replay is already
+    /// looking: a flush is handed a range, and a range that opens with this
+    /// can be taken in one [`IrHost::stretch`] call instead of being walked.
+    /// `flush_thunk` has the argument for why the two are the same replay.
+    ///
+    /// Sixteen-bit counts, so that all of it is one event and the path that
+    /// reads it is one load wide. A range that charges more than sixty-five
+    /// thousand ticks has no summary and is walked, which costs nothing
+    /// anybody will measure: a region is a handful of guest instructions.
+    Head {
+        /// One more than the ticks charged ahead of the range's last
+        /// boundary a run may leave at, or zero when it holds none. A host
+        /// with at least this much [`IrHost::headroom`] is not
+        /// [`IrHost::spent`] at any boundary in the range.
+        need: u16,
+        /// The ticks charged ahead of the range's last boundary.
+        before: u16,
+        /// The ticks charged after it.
+        after: u16,
+        /// How many boundaries the range passes, which is at least one.
+        count: u16,
+        /// The last one's index into [`Block::marks`]. The one before it is
+        /// at `last - 1`: a range whose marks are not consecutive has no
+        /// summary.
+        last: u32,
     },
 }
 
@@ -482,6 +523,10 @@ fn shadowed(c: &Ctx, block: &Block, slot: RegSlot) -> bool {
 /// [`compile`](super::compile)'s "Deferred bookkeeping" for why a static range
 /// is exactly the set of instructions that ran.
 ///
+/// That is `replay`, below. What is *here* is the other way a range is
+/// delivered — whole, to a host that asked for it that way and has the
+/// headroom for it — and the argument that the two are one replay.
+///
 /// A host cannot tell the difference, because nothing it can observe happens
 /// between an instruction and its replay: between two flush points generated
 /// code touches only the temporary frame and this context, and every other
@@ -503,6 +548,109 @@ unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(
         let c = ctx(raw);
         let block = &*c.block;
         let all = core::slice::from_raw_parts(c.events, c.event_count as usize);
+        // The whole range in one step, where `plan` could summarise it and
+        // the host has the headroom for it. This is the event loop in
+        // `replay` with its `spent` question answered ahead of time, and
+        // nothing else: `need` is one more than the ticks charged ahead of
+        // the last boundary the loop could leave at, a charge lowers the
+        // headroom by exactly its own count and nothing else in a range
+        // moves it (`IrHost::headroom`), so with `room >= need` every one of
+        // those questions is asked with headroom left and answers `false`.
+        // The loop would therefore run to the end of the range, and what it
+        // leaves behind is what is written here — the context as of the
+        // last boundary, the count of boundaries passed, the ticks either
+        // side of it — with the host told the same thing through
+        // `IrHost::stretch`, whose contract is that equivalence.
+        //
+        // A range that might stop goes to the loop, so *where* a block
+        // leaves and what it has charged by then never depend on this path.
+        // `hi` is not read here: a summary describes the range `plan`
+        // handed out with it, so the one event at `lo` is the whole
+        // answer, and a corrupted `hi` could not make it a different one.
+        // `ir`'s decision 2 has what this is worth.
+        'whole: {
+            let Some(&Event::Head {
+                need,
+                before,
+                after,
+                count,
+                last,
+            }) = all.get(lo as usize)
+            else {
+                break 'whole;
+            };
+            let Some(room) = host_of::<H>(c).headroom() else {
+                break 'whole;
+            };
+            if room < u64::from(need) {
+                break 'whole;
+            }
+            // `plan` only names marks the block has, and only summarises a
+            // range whose marks are consecutive, so the lookup cannot fail
+            // and the boundary ahead of the last is the record ahead of it;
+            // a range it somehow could fail for is walked instead.
+            let marks = block.marks();
+            let at = last as usize;
+            let Some(mark) = marks.get(at) else {
+                break 'whole;
+            };
+            let earlier = if count > 1 {
+                let Some(earlier) = marks.get(at.wrapping_sub(1)) else {
+                    break 'whole;
+                };
+                Some(earlier)
+            } else {
+                None
+            };
+            let retired = c.ticks.wrapping_add(u64::from(before));
+            c.ticks = retired.wrapping_add(u64::from(after));
+            c.retired = retired;
+            c.boundaries = c.boundaries.wrapping_add(u64::from(count));
+            c.mark = i64::from(last);
+            c.published = 0;
+            c.boundary_pc = mark.pc;
+            // `plan` summarises no range holding a `charge(0)`, so a charge
+            // followed the last boundary exactly when ticks did.
+            c.committed = u64::from(after != 0);
+            host_of::<H>(c).stretch(&Stretch {
+                before: u64::from(before),
+                prev: earlier,
+                last: mark,
+                after: u64::from(after),
+            });
+            return 0;
+        }
+        replay::<H>(raw, lo, hi)
+    }
+}
+
+/// The event-by-event replay: every range a host is not handed whole.
+///
+/// Out of line, and deliberately. It is the half of a flush that needs a
+/// frame — an event cursor and a fused count live across calls into the host
+/// — and kept inline it bought `flush_thunk` that frame's pushes and pops on
+/// every call, including the ones that return from the path above having
+/// used none of it.
+///
+/// Handed the raw context rather than what `flush_thunk` had already taken
+/// out of it, and for the same reason: three more values kept alive for a
+/// call that is not usually made are three more registers saved on the path
+/// that does not make it.
+///
+/// # Safety
+///
+/// Exactly `flush_thunk`'s: `raw` is the context generated code was entered
+/// with, and nothing else holds a reference into it or into its host.
+#[inline(never)]
+unsafe fn replay<H: IrHost + FastMem>(raw: *mut c_void, lo: u64, hi: u64) -> u64 {
+    // SAFETY: the caller's obligation, stated above, which is `flush_thunk`'s
+    // own: the context, its host, its block and its event table are live and
+    // name four distinct objects. Every `host_of` below reconstitutes the
+    // one `&mut H` the context names, and none outlives its statement.
+    unsafe {
+        let c = ctx(raw);
+        let block = &*c.block;
+        let all = core::slice::from_raw_parts(c.events, c.event_count as usize);
         let hi = (hi as usize).min(all.len());
         // Clamped to `hi`, not to the table. `compile` never emits a reversed
         // range — `plan` only ever hands out `(region, here)` with
@@ -514,8 +662,12 @@ unsafe extern "sysv64" fn flush_thunk<H: IrHost + FastMem>(
         // This is the arm that answers a corrupted immediate with nothing
         // rather than with a panic in generated-code territory.
         let lo = (lo as usize).min(hi);
-        for event in &all[lo..hi] {
+        let range = &all[lo..hi];
+        for event in range {
             match *event {
+                // A summary of what follows, which this loop is about to
+                // walk instead.
+                Event::Head { .. } => {}
                 Event::Charge(ticks) => {
                     // The context first, then the host — and the order is
                     // *unobservable*, which is worth writing down because a

@@ -294,6 +294,50 @@
 //! backend design, it is unproven, and the two savings above are worth more
 //! than it is.
 //!
+//! ### The seam change that did work: the host says how far it can go
+//!
+//! Both attempts above kept the event loop and tried to skip a question
+//! inside it. What landed removes the loop instead, for the ranges where the
+//! question has one answer. [`IrHost::headroom`] is the host publishing its
+//! distance to `spent` rather than the bit, and a backend's `plan` puts one
+//! summary event ahead of each flush range: the ticks it charges either side
+//! of its last boundary, how many boundaries it passes, and the headroom
+//! below which one of them could stop the block. A flush reads the summary,
+//! asks the host once, and where the headroom covers the range hands all of
+//! it over in a single [`IrHost::stretch`]. Where it does not — the last
+//! range or two of a quantum — the loop runs exactly as it always did, so the
+//! boundary a block leaves at and the ticks charged by then are the loop's
+//! in every case. That is the whole correctness argument, and it is why no
+//! state hash moved: the fast path is taken only when the slow one provably
+//! would not have stopped, and a host that takes it has promised that a sum
+//! of charges is a charge and that it keeps no boundary but the last two.
+//!
+//! `benches/a64_linux_boot.rs`'s default span and `benches/x86_linux_boot.rs
+//! --seconds 20`, same guest instructions and same `Machine::state_hash`
+//! either side (`0xeef1f3d630b080cf` and `0xf4c6f0d1c9a91de5`):
+//!
+//! | | host instructions | `flush_thunk` |
+//! | --- | --- | --- |
+//! | A64 before | 37 304 392 469 | 8 715 484 027 (23.36%) |
+//! | A64 after | 32 741 401 292 (**−12.23%**) | 4 232 178 718 (12.93%) |
+//! | x86 before | 46 922 679 771 | 9 810 671 496 (20.91%) |
+//! | x86 after | 43 575 108 415 (**−7.13%**) | 6 320 217 890 (14.50%) |
+//!
+//! 97.2% of the A64 boot's 61.9 M flushes are taken whole. What is left is
+//! about seventy host instructions a flush, and it is no longer a function
+//! of how many guest instructions the range holds — so the next thing that
+//! shortens this row is **fewer flushes**, not cheaper ones: x86 makes 83 M
+//! of them for 148 M guest instructions, one for nearly every access.
+//!
+//! Two things the first build of it got wrong are worth keeping. It read the
+//! summary as two events and left the loop inline, and on x86 it was worth
+//! **1.2%** rather than seven: a range there is 1.8 guest instructions, so
+//! the walk it replaced was already short, and the frame the inline loop
+//! needed was being pushed and popped on the path that never used it.
+//! Moving the loop out of line (`replay`), folding the summary into one
+//! sixteen-byte event and inlining the x86 host's `stretch` is the other six
+//! points.
+//!
 //! ### The next one, measured and not taken: narrowing [`IrHost::insn_start`]
 //!
 //! All three engines' `insn_start` read [`InsnStart::pc`] and
@@ -526,7 +570,7 @@ mod types;
 mod verify;
 
 pub use block::{Block, BlockBuilder, InsnStart, Inst, RegSlot};
-pub use interp::{Fault, Interp, IrHost, Outcome};
+pub use interp::{Fault, Interp, IrHost, Outcome, Stretch};
 pub use op::{
     AccessKind, Align, Cond, Endian, MemOp, MemSpace, Opcode, SegId, Sign, bitfield_aux,
     bitfield_parts,
