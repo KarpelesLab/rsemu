@@ -308,6 +308,58 @@ fn the_trace_bit_takes_an_exception_after_each_instruction() {
 }
 
 #[test]
+fn a_traced_trap_is_followed_by_the_trace_on_a_68000_too() {
+    // MC68000UM §6.3.8: "During the execution of the instruction, if an
+    // exception is forced by that instruction, the exception processing for
+    // the instruction exception occurs before that of the trace exception."
+    // And its own illustration: "First, the trap exception is processed, then
+    // the trace exception". So a traced `TRAP #0` stacks two frames, and the
+    // trace handler returns into the first instruction of the trap handler.
+    let board = Board::new();
+    board.boot(&[0x4e40]); // TRAP #0
+    board.poke_long(u64::from(vector::TRAP_BASE) * 4, 0x0c00);
+    board.poke_long(u64::from(vector::TRACE) * 4, 0x0f80);
+    let mut regs = board.cpu.regs();
+    regs.sr |= flags::T;
+    let (sr, ssp) = (regs.sr, regs.ssp);
+    board.cpu.set_regs(regs);
+
+    board.cpu.step();
+    let regs = board.cpu.regs();
+    assert_eq!(regs.pc, 0x0f80, "in the trace handler");
+    assert!(!regs.flag(flags::T));
+    let sp = u64::from(regs.ssp);
+    assert_eq!(sp, u64::from(ssp) - 12, "two three-word frames");
+    // The trace's frame: taken from inside the trap's processing, so T is
+    // already off in the copy and the return address is the trap handler.
+    assert_eq!(board.peek_word(sp), sr & !flags::T);
+    assert_eq!(board.peek_long(sp + 2), 0x0c00);
+    // The trap's frame beneath it: the traced program, T still set.
+    assert_eq!(board.peek_word(sp + 6), sr);
+    assert_eq!(board.peek_long(sp + 8), 0x402);
+}
+
+#[test]
+fn an_instruction_that_was_never_executed_is_not_traced() {
+    // The other half of the same paragraph: "If the instruction is not
+    // executed because ... the instruction is illegal or privileged, the trace
+    // exception does not occur."
+    let board = Board::new();
+    board.boot(&[0x4afc]); // ILLEGAL
+    board.poke_long(u64::from(vector::ILLEGAL) * 4, 0x0c00);
+    board.poke_long(u64::from(vector::TRACE) * 4, 0x0f80);
+    let mut regs = board.cpu.regs();
+    regs.sr |= flags::T;
+    let ssp = regs.ssp;
+    board.cpu.set_regs(regs);
+
+    board.cpu.step();
+    let regs = board.cpu.regs();
+    assert_eq!(regs.pc, 0x0c00, "the illegal-instruction handler, untraced");
+    assert_eq!(regs.ssp, ssp - 6, "one frame");
+}
+
+#[test]
 fn addresses_reach_the_bus_modulo_sixteen_megabytes() {
     let board = Board::new();
     // MOVE.W #$1234,($FF001000).L — the high byte has no pin to drive.

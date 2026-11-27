@@ -2179,11 +2179,19 @@ impl<'a> Exec<'a> {
             }
             Err(trap) => {
                 self.service(trap);
-                // On a 68020 an instruction whose own execution raised an
-                // exception is still traced, straight after it: the trap is
-                // processed first, then the trace, so the trace handler
-                // returns into the trap handler (MC68020UM §6.1.11). A 68000
-                // or 68010 does not, and this core keeps what they do.
+                // An instruction whose own execution raised an exception is
+                // still traced, straight after it: the trap is processed
+                // first, then the trace, so the trace handler returns into
+                // the trap handler. On every model — MC68020UM §6.1.11, and
+                // MC68000UM §6.3.8 for the 68000 and 68010: "During the
+                // execution of the instruction, if an exception is forced by
+                // that instruction, the exception processing for the
+                // instruction exception occurs before that of the trace
+                // exception", with a traced `TRAP` as its own example ("First,
+                // the trap exception is processed, then the trace exception").
+                // An instruction that was never executed — illegal,
+                // privileged, or aborted by a bus or address error — is not
+                // traced, by the same paragraph.
                 let executed = matches!(
                     trap,
                     Trap::Vectored {
@@ -2191,8 +2199,7 @@ impl<'a> Exec<'a> {
                         ..
                     }
                 );
-                if self.model.has_020() && executed && !self.state.halted && (traced || traced_flow)
-                {
+                if executed && !self.state.halted && (traced || traced_flow) {
                     let pc = self.state.pc;
                     self.service(Trap::six(vector::TRACE, pc, pc0));
                 }
