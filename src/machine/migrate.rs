@@ -113,6 +113,8 @@ pub fn default_migrations() -> Result<Migrations> {
     crate::cpu::x86::migrations(&mut migrations)?;
     #[cfg(feature = "dev-sgx")]
     crate::dev::sgx::migrations(&mut migrations)?;
+    #[cfg(feature = "dev-amiga-akiko")]
+    crate::dev::amiga::akiko::migrations(&mut migrations)?;
     Ok(migrations)
 }
 
@@ -136,6 +138,8 @@ mod tests {
         "cpu.arm",
         #[cfg(feature = "cpu-x86")]
         "cpu.x86",
+        #[cfg(feature = "dev-amiga-akiko")]
+        crate::dev::amiga::akiko::CLASS_NAME,
     ];
 
     #[test]

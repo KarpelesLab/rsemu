@@ -230,6 +230,7 @@
 //! or fills the converter.
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
@@ -248,7 +249,11 @@ use crate::machine::validate::{ClassSchema, PropSchema};
 pub const CLASS_NAME: &str = "amiga.akiko";
 
 /// Snapshot version for this class's chunk encoding.
-const STATE_VERSION: u32 = 1;
+///
+/// 2: the EEPROM's position on its two-wire bus follows the cells. Version 1
+/// saved the cells alone and restored the part idle, which cut a transfer the
+/// restored processor was still in the middle of. [`migrations`] has the step.
+const STATE_VERSION: u32 = 2;
 
 /// How much of the map the chip's select covers: `$B8_0000`–`$B8_7FFF`.
 pub const WINDOW: u64 = 0x8000;
@@ -412,6 +417,64 @@ impl Eeprom {
     #[must_use]
     pub fn cells(&self) -> &[u8; NVRAM_BYTES] {
         &self.cells
+    }
+
+    /// Where the part is on its bus, after the cells in a snapshot.
+    fn save_bus(&self, w: &mut impl Sink) -> Result<()> {
+        w.write_u8(match self.phase {
+            Phase::Idle => 0,
+            Phase::Device => 1,
+            Phase::WordAddress => 2,
+            Phase::Writing => 3,
+            Phase::Reading => 4,
+        })?;
+        w.write_u8(self.shift)?;
+        w.write_u8(self.clocks)?;
+        w.write_u16(self.addr)?;
+        for flag in [
+            self.scl,
+            self.sda,
+            self.acking,
+            self.master_ack,
+            self.ninth,
+            self.presenting,
+        ] {
+            w.write_bool(flag)?;
+        }
+        Ok(())
+    }
+
+    /// Read back what [`Eeprom::save_bus`] wrote.
+    fn load_bus(&mut self, r: &mut ChunkReader<'_>) -> Result<()> {
+        self.phase = match r.read_u8()? {
+            0 => Phase::Idle,
+            1 => Phase::Device,
+            2 => Phase::WordAddress,
+            3 => Phase::Writing,
+            4 => Phase::Reading,
+            other => {
+                return Err(Error::State(format!(
+                    "amiga.akiko: {other} is not a phase of a 24C08's transfer"
+                )));
+            }
+        };
+        self.shift = r.read_u8()?;
+        self.clocks = r.read_u8()?;
+        self.addr = r.read_u16()?;
+        // Eight is the ninth clock and there is no tenth; the address counter
+        // is ten bits, the part's 1 KiB.
+        if self.clocks > 8 || usize::from(self.addr) >= NVRAM_BYTES {
+            return Err(Error::State(String::from(
+                "amiga.akiko: an EEPROM bit count or address past the part's",
+            )));
+        }
+        self.scl = r.read_bool()?;
+        self.sda = r.read_bool()?;
+        self.acking = r.read_bool()?;
+        self.master_ack = r.read_bool()?;
+        self.ninth = r.read_bool()?;
+        self.presenting = r.read_bool()?;
+        Ok(())
     }
 
     /// Whether the part is pulling SDA low this instant.
@@ -859,7 +922,7 @@ impl Device for Akiko {
         for b in st.nvram.cells() {
             w.write_u8(*b)?;
         }
-        Ok(())
+        st.nvram.save_bus(w)
     }
 
     fn load(&self, r: &mut ChunkReader<'_>) -> Result<()> {
@@ -881,18 +944,46 @@ impl Device for Akiko {
         for b in &mut cells {
             *b = r.read_u8()?;
         }
+        // Where the EEPROM's bus stood is state like the cells are. The
+        // master is the guest's processor, restored in the middle of whatever
+        // routine was clocking the two wires, and it carries on from there:
+        // a part that came back idle would refuse the byte it had already
+        // been addressed for, or answer a read from cell zero.
+        let mut nvram = Eeprom::holding(cells);
+        nvram.load_bus(r)?;
         let mut st = self.regs.state.lock();
-        // Where the EEPROM's bus stood is *derived*: it is a position within a
-        // transfer nobody can resume, and a part that lost its clock comes
-        // back idle. The cells are the state; the shift register is not.
         *st = State {
             regs,
             chunky,
             c2p_at,
-            nvram: Eeprom::holding(cells),
+            nvram,
         };
         Ok(())
     }
+}
+
+/// Snapshot upgrades for `amiga.akiko`, which
+/// `crate::machine::default_migrations` calls so a save state from an older
+/// build still loads.
+///
+/// # v1 -> v2: the EEPROM's bus position
+///
+/// v2 appends where the 24C08 is in a transfer ([`Eeprom::save_bus`]). A v1
+/// build wrote the cells and nothing after them, and on load put the part
+/// back idle with both wires high — so that is what a v1 chunk means, and the
+/// step copies it verbatim and appends exactly that. A v1 snapshot taken in
+/// the middle of a transfer loses the transfer here as it did there; nothing
+/// in the chunk says where it was.
+///
+/// # Errors
+///
+/// [`Error::State`] if a step is already registered for this class.
+pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()> {
+    migrations.register(CLASS_NAME, 1, |r, out| {
+        let body = r.take(r.remaining())?;
+        out.extend_from_slice(body);
+        Eeprom::erased().save_bus(out)
+    })
 }
 
 impl Instance for Akiko {
@@ -1403,6 +1494,120 @@ mod tests {
         assert_eq!(snapshot(&restored), snapshot(&saved));
     }
 
+    /// A snapshot taken in the middle of a two-wire transfer resumes it. The
+    /// processor that is bit-banging the bus is restored mid-routine and
+    /// carries on clocking, so the part has to be where it was: addressed,
+    /// with its word address latched and, on a read, the bit it was
+    /// presenting still on SDA.
+    #[test]
+    fn a_snapshot_in_the_middle_of_a_transfer_resumes_the_transfer() {
+        let restore = |from: &Akiko| {
+            let bytes = snapshot(from);
+            let to = akiko();
+            let reader = StateReader::new(&bytes).unwrap();
+            let chunk = reader
+                .load("akiko", CLASS_NAME, STATE_VERSION, &Migrations::new())
+                .unwrap();
+            Device::load(&to, &mut chunk.reader()).unwrap();
+            assert_eq!(snapshot(&to), bytes, "a round trip is a fixed point");
+            to
+        };
+        let mut cells = [0xFFu8; NVRAM_BYTES];
+        cells[0x120] = 0xA5;
+        cells[0x121] = 0x3C;
+
+        // A write, cut between the word address and the data byte.
+        let saved = akiko();
+        saved.set_nvram(cells);
+        let mut m = Master::new(&saved);
+        m.start();
+        assert!(m.send(0xA2), "device address, page 1, write");
+        assert!(m.send(0x30), "word address");
+        let restored = restore(&saved);
+        let mut m = Master::new(&restored);
+        m.sda_out = true;
+        assert!(
+            m.send(0x77),
+            "the data byte is acknowledged: still addressed"
+        );
+        m.stop();
+        assert_eq!(
+            restored.nvram()[0x130],
+            0x77,
+            "and lands on the latched address"
+        );
+
+        // A random read, cut after the read address byte: the part is
+        // presenting the first bit of the cell at $120.
+        let saved = akiko();
+        saved.set_nvram(cells);
+        let mut m = Master::new(&saved);
+        m.start();
+        assert!(m.send(0xA2));
+        assert!(m.send(0x20));
+        m.start();
+        assert!(m.send(0xA3), "device address, page 1, read");
+        let restored = restore(&saved);
+        let mut m = Master::new(&restored);
+        assert_eq!(m.receive(true), 0xA5);
+        // And cut again between two bytes of the same sequential read.
+        let again = restore(&restored);
+        let mut m = Master::new(&again);
+        assert_eq!(m.receive(false), 0x3C);
+        m.stop();
+    }
+
+    /// A version-1 chunk — the cells and nothing after them — loads into this
+    /// build with the part idle, which is what the build that wrote it did.
+    #[test]
+    fn a_v1_chunk_loads_into_this_build_with_the_bus_idle() {
+        let saved = akiko();
+        let mut m = Master::new(&saved);
+        m.start();
+        assert!(m.send(0xA0));
+        assert!(m.send(0x11));
+        assert!(m.send(0x22));
+        m.stop();
+        write_long(&saved, off::INTENA, 0x1800_0000);
+        let v2 = snapshot(&saved);
+        // v1 is v2 without the eleven bytes of bus position at the end: three
+        // bytes, a sixteen-bit address and six flags.
+        let reader = StateReader::new(&v2).unwrap();
+        let (class, version, data) = reader.load_raw("akiko").unwrap();
+        assert_eq!(
+            version, 2,
+            "this test knows how to undo v2 and nothing else"
+        );
+        let mut w = StateWriter::new(reader.shape().clone());
+        w.raw_chunk("akiko", class, 1, &data[..data.len() - 11])
+            .unwrap();
+        let v1 = w.to_vec().unwrap();
+
+        let restored = akiko();
+        let reader = StateReader::new(&v1).unwrap();
+        let chunk = reader
+            .load(
+                "akiko",
+                CLASS_NAME,
+                STATE_VERSION,
+                &crate::machine::default_migrations().unwrap(),
+            )
+            .unwrap();
+        assert!(chunk.migrated(), "the chain ran");
+        Device::load(&restored, &mut chunk.reader()).unwrap();
+        assert_eq!(restored.nvram(), saved.nvram(), "the cells came across");
+        assert_eq!(read_long(&restored, off::INTENA), 0x1800_0000);
+        // And the part runs on: a fresh transfer reads back what was written.
+        let mut m = Master::new(&restored);
+        m.start();
+        assert!(m.send(0xA0));
+        assert!(m.send(0x11));
+        m.start();
+        assert!(m.send(0xA1));
+        assert_eq!(m.receive(false), 0x22);
+        m.stop();
+    }
+
     /// A corner-turn pointer past its matrix is derived state that cannot be
     /// true, so a snapshot carrying one is refused rather than clamped.
     #[test]
@@ -1422,6 +1627,7 @@ mod tests {
             for _ in 0..NVRAM_BYTES {
                 chunk.write_u8(0xFF).unwrap();
             }
+            Eeprom::erased().save_bus(&mut chunk).unwrap();
         }
         let bytes = w.to_vec().unwrap();
         let reader = StateReader::new(&bytes).unwrap();
