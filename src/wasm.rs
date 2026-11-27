@@ -171,7 +171,8 @@ fn version_static() -> &'static str {
         return leaked(cached, len);
     }
 
-    let info: String = crate::build_info();
+    // One line: this is a page footer, and the page lists its own machines.
+    let info: String = crate::core::build::build_line();
     let leaked_str: &'static str = String::leak(info);
     LEN.store(leaked_str.len(), Ordering::Release);
     CACHE.store(leaked_str.as_ptr().cast_mut(), Ordering::Release);

@@ -214,10 +214,12 @@ pub extern "C" fn rsemu_strerror(status: i32) -> *const c_char {
     text.as_ptr().cast::<c_char>()
 }
 
-/// Writes a one-line description of how this library was configured.
+/// Writes a description of how this library was configured.
 ///
 /// A machine is a feature set, so "which rsemu is this?" has a build-specific
-/// answer and this is it: the version and the features that were enabled.
+/// answer and this is it: the version on the first line, then the features
+/// that were enabled, grouped by kind and wrapped — several lines, separated
+/// by `\n`, with no trailing newline. It is what `rsemu --version` prints.
 ///
 /// # Safety
 ///

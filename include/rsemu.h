@@ -206,10 +206,12 @@ uint32_t rsemu_abi_version(void);
 const char *rsemu_strerror(int32_t status);
 
 /*
- * Writes a one-line description of how this library was configured.
+ * Writes a description of how this library was configured.
  *
  * A machine is a feature set, so "which rsemu is this?" has a build-specific
- * answer and this is it: the version and the features that were enabled.
+ * answer and this is it: the version on the first line, then the features
+ * that were enabled, grouped by kind and wrapped -- several lines, separated
+ * by `\n`, with no trailing newline. It is what `rsemu --version` prints.
  *
  * Safety:
  *

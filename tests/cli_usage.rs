@@ -495,3 +495,30 @@ fn a_refused_property_names_its_object_and_its_line() {
     assert!(stderr.contains(&format!("{path}:5:5")), "{stderr}");
     assert!(stderr.contains("size = 0xffffffffffffffff"), "{stderr}");
 }
+
+/// `--version` lists the build by kind, and lists all of it.
+///
+/// It named twenty-eight features of more than two hundred from a list kept by
+/// hand — `machine-nes` was in it and `machine-gameboy` was not.
+#[test]
+fn the_version_lists_every_kind_of_feature_this_build_has() {
+    let (code, stdout, stderr) = run(&["--version"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let mut lines = stdout.lines();
+    let first = lines.next().unwrap_or_default();
+    assert!(
+        first.starts_with("rsemu ") && !first.contains(','),
+        "the first line is the version alone: {first:?}"
+    );
+    assert!(stdout.lines().all(|l| l.len() <= 78), "{stdout}");
+    let build = stdout
+        .lines()
+        .find(|l| l.starts_with("  build "))
+        .unwrap_or_else(|| panic!("no `build` group:\n{stdout}"));
+    assert!(build.contains("cli"), "{build}");
+    #[cfg(feature = "machine-gameboy")]
+    {
+        let at = stdout.find("\n  machine ").expect("a machine group");
+        assert!(stdout[at..].contains("gameboy"), "{stdout}");
+    }
+}

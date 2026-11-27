@@ -10,6 +10,7 @@
 //!
 //! | Module | Covers |
 //! | --- | --- |
+//! | [`build`] | which rsemu this is: the version and the features of this build |
 //! | [`error`] | crate-wide error and result types |
 //! | [`exec`] | the execution seam: how a core stops, and why (§4.6, §2.1) |
 //! | [`hosts`] | build-scoped host objects: ports, pads, signals, capture (§4.4) |
@@ -35,6 +36,7 @@
 //! device needs, so the machine layer hands those over afterwards through its
 //! own `Instance::bind`.
 
+pub mod build;
 pub mod clock;
 pub mod device;
 pub mod error;
