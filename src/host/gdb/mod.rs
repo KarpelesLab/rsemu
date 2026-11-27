@@ -107,12 +107,48 @@ pub use target::{
     memory_map_xml,
 };
 
-/// How long an idle poll sleeps rather than spinning on a socket that has
+/// How long an idle poll waits rather than spinning on a socket that has
 /// nothing to say.
 ///
 /// One millisecond: below a person's reaction time, and it keeps a halted
-/// session off the CPU entirely.
+/// session off the CPU entirely. It is the longest a poll holds its caller,
+/// not how long a packet waits — see [`wait_for_packet`].
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
+
+/// How many bytes one poll takes from the socket.
+///
+/// Twice the `PacketSize` the stub advertises, so a whole packet — a 4 KiB `X`
+/// of a `load`, escapes and all — arrives in one turn rather than being
+/// reassembled across four.
+const READ_CHUNK: usize = 8192;
+
+/// Wait up to [`IDLE_SLEEP`] for the client to say something.
+///
+/// What a halted session does between packets, in place of an unconditional
+/// sleep. A sleep made every request wait out the rest of its millisecond
+/// whether or not the bytes were already there: GDB's protocol is strictly
+/// request and reply, a single `stepi` with a register window open is dozens
+/// of round trips, and each of them cost a full tick.
+///
+/// A blocking `peek` with a receive timeout returns the moment a byte arrives
+/// and consumes nothing, so the next poll reads it normally. The socket is put
+/// back to non-blocking before returning; if the mode cannot be changed at all
+/// this degrades to the sleep it replaces.
+fn wait_for_packet(stream: &TcpStream) {
+    if stream.set_nonblocking(false).is_err() {
+        std::thread::sleep(IDLE_SLEEP);
+        return;
+    }
+    if stream.set_read_timeout(Some(IDLE_SLEEP)).is_ok() {
+        // The result is deliberately unread: data, a timeout, a hang-up and an
+        // error are all "go round again", and the poll's own read is what
+        // tells them apart.
+        let _ = stream.peek(&mut [0u8; 1]);
+    } else {
+        std::thread::sleep(IDLE_SLEEP);
+    }
+    let _ = stream.set_nonblocking(true);
+}
 
 /// Where a session has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,7 +272,7 @@ impl GdbServer {
         let mut outcome = Outcome::Continue;
         let mut closed = false;
 
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; READ_CHUNK];
         match conn.stream.read(&mut buf) {
             Ok(0) => closed = true,
             Ok(n) => {
@@ -249,8 +285,13 @@ impl GdbServer {
                     }
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // `TimedOut` is how Windows spells a receive timeout, and one is
+            // armed on this socket by `wait_for_packet`.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::Interrupted | ErrorKind::TimedOut
+                ) => {}
             Err(_) => closed = true,
         }
 
@@ -303,8 +344,9 @@ impl GdbServer {
         if running {
             Ok(Progress::Running)
         } else {
-            // Nothing to do but wait for the next packet.
-            std::thread::sleep(IDLE_SLEEP);
+            // Nothing to do but wait for the next packet — and to wake when it
+            // comes, rather than a tick later.
+            wait_for_packet(&conn.stream);
             Ok(Progress::Halted)
         }
     }
@@ -436,6 +478,107 @@ mod tests {
     fn a_nonsense_address_is_an_error_not_a_panic() {
         assert!(resolve("").is_err());
         assert!(resolve("not a host name at all:1").is_err());
+    }
+
+    /// A target nothing is ever asked of: the two tests below are about the
+    /// socket, and never get as far as a packet that needs a machine.
+    #[derive(Debug)]
+    struct Inert;
+
+    impl DebugTarget for Inert {
+        fn cpu_count(&self) -> usize {
+            0
+        }
+        fn cpu_path(&self, _cpu: usize) -> TargetResult<&str> {
+            Err(TargetError::NoSuchCpu)
+        }
+        fn arch(&self, _cpu: usize) -> TargetResult<&'static arch::Arch> {
+            Err(TargetError::NoSuchCpu)
+        }
+        fn read_registers(&self, _cpu: usize) -> TargetResult<Vec<u8>> {
+            Err(TargetError::NoSuchCpu)
+        }
+        fn write_registers(&mut self, _cpu: usize, _data: &[u8]) -> TargetResult<()> {
+            Err(TargetError::NoSuchCpu)
+        }
+        fn read_register(&self, _cpu: usize, _index: usize) -> TargetResult<Vec<u8>> {
+            Err(TargetError::NoSuchCpu)
+        }
+        fn write_register(&mut self, _cpu: usize, _index: usize, _data: &[u8]) -> TargetResult<()> {
+            Err(TargetError::NoSuchCpu)
+        }
+        fn read_memory(&self, _cpu: usize, _addr: u64, _dst: &mut [u8]) -> TargetResult<()> {
+            Err(TargetError::Fault)
+        }
+        fn write_memory(&mut self, _cpu: usize, _addr: u64, _src: &[u8]) -> TargetResult<()> {
+            Err(TargetError::Fault)
+        }
+        fn add_breakpoint(&mut self, _addr: u64, _hardware: bool) -> TargetResult<()> {
+            Ok(())
+        }
+        fn remove_breakpoint(&mut self, _addr: u64, _hardware: bool) -> TargetResult<()> {
+            Ok(())
+        }
+        fn step(&mut self, _cpu: usize) -> TargetResult<Stop> {
+            Err(TargetError::NoSuchCpu)
+        }
+        fn resume(&mut self) -> TargetResult<Option<Stop>> {
+            Ok(None)
+        }
+    }
+
+    /// Attach a client and turn the crank until the server has it.
+    fn attached(server: &mut GdbServer, target: &mut Inert) -> TcpStream {
+        let client = TcpStream::connect(server.local_addr().expect("addr")).expect("connect");
+        for _ in 0..1000 {
+            server.poll(target).expect("poll");
+            if server.is_attached() {
+                return client;
+            }
+        }
+        panic!("the server never accepted the connection");
+    }
+
+    /// Waking on the client's packet must not have turned the halted wait
+    /// into a spin: with nothing arriving, each poll still gives the host its
+    /// millisecond back. A lower bound only — how *long* a sleep overshoots is
+    /// the host's business and asserting on it would be a flaky test.
+    #[test]
+    fn a_halted_session_with_nothing_to_read_stays_off_the_cpu() {
+        let mut server = GdbServer::bind(":0").expect("bind");
+        let mut target = Inert;
+        let _client = attached(&mut server, &mut target);
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            assert_eq!(server.poll(&mut target).expect("poll"), Progress::Halted);
+        }
+        assert!(
+            start.elapsed() >= IDLE_SLEEP * 25,
+            "50 idle polls took {:?}; the wait is not waiting",
+            start.elapsed()
+        );
+    }
+
+    /// And the wait leaves the socket as it found it: the byte it noticed is
+    /// still there for the poll to read, and a packet that arrives during a
+    /// wait is answered by the very next turn.
+    #[test]
+    fn a_packet_that_arrives_during_the_wait_is_answered_next_turn() {
+        let mut server = GdbServer::bind(":0").expect("bind");
+        let mut target = Inert;
+        let mut client = attached(&mut server, &mut target);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        for _ in 0..20 {
+            client.write_all(b"$qAttached#8f").expect("write");
+            // At most two turns: one whose wait the packet ends, one to answer.
+            server.poll(&mut target).expect("poll");
+            server.poll(&mut target).expect("poll");
+            let mut reply = [0u8; 6];
+            client.read_exact(&mut reply).expect("the reply");
+            assert_eq!(&reply, b"+$1#31");
+        }
     }
 
     #[test]
