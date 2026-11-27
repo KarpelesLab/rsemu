@@ -862,6 +862,16 @@ impl Device for SnesApu {
                 "snes.apu: register block has the wrong size",
             )));
         };
+        // The timer prescaler counts SMP cycles modulo 128, and `Io::tick`
+        // advances it with `(prescale + 1) & 0x7f` — which overflows before
+        // the mask for the one value a `u8` holds that the counter never
+        // does. A snapshot is a file somebody can be handed; a prescaler
+        // outside its modulus is refused rather than believed.
+        if prescale > 0x7f {
+            return Err(Error::State(alloc::format!(
+                "snes.apu: the timer prescaler is {prescale}, and it counts modulo 128"
+            )));
+        }
         let mut port = [0u8; 8];
         for p in &mut port {
             *p = r.read_u8()?;
@@ -1098,6 +1108,46 @@ mod tests {
         b.run_budget(3000);
         assert_eq!(image(&a), image(&b), "and identical futures");
         assert_eq!(b.smp_read(0xf6), 0x99);
+    }
+
+    #[test]
+    fn a_snapshot_with_the_timer_prescaler_outside_its_modulus_is_refused() {
+        // The prescaler counts SMP cycles modulo 128 and `Io::tick` steps it
+        // with `(prescale + 1) & 0x7f`, which overflows before the mask for
+        // 255. With the null DSP the chunk ends: the fifteen-byte register
+        // block (the prescaler last), the eight port latches, and the DSP's
+        // 128 registers behind their length.
+        let a = apu();
+        a.run_budget(5000);
+        let first = image(&a);
+        let reader = StateReader::new(&first).unwrap();
+        let (_, _, payload) = reader.load_raw("apu").unwrap();
+        let prescale_at = payload.len() - (8 + 128) - 8 - 1;
+        assert!(payload[prescale_at] <= 0x7f);
+
+        let try_load = |value: u8| {
+            let mut payload = payload.to_vec();
+            payload[prescale_at] = value;
+            let mut shape = MachineShape::new();
+            shape.add_device("apu", CLASS.name).unwrap();
+            let mut w = StateWriter::new(shape);
+            w.raw_chunk("apu", CLASS.name, CLASS.version, &payload)
+                .unwrap();
+            let bytes = w.to_vec().unwrap();
+            let b = apu();
+            let reader = StateReader::new(&bytes).unwrap();
+            let chunk = reader
+                .load("apu", CLASS.name, CLASS.version, &Migrations::new())
+                .unwrap();
+            let result = Device::load(&b, &mut chunk.reader());
+            if result.is_ok() {
+                b.run_budget(3000);
+            }
+            result
+        };
+        try_load(0x7f).expect("the last count of the modulus");
+        assert!(try_load(0x80).is_err());
+        assert!(try_load(0xff).is_err(), "255 + 1 is the overflow");
     }
 
     #[test]
