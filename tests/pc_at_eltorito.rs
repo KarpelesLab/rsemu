@@ -699,3 +699,36 @@ fn an_extended_read_of_a_block_past_32_bits_is_refused_not_aliased() {
         .collect();
     assert_eq!(landed, [0u8; 6], "block 16 was read into the buffer");
 }
+
+#[test]
+fn a_catalog_asking_for_more_sectors_than_the_disc_has_is_declined() {
+    // The entry's sector count is a sixteen-bit number of 512-byte sectors,
+    // rounded up to 2048-byte blocks. FFFFh of them is 16,384 blocks, which
+    // this disc does not have, so the read fails and the entry is declined.
+    //
+    // It used not to be: the rounding was `(n + 3) / 4` in sixteen bits, which
+    // for FFFFh is `2 / 4` — no blocks at all. The read of nothing succeeded
+    // and the bootstrap announced a CD boot and jumped to a load segment
+    // nothing had been loaded into.
+    let image = iso9660::bootable_disc(
+        FILE_TEXT,
+        &no_emulation_image(),
+        iso9660::Emulation::None {
+            load_segment: 0,
+            sectors: 0xffff,
+        },
+        true,
+    );
+    let (mut m, _cpu) = board(disc("huge", image), Vec::new());
+    m.run_for(BOOTED).expect("the machine runs");
+    assert!(
+        !says(&m, "Booting from CD-ROM"),
+        "an image that was never loaded was booted:\n{}",
+        show(&m)
+    );
+    assert!(
+        says(&m, "No bootable device."),
+        "the board did not fall through to INT 18h:\n{}",
+        show(&m)
+    );
+}

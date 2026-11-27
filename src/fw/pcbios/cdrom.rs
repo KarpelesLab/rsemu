@@ -1027,9 +1027,18 @@ fn boot(a: &mut Asm, l: &Labels) {
     a.mov(AX, Mem::abs(EBDA_CD_SPEC + 0x0e));
     a.alui(Alu::CMP, AX, 0);
     a.jcc(Cc::E, no);
-    a.alui(Alu::ADD, AX, 3);
-    a.shift(Shift::SHR, AX, 2);
+    // Divide first and round afterwards. `(n + 3) / 4` is the same number
+    // until `n + 3` no longer fits in sixteen bits: a catalog asking for
+    // FFFDh sectors or more wrapped to a count of zero, the read of nothing
+    // "succeeded", and the bootstrap jumped into a load segment it had not
+    // loaded.
+    let whole = a.label();
     a.mov(CX, AX);
+    a.shift(Shift::SHR, CX, 2);
+    a.testi(AX, 3);
+    a.jcc(Cc::E, whole);
+    a.inc(CX);
+    a.bind(whole);
     a.mov(BX, Mem::abs(EBDA_CD_SPEC + 0x0c));
     a.movsr(ES, BX);
     a.movi(BX, 0);
