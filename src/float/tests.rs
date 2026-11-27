@@ -1752,6 +1752,42 @@ fn the_two_remainders_differ_in_how_they_round_the_quotient() {
 }
 
 #[test]
+fn a_remainder_that_is_its_dividend_is_still_normalised() {
+    // Three of the vectors an x86 host (AMD Zen 5) produced: a
+    // pseudo-denormal dividend smaller than the divisor is its own remainder,
+    // and comes back as the normal number it is, with `DE` for the operand.
+    for (ieee, a, b) in [
+        (
+            false,
+            (0x8000, 0x9dd1_8303_b2d8_92f8),
+            (0x3ef6, 0x9fe5_7398_3df9_e32e),
+        ),
+        (
+            false,
+            (0x0000, 0x9fca_3a40_9d95_86fd),
+            (0x0003, 0x8000_0000_0000_0001),
+        ),
+        (
+            true,
+            (0x8000, 0xfeff_ffff_ffff_ffff),
+            (0xced3, 0x9282_5a91_f0d5_0974),
+        ),
+    ] {
+        let r = x87::remainder(F80::new(a.0, a.1), F80::new(b.0, b.1), ieee, Env::X87);
+        assert_eq!(r.value, F80::new(a.0 | 1, a.1));
+        assert_eq!(r.flags, Flags::DENORMAL);
+        assert!(!r.incomplete);
+        assert_eq!(r.quotient, 0);
+    }
+    // An infinite divisor takes the same path.
+    let r = x87::remainder(F80::new(0, 1 << 63), F80::INFINITY, false, Env::X87);
+    assert_eq!(r.value, F80::new(1, 1 << 63));
+    // A true denormal has no other encoding and is returned as it came.
+    let r = x87::remainder(F80::new(0x8000, 5), e(d(1.0)), false, Env::X87);
+    assert_eq!((r.value, r.flags), (F80::new(0x8000, 5), Flags::DENORMAL));
+}
+
+#[test]
 fn a_complete_remainder_is_always_exact() {
     // Sweep a range of exponent differences and check that nothing ever
     // reports inexact and that `a - q*b` really is what came back. The

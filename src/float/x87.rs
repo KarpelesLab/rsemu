@@ -696,9 +696,26 @@ pub fn remainder(a: F80, b: F80, ieee: bool, env: Env) -> Remainder {
     if pa.class == Class::Inf || pb.class == Class::Zero {
         return nan(Outcome::DefaultNan, Flags::INVALID);
     }
+    // The dividend as its own remainder. "Unchanged" is the value, not the
+    // encoding: a pseudo-denormal dividend comes back normalised, with the
+    // exponent field 1 its integer bit implies — `FPREM` of
+    // `0000:9DD18303B2D892F8` by anything larger delivers
+    // `0001:9DD18303B2D892F8` on an x86 host (AMD Zen 5), and `FPREM1` the
+    // same. Re-rounding an operand at full precision is exact.
+    let unchanged = || {
+        let value = match pa.class {
+            Class::Finite => {
+                let (o, _) =
+                    kernel::round_exact(pa.sign, pa.exp, u128::from(pa.frac), F80::SPEC, env);
+                encode(o, env)
+            }
+            _ => a,
+        };
+        out(value, fa | fb)
+    };
     // A zero dividend, or an infinite divisor, leaves the dividend alone.
     if pa.class == Class::Zero || pb.class == Class::Inf {
-        return out(a, fa | fb);
+        return unchanged();
     }
 
     // Normalise both significands to bit 63, so that the difference of the two
@@ -729,7 +746,7 @@ pub fn remainder(a: F80, b: F80, ieee: bool, env: Env) -> Remainder {
     // Less than a quarter of the divisor: the quotient is zero under either
     // rounding rule, so the dividend is its own remainder.
     if d <= -2 {
-        return out(a, fa | fb);
+        return unchanged();
     }
 
     let (n, den, scale) = if d >= 0 {
