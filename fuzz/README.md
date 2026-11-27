@@ -30,7 +30,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `machine_parser`  | `machine::lexer` → `machine::parser` → `Diagnostic::render`, plus constant folding | never panics |
 | `state_decoder`   | `core::state::StateReader` over arbitrary bytes     | never panics; canonical encoding |
 | `state_roundtrip` | `StateWriter` → `StateReader`, structured input     | writer/reader are inverses |
-| `state_migration` | `machine::default_migrations` — the upgrade steps this build ships, then the device `load` behind them | a step never panics on an old chunk; what it produces is loadable or refused, never half-applied |
+| `state_migration` | `machine::default_migrations` — every class with an upgrade step this build ships (`flash.spinor`, `stm32.octospi`, `rcar.scif`, `cpu.arm`, `cpu.x86`, the SGX), then for the flash part the device `load` behind them | a step never panics on an old chunk; what it produces is loadable or refused, never half-applied |
 | `flash_cfi`       | `dev::flash::cfi` — the NOR flash MMIO surface and its snapshot chunk | a program only ever clears bits |
 | `dfuse_image`     | `dev::dfuse::Image::parse` and `dev::dfuse::Loader` over a DfuSe (`.dfu`, UM0391) container | never panics; an accepted element describes bytes that exist; `verify-crc` only ever narrows; an element outside every mapped region is refused rather than dropped |
 | `amiga_adf_track` | `dev::amiga::adf::scan_track` and `decode_track` over the cells a guest wrote to an Amiga floppy | never panics; an accepted sector names this track; one flipped cell never passes as different data |
