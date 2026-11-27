@@ -2448,6 +2448,92 @@ fn a_missing_page_faults_with_the_address_in_cr2_and_the_reason_in_the_code() {
     assert_eq!(pc.read32(at::STACK0 - 16), 0b010);
 }
 
+/// `CMPXCHG8B` either completes or leaves its operand alone, and it needs
+/// write access whichever way the comparison goes.
+///
+/// *Intel SDM* volume 2, `CMPXCHG8B/CMPXCHG16B`: "the destination operand
+/// receives a write cycle without regard to the result of the comparison. The
+/// destination operand is written back if the comparison fails; otherwise, the
+/// source operand is written into the destination."
+///
+/// The operand is two stores here. With the far half on a read-only page the
+/// first store landed and the second faulted, so the restarted instruction
+/// compared against `new_lo:old_hi`, failed, and loaded `EDX:EAX` with a value
+/// nobody stored — and a failing comparison on a read-only page did not fault
+/// at all.
+#[test]
+fn cmpxchg8b_faults_before_it_stores_and_stores_either_way() {
+    const OPERAND: u64 = 0x20_0ffc;
+    let setup = |matching: bool| {
+        let pc = Pc::new(Variant::X86_64);
+        pc.start_protected();
+        pc.write32(at::PDIR, at::PTAB | 0b111);
+        for page in 0..1024u64 {
+            pc.write32(at::PTAB + page * 4, (page << 12) | 0b111);
+        }
+        // The page holding the operand's upper half: present, not writable.
+        pc.write32(at::PTAB + 0x201 * 4, 0x20_1000 | 0b101);
+        let mut sys = pc.cpu.sys();
+        sys.cr3 = at::PDIR;
+        sys.cr0 |= cr0::PG | cr0::WP;
+        pc.cpu.set_sys(sys);
+        pc.idt(14, gate(0x08, 0x3100, sys_type::INT_GATE32, 0));
+        pc.write(0x3100, &[0xf4]);
+        pc.write32(OPERAND, 0x2222_2222);
+        pc.write32(OPERAND + 4, 0x1111_1111);
+        let mut code = alloc::vec![0xb8]; // mov eax
+        code.extend_from_slice(
+            &(if matching {
+                0x2222_2222u32
+            } else {
+                0x5555_5555
+            })
+            .to_le_bytes(),
+        );
+        code.push(0xba); // mov edx
+        code.extend_from_slice(&0x1111_1111u32.to_le_bytes());
+        code.push(0xbb); // mov ebx
+        code.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+        code.push(0xb9); // mov ecx
+        code.extend_from_slice(&0xcafe_babeu32.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0xc7, 0x0d]); // cmpxchg8b [OPERAND]
+        code.extend_from_slice(&(OPERAND as u32).to_le_bytes());
+        code.push(0xf4);
+        pc.write(at::CODE0, &code);
+        for _ in 0..5 {
+            pc.cpu.step();
+        }
+        pc
+    };
+
+    let pc = setup(true);
+    assert_eq!(
+        pc.regs().rip,
+        0x3100,
+        "the exchange faulted on the far page"
+    );
+    assert_eq!(
+        pc.read32(OPERAND),
+        0x2222_2222,
+        "and stored nothing on the near one"
+    );
+    // The error code: present, write, supervisor.
+    assert_eq!(pc.read32(at::STACK0 - 16), 0b011);
+    assert_eq!(pc.cpu.sys().cr2, 0x20_1000, "naming the far page");
+
+    let pc = setup(false);
+    assert_eq!(
+        pc.regs().rip,
+        0x3100,
+        "a failing comparison needs write access just the same"
+    );
+    assert_eq!(
+        pc.regs().rax,
+        0x5555_5555,
+        "and loaded nothing before the fault"
+    );
+}
+
 #[test]
 fn write_protect_decides_whether_ring_zero_obeys_a_read_only_page() {
     // A 386 has no `CR0.WP` at all and the kernel may write any present page;

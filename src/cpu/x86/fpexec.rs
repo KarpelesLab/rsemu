@@ -2301,6 +2301,23 @@ impl Exec<'_> {
         // architecture promises one indivisible operation. The same gap the
         // other three read-modify-writes have and from the same cause; see
         // `cpu::x86`'s "What is not modelled", under `LOCK`.
+        //
+        // What *is* promised here is that the instruction either completes or
+        // leaves memory alone. The operand is two accesses wide, so the
+        // second store could fault — the far side of a page boundary — after
+        // the first had landed, and the restarted instruction would then
+        // compare against a half-exchanged operand, fail, and load `EDX:EAX`
+        // with a value no program ever stored. So the whole operand is
+        // checked for write access before anything is read: a fault is taken
+        // here or not at all.
+        //
+        // Unconditionally, because the store is unconditional (*Intel SDM*
+        // volume 2, `CMPXCHG8B/CMPXCHG16B`): "the destination operand
+        // receives a write cycle without regard to the result of the
+        // comparison. The destination operand is written back if the
+        // comparison fails; otherwise, the source operand is written into the
+        // destination."
+        self.require_writable(sr, off, u64::from(half) * 2)?;
         let lo = self.read_mem(sr, off, half)?;
         let hi = self.read_mem(sr, off.wrapping_add(u64::from(half)), half)?;
         let width = u32::from(half) * 8;
@@ -2322,6 +2339,10 @@ impl Exec<'_> {
             // is what makes a compare-and-exchange loop terminate.
             self.state.regs.write(0, half, false, lo);
             self.state.regs.write(2, half, false, hi);
+            // And the write cycle the manual says happens either way, as
+            // `CMPXCHG` beside it in `Exec::execute` already does.
+            self.write_mem(sr, off, half, lo)?;
+            self.write_mem(sr, off.wrapping_add(u64::from(half)), half, hi)?;
             self.set_flag(flags::ZF, false);
         }
         Ok(())

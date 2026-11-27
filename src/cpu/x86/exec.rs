@@ -1368,6 +1368,35 @@ impl<'a> Exec<'a> {
         self.linear_write(lin, size, value)
     }
 
+    /// Check that `size` bytes at `sr:offset` could be written, and write
+    /// nothing: the segment checks a store makes, and under paging the
+    /// translation of the first and the last byte for a write.
+    ///
+    /// For an instruction that stores to one operand in more than one access
+    /// and must not be left half-done by a fault on a later one. It is the
+    /// processor's own order — a write that will happen is checked before the
+    /// instruction commits to anything — and it has a store's side effects on
+    /// the page tables: the accessed and dirty bits are set, as they are
+    /// about to be anyway.
+    pub(super) fn require_writable(&mut self, sr: u8, offset: u64, size: u64) -> Ex<()> {
+        if self.legacy() || size == 0 {
+            return Ok(());
+        }
+        let lin = self.seg_linear(sr, offset, size, true)?;
+        if !self.state.sys.paging() {
+            return Ok(());
+        }
+        let user = self.cpl() == 3;
+        self.translate(lin, true, user)?;
+        let last = lin.wrapping_add(size - 1);
+        if (lin ^ last) & !0xfff != 0 {
+            // The first byte on the far page, which is the address a store
+            // faulting there would have reported in `CR2`.
+            self.translate(last & !0xfff, true, user)?;
+        }
+        Ok(())
+    }
+
     /// Read `size` bytes from a linear address, splitting the access if it
     /// straddles a page boundary.
     pub(super) fn linear_read(&mut self, lin: u64, size: u8) -> Ex<u64> {
