@@ -478,6 +478,14 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     // refused, as EDD 1.1 limits it — and as it must be here, because the
     // count reaches the drive through an eight-bit register where zero means
     // 256.
+    //
+    // **The block number is checked against what the command can carry.** The
+    // packet has room for 64 bits and `ata_read` below sends 28 — three
+    // address registers and the Device register's low nibble, which it masks
+    // — so anything with a bit set above the 28th is refused here. It used
+    // not to be: the excess bits fell on the floor and block `1000_0000h` was
+    // block 0. For a read that is wrong data reported as success; for a write
+    // it is somebody's master boot record.
     a.bind(ext_write);
     a.movi8(AL, 0x30); // WRITE SECTOR(S), T13/1410D §8.45
     let ext_xfer = a.label();
@@ -494,7 +502,18 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     a.mov(AX, Mem::si(6));
     a.mov(BX, Mem::si(8));
     a.mov(DX, Mem::si(10));
+    // The block number's high double word, folded into `SI` — which has
+    // served its purpose — so that it outlives the caller's `DS`.
+    a.push(AX);
+    a.mov(AX, Mem::si(12));
+    a.alu(Alu::OR, AX, Mem::si(14));
+    a.mov(SI, AX);
+    a.pop(AX);
     a.pops(DS);
+    a.alui(Alu::CMP, SI, 0);
+    a.jcc(Cc::NE, l.disk_fail);
+    a.testi(DX, 0xf000);
+    a.jcc(Cc::NE, l.disk_fail);
     a.movto(Mem::abs(EBDA_LBA_LOW), BX);
     a.movto(Mem::abs(EBDA_LBA_HIGH), DX);
     a.movsr(ES, AX);
