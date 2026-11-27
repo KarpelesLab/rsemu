@@ -358,6 +358,44 @@ fn a_mode_4_tile_reaches_the_framebuffer_through_colour_ram() {
 }
 
 #[test]
+fn a_16x16_tms_sprite_reads_all_sixteen_rows_of_each_half() {
+    // Sean Young, *Texas Instruments TMS9918A VDP*, §4.2 (sprites): "In the
+    // case of 16 x 16 [...] each pattern is 32 bytes now. [...] The first 16
+    // bytes set the colour of the left 8 pixels of the sprite, the next 16
+    // bytes set the colour of the right 16 pixels of the sprite." The row
+    // index was taken modulo 8, so rows 8-15 showed rows 0-7 over again.
+    let vdp = SmsVdp::new(TvRegion::Ntsc);
+    vdp.write_port(1, 0x00); // R0: Graphic I
+    vdp.write_port(1, 0x80);
+    vdp.write_port(1, 0x42); // R1: display on, 16x16 sprites
+    vdp.write_port(1, 0x81);
+    vdp.write_port(1, 0x36); // R5: sprite attributes at $1B00
+    vdp.write_port(1, 0x85);
+    vdp.write_port(1, 0x07); // R6: sprite patterns at $3800
+    vdp.write_port(1, 0x86);
+    // Sprite 0 at (16, 0), pattern 0, white; then the terminator.
+    for (i, byte) in [0xffu8, 16, 0, 15, 0xd0].into_iter().enumerate() {
+        vdp.poke_vram(0x1b00 + i, byte);
+    }
+    // The top half of the sprite is empty and the bottom half solid, in both
+    // columns: bytes 8-15 and 24-31 of the 32.
+    for row in 8..16 {
+        vdp.poke_vram(0x3800 + row, 0xff);
+        vdp.poke_vram(0x3800 + 16 + row, 0xff);
+    }
+    vdp.advance_to(DOTS_PER_LINE * 262);
+    let white = 0x3f;
+    assert_ne!(vdp.pixel(16, 4), Some(white), "the top half is empty");
+    assert_ne!(vdp.pixel(24, 4), Some(white));
+    assert_eq!(vdp.pixel(16, 12), Some(white), "the bottom left is byte 12");
+    assert_eq!(
+        vdp.pixel(31, 15),
+        Some(white),
+        "the bottom right is byte 31"
+    );
+}
+
+#[test]
 fn hiding_the_left_column_paints_it_with_the_backdrop() {
     let vdp = SmsVdp::new(TvRegion::Ntsc);
     mode4(&vdp);

@@ -1008,10 +1008,13 @@ impl Engine {
             let value = TMS_PALETTE[colour as usize];
             let width = if large { 16usize } else { 8 };
             for i in 0..width {
-                // A 16x16 sprite is four 8x8 patterns in column-major order: its
-                // right half is the pattern sixteen bytes further on.
+                // A 16x16 sprite is 32 bytes in column-major order: "The first
+                // 16 bytes set the colour of the left 8 pixels of the sprite,
+                // the next 16 bytes set the colour of the right" (Sean Young,
+                // *Texas Instruments TMS9918A VDP*, §4.2). `py` runs to 15 for
+                // one, so it indexes the sixteen directly.
                 let half = (i / 8) * 16;
-                let byte = self.vram[(pattern_base + name * 8 + half + (py % 8)) & 0x3fff];
+                let byte = self.vram[(pattern_base + name * 8 + half + py) & 0x3fff];
                 if byte & (0x80 >> (i % 8)) == 0 {
                     continue;
                 }
