@@ -52,6 +52,19 @@ use super::{Backend, DEVICE_ID_ENTROPY};
 /// How many bytes are generated per call before the buffer is flushed out.
 const CHUNK: usize = 256;
 
+/// The most one request is answered with.
+///
+/// A chain's writable length is a queue's worth of `u32`s the guest wrote, so
+/// it can claim a terabyte, and on a bus whose unassigned policy swallows
+/// writes nothing stops the device from generating all of it — 256 bytes at a
+/// time, inside one `QueueNotify`. §5.4.6.2 makes a bound legal: *"The device
+/// MUST place one or more random bytes into the buffer, but it MAY use less
+/// than the entire buffer length"*, and §5.4.6.1 has the driver read the used
+/// length to find out how many it got. 64 KiB is far past what a driver asks
+/// an entropy source for at once, and it is the same staging bound
+/// `virtio.blk` puts on a transfer.
+const MAX_REQUEST: u64 = 64 * 1024;
+
 /// A deterministic entropy source.
 #[derive(Debug)]
 pub struct VirtioRng {
@@ -100,7 +113,7 @@ impl Backend for VirtioRng {
     }
 
     fn handle(&self, _queue: usize, q: &Queue<'_>, chain: &[Descriptor]) -> u32 {
-        let want = Queue::writable_len(chain);
+        let want = Queue::writable_len(chain).min(MAX_REQUEST);
         if want == 0 {
             return 0;
         }
@@ -212,6 +225,43 @@ mod tests {
                 .unwrap() as u8;
             assert_eq!(got, *want, "byte {i}");
         }
+    }
+
+    #[test]
+    fn a_chain_claiming_more_than_any_driver_wants_is_answered_short() {
+        use crate::core::space::UnassignedPolicy;
+        // Eight descriptors of 64 MiB each, aimed where nothing is mapped, on
+        // a bus that swallows such writes. §5.4.6.2 lets the device use less
+        // than the buffer, and it has to: the alternative is generating
+        // whatever the guest's descriptors add up to inside one notify.
+        let space = AddressSpace::new("mem", 64).with_unassigned(UnassignedPolicy::ONES);
+        space
+            .topology()
+            .map(Region::ram("ram", Arc::new(RamStore::new(0x1_0000))), 0)
+            .unwrap();
+        let layout = Layout {
+            size: 8,
+            desc: DESC,
+            avail: 0x2000,
+            used: 0x3000,
+            ready: true,
+        };
+        for i in 0..8u64 {
+            let last = i == 7;
+            descriptor(
+                &space,
+                i,
+                0x1_0000_0000 + (i << 28),
+                0x0400_0000,
+                DESC_F_WRITE | if last { 0 } else { DESC_F_NEXT },
+                (i + 1) as u16,
+            );
+        }
+        let q = Queue::new(layout, &space, RequesterId(1));
+        let chain = q.chain(0).unwrap();
+        assert_eq!(Queue::writable_len(&chain), 8 * 0x0400_0000);
+        let written = VirtioRng::new(5).handle(0, &q, &chain);
+        assert_eq!(u64::from(written), MAX_REQUEST);
     }
 
     #[test]
