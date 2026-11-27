@@ -584,7 +584,18 @@ impl Dmc {
         let byte = r.read_u8()?;
         self.buffer = if filled { Some(byte) } else { None };
         self.shift = r.read_u8()?;
-        self.bits_remaining = r.read_u8()?;
+        // The output unit counts a byte's bits down from eight and reloads on
+        // reaching zero, so the counter is never zero between clocks — and
+        // `clock_output` decrements it before it looks. A snapshot is a file
+        // somebody can be handed; one that says zero (or nine) is refused
+        // here rather than believed until the next output clock.
+        let bits_remaining = r.read_u8()?;
+        if !(1..=8).contains(&bits_remaining) {
+            return Err(crate::core::error::Error::State(alloc::format!(
+                "snapshot has the DMC output unit {bits_remaining} bit(s) into a byte of eight"
+            )));
+        }
+        self.bits_remaining = bits_remaining;
         self.silence = r.read_bool()?;
         self.timer = r.read_u16()?;
         self.irq = r.read_bool()?;

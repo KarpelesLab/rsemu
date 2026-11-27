@@ -1519,3 +1519,49 @@ fn silencing_an_idle_dmc_never_schedules_an_aborted_dma() {
         }
     }
 }
+
+#[test]
+fn a_dmc_snapshot_with_no_bits_left_in_its_byte_is_refused() {
+    use crate::core::state::SliceSource;
+
+    // The output unit counts a byte's bits down from eight and reloads at
+    // zero, so between clocks the counter is one to eight. `clock_output`
+    // decrements before it looks: a snapshot that said zero loaded, and the
+    // next output clock underflowed.
+    //
+    // The field is the fourteenth byte `Dmc::save` writes: two flags, four
+    // register bytes, two 16-bit counters, the sample buffer's flag and byte,
+    // and the shift register come first.
+    const BITS_REMAINING: usize = 13;
+    let saved = dmc::Dmc::new(Region::Ntsc);
+    let mut bytes = Vec::new();
+    saved.save(&mut bytes).unwrap();
+    assert_eq!(
+        bytes[BITS_REMAINING], 8,
+        "a powered-on unit is at the top of a byte"
+    );
+
+    let mut honest = dmc::Dmc::new(Region::Ntsc);
+    honest.load(&mut SliceSource::new(&bytes)).unwrap();
+    for now in 0..2000 {
+        honest.tick_timer(now);
+    }
+
+    for bad in [0u8, 9, 0xff] {
+        let mut doctored = bytes.clone();
+        doctored[BITS_REMAINING] = bad;
+        let mut unit = dmc::Dmc::new(Region::Ntsc);
+        let refused = unit.load(&mut SliceSource::new(&doctored));
+        assert!(refused.is_err(), "{bad} bits left of eight was believed");
+    }
+    // Every value the counter does take still loads and runs.
+    for good in 1..=8u8 {
+        let mut doctored = bytes.clone();
+        doctored[BITS_REMAINING] = good;
+        let mut unit = dmc::Dmc::new(Region::Ntsc);
+        unit.load(&mut SliceSource::new(&doctored)).unwrap();
+        for now in 0..2000 {
+            unit.tick_timer(now);
+        }
+    }
+}
