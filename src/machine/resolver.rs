@@ -727,7 +727,7 @@ impl<'a> Resolver<'a> {
         // 3. Templates and parameters, from both scopes.
         self.collect_templates(&stmts)?;
         self.collect_templates(&machine.body)?;
-        self.collect_params(&stmts, &machine.body)?;
+        self.collect_params(&stmts, &machine.body, machine.name.span)?;
 
         // 4. Expand instances and loops into a flat list of declarations.
         let mut expanded = Vec::new();
@@ -890,7 +890,15 @@ impl<'a> Resolver<'a> {
     }
 
     /// Collect `param` declarations and apply the caller's overrides.
-    fn collect_params(&mut self, file: &[Stmt], machine: &[Stmt]) -> Result<(), Diagnostic> {
+    ///
+    /// `scope` is where the machine is named, which is where an override that
+    /// matches nothing is reported when there is no better place.
+    fn collect_params(
+        &mut self,
+        file: &[Stmt],
+        machine: &[Stmt],
+        scope: Span,
+    ) -> Result<(), Diagnostic> {
         let mut decls: Vec<&ParamDecl> = Vec::new();
         let mut seen: BTreeMap<String, Span> = BTreeMap::new();
         for stmt in file.iter().chain(machine.iter()) {
@@ -946,13 +954,24 @@ impl<'a> Resolver<'a> {
 
         // An override nobody declared is a typo, and silently ignoring it is
         // how an afternoon disappears.
+        //
+        // An override was written on a command line, so there is no place in
+        // the file that is *it*. The caret used to go under the first `param`
+        // the machine declares, whatever that was â€” `-p hd0siez=1` pointed at
+        // `param basemem = 640K`, which reads as though `basemem` were the
+        // problem. It goes under the parameter that was probably meant when
+        // one is close, and otherwise under the machine's own name, which is
+        // at least the subject of the sentence.
         for (name, _) in &self.options.params {
             if !self.params.contains_key(name) {
                 let known = list(self.param_order.iter().map(String::as_str));
-                let span = decls.first().map_or(Span::at(0), |d| d.span);
+                let names: Vec<&str> = self.param_order.iter().map(String::as_str).collect();
+                let near = crate::core::props::suggest(name, &names);
+                let span = near.and_then(|n| seen.get(n).copied()).unwrap_or(scope);
+                let hint = near.map_or_else(String::new, |n| format!(" (did you mean `{n}`?)"));
                 return Err(Diagnostic::new(
                     span,
-                    format!("no parameter named `{name}`; this machine declares {known}"),
+                    format!("no parameter named `{name}`{hint}; this machine declares {known}"),
                 ));
             }
         }
@@ -2761,11 +2780,47 @@ error: parameter `ram` has no default and was not given a value (pass `-p ram=â€
         assert_eq!(
             map.render(&diag),
             "\
-error: no parameter named `rma`; this machine declares `ram`
- --> m.machine:2:3
+error: no parameter named `rma` (did you mean `ram`?); this machine declares `ram`
+ --> m.machine:2:9
   |
 2 |   param ram = 4M
-  |   ^^^^^^^^^^^^^^"
+  |         ^^^"
+        );
+    }
+
+    /// An override that resembles nothing is reported against the machine,
+    /// not against whichever parameter happens to be declared first.
+    #[test]
+    fn golden_override_of_a_parameter_nothing_like_any_declared() {
+        let mut map = SourceMap::new();
+        let root = map
+            .add(
+                "m.machine",
+                "machine \"m\" {\n  param basemem = 640K\n  param hd0size = 0\n}\n",
+            )
+            .expect("fits");
+        let opts = ResolveOptions::new().with_param("cylinders", "8");
+        let diag = resolve(&mut map, root, &mut NoIncludes, &opts).expect_err("no such knob");
+        assert_eq!(
+            map.render(&diag),
+            "\
+error: no parameter named `cylinders`; this machine declares `basemem`, `hd0size`
+ --> m.machine:1:9
+  |
+1 | machine \"m\" {
+  |         ^^^"
+        );
+        // And a near miss of the *second* one points at the second one.
+        let opts = ResolveOptions::new().with_param("hd0siez", "8");
+        let diag = resolve(&mut map, root, &mut NoIncludes, &opts).expect_err("typo");
+        assert_eq!(
+            map.render(&diag),
+            "\
+error: no parameter named `hd0siez` (did you mean `hd0size`?); this machine declares `basemem`, `hd0size`
+ --> m.machine:3:9
+  |
+3 |   param hd0size = 0
+  |         ^^^^^^^"
         );
     }
 

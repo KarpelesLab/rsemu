@@ -436,3 +436,33 @@ fn the_listing_commands_refuse_surplus_arguments() {
         assert_eq!(code, Some(0), "{args:?}: {stderr}");
     }
 }
+
+/// A mistyped `-p` points at the parameter that was meant.
+///
+/// The caret used to go under the first `param` in the file whatever it was:
+/// `-p hd0siez=1` underlined `param basemem = 640K`, as if `basemem` were at
+/// fault. An override that resembles nothing is reported against the machine.
+#[cfg(feature = "machine-pc-at")]
+#[test]
+fn a_mistyped_parameter_points_at_the_one_that_was_meant() {
+    let (code, _, stderr) = run(&["run", "pc-at", "--headless", "-p", "hd0siez=1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("no parameter named `hd0siez` (did you mean `hd0size`?)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("param hd0size"),
+        "the caret's line: {stderr}"
+    );
+    assert!(!stderr.contains("param basemem"), "{stderr}");
+
+    let (code, _, stderr) = run(&["run", "pc-at", "--headless", "-p", "zzzzzz=1"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("no parameter named `zzzzzz`;"), "{stderr}");
+    assert!(
+        stderr.contains("machine \"pc-at\""),
+        "the caret's line: {stderr}"
+    );
+    assert!(!stderr.contains("param basemem"), "{stderr}");
+}
