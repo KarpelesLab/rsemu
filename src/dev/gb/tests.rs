@@ -820,6 +820,74 @@ fn an_object_behind_the_background_still_hides_the_objects_under_it() {
     assert_eq!(ppu.pixel(28, 0), Some(2), "past the mask it draws normally");
 }
 
+/// A controller showing a blank background and a window of solid colour 3,
+/// with the window at the left edge and `WY` as given.
+fn lcd_with_a_solid_window(wy: u8) -> GbPpu {
+    let ppu = lcd(0);
+    for i in 16..32u64 {
+        ppu.poke_vram(i, 0xff);
+    }
+    // The $9C00 map, every entry tile 1.
+    for i in 0..0x400u64 {
+        ppu.poke_vram(0x1c00 + i, 1);
+    }
+    ppu.write_register(0x07, 0b11_10_01_00); // BGP: identity
+    ppu.write_register(0x0a, wy);
+    ppu.write_register(0x0b, 7); // WX: the left edge
+    ppu.write_register(
+        0x00,
+        lcdc::LCD_ENABLE
+            | lcdc::BG_ENABLE
+            | lcdc::TILE_DATA
+            | lcdc::WINDOW_ENABLE
+            | lcdc::WINDOW_MAP,
+    );
+    ppu
+}
+
+#[test]
+fn the_window_starts_where_wy_met_ly_and_not_wherever_ly_passes_it() {
+    // Pan Docs, *Window*, "Window rendering criteria": "The PPU keeps track of
+    // a 'Y condition' throughout a frame. On each VBlank, the Y condition is
+    // cleared (becomes false). At the beginning of each scanline, if the value
+    // of `WY` is equal to `LY`, the Y condition becomes true (and remains so
+    // for subsequent scanlines)."
+    //
+    // Once met it stays met: moving `WY` below the beam afterwards does not
+    // take the window away again.
+    let ppu = lcd_with_a_solid_window(0);
+    ppu.advance_by(ppu::DOTS_PER_LINE * 10);
+    ppu.write_register(0x0a, 100);
+    ppu.advance_by(ppu::DOTS_PER_LINE * 60);
+    assert_eq!(ppu.pixel(0, 5), Some(3), "drawn from line 0");
+    assert_eq!(
+        ppu.pixel(0, 50),
+        Some(3),
+        "and still drawn after WY moved away"
+    );
+
+    // And it is an equality, sampled as each line starts: a `WY` the beam has
+    // already passed is not met until the next frame.
+    let ppu = lcd_with_a_solid_window(100);
+    ppu.advance_by(ppu::DOTS_PER_LINE * 50);
+    ppu.write_register(0x0a, 10);
+    ppu.advance_by(ppu::DOTS_PER_LINE * 80);
+    assert_eq!(
+        ppu.pixel(0, 60),
+        Some(0),
+        "line 10 went by before WY was 10"
+    );
+    assert_eq!(
+        ppu.pixel(0, 120),
+        Some(0),
+        "and 100 is no longer the target"
+    );
+    // The next frame meets it at line 10.
+    ppu.advance_by(ppu::DOTS_PER_FRAME);
+    assert_eq!(ppu.pixel(0, 9), Some(0));
+    assert_eq!(ppu.pixel(0, 10), Some(3));
+}
+
 #[test]
 fn an_oam_transfer_copies_a_page_over_160_machine_cycles() {
     use crate::core::space::{AddressSpace, RamStore, Region};

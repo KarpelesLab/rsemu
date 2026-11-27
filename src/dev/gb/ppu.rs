@@ -342,7 +342,9 @@ struct Engine {
     /// The window's own line counter, which advances only on lines where the
     /// window was actually drawn.
     window_line: u8,
-    /// Whether the window has been drawn on this frame yet.
+    /// The window's *Y condition*: whether `WY` has equalled `LY` at the start
+    /// of a line of this frame. Once true it stays true until the frame ends,
+    /// whatever `WY` is changed to (Pan Docs, *Window*).
     window_active: bool,
     /// Whether the controller is still inside the first object scan after the
     /// LCD was switched on.
@@ -645,7 +647,7 @@ impl Engine {
     fn window_visible_on_line(&self) -> bool {
         self.lcdc & lcdc::WINDOW_ENABLE != 0
             && self.lcdc & lcdc::BG_ENABLE != 0
-            && self.ly >= self.wy
+            && self.window_active
             && self.wx <= 166
     }
 
@@ -736,7 +738,6 @@ impl Engine {
             // The window's line counter advances only on lines it appeared on,
             // which is what lets a game move `WY` mid-frame without tearing.
             self.window_line = self.window_line.wrapping_add(1);
-            self.window_active = true;
         }
 
         if self.lcdc & lcdc::OBJ_ENABLE == 0 {
@@ -862,7 +863,15 @@ impl Engine {
         self.dot += 1;
         if entering_mode3 {
             // The line's registers are sampled here, once, and the line is
-            // drawn from them. See the module documentation.
+            // drawn from them. See the module documentation. That includes the
+            // comparison that arms the window: "if the value of `WY` is equal
+            // to `LY`, the *Y condition* becomes true (and remains so for
+            // subsequent scanlines)" (Pan Docs, *Window*). An equality, held:
+            // not `LY >= WY`, which would both drop a window whose `WY` moved
+            // below the beam and conjure one whose `WY` moved above it.
+            if self.wy == self.ly {
+                self.window_active = true;
+            }
             self.mode3_len = self.compute_mode3();
             self.render_line();
         }
