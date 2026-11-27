@@ -785,14 +785,21 @@ impl Sys {
         }
     }
 
-    /// The highest-priority pending, enabled exception, if any.
+    /// The highest-priority pending, enabled exception, if any, with its
+    /// *group* priority — the value preemption compares.
     ///
-    /// Ties go to the lowest exception number, which is the architecture's
-    /// rule and the reason NMI beats HardFault at the same nominal priority
-    /// (DDI 0403 B1.5.4).
+    /// Within a group the sub-priority decides (DDI 0403E.b B1.5.4, "Priority
+    /// grouping": "If multiple pending exceptions have the same group
+    /// priority, the exception processing logic uses the subpriority field to
+    /// resolve priority within the group"), and what is still tied goes to
+    /// the lowest exception number ("When multiple pending exceptions have
+    /// the same priority number, the exception with the lowest exception
+    /// number takes precedence").
     #[must_use]
     pub fn highest_pending(&self) -> Option<(Exception, i32)> {
-        let mut best: Option<(Exception, i32)> = None;
+        // The whole priority value orders both fields at once: the group
+        // priority is its high bits and the sub-priority its low ones.
+        let mut best: Option<(Exception, i32, i32)> = None;
         for (word_index, word) in self.pending.iter().enumerate() {
             let mut bits = *word;
             while bits != 0 {
@@ -802,14 +809,19 @@ impl Sys {
                 if !self.is_enabled(e) {
                     continue;
                 }
-                let p = self.priority_of(e);
+                let group = self.priority_of(e);
+                let whole = if group < 0 {
+                    group
+                } else {
+                    i32::from(self.priority[(e.0 as usize) & (Exception::COUNT - 1)])
+                };
                 match best {
-                    Some((_, bp)) if bp <= p => {}
-                    _ => best = Some((e, p)),
+                    Some((_, _, bw)) if bw <= whole => {}
+                    _ => best = Some((e, group, whole)),
                 }
             }
         }
-        best
+        best.map(|(e, group, _)| (e, group))
     }
 
     /// The lowest priority among the active exceptions, which is the priority

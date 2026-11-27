@@ -1485,13 +1485,20 @@ fn prigroup_masks_the_sub_priority_out_of_a_comparison() {
     );
     assert_eq!(sys.priority_of(Exception(17)), 0x10);
     sys.prigroup = 0;
-    // With the sub-priority masked away the two are equal, so the lower
-    // exception number wins.
+    // Equal group priorities, so neither preempts the other — but which of
+    // two *pending* ones is taken first is the sub-priority's to say (DDI
+    // 0403E.b B1.5.4: "If multiple pending exceptions have the same group
+    // priority, the exception processing logic uses the subpriority field to
+    // resolve priority within the group"). IRQ 1 has sub-priority 0 against
+    // IRQ 0's 1, and wins despite the higher exception number.
     sys.set_enable(Exception(16), true);
     sys.set_enable(Exception(17), true);
     sys.set_pending(Exception(16), true);
     sys.set_pending(Exception(17), true);
-    assert_eq!(sys.highest_pending().unwrap().0, Exception(16));
+    assert_eq!(sys.highest_pending(), Some((Exception(17), 0x10)));
+    // Only a full tie falls back to the exception number.
+    sys.priority[16] = 0x10;
+    assert_eq!(sys.highest_pending(), Some((Exception(16), 0x10)));
 }
 
 #[test]
