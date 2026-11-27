@@ -5931,6 +5931,39 @@ mod long_mode {
         assert_eq!(regs.cs & 3, 3, "at privilege level three");
     }
 
+    /// `STAR`'s selector fields are whatever ring 0 wrote, and the selectors
+    /// derived from them are sixteen-bit sums that wrap.
+    ///
+    /// *Intel SDM* volume 2, `SYSCALL`: "SS.Selector := IA32_STAR[47:32] +
+    /// 8;" and `SYSRET`: "CS.Selector := IA32_STAR[63:48]+16; ...
+    /// SS.Selector := (IA32_STAR[63:48]+8) OR 3;". With a field near the top
+    /// of the range the unchecked `+` was an overflow panic in a debug build
+    /// and a wrap in a release one.
+    #[test]
+    fn syscall_and_sysret_wrap_their_selector_arithmetic() {
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        let mut sys = pc.cpu.sys();
+        sys.efer |= efer::SCE;
+        sys.star = (0xfff8u64 << 48) | (0xfffcu64 << 32);
+        sys.lstar = la::HANDLER;
+        pc.cpu.set_sys(sys);
+        // The kernel side: keep the selectors `SYSCALL` loaded, then return.
+        // mov ebx, cs ; mov edx, ss ; sysretq
+        pc.write(la::HANDLER, &[0x8c, 0xcb, 0x8c, 0xd2, 0x48, 0x0f, 0x07]);
+        // syscall ; hlt — at privilege 3 afterwards, where `hlt` faults and,
+        // with no gate for it, shuts the processor down. Either way it stops.
+        pc.write(la::CODE64, &[0x0f, 0x05, 0xf4]);
+        pc.run(80);
+        let regs = pc.regs();
+        assert_eq!(regs.rbx, 0xfffc, "SYSCALL's CS");
+        assert_eq!(regs.rdx, 0x0004, "and its SS, eight further on and wrapped");
+        assert_eq!(regs.cs, 0x000b, "SYSRET's CS: 0xfff8 + 16, at privilege 3");
+        assert_eq!(regs.ss, 0x0003, "and its SS: 0xfff8 + 8");
+    }
+
     #[test]
     fn swapgs_exchanges_the_gs_base_with_the_kernels() {
         // The one instruction a 64-bit kernel cannot do without: entered from

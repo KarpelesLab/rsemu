@@ -3754,13 +3754,17 @@ impl Exec<'_> {
         // `STAR[47:32]` is the kernel's `CS`; `SS` is that plus eight, which
         // is why the GDT has to hold them adjacently.
         let cs_sel = ((sys.star >> 32) as u16) & 0xfffc;
+        // A selector is sixteen bits and the sum is the guest's: `STAR` is
+        // whatever ring 0 wrote, so this wraps rather than trusting the
+        // build profile to (CLAUDE.md, "Arithmetic").
+        let ss_sel = cs_sel.wrapping_add(8);
         self.state.regs.rcx = self.state.regs.rip;
         self.state.regs.r[3] = u64::from(self.state.regs.eflags);
         self.state.regs.rip = sys.lstar;
         *self.state.sys.seg_mut(seg::CS) = Self::syscall_seg(cs_sel, true, true);
-        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(cs_sel + 8, false, true);
+        *self.state.sys.seg_mut(seg::SS) = Self::syscall_seg(ss_sel, false, true);
         self.state.regs.cs = cs_sel;
-        self.state.regs.ss = cs_sel + 8;
+        self.state.regs.ss = ss_sel;
         let masked = self.state.regs.eflags & !(sys.sfmask as u32) & !flags::RF;
         self.set_flags(masked);
         self.state.queue.flush();
@@ -3789,8 +3793,8 @@ impl Exec<'_> {
         let wide = opsize == 8;
         // `STAR[63:48]` names the compatibility-mode `CS`; the 64-bit one is
         // sixteen further on, and both come back at privilege 3.
-        let cs_sel = (base + if wide { 16 } else { 0 }) | 3;
-        let ss_sel = (base + 8) | 3;
+        let cs_sel = base.wrapping_add(if wide { 16 } else { 0 }) | 3;
+        let ss_sel = base.wrapping_add(8) | 3;
         let target = self.state.regs.rcx;
         if wide && !canonical(target) {
             return Err(Fault::gp(0));
