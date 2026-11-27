@@ -2303,6 +2303,15 @@ impl Exec<'_> {
             return Ok(());
         }
         if self.flag(flags::NT) {
+            // Long mode has no hardware task switching, so it has no nested
+            // task to return to either, and the task state segment there
+            // holds no back link — offset zero is reserved. *Intel SDM*
+            // volume 2, `IRET`, "Operation": "IA-32e-MODE: IF NT = 1 THEN
+            // #GP(0);", and under both "Compatibility Mode Exceptions" and
+            // "64-Bit Mode Exceptions": "#GP(0) If EFLAGS.NT[bit 14] = 1."
+            if self.state.sys.long_mode() {
+                return Err(Fault::gp(0));
+            }
             // A nested task returns to whoever called it, named by the back
             // link at offset zero of the current task state segment.
             let tss = self.state.sys.task;
@@ -2349,11 +2358,20 @@ impl Exec<'_> {
             return Err(Fault::coded(VEC_NP, u32::from(selector & 0xfffc)));
         }
 
-        // In long mode `IRET` **always** pops `SS:RSP`, because the interrupt
-        // always pushed it. That is the difference that breaks a 32-bit `IRET`
-        // reused unchanged: the frame is five words, not three, and popping
-        // three leaves the stack two deep in the wrong place.
-        let long = self.state.sys.long_mode();
+        // In 64-bit mode `IRET` **always** pops `SS:RSP`, because the
+        // interrupt always pushed it. That is the difference that breaks a
+        // 32-bit `IRET` reused unchanged: the frame is five words, not three,
+        // and popping three leaves the stack two deep in the wrong place.
+        //
+        // **64-bit mode, not long mode.** An `IRET` executed by a 32-bit code
+        // segment under `EFER.LMA` is the legacy instruction and pops the
+        // stack only when it returns outward (*Intel SDM* volume 2, `IRET`,
+        // "Operation", `IA-32e-MODE`: "IF CS.RPL > CPL THEN GOTO
+        // RETURN-TO-OUTER-PRIVILEGE-LEVEL; ELSE IF instruction began in
+        // 64-Bit Mode THEN ... ESP := Pop(); SS := Pop();"). Asking `LMA`
+        // here made a same-privilege `IRETD` in compatibility mode eat two
+        // more doublewords and load `SS` from whatever the second was.
+        let long = self.sixty_four();
         let outward = sel.rpl() > cpl;
         if long || outward {
             let new_sp = self.pop(opsize)?;

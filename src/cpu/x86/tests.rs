@@ -4433,6 +4433,83 @@ mod long_mode {
         pc
     }
 
+    /// A same-privilege `IRETD` in **compatibility mode** pops three
+    /// doublewords, not five.
+    ///
+    /// *Intel SDM* volume 2, `IRET`, "Operation", `IA-32e-MODE`: the stack
+    /// pointer and `SS` are popped on an outward return, "ELSE IF instruction
+    /// began in 64-Bit Mode" — and a 32-bit code segment under `EFER.LMA` did
+    /// not. The test for it was `LMA`, so this `IRETD` took two more
+    /// doublewords off the stack and tried to load `SS` from the second.
+    #[test]
+    fn an_iret_in_compatibility_mode_pops_the_stack_only_on_an_outward_return() {
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        // 64-bit: push 0x08 ; push HANDLER ; retfq — into the 32-bit code
+        // segment `start_protected` built, which under `LMA` is compatibility
+        // mode at privilege 0.
+        let mut code = alloc::vec![0x6a, 0x08, 0x68];
+        code.extend_from_slice(&(la::HANDLER as u32).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xcb]);
+        pc.write(la::CODE64, &code);
+        // 32-bit: mov ebx, esp ; pushfd ; push cs ; push after ; iretd ;
+        // after: mov ecx, esp ; hlt
+        let after = (la::HANDLER + 10) as u32;
+        let mut code = alloc::vec![0x89, 0xe3, 0x9c, 0x0e, 0x68];
+        code.extend_from_slice(&after.to_le_bytes());
+        code.extend_from_slice(&[0xcf, 0x89, 0xe1, 0xf4]);
+        pc.write(la::HANDLER, &code);
+        let steps = pc.run(200);
+        assert!(steps < 200, "the program halted");
+        let sys = pc.cpu.sys();
+        assert!(
+            sys.long_mode() && !sys.sixty_four(),
+            "in compatibility mode"
+        );
+        let regs = pc.regs();
+        assert_eq!(regs.rip, u64::from(after) + 3, "at the hlt after the iretd");
+        assert_eq!(regs.rcx, regs.rbx, "which popped exactly what was pushed");
+        assert_eq!(regs.ss, 0x10, "and left SS alone");
+    }
+
+    /// `IRET` with `EFLAGS.NT` set is `#GP(0)` in long mode, not a task
+    /// switch through a back link the 64-bit task state segment does not have.
+    ///
+    /// *Intel SDM* volume 2, `IRET`: "IA-32e-MODE: IF NT = 1 THEN #GP(0);".
+    #[test]
+    fn an_iret_with_the_nested_task_flag_is_general_protection_in_long_mode() {
+        let pc = pc64();
+        pc.start_protected();
+        pc.prepare_long();
+        pc.write(at::CODE0, &enter_long_mode_code(la::CODE64));
+        pc.idt64(13, 0x18, la::HANDLER);
+        // mov rbx, 42 ; hlt
+        pc.write(
+            la::HANDLER,
+            &[0x48, 0xc7, 0xc3, 0x2a, 0x00, 0x00, 0x00, 0xf4],
+        );
+        // pushfq ; or dword [rsp], NT ; popfq ; iretq
+        pc.write(
+            la::CODE64,
+            &[
+                0x9c, 0x81, 0x0c, 0x24, 0x00, 0x40, 0x00, 0x00, 0x9d, 0x48, 0xcf,
+            ],
+        );
+        let steps = pc.run(200);
+        assert!(steps < 200, "the program halted");
+        let regs = pc.regs();
+        assert_eq!(regs.rbx, 42, "#GP was delivered");
+        // The frame is SS, RSP, RFLAGS, CS, RIP and then the error code.
+        assert_eq!(pc.read64(regs.rsp), 0, "with an error code of zero");
+        assert_eq!(
+            pc.read64(regs.rsp + 8),
+            la::CODE64 + 9,
+            "naming the iretq itself"
+        );
+    }
+
     /// A selector load into `FS` or `GS` moves the base a 64-bit access uses.
     ///
     /// *Intel SDM* volume 3A §3.4.4: "Normal segment loads (MOV to Sreg and
