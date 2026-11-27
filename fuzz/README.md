@@ -39,6 +39,7 @@ See [The phase-2 gate](#the-phase-2-gate) for the exact command.
 | `record_log`      | `core::record::InputLog` — a recorded session, plus the replay path that reads it | never panics; canonical encoding; a replay cursor always advances |
 | `journal_log`     | `usermode::journal::Journal` — the second seam's recording, and the snapshot form that embeds it | never panics; canonical encoding; the two forms agree |
 | `machine_mmio`    | every non-RAM range of every address space of a whole board from `machine::catalog` (STM32 U5, F4 and WB, PC/AT, riscv-virt, Mac Plus, Amiga 500), with the machine run between accesses | never panics; a debug read leaves the machine's snapshot byte-identical; save, load, save is a round trip; a dropped machine is freed |
+| `machine_snapshot` | a whole board from `machine::catalog` (NES, Game Boy, STM32 U5) loaded from its own snapshot with one device chunk doctored — a few bytes overwritten, sometimes the tail cut off — and then run; build with `-a`, because most of what a false snapshot does is an arithmetic overflow | `load` answers `Error::State` or yields a machine that runs, reads back through a debugger and saves; a board always takes its own baseline snapshot back |
 
 This table is not the list of targets — `cargo +nightly fuzz list` is, and
 `fuzz/Cargo.toml` says what each of the rest is for.

@@ -37,7 +37,7 @@ libfuzzer-sys = "0.4"
 [dependencies.rsemu]
 path             = ".."
 default-features = false
-features         = ["std", "vnc", "dev-flash-cfi", "dev-flash-spinor", "dev-usb-ehci", "dev-usb-xhci", "dev-usb-xhci-pci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-hub", "dev-usb-msd", "dev-blk", "dev-dfuse", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-virtio", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35", "cpu-x86-lift", "usermode", "cpu-arm-a64-lift", "dev-amiga-floppy", "dev-ncr5380", "dev-mac", "machine-stm32f407", "machine-stm32u585", "machine-stm32wb55", "machine-pc-at", "machine-riscv-virt", "machine-mac-plus", "machine-amiga-a500", "dev-stm32-octospi", "dev-rcar", "dev-sgx", "cpu-arm-aprofile"]
+features         = ["std", "vnc", "dev-flash-cfi", "dev-flash-spinor", "dev-usb-ehci", "dev-usb-xhci", "dev-usb-xhci-pci", "dev-usb-dwc2", "dev-usb-hid", "dev-usb-hub", "dev-usb-msd", "dev-blk", "dev-dfuse", "dev-ne2000", "dev-nvme", "dev-ahci", "dev-riscv", "dev-virtio", "dev-pc-apic", "dev-pc-hpet", "ir", "jit", "cpu-riscv-lift", "float", "dev-q35", "cpu-x86-lift", "usermode", "cpu-arm-a64-lift", "dev-amiga-floppy", "dev-ncr5380", "dev-mac", "machine-stm32f407", "machine-stm32u585", "machine-stm32wb55", "machine-pc-at", "machine-riscv-virt", "machine-mac-plus", "machine-amiga-a500", "dev-stm32-octospi", "dev-rcar", "dev-sgx", "cpu-arm-aprofile", "machine-nes", "machine-gameboy"]
 
 # Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention they live
 # under fuzz_targets/.
@@ -417,6 +417,20 @@ bench = false
 [[bin]]
 name  = "machine_mmio"
 path  = "fuzz_targets/machine_mmio.rs"
+test  = false
+doc   = false
+bench = false
+
+# A snapshot that is well formed and says something false: one device chunk of
+# a real board's own save state, doctored, loaded back into that board and then
+# run. `state_decoder` and `state_roundtrip` stop at the container; this is the
+# only target that reaches a device's `load` with values the device could never
+# have saved, which is where a save state a user was handed turns into a panic
+# an hour later. The target's board table is the list of boards that survive a
+# campaign, and it only grows.
+[[bin]]
+name  = "machine_snapshot"
+path  = "fuzz_targets/machine_snapshot.rs"
 test  = false
 doc   = false
 bench = false
