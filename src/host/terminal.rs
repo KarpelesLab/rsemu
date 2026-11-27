@@ -68,6 +68,10 @@ pub struct Terminal {
     saved: Option<String>,
     /// Set when the user pressed Ctrl-C in raw mode.
     interrupted: AtomicBool,
+    /// Whether the last byte written was a carriage return, so that a line
+    /// feed arriving in the *next* write is still the second half of one line
+    /// break. See [`expand_line_breaks`].
+    after_cr: AtomicBool,
 }
 
 /// The receiving end of the reader thread, plus the bytes not yet handed out.
@@ -117,6 +121,7 @@ impl Terminal {
             }),
             saved,
             interrupted: AtomicBool::new(false),
+            after_cr: AtomicBool::new(false),
         }
     }
 
@@ -250,22 +255,9 @@ impl CharDevice for Terminal {
         // property of this backend rather than of the stream, which carries
         // bytes and says nothing about what they mean.
         let mut buf = Vec::with_capacity(src.len() + 8);
-        let mut i = 0;
-        while i < src.len() {
-            match src[i] {
-                b'\r' => {
-                    buf.extend_from_slice(b"\r\n");
-                    // A guest that already sends CR LF gets one line break, not
-                    // two.
-                    if src.get(i + 1) == Some(&b'\n') {
-                        i += 1;
-                    }
-                }
-                b'\n' => buf.extend_from_slice(b"\r\n"),
-                byte => buf.push(byte),
-            }
-            i += 1;
-        }
+        let mut after_cr = self.after_cr.load(Ordering::Relaxed);
+        expand_line_breaks(src, &mut after_cr, &mut buf);
+        self.after_cr.store(after_cr, Ordering::Relaxed);
         let ok = std::io::stdout().lock().write_all(&buf);
         if ok.is_err() { 0 } else { src.len() }
     }
@@ -279,6 +271,35 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(saved) = self.saved.take() {
             let _ = stty(&[&saved]);
+        }
+    }
+}
+
+/// Turn a guest's line endings into the `CR LF` a raw terminal needs.
+///
+/// A bare carriage return and a bare line feed each become one line break, and
+/// a `CR LF` pair becomes one rather than two. `after_cr` carries "the last
+/// byte was a carriage return" **across calls**, because the pair does not
+/// have to arrive in one: a guest printing through a UART emits a character at
+/// a time, the run loop drains the port once a slice, and a slice boundary
+/// falls between the two halves as readily as anywhere else. Looking ahead
+/// only within one buffer turned every pair split that way into a blank line,
+/// at no pattern a user could name.
+fn expand_line_breaks(src: &[u8], after_cr: &mut bool, out: &mut Vec<u8>) {
+    for &byte in src {
+        match byte {
+            b'\r' => {
+                out.extend_from_slice(b"\r\n");
+                *after_cr = true;
+            }
+            // The second half of a pair whose first half already broke the
+            // line, whichever write that was in.
+            b'\n' if *after_cr => *after_cr = false,
+            b'\n' => out.extend_from_slice(b"\r\n"),
+            byte => {
+                out.push(byte);
+                *after_cr = false;
+            }
         }
     }
 }
@@ -332,6 +353,39 @@ mod tests {
         // Reading must not block, whatever stdin is.
         let mut buf = [0u8; 4];
         let _ = term.read(&mut buf);
+    }
+
+    /// Every way a guest ends a line, as the terminal is sent it.
+    fn expanded(writes: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut after_cr = false;
+        for write in writes {
+            expand_line_breaks(write, &mut after_cr, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn each_kind_of_line_ending_is_one_line_break() {
+        assert_eq!(expanded(&[b"a\rb"]), b"a\r\nb");
+        assert_eq!(expanded(&[b"a\nb"]), b"a\r\nb");
+        assert_eq!(expanded(&[b"a\r\nb"]), b"a\r\nb");
+        // Two of them are two.
+        assert_eq!(expanded(&[b"a\r\rb"]), b"a\r\n\r\nb");
+        assert_eq!(expanded(&[b"a\n\nb"]), b"a\r\n\r\nb");
+        assert_eq!(expanded(&[b"a\r\n\r\nb"]), b"a\r\n\r\nb");
+    }
+
+    /// The pair does not have to arrive in one write: the run loop drains the
+    /// port once a slice, and a slow UART's `CR` and `LF` land either side of
+    /// a slice boundary as often as not.
+    #[test]
+    fn a_cr_lf_pair_split_across_two_writes_is_still_one_line_break() {
+        assert_eq!(expanded(&[b"a\r", b"\nb"]), b"a\r\nb");
+        assert_eq!(expanded(&[b"a\r", b"", b"\nb"]), b"a\r\nb");
+        // Only the line feed *immediately* after: anything between ends it.
+        assert_eq!(expanded(&[b"a\r", b"b\n"]), b"a\r\nb\r\n");
+        assert_eq!(expanded(&[b"a\r\n", b"\nb"]), b"a\r\n\r\nb");
     }
 
     #[test]
