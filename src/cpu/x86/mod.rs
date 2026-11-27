@@ -3910,8 +3910,11 @@ impl X86 {
             // the same number.
             let linear = if legacy {
                 base.wrapping_add(addr) & 0xf_ffff
-            } else {
+            } else if matches!(bits, isa::Bits::B64) {
                 base.wrapping_add(addr)
+            } else {
+                // Where `Exec::fetch_at` would fetch from: thirty-two bits.
+                prot::linear32(base, addr)
             };
             let addr = paging::debug_translate(&sys, features, &space, linear).phys(linear)?;
             space

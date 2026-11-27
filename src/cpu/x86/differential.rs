@@ -1481,7 +1481,7 @@ impl Segments {
             // instruction, in the same state.
             return Err(BusError::Protected);
         }
-        Ok(self.base[sr].wrapping_add(offset))
+        Ok(crate::cpu::x86::prot::linear32(self.base[sr], offset))
     }
 }
 

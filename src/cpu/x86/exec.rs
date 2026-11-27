@@ -683,7 +683,7 @@ impl<'a> Exec<'a> {
         if self.sixty_four() {
             return rip;
         }
-        self.state.sys.seg(seg::CS).base.wrapping_add(rip) & 0xffff_ffff
+        prot::linear32(self.state.sys.seg(seg::CS).base, rip)
     }
 
     /// Stop at a host-armed breakpoint, if the next instruction starts on one
@@ -1616,7 +1616,7 @@ impl<'a> Exec<'a> {
             if !cs.in_bounds(offset, 1) {
                 return Err(Fault::gp(0));
             }
-            cs.base.wrapping_add(offset)
+            prot::linear32(cs.base, offset)
         };
         let user = self.cpl() == 3;
         if !self.state.sys.paging() {
@@ -2931,7 +2931,14 @@ impl<'a> Exec<'a> {
                 }
                 let (_, offset) = self.ea();
                 let base = self.state.sys.seg(f.mem_segment()).base;
-                self.state.tlb.invalidate(base.wrapping_add(offset));
+                // The page the operand's *linear* address is on, formed the
+                // way an access through the same operand would form it.
+                let linear = if self.sixty_four() {
+                    base.wrapping_add(offset)
+                } else {
+                    prot::linear32(base, offset)
+                };
+                self.state.tlb.invalidate(linear);
             }
             Op::LGDT | Op::LIDT => self.load_table_register(f)?,
             Op::SGDT | Op::SIDT => self.store_table_register(f)?,

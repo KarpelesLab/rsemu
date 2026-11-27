@@ -1208,14 +1208,19 @@ impl World {
 
     /// The linear address `EIP` names.
     ///
-    /// Deliberately **not** masked to 32 bits, because `Exec::fetch_at` does
-    /// not mask either: it computes `cs.base.wrapping_add(offset)` and hands
-    /// the result to the bus. Matching the interpreter is the whole contract,
-    /// so a difference here would be a divergence rather than a tidying.
+    /// Truncated to 32 bits below 64-bit mode, because `Exec::fetch_at` is:
+    /// both go through [`linear32`](super::prot::linear32), where the reason
+    /// is. Matching the interpreter is the whole contract, so a difference
+    /// here would be a divergence rather than a tidying. In 64-bit mode
+    /// [`World::cs_base`] is zero and the program counter is the address.
     #[inline]
     #[must_use]
     pub const fn linear(&self, eip: u64) -> u64 {
-        self.cs_base.wrapping_add(eip)
+        if self.long() {
+            eip
+        } else {
+            super::prot::linear32(self.cs_base, eip)
+        }
     }
 
     /// Whether this is long mode's world, which is the one question the rest

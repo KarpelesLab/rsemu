@@ -384,6 +384,31 @@ impl SegReg {
     }
 }
 
+/// The linear address a segment base and an offset make **outside 64-bit
+/// mode**: their sum, truncated to thirty-two bits.
+///
+/// A based segment with a 4 GiB limit reaches the bottom of the address space
+/// from the top of it — which is not a corner: every 32-bit thread-local
+/// access below the thread pointer is `gs:` with an offset of `0xfffffffc` or
+/// so, on a base somewhere in the middle of the address space. The sum
+/// carries out of bit 31 and the carry is discarded. *Intel SDM* volume 3A
+/// §5.1.1: "legacy protected mode cannot produce linear addresses larger than
+/// 32 bits", and of the other sub-mode this function serves, "Compatibility
+/// mode. This sub-mode uses only 32-bit linear addresses. In this sub-mode,
+/// 4-level paging and 5-level paging treat bits 63:32 of such an address as
+/// all 0."
+///
+/// Keeping the carry was invisible with 32-bit paging, whose walk never looks
+/// above bit 31, and wrong everywhere else: with paging off the access left
+/// for a physical address above 4 GiB that nothing answers, and in
+/// compatibility mode the four-level walk indexed its top two tables with the
+/// carry and found another page or none.
+#[inline]
+#[must_use]
+pub const fn linear32(base: u64, offset: u64) -> u64 {
+    base.wrapping_add(offset) & 0xffff_ffff
+}
+
 /// A descriptor table register: `GDTR` and `IDTR`, which have a base and a
 /// limit and no selector at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -1555,7 +1580,7 @@ impl Exec<'_> {
         if !s.in_bounds(offset, size) {
             return Err(Fault::coded(vector, 0));
         }
-        Ok(s.base.wrapping_add(offset))
+        Ok(linear32(s.base, offset))
     }
 
     // -- Descriptor tables ---------------------------------------------

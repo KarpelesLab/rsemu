@@ -2756,6 +2756,50 @@ fn enter_and_leave_build_and_unmake_a_frame() {
     assert_eq!(regs.rsp, at::STACK0);
 }
 
+/// A segment base plus an offset is a 32-bit sum outside 64-bit mode.
+///
+/// *Intel SDM* volume 3A §5.1.1: "legacy protected mode cannot produce linear
+/// addresses larger than 32 bits". A based segment with a 4 GiB limit reaches
+/// low memory from high — it is how every 32-bit thread-local access below
+/// the thread pointer works — and the carry out of bit 31 used to be kept, so
+/// the access left for a physical address above 4 GiB that nothing answers.
+#[test]
+fn a_based_segment_wraps_its_linear_address_at_four_gigabytes() {
+    let pc = pc386();
+    pc.start_protected();
+    pc.gdt(3, descriptor(0xffff_f000, 0xffff_ffff, rights::DATA32));
+    pc.gdt(4, descriptor(0xffff_f000, 0xffff_ffff, rights::CODE32));
+    pc.write32(at::MARK + 4, 0xcafe_babe);
+    let data = (at::MARK + 0x1000) as u32;
+    let target = (at::CODE3 + 0x1000) as u32;
+    let mut code = alloc::vec![
+        0x66, 0xb8, 0x18, 0x00, // mov ax, 0x18
+        0x8e, 0xd8, // mov ds, ax
+        0xa1, // mov eax, [data + 4]
+    ];
+    code.extend_from_slice(&(data + 4).to_le_bytes());
+    code.push(0xa3); // mov [data + 8], eax
+    code.extend_from_slice(&(data + 8).to_le_bytes());
+    code.push(0xea); // jmp 0x20:target
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0x20, 0x00]);
+    pc.write(at::CODE0, &code);
+    // Through the based code segment, at linear `CODE3`.
+    pc.write(at::CODE3, &[0xbb, 0x78, 0x56, 0x34, 0x12, 0xf4]); // mov ebx, 0x12345678 ; hlt
+    for _ in 0..6 {
+        pc.cpu.step();
+    }
+    let regs = pc.regs();
+    assert_eq!(regs.rax, 0xcafe_babe, "the load wrapped to low memory");
+    assert_eq!(pc.read32(at::MARK + 8), 0xcafe_babe, "and so did the store");
+    assert_eq!(regs.rbx, 0x1234_5678, "and so did the fetch");
+    assert_eq!(
+        pc.cpu.session.lock().state.faults,
+        0,
+        "nothing left the bus"
+    );
+}
+
 /// `ENTER` with a nesting level reserves its locals **below** the display.
 ///
 /// *Intel SDM* volume 2, `ENTER`, "Operation": after the `Push([EBP])` loop
