@@ -1325,3 +1325,26 @@ fn an_ecs_snapshot_round_trips_with_its_raster_and_columns() {
         .unwrap();
     assert!(Device::load(&ocs, &mut chunk.reader()).is_err());
 }
+
+#[test]
+fn a_raster_that_starts_past_the_end_of_any_line_is_held_to_one() {
+    // The horizontal counter is eight bits of colour clocks, so no raster an
+    // Agnus can describe starts past count 255 — but a snapshot's can say
+    // anything, and the layout doubles it into a sixteen-bit column.
+    let wild = Raster {
+        first_clock: 0xffff,
+        ..Raster::standard(Standard::Pal)
+    };
+    let layout = Layout::of(wild, false, false);
+    assert_eq!(layout.left, 2 * 0xff);
+    // What a real part can produce is left exactly as it was.
+    let real = Raster {
+        first_clock: 0xff,
+        ..Raster::standard(Standard::Pal)
+    };
+    assert_eq!(real.bounded(), real);
+    assert_eq!(
+        Raster::standard(Standard::Ntsc).bounded(),
+        Raster::standard(Standard::Ntsc)
+    );
+}

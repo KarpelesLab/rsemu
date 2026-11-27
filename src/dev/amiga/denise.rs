@@ -628,8 +628,18 @@ impl Raster {
         } else {
             self.lines
         };
+        // The horizontal counter is eight bits of colour clocks, so 255 is
+        // the last count a raster can start on. Nothing an Agnus describes is
+        // past it; a snapshot's might be, and the layout doubles this into a
+        // sixteen-bit column.
+        let first_clock = if self.first_clock > 0xff {
+            0xff
+        } else {
+            self.first_clock
+        };
         Raster {
             lines,
+            first_clock,
             clocks,
             ..self
         }
