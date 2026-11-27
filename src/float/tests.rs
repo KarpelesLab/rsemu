@@ -508,6 +508,28 @@ fn flush_to_zero_is_a_mode_not_a_property_of_the_format() {
     let (v, f) = add::<B64>(MIN_SUB64, d(1.0), Env::X86_SSE.daz(true));
     assert_eq!(v, d(1.0));
     assert_eq!(f, Flags::NONE);
+    // ARM's flushed result is an underflow and nothing else. DDI 0487C.a,
+    // J1.3, `FPRound`: "if ((fpcr.FZ == '1' && N != 16) || ...) && exponent <
+    // minimum_exp then // Flush-to-zero never generates a trapped exception
+    // ... FPSR.UFC = '1'; return FPZero(sign);" — the return precedes the
+    // rounding that would have set `IXC`. DDI 0403E.b's `FPRound` is the same
+    // statement on `FPSCR.UFC`.
+    let fz = Env::ARM.flush(true);
+    assert_eq!(
+        mul::<B64>(MIN_NORM64, d(0.5), fz),
+        (0, Flags::UNDERFLOW),
+        "an exact subnormal product"
+    );
+    assert_eq!(
+        mul::<B64>(MIN_NORM64, d(0.3), fz),
+        (0, Flags::UNDERFLOW),
+        "and one that would have rounded"
+    );
+    assert_eq!(
+        convert::<B64, B32>(d(1e-40), fz),
+        (0, Flags::UNDERFLOW),
+        "a narrowing that lands below the single format"
+    );
     // ARM's single FZ bit does both halves and *does* report the flushed
     // input, as FPSR.IDC.
     let (v, f) = add::<B64>(MIN_SUB64, d(1.0), Env::ARM.flush(true));

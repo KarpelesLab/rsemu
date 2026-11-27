@@ -453,12 +453,15 @@ pub(super) fn round_exact(
     };
     if tiny && env.flush_outputs {
         // x86 `MXCSR.FTZ` and ARM `FPCR.FZ` deliver a zero of the result's
-        // sign and report both underflow and inexact, whether or not the
-        // subnormal result was itself exact.
-        return (
-            Outcome::Num(sign, Rounded::Zero),
-            Flags::INEXACT | Flags::UNDERFLOW,
-        );
+        // sign and report underflow, whether or not the subnormal result was
+        // itself exact. x86 reports inexact beside it; ARM returns before
+        // the rounding that would (see `Env::flush_inexact`).
+        let flags = if env.flush_inexact {
+            Flags::INEXACT | Flags::UNDERFLOW
+        } else {
+            Flags::UNDERFLOW
+        };
+        return (Outcome::Num(sign, Rounded::Zero), flags);
     }
     let mut flags = if inexact { Flags::INEXACT } else { Flags::NONE };
     if tiny && inexact {

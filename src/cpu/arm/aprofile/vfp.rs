@@ -390,28 +390,6 @@ macro_rules! by_prec {
     };
 }
 
-/// ARMv7's `FPRound` under flush-to-zero sets **only** `UFC` for a result it
-/// flushed: "if FPSCR.FZ == '1' && exponent < minimum_exp then result =
-/// FPZero(sign); FPSCR.UFC = '1'" (DDI 0406C, the shared floating-point pseudocode).
-/// [`crate::float`]'s flush reports underflow *and* inexact, which is x86's
-/// `MXCSR.FTZ` rule, so the inexact is taken back here. Under `FZ` every tiny
-/// result is flushed, so an underflow flag always means a flush and the
-/// inexact beside it is always the flush's.
-#[inline]
-fn fz_fixup(flags: Flags, env: Env) -> Flags {
-    if env.flush_outputs && flags.contains(Flags::UNDERFLOW) {
-        Flags(flags.0 & !Flags::INEXACT.0)
-    } else {
-        flags
-    }
-}
-
-/// Apply [`fz_fixup`] to an operation's result.
-#[inline]
-fn fixed((v, f): (u64, Flags), env: Env) -> (u64, Flags) {
-    (v, fz_fixup(f, env))
-}
-
 /// The sign bit at a precision.
 #[inline]
 const fn sign_bit(dp: bool) -> u64 {
@@ -447,31 +425,31 @@ pub fn classify(dp: bool, a: u64) -> Category {
 /// `FPAdd`.
 #[must_use]
 pub fn add(dp: bool, a: u64, b: u64, env: Env) -> (u64, Flags) {
-    fixed(by_prec!(dp, add, a, b, env), env)
+    by_prec!(dp, add, a, b, env)
 }
 
 /// `FPSub`.
 #[must_use]
 pub fn sub(dp: bool, a: u64, b: u64, env: Env) -> (u64, Flags) {
-    fixed(by_prec!(dp, sub, a, b, env), env)
+    by_prec!(dp, sub, a, b, env)
 }
 
 /// `FPMul`.
 #[must_use]
 pub fn mul(dp: bool, a: u64, b: u64, env: Env) -> (u64, Flags) {
-    fixed(by_prec!(dp, mul, a, b, env), env)
+    by_prec!(dp, mul, a, b, env)
 }
 
 /// `FPDiv`.
 #[must_use]
 pub fn div(dp: bool, a: u64, b: u64, env: Env) -> (u64, Flags) {
-    fixed(by_prec!(dp, div, a, b, env), env)
+    by_prec!(dp, div, a, b, env)
 }
 
 /// `FPSqrt`.
 #[must_use]
 pub fn sqrt(dp: bool, a: u64, env: Env) -> (u64, Flags) {
-    fixed(by_prec!(dp, sqrt, a, env), env)
+    by_prec!(dp, sqrt, a, env)
 }
 
 /// The four chained multiply-accumulates, as the VFPv3 pseudocode writes them
@@ -568,9 +546,9 @@ pub fn compare(dp: bool, a: u64, b: u64, signal_all: bool, env: Env) -> (u32, Fl
 #[must_use]
 pub fn convert_precision(to_double: bool, value: u64, env: Env) -> (u64, Flags) {
     if to_double {
-        fixed(float::convert::<B32, B64>(value, env), env)
+        float::convert::<B32, B64>(value, env)
     } else {
-        fixed(float::convert::<B64, B32>(value, env), env)
+        float::convert::<B64, B32>(value, env)
     }
 }
 
@@ -621,21 +599,15 @@ pub fn from_fixed(
     env: Env,
 ) -> (u64, Flags) {
     if unsigned {
-        fixed(
-            by_prec!(dp, from_unsigned_fixed, u64::from(value), size, fbits, env),
-            env,
-        )
+        by_prec!(dp, from_unsigned_fixed, u64::from(value), size, fbits, env)
     } else {
-        fixed(
-            by_prec!(
-                dp,
-                from_signed_fixed,
-                i64::from(value as i32),
-                size,
-                fbits,
-                env
-            ),
-            env,
+        by_prec!(
+            dp,
+            from_signed_fixed,
+            i64::from(value as i32),
+            size,
+            fbits,
+            env
         )
     }
 }

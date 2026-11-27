@@ -833,6 +833,37 @@ mod tests {
         assert_eq!(rounding(3 << 22), Round::TowardZero);
     }
 
+    /// A result `FPCR.FZ` flushed sets `FPSR.UFC` and not `IXC`.
+    ///
+    /// DDI 0487C.a, J1.3, `FPRound`: "// Deal with flush-to-zero. if
+    /// ((fpcr.FZ == '1' && N != 16) || (fpcr.FZ16 == '1' && N == 16)) &&
+    /// exponent < minimum_exp then // Flush-to-zero never generates a
+    /// trapped exception if UsingAArch32() then FPSCR.UFC = '1'; else
+    /// FPSR.UFC = '1'; return FPZero(sign);".
+    #[test]
+    fn a_flushed_result_sets_ufc_alone() {
+        let fz = env(fpcr::FZ, Prec::Double);
+        let min = f64::MIN_POSITIVE.to_bits();
+        for (what, (v, f)) in [
+            ("an exact product", mul(Prec::Double, min, d(0.5), fz)),
+            ("an inexact one", mul(Prec::Double, min, d(0.3), fz)),
+            ("a quotient", div(Prec::Double, min, d(3.0), fz)),
+            ("a fused product", mul_add(Prec::Double, 0, min, d(0.3), fz)),
+            (
+                "a narrowing",
+                convert(Prec::Double, Prec::Single, d(1e-40), fpcr::FZ),
+            ),
+        ] {
+            assert_eq!(v, 0, "{what}: flushed to zero");
+            let mut fpsr = 0;
+            accumulate(&mut fpsr, f);
+            assert_eq!(fpsr, u64::from(Flags::UNDERFLOW.to_fpsr()), "{what}");
+        }
+        // Without `FZ` the inexact product is a subnormal and says both.
+        let (_, f) = mul(Prec::Double, min, d(0.3), Env::ARM);
+        assert_eq!(f, Flags::UNDERFLOW | Flags::INEXACT);
+    }
+
     #[test]
     fn flush_to_zero_does_not_reach_half_precision() {
         let fz = fpcr::FZ;

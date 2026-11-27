@@ -501,6 +501,7 @@ const M68881: Env = Env {
     tininess: Tininess::BeforeRounding,
     subnormal_inputs: InputSubnormal::Exact,
     flush_outputs: false,
+    flush_inexact: false,
     min_max: MinMax::PropagateNan,
     int_overflow: IntOverflow::SaturateNanMax,
 };

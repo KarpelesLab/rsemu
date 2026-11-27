@@ -480,9 +480,22 @@ pub struct Env {
     /// What happens to a subnormal operand. x86 `MXCSR.DAZ` and the
     /// denormal-operand exception; ARM `FPCR.FZ`.
     pub subnormal_inputs: InputSubnormal,
-    /// Flush a tiny *result* to a zero of the same sign, raising underflow and
-    /// inexact. x86 `MXCSR.FTZ`; ARM `FPCR.FZ`.
+    /// Flush a tiny *result* to a zero of the same sign, raising underflow —
+    /// and inexact too where [`Env::flush_inexact`] says so. x86 `MXCSR.FTZ`;
+    /// ARM `FPCR.FZ`.
     pub flush_outputs: bool,
+    /// Whether a flushed result reports inexact beside its underflow. Only
+    /// read when [`Env::flush_outputs`] is set.
+    ///
+    /// x86 does: flush-to-zero "Returns a zero result with the sign of the
+    /// true result. Sets the precision and underflow exception flags."
+    /// (*Intel SDM* volume 1 §10.2.3.3). ARM does not: `FPRound` sets `UFC`
+    /// and returns the zero before it reaches the rounding that would set
+    /// `IXC` — "if ((fpcr.FZ == '1' && N != 16) || ...) && exponent <
+    /// minimum_exp then // Flush-to-zero never generates a trapped exception
+    /// ... FPSR.UFC = '1'; return FPZero(sign);" (DDI 0487C.a, J1.3; DDI
+    /// 0403E.b and DDI 0406C say the same of `FPSCR.UFC`).
+    pub flush_inexact: bool,
     /// The `min`/`max` rule.
     pub min_max: MinMax,
     /// The float-to-integer overflow rule.
@@ -501,6 +514,7 @@ impl Env {
         tininess: Tininess::AfterRounding,
         subnormal_inputs: InputSubnormal::Exact,
         flush_outputs: false,
+        flush_inexact: true,
         min_max: MinMax::NonNan,
         int_overflow: IntOverflow::SaturateNanMax,
     };
@@ -516,6 +530,7 @@ impl Env {
         tininess: Tininess::AfterRounding,
         subnormal_inputs: InputSubnormal::Flagged,
         flush_outputs: false,
+        flush_inexact: true,
         min_max: MinMax::SecondOperand,
         int_overflow: IntOverflow::Indefinite,
     };
@@ -542,6 +557,7 @@ impl Env {
         tininess: Tininess::BeforeRounding,
         subnormal_inputs: InputSubnormal::Exact,
         flush_outputs: false,
+        flush_inexact: false,
         min_max: MinMax::PropagateNan,
         int_overflow: IntOverflow::SaturateNanZero,
     };

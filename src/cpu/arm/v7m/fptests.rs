@@ -1590,6 +1590,34 @@ fn the_environment_maps_every_fpscr_mode_bit() {
     assert!(fp::env(fpscr::FZ).subnormal_inputs.reports());
 }
 
+/// A result `FPSCR.FZ` flushed sets `UFC` and not `IXC`.
+///
+/// DDI 0403E.b, A2.5 pseudocode, `FPRound`: "// Deal with flush-to-zero. if
+/// fpscr_val<24> == '1' && N != 16 && exponent < minimum_exp then result =
+/// FPZero(sign, N); FPSCR.UFC = '1'; // Flush-to-zero never generates a
+/// trapped exception else ..." — the rounding, and the `IXC` it would set, are
+/// in the `else`.
+#[test]
+fn a_flushed_result_sets_ufc_alone() {
+    let fz = fp::env(fpscr::FZ);
+    let min = f32::MIN_POSITIVE.to_bits();
+    let third = 0.3f32.to_bits();
+    for (what, (v, f)) in [
+        ("an exact product", fp::mul(min, 0.5f32.to_bits(), fz)),
+        ("an inexact one", fp::mul(min, third, fz)),
+        ("a quotient", fp::div(min, 3.0f32.to_bits(), fz)),
+        ("a fused product", fp::mul_add(0, min, third, fz)),
+    ] {
+        assert_eq!(v, 0, "{what}: flushed to zero");
+        let mut value = 0u32;
+        fp::accumulate(&mut value, f);
+        assert_eq!(value, fpscr::UFC, "{what}");
+    }
+    // Without `FZ` the inexact product is a subnormal and says both.
+    let (_, f) = fp::mul(min, third, fp::env(0));
+    assert_eq!(f, Flags::UNDERFLOW | Flags::INEXACT);
+}
+
 #[test]
 fn the_flags_reach_fpscr_in_the_architectures_order() {
     let mut v = 0u32;
