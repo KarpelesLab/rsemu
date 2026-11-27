@@ -411,8 +411,24 @@ stage_crosshost() {
 
   if ! rustc --print target-libdir --target "$t" >/dev/null 2>&1; then
     crosshost_absent "crosshost i686 (target not installed: rustup target add $t)"
-  elif ! cargo build --target "$t" --no-default-features \
-         --features "$CROSSHOST_FEATURES" >"$probe" 2>&1; then
+  # Two questions, asked separately because their answers mean opposite
+  # things. "Does the crate *compile* for a 32-bit `usize`" is the stage's own
+  # subject — a literal that does not fit, a `u64 as usize` the lints reject —
+  # and a no there is a FAIL. "Can this host *link* a 32-bit test binary" is
+  # provisioning, and a no there is a skip.
+  #
+  # One `cargo build` used to stand for both, with its output discarded, so a
+  # genuine 32-bit compile error was recorded as "skip ... does not link here"
+  # and the run ended CHECK OK. It could not even answer the second question:
+  # the binary needs `cli`, so that build produced an rlib and never ran a
+  # linker. `cargo check` needs no linker at all and so cannot be confused by
+  # one; `cargo test --no-run` is the first thing that does link.
+  elif ! cargo check --target "$t" --no-default-features \
+         --features "$CROSSHOST_FEATURES" --tests; then
+    record "FAIL  crosshost i686 (does not compile for $t, disk: $(disk_free))"
+    FAILED=$((FAILED + 1))
+  elif ! cargo test --no-run --target "$t" --no-default-features \
+         --features "$CROSSHOST_FEATURES" --test record_replay >"$probe" 2>&1; then
     crosshost_absent "crosshost i686 ($t does not link here: 32-bit runtime missing?)"
   else
     run "crosshost replay ($t)" \
