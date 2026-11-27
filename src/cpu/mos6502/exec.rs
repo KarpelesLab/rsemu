@@ -1414,8 +1414,19 @@ impl<'a> Exec<'a> {
         let target = pc.wrapping_add(offset as i8 as u16);
         if (target & 0xff00) != (pc & 0xff00) {
             // The fourth cycle only exists when the high byte needs fixing,
-            // and it reads from the half-fixed address.
+            // and it reads from the half-fixed address. It polls again, and
+            // `poll` overwrites — right everywhere else, where the last poll
+            // is the only one, and wrong here, where there are two and either
+            // counts: "An interrupt being detected at either of these polling
+            // points (including only being detected at the first one) will
+            // trigger a CPU interrupt" (NESdev, *CPU interrupts*, "Branch
+            // instructions and interrupts"). That is an NMOS observation; the
+            // CMOS parts keep the plain last-poll rule for want of a source.
+            let first = self.state.pending;
             self.read((pc & 0xff00) | (target & 0x00ff));
+            if !self.cmos && self.state.pending.is_none() {
+                self.state.pending = first;
+            }
         }
         self.state.regs.pc = target;
     }

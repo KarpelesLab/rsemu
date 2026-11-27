@@ -58,6 +58,9 @@ struct MemState {
     /// Reading this address asserts IRQ, mid-instruction — the only way to
     /// test *when* the lines are sampled.
     irq_on_read: Option<u16>,
+    /// Reading this address releases IRQ again, for a request that is only
+    /// there for part of an instruction.
+    irq_off_on_read: Option<u16>,
     cpu: Weak<Mos6502>,
 }
 
@@ -75,6 +78,7 @@ impl TestBus {
                 ram: alloc::vec![0; 0x1_0000],
                 log: Vec::new(),
                 irq_on_read: None,
+                irq_off_on_read: None,
                 cpu: Weak::new(),
             },
         ))
@@ -113,13 +117,16 @@ impl MemOps for TestBus {
                 }
             }
             if !attrs.debug && m.irq_on_read == Some(addr) {
-                fire = m.cpu.upgrade();
+                fire = m.cpu.upgrade().map(|cpu| (cpu, true));
+            }
+            if !attrs.debug && m.irq_off_on_read == Some(addr) {
+                fire = m.cpu.upgrade().map(|cpu| (cpu, false));
             }
         }
         // Outward call *after* the critical section, per the re-entrancy
         // contract — and it reaches back into the CPU that is mid-access.
-        if let Some(cpu) = fire {
-            cpu.set_irq(true);
+        if let Some((cpu, level)) = fire {
+            cpu.set_irq(level);
         }
         Ok(())
     }
@@ -2198,6 +2205,38 @@ fn properties_name_the_part_and_default_its_adder() {
     let props = Props::new().with("variant", "65816");
     let err = Mos6502::from_props(&props).expect_err("not a mos6502 variant");
     assert!(alloc::format!("{err}").contains("cpu.w65c816"), "{err}");
+}
+
+#[test]
+fn a_page_crossing_branch_keeps_an_irq_seen_only_at_its_first_poll() {
+    // NESdev, *CPU interrupts*, "Branch instructions and interrupts":
+    // "Interrupts are always polled before the second CPU cycle (the operand
+    // fetch), but not before the third CPU cycle on a taken branch.
+    // Additionally, for taken branches that cross a page boundary, interrupts
+    // are polled before the PCH fixup cycle [...] An interrupt being detected
+    // at either of these polling points (including only being detected at the
+    // first one) will trigger a CPU interrupt."
+    let h = Harness::running(&[]);
+    h.bus.poke(0xfffe, &[0x00, 0xd0]);
+    h.bus.poke(0xc0fd, &[0xd0, 0x05]); // BNE $c104, from $c0ff: a page away
+    h.set_regs(|r| {
+        r.pc = 0xc0fd;
+        r.p &= !(flags::Z | flags::I);
+    });
+    // Asserted going in, and released by the operand fetch itself — after the
+    // first poll, which precedes that cycle, and before the second.
+    h.cpu.set_irq(true);
+    h.bus.0.lock().irq_off_on_read = Some(0xc0fe);
+    assert_eq!(h.step(), 4, "taken, and across a page");
+    assert_eq!(h.regs().pc, 0xc104);
+    assert!(!h.cpu.irq_asserted(), "the line was released mid-branch");
+    assert_eq!(
+        h.cpu.pending_interrupt(),
+        Some(Interrupt::Irq),
+        "the first poll's detection stands"
+    );
+    assert_eq!(h.step(), 7);
+    assert_eq!(h.regs().pc, 0xd000);
 }
 
 #[test]
