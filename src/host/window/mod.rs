@@ -69,6 +69,34 @@ impl core::fmt::Display for WindowError {
 
 impl std::error::Error for WindowError {}
 
+/// The most pixels a side this window will hold.
+///
+/// A scanout reports whatever geometry its device computed, and on a machine
+/// with a programmable display that is whatever the guest wrote into a mode
+/// register. The adapters in this tree bound their own, but this is the last
+/// place before a host allocation and a window-system call, and it should not
+/// depend on every device model, present and future, having remembered to.
+/// 16 384 a side is far past any display this tree models and inside what a
+/// window system that counts pixels in sixteen bits can be asked for.
+pub const MAX_SIDE: u32 = 16_384;
+
+/// How many `0RGB` words a `width` x `height` picture is, or why this window
+/// will not hold one.
+///
+/// The product is taken in `usize` after both factors are bounded: as
+/// `(width * height) as usize` it was a `u32` multiply, which panics in a
+/// debug build and wraps in a release one for a geometry of 65 536 squared —
+/// leaving a buffer of the wrong size behind a window of the right one.
+fn words_for(width: u32, height: u32) -> Result<usize, WindowError> {
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return Err(WindowError(format!(
+            "the display reports a {width}x{height} picture, and a window holds at most \
+             {MAX_SIDE} pixels a side"
+        )));
+    }
+    Ok(width as usize * height as usize)
+}
+
 /// A machine, a window, and the loop between them.
 pub struct WindowSession {
     window: Window,
@@ -81,6 +109,11 @@ pub struct WindowSession {
     captured: u64,
     /// The pointer state last sent, so only changes cross the seam.
     pointer: Option<(u32, u32, u8)>,
+    /// What the window was opened as, to put back once it stops saying why it
+    /// is not showing the guest's picture.
+    title: String,
+    /// The geometry currently being refused ([`MAX_SIDE`]), if any.
+    refused: Option<(u32, u32)>,
 }
 
 impl core::fmt::Debug for WindowSession {
@@ -105,6 +138,8 @@ impl WindowSession {
         scale: u32,
     ) -> Result<WindowSession, WindowError> {
         let info = scanout.info();
+        // Before the window exists, so a refusal leaves nothing to tear down.
+        let words = words_for(info.width, info.height)?;
         let options = WindowOptions {
             resize: true,
             scale: match scale {
@@ -123,12 +158,14 @@ impl WindowSession {
         Ok(WindowSession {
             window,
             surface: Surface::new(PixelFormat::BGRA8888, info.width, info.height),
-            words: vec![0; (info.width * info.height) as usize],
+            words: vec![0; words],
             scanout,
             feed: Arc::new(Feed::new()),
             channel: input::channel(input::DEFAULT_STREAM),
             captured: u64::MAX,
             pointer: None,
+            title: title.to_string(),
+            refused: None,
         })
     }
 
@@ -218,12 +255,36 @@ impl WindowSession {
 
     /// Refill the surface if the device drew since, and put it on screen.
     /// Pumps the window's event queue either way.
+    ///
+    /// A guest that programs a picture larger than a window holds
+    /// ([`MAX_SIDE`]) is not a reason to end the run — a mode set can pass
+    /// through nonsense on its way somewhere sensible. The window keeps its
+    /// last picture and says why in its title, and nothing of the refused
+    /// size is allocated: the check is before the surface is reshaped or the
+    /// device is asked to paint.
     fn present(&mut self) {
         let info = self.scanout.info();
+        let words = match words_for(info.width, info.height) {
+            Ok(words) => words,
+            Err(e) => {
+                if self.refused != Some((info.width, info.height)) {
+                    self.refused = Some((info.width, info.height));
+                    self.window.set_title(&format!("{} — {e}", self.title));
+                }
+                // The event queue still has to be answered.
+                self.window.update();
+                return;
+            }
+        };
+        // Back to something a window holds — which may be the very geometry
+        // the surface still has, so this is not inside the reshape below.
+        if self.refused.take().is_some() {
+            self.window.set_title(&self.title);
+        }
         if info.width != self.surface.width() || info.height != self.surface.height() {
             self.surface
                 .reshape(PixelFormat::BGRA8888, info.width, info.height);
-            self.words = vec![0; (info.width * info.height) as usize];
+            self.words = vec![0; words];
             self.captured = u64::MAX;
         }
         let counter = self.scanout.frame_counter();
@@ -399,6 +460,26 @@ fn keysym(key: Key) -> Option<Keysym> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A geometry no window holds is refused with its numbers in the message,
+    /// and one that fits is sized without a 32-bit multiply.
+    #[test]
+    fn an_absurd_geometry_is_refused_rather_than_multiplied() {
+        assert_eq!(words_for(720, 400).ok(), Some(288_000));
+        assert_eq!(words_for(0, 0).ok(), Some(0));
+        assert_eq!(
+            words_for(MAX_SIDE, MAX_SIDE).ok(),
+            Some(MAX_SIDE as usize * MAX_SIDE as usize)
+        );
+        // 65 536 squared is zero as a `u32` product: the old sizing made an
+        // empty buffer for it in release and panicked in debug.
+        for (w, h) in [(65_536, 65_536), (MAX_SIDE + 1, 1), (1, u32::MAX)] {
+            let e = words_for(w, h).expect_err("too large");
+            let text = e.to_string();
+            assert!(text.contains(&format!("{w}x{h}")), "{text}");
+            assert!(text.contains("16384"), "{text}");
+        }
+    }
 
     #[test]
     fn keys_map_to_x11_keysyms() {
