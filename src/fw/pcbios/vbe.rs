@@ -56,8 +56,8 @@ use crate::fw::asm16::{
     AH, AL, AX, Alu, Asm, BH, BL, BX, CL, CS, CX, Cc, DI, DS, DX, ES, Label, Mem, SI,
 };
 
-/// The saved `DI` in the `PUSHA` frame: `PUSHA` pushes it last, so it is the
-/// lowest word of the frame.
+/// The saved `DI` in the service frame: `PUSHAD` pushes `EDI` last, so its low
+/// word is the lowest word of the frame.
 const F_DI: i32 = 0;
 
 /// The sequencer's index port, which the extension registers share.

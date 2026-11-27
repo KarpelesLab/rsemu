@@ -243,3 +243,56 @@ fn an_extended_transfer_beyond_28_bits_is_refused_rather_than_wrapped() {
         "the out-of-range write landed on block 0"
     );
 }
+
+fn peek32(m: &Machine, at: u16) -> u32 {
+    u32::from(peek16(m, at)) | (u32::from(peek16(m, at + 2)) << 16)
+}
+
+/// A service that saves its caller's registers must save all of each one.
+///
+/// `INT 13h` and `INT 10h` opened with a 16-bit `PUSHA` and then used `EAX`,
+/// `EBX`, `ECX` and `EDX` as 32-bit scratch — the CHS translation multiplies
+/// in 32 bits, the VBE services call the PCI BIOS with a class code in `ECX`
+/// — so a caller came back with the upper halves of registers the interface
+/// does not return anything in overwritten. A 32-bit real-mode loader that
+/// keeps a block number in `EBX` across a read is the program that notices.
+#[test]
+fn the_disk_and_video_services_preserve_the_upper_register_halves() {
+    use rsemu::fw::asm16::{BX, CX, DI, DX, SI};
+
+    let (m, _hosts) = run("upper halves", |a| {
+        // AH=02h: one sector, cylinder 0, head 0, sector 1 of the fixed disk.
+        a.movi32(AX, 0xa5a5_0201);
+        a.movi32(BX, 0x5a5a_0c00);
+        a.movi32(CX, 0x1111_0001);
+        a.movi32(DX, 0x2222_0080);
+        a.movi32(SI, 0x3333_0000);
+        a.movi32(DI, 0x4444_0000);
+        a.int(0x13);
+        for (slot, register) in [AX, BX, CX, DX, SI, DI].into_iter().enumerate() {
+            a.movto32(Mem::abs(R + 4 * slot as u16), register);
+        }
+        // AX=4F01h: the mode information block for mode 101h, at 0000:0E00.
+        a.movi32(AX, 0xa5a5_4f01);
+        a.movi32(CX, 0x1111_0101);
+        a.movi32(DX, 0x2222_0000);
+        a.movi32(DI, 0x4444_0e00);
+        a.int(0x10);
+        for (slot, register) in [AX, CX, DX, DI].into_iter().enumerate() {
+            a.movto32(Mem::abs(R + 24 + 4 * slot as u16), register);
+        }
+    });
+
+    assert_eq!(peek32(&m, R), 0xa5a5_0001, "EAX after INT 13h AH=02h");
+    assert_eq!(peek16(&m, 0x0c00), u16::from_le_bytes([HD_FILL, HD_FILL]));
+    assert_eq!(peek32(&m, R + 4), 0x5a5a_0c00, "EBX after INT 13h AH=02h");
+    assert_eq!(peek32(&m, R + 8), 0x1111_0001, "ECX after INT 13h AH=02h");
+    assert_eq!(peek32(&m, R + 12), 0x2222_0080, "EDX after INT 13h AH=02h");
+    assert_eq!(peek32(&m, R + 16), 0x3333_0000, "ESI after INT 13h AH=02h");
+    assert_eq!(peek32(&m, R + 20), 0x4444_0000, "EDI after INT 13h AH=02h");
+
+    assert_eq!(peek32(&m, R + 24), 0xa5a5_004f, "EAX after AX=4F01h");
+    assert_eq!(peek32(&m, R + 28), 0x1111_0101, "ECX after AX=4F01h");
+    assert_eq!(peek32(&m, R + 32), 0x2222_0000, "EDX after AX=4F01h");
+    assert_eq!(peek32(&m, R + 36), 0x4444_0e00, "EDI after AX=4F01h");
+}

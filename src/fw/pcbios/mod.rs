@@ -405,36 +405,44 @@ const E820_ENTRY: u16 = 20;
 
 // -- the interrupt frame -----------------------------------------------------
 //
-// Every service handler below opens with `push ds; push es; pusha; mov bp,sp`,
+// Every service handler below opens with `push ds; push es; pushad; mov bp,sp`,
 // so `[bp+n]` names the caller's registers and its `IRET` frame. A handler
 // returns a value by writing the *saved* register, and sets carry by writing
 // the *saved* flags — the only way to affect a caller that is resumed by
 // `IRET`.
+//
+// `PUSHAD`, not `PUSHA`, in every one of them. `INT 15h` and the PCI BIOS
+// interface are *specified* in 32-bit registers, which is the obvious reason;
+// the less obvious one is that the 16-bit services use 32-bit registers as
+// scratch — `INT 13h` translates a cylinder/head/sector triple with 32-bit
+// multiplies, and the VBE functions pass a class code to the PCI BIOS in `ECX`
+// — and a 16-bit `PUSHA` restores only the halves it saved. With it, a caller
+// came back from `INT 13h AH=02h` with the upper halves of `EAX`, `EBX` and
+// `EDX` zeroed, which no interface says and which a 32-bit real-mode loader
+// holding a block number across the call does not survive.
+//
+// The `F_*` names are the 16-bit registers a service's interface is written
+// in and the `G_*` names the 32-bit ones; they are the same frame, and each
+// 16-bit register is the low word of its slot.
 
 /// The saved `SI`.
-const F_SI: i32 = 2;
+const F_SI: i32 = G_ESI;
 /// The saved `BP`.
-const F_BP: i32 = 4;
+const F_BP: i32 = 8;
 /// The saved `BX`.
-const F_BX: i32 = 8;
+const F_BX: i32 = G_EBX;
 /// The saved `DX`.
-const F_DX: i32 = 10;
+const F_DX: i32 = G_EDX;
 /// The saved `CX`.
-const F_CX: i32 = 12;
+const F_CX: i32 = G_ECX;
 /// The saved `AX`.
-const F_AX: i32 = 14;
+const F_AX: i32 = G_EAX;
 /// The saved `ES`.
-const F_ES: i32 = 16;
+const F_ES: i32 = 32;
 /// The saved `DS`.
-const F_DS: i32 = 18;
+const F_DS: i32 = 34;
 /// The caller's `FLAGS`, as `IRET` will restore them.
-const F_FLAGS: i32 = 24;
-
-// The `PUSHAD` frame. `INT 15h` and the PCI BIOS interface both open with
-// `push ds; push es; pushad`, because both are specified in terms of 32-bit
-// registers and a 16-bit `PUSHA` would drop the halves the caller cares about.
-// Four bytes per register, so every offset differs from the `PUSHA` frame
-// above.
+const F_FLAGS: i32 = G_FLAGS;
 
 /// The saved `EDI` — where a configuration register number arrives.
 const G_EDI: i32 = 0;
@@ -448,7 +456,8 @@ const G_EDX: i32 = 20;
 const G_ECX: i32 = 24;
 /// The saved `EAX` — the function number, and the return code in `AH`.
 const G_EAX: i32 = 28;
-/// The caller's `FLAGS` in the `PUSHAD` frame.
+/// The caller's `FLAGS`: past eight 32-bit registers, `ES`, `DS`, and the
+/// return address `INT n` pushed.
 const G_FLAGS: i32 = 40;
 
 /// The carry flag's bit in `FLAGS` (SDM Vol. 1 §3.4.3).
@@ -628,13 +637,13 @@ pub(crate) fn enter(a: &mut Asm) {
     a.sti();
     a.pushs(DS);
     a.pushs(crate::fw::asm16::ES);
-    a.pusha();
+    a.pushad();
     a.mov(crate::fw::asm16::BP, SP);
 }
 
 /// A service handler's epilogue.
 pub(crate) fn leave(a: &mut Asm) {
-    a.popa();
+    a.popad();
     a.pops(crate::fw::asm16::ES);
     a.pops(DS);
     a.iret();

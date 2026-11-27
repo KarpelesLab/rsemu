@@ -343,10 +343,11 @@ pub(super) fn emit(a: &mut Asm, l: &Labels) {
     //
     // The clock functions and the PCI BIOS interface share a vector and share
     // nothing else: `AH=B1h`'s functions are specified in terms of 32-bit
-    // registers, so they need the `PUSHAD` frame rather than the `PUSHA` one
-    // the clock uses. The test that separates them is made *before* the
-    // prologue, which costs nothing — `INT n` has already pushed the caller's
-    // `FLAGS` (SDM Vol. 2A, `INT n`), so the flags register is scratch here.
+    // registers and run with `DS` on the EBDA, the clock's in 16-bit ones
+    // with `DS` on the BDA, so each has a prologue of its own. The test that
+    // separates them is made *before* either, which costs nothing — `INT n`
+    // has already pushed the caller's `FLAGS` (SDM Vol. 2A, `INT n`), so the
+    // flags register is scratch here.
     a.bind(l.int1a);
     a.alui8(Alu::CMP, AH, super::pci::PCI_FUNCTION);
     a.jcc(Cc::E, l.int1a_pci);
