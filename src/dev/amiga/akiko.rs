@@ -968,7 +968,7 @@ impl Device for Akiko {
 ///
 /// # v1 -> v2: the EEPROM's bus position
 ///
-/// v2 appends where the 24C08 is in a transfer ([`Eeprom::save_bus`]). A v1
+/// v2 appends where the 24C08 is in a transfer (`Eeprom::save_bus`). A v1
 /// build wrote the cells and nothing after them, and on load put the part
 /// back idle with both wires high — so that is what a v1 chunk means, and the
 /// step copies it verbatim and appends exactly that. A v1 snapshot taken in

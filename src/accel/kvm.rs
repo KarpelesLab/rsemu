@@ -300,7 +300,7 @@ pub const KVM_CAP_IMMEDIATE_EXIT: u64 = 136;
 /// `KVM_CAP_XSAVE`: `KVM_GET_XSAVE` and `KVM_SET_XSAVE` exist.
 pub const KVM_CAP_XSAVE: u64 = 55;
 /// `KVM_CAP_XSAVE2`: asked of the **VM** descriptor, how many bytes
-/// `KVM_SET_XSAVE` reads from its argument. See [`Vm::xsave_fits`].
+/// `KVM_SET_XSAVE` reads from its argument. See `Vm::xsave_fits`.
 pub const KVM_CAP_XSAVE2: u64 = 208;
 
 /// `KVM_MEM_READONLY`, the flag that makes a slot's pages read-only to the

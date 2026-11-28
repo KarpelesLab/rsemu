@@ -6,7 +6,7 @@
 //!
 //! # The machine this compiles to
 //!
-//! **Temporaries live where [`linear_scan`] puts them**, which is
+//! **Temporaries live where [`linear_scan`](crate::ir::linear_scan) puts them**, which is
 //! `ROADMAP.md` §9's pipeline finished: *"register allocation (linear scan) →
 //! host backend"*. A temporary with a host register is read and written there
 //! and never touches memory; one the allocator could not place keeps its slot
@@ -515,7 +515,7 @@ pub enum Regs {
     /// Every temporary lives in the frame: the backend as it stood before the
     /// allocator, kept runnable.
     Frame,
-    /// Linear scan over the block's live intervals — [`linear_scan`].
+    /// Linear scan over the block's live intervals — [`linear_scan`](crate::ir::linear_scan).
     #[default]
     Scan,
 }
@@ -609,7 +609,7 @@ const fn reg_of(n: u8) -> Reg {
 /// Whether this backend's lowering of `op` calls into the host *after*
 /// reading its operands and *before* writing its results.
 ///
-/// One of the two inputs [`linear_scan`] cannot check for itself, so it is one
+/// One of the two inputs [`linear_scan`](crate::ir::linear_scan) cannot check for itself, so it is one
 /// expression that can be read against the lowerings — and
 /// `the_call_map_the_allocator_is_given_matches_what_the_lowerings_emit`
 /// asserts it against the emitted bytes rather than against this list.

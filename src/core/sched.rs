@@ -2993,7 +2993,7 @@ pub struct Scheduler {
 
 /// Break the reference cycle every lazily-advanced device is part of.
 ///
-/// A [`LazySlot`] owns its device, and the device owns the slot back: the
+/// A `LazySlot` owns its device, and the device owns the slot back: the
 /// [`LazyHandle`] it is given so that an access can ask for catch-up is an
 /// `Arc` of that same slot. Neither edge can be weak without paying for an
 /// upgrade on every access, and while the scheduler lives the cycle is

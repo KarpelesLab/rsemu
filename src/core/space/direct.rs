@@ -184,7 +184,7 @@ impl Slot {
 /// plainest form: direct-mapped on the page number, read-only, and exact.
 /// [`ReadCache::read`] is [`AddressSpace::read`] — the same value and the same
 /// errors, because a page is served from here only under the conditions in the
-/// [module docs](self) and everything else is handed to the space unchanged.
+/// module docs and everything else is handed to the space unchanged.
 /// What a hit skips is the topology read guard, the dispatch table, the flat
 /// entry and the checks, which is most of what a load from RAM costs.
 ///
@@ -339,7 +339,7 @@ impl SpaceView<'_> {
     /// write.
     ///
     /// `None` is "take the slow path", never an error; see the
-    /// [module docs](self) for each condition.
+    /// module docs for each condition.
     #[must_use]
     pub fn direct_span(&self, addr: u64, len: u64, need: Perms) -> Option<DirectSpan> {
         if len == 0 || need.contains(Perms::WRITE) {
