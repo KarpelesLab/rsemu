@@ -793,6 +793,48 @@ impl Exceptions {
     }
 }
 
+/// Serialises every test that switches a channel on or calls [`reset`].
+///
+/// The channel mask is process-global and `cargo test` runs a target's tests
+/// on several threads, so a test that enabled `exc` while another reset the
+/// mask would count some of its exceptions and not others. The counter core's
+/// own tests hold this, and so does [`counting_exceptions`].
+///
+/// [`LockRank::UNCHECKED`](crate::core::sync::LockRank::UNCHECKED) rather than
+/// the `LEAF` a `static` usually takes: a core's test holds it for the whole of
+/// a run, underneath every lock the machine takes, which no rank but "outside
+/// the ladder" describes.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: crate::core::sync::Global<()> =
+    crate::core::sync::Global::with_rank(crate::core::sync::LockRank::UNCHECKED, ());
+
+/// Held by a test that asserts what a core's [`Exceptions`] counted: `exc` is
+/// on, and nothing else in the process can switch it off, until it drops.
+#[cfg(test)]
+pub(crate) struct CountingExceptions {
+    _serial: crate::core::sync::GlobalGuard<'static, ()>,
+}
+
+/// Switch `exc` on for the length of a test (see [`CountingExceptions`]).
+///
+/// A core's tests construct the processor *after* calling this or before —
+/// it makes no difference, because the counters are the core's and only the
+/// switch is shared.
+#[cfg(test)]
+pub(crate) fn counting_exceptions() -> CountingExceptions {
+    let serial = TEST_SERIAL.lock();
+    reset();
+    enable(Channel::EXC);
+    CountingExceptions { _serial: serial }
+}
+
+#[cfg(test)]
+impl Drop for CountingExceptions {
+    fn drop(&mut self) {
+        reset();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The one live hook
 // ---------------------------------------------------------------------------

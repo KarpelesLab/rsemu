@@ -1395,6 +1395,49 @@ fn an_enabled_machine_interrupt_is_taken_between_instructions() {
     assert_eq!(h.hart.x(12), 0);
 }
 
+/// The `exc` trace channel counts each trap the hart took once, under the
+/// privileged spec's name, and files an interrupt apart from an exception.
+#[test]
+fn every_trap_taken_is_counted_once_for_the_exc_channel() {
+    use crate::core::device::Device;
+    let _exc = crate::core::trace::counting_exceptions();
+    let h = Harness::rv64i(&[
+        addi(10, 0, (irq::MTI) as i32),
+        csrrs(0, num::MIE, 10),
+        ECALL,
+        addi(11, 0, status::MIE as i32),
+        csrrs(0, num::MSTATUS, 11),
+        addi(12, 0, 1),
+    ]);
+    // mtvec is zero, which nothing is mapped at: the ECALL's handler fetch
+    // faults, and so would every fetch after it. So step the ECALL and its one
+    // fetch fault, then put the PC back.
+    h.steps(4);
+    h.hart.set_pc(BASE + 12);
+    h.steps(2);
+    h.hart.set_interrupt(irq::MTI, true);
+    h.steps(1);
+    let rows: Vec<_> = h
+        .hart
+        .exceptions()
+        .expect("a hart counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    if cfg!(feature = "trace") {
+        assert_eq!(
+            rows,
+            [
+                ("fetch-access".into(), false, 1),
+                ("ecall-m".into(), false, 1),
+                ("machine-timer".into(), true, 1),
+            ]
+        );
+    } else {
+        assert!(rows.is_empty(), "no counters compiled in");
+    }
+}
+
 #[test]
 fn a_disabled_interrupt_is_not_taken() {
     let h = Harness::rv64i(&[addi(12, 0, 1)]);

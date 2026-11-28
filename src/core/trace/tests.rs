@@ -25,14 +25,11 @@
 //! *each other* over the same slots.
 
 use super::{BUCKETS, Channel, Counter, SLOTS, Table};
-use crate::core::sync::Global;
 
-/// Held for the length of any test that touches the global counters.
-///
-/// [`Global`] rather than [`Mutex`](crate::core::sync::Mutex) because this is a
-/// `static`: the `single` backend's mutex reports a second lock as a recursive
-/// one, and `core::sync`'s own test enforces the rule.
-static SERIAL: Global<()> = Global::new(());
+/// Held for the length of any test that touches the global counters — shared
+/// with the cores' tests through [`super::counting_exceptions`], which is why
+/// it lives in the parent module.
+use super::TEST_SERIAL as SERIAL;
 
 /// A counter slot with no name and no hook: writing it disturbs nothing and
 /// nothing disturbs it.
