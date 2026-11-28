@@ -27,6 +27,9 @@
 //! datasheet for the part that has no TLB. Where the two disagree, the
 //! disagreement is noted at the point it matters.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::core::sync::{AtomicBool, AtomicU32, Ordering};
 
 use super::isa::Endian;
@@ -533,16 +536,106 @@ impl Tlb {
 /// interrupt from inside a write the CPU itself issued must not have to take
 /// the CPU's own lock, or a `sw` to an interrupt controller would deadlock
 /// against the instruction that made it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Lines {
     /// The six hardware interrupt pins, in `Cause.IP[7:2]` order, as a
     /// six-bit level.
     hw: AtomicU32,
     /// Whether a reset has been requested since the last step.
     reset: AtomicBool,
+    /// Exceptions taken, for the `exc` trace channel ([`Lines::count_exception`]).
+    ///
+    /// Here rather than in the CPU state because this is the one piece of
+    /// wiring every execution borrow already holds — `Exec` is handed it for
+    /// the interrupt pins — so counting needs no new argument threaded through
+    /// anything. Not guest state, like its neighbours: it is in no snapshot
+    /// and not in the state hash, and since a reset replaces the `State` but
+    /// never this struct, it survives a reset too.
+    exceptions: crate::core::trace::Exceptions,
+}
+
+impl Default for Lines {
+    fn default() -> Lines {
+        Lines {
+            hw: AtomicU32::new(0),
+            reset: AtomicBool::new(false),
+            exceptions: crate::core::trace::Exceptions::new(Lines::EXC_CODES),
+        }
+    }
 }
 
 impl Lines {
+    /// The `exc` code space: a synchronous exception as its five-bit
+    /// `Cause.ExcCode` (0 to 31), and an interrupt at `32 + n` for the
+    /// interrupt line `IP[n]` (0 to 7) it was taken for.
+    ///
+    /// `ExcCode` 0 (`Int`) is therefore never counted itself: "the guest took
+    /// interrupts" is far less useful than "the guest took timer interrupts",
+    /// and the line is in hand when the exception is taken.
+    const EXC_CODES: u32 = 40;
+
+    /// Where interrupt line `IP[0]` is counted.
+    const EXC_INT_BASE: u32 = 32;
+
+    /// A synchronous exception with `Cause.ExcCode` `code` was taken into the
+    /// guest.
+    #[inline]
+    pub(super) fn count_exception(&self, code: u32) {
+        self.exceptions.count(code & 31);
+    }
+
+    /// An interrupt was taken into the guest with `ready` — the pending,
+    /// enabled and unmasked `IP[7:0]` bits — non-zero.
+    ///
+    /// The R3000 has no hardware priority among the `IP` bits: one exception
+    /// is taken and the handler polls `Cause.IP` (IDT R3051 family manual,
+    /// exception chapter). When more than one line is ready, the count goes
+    /// to the highest-numbered one, which is the order MIPS32 Release 2's
+    /// vectored-interrupt mode prioritises them in (*MIPS32 Privileged
+    /// Resource Architecture*, "Vectored Interrupt Mode": IP7 highest) and the
+    /// one a conventional dispatcher services first.
+    #[inline]
+    pub(super) fn count_interrupt(&self, ready: u32) {
+        let line = 31 - (ready & 0xff).max(1).leading_zeros();
+        self.exceptions.count(Lines::EXC_INT_BASE + line);
+    }
+
+    /// Every exception taken so far: interrupts as `int.ip<n>`, exceptions by
+    /// their `Cause.ExcCode` mnemonic in lower case (Kane & Heinrich, *MIPS
+    /// RISC Architecture*, the exception-code table; `trap` and `fpe` as the
+    /// MIPS32 PRA's `Cause` register table numbers them, though an R3000
+    /// raises neither), and anything reserved as `exccode-<n>`.
+    pub(super) fn exception_report(&self) -> Vec<crate::core::trace::ExceptionCount> {
+        self.exceptions.report(|code| {
+            if code >= Lines::EXC_INT_BASE {
+                return (alloc::format!("int.ip{}", code - Lines::EXC_INT_BASE), true);
+            }
+            let name = match code {
+                exc::MOD => "tlb-mod",
+                exc::TLBL => "tlbl",
+                exc::TLBS => "tlbs",
+                exc::ADEL => "adel",
+                exc::ADES => "ades",
+                exc::IBE => "ibe",
+                exc::DBE => "dbe",
+                exc::SYS => "syscall",
+                exc::BP => "break",
+                exc::RI => "ri",
+                exc::CPU => "cpu",
+                exc::OV => "overflow",
+                13 => "trap",
+                15 => "fpe",
+                _ => "",
+            };
+            let name = if name.is_empty() {
+                alloc::format!("exccode-{code}")
+            } else {
+                String::from(name)
+            };
+            (name, false)
+        })
+    }
+
     /// Drive one hardware interrupt pin. `pin` is 0 to 5, matching
     /// `Cause.IP[2]` to `Cause.IP[7]`.
     pub fn set_hw(&self, pin: u32, asserted: bool) {

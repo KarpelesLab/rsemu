@@ -319,7 +319,10 @@ impl<'a> Exec<'a> {
             // the *previous* one issued has already written back — R3000
             // exceptions are precise.
             self.settle();
-            let _ = pending;
+            // Counted here rather than in `enter_exception`, because only
+            // here is the line known. An interrupt is never an exit, so this
+            // is one count per interrupt the guest took.
+            self.lines.count_interrupt(pending);
             self.enter_exception(Trap::bare(exc::INT));
             return self.finish();
         }
@@ -343,7 +346,13 @@ impl<'a> Exec<'a> {
                         }
                         self.exit = Some(exit);
                     }
-                    None => self.enter_exception(trap),
+                    None => {
+                        // After the exit check: a trap the exit mask hands to
+                        // the host never reached the guest, so it is not
+                        // counted (`core::trace::Exceptions`).
+                        self.lines.count_exception(trap.code);
+                        self.enter_exception(trap);
+                    }
                 }
             }
         }

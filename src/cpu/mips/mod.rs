@@ -951,6 +951,10 @@ impl Device for Cpu {
         Consumed::new(self.run_budget(budget.ticks))
     }
 
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.lines.exception_report())
+    }
+
     fn reset(&self, kind: ResetKind) {
         let cfg = self.effective_config();
         let mut session = self.session.lock();

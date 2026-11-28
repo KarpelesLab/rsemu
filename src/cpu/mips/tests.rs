@@ -1611,6 +1611,58 @@ fn an_unarmed_syscall_vectors_the_way_a_machine_needs() {
     assert_eq!(h.cpu.pc(), cp0::GENERAL_VECTOR);
 }
 
+/// The `exc` trace channel counts each exception the guest took once, under
+/// its `Cause.ExcCode` mnemonic; an interrupt under the line it was taken for;
+/// and an exception the exit mask handed to the host not at all.
+#[test]
+fn every_exception_taken_is_counted_once_for_the_exc_channel() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let h = Harness::r3000a(&[SYSCALL, BREAK, lw(T0, 0, 1), SYSCALL, nop(), nop()]);
+    // The vector is in RAM that holds nothing, so step each exception alone
+    // and put the PC back on the next one.
+    h.steps(1);
+    h.cpu.set_pc(BASE + 4);
+    h.steps(1);
+    h.cpu.set_pc(BASE + 8);
+    h.steps(1);
+    assert_eq!(h.exc_code(), exc::ADEL);
+    h.cpu.set_pc(BASE + 12);
+    h.cpu.set_exit_mask(ExitMask::USER);
+    let run = h.cpu.run_to_exit_ticks(100);
+    assert!(run.exit.is_some(), "the armed syscall left for the host");
+    h.cpu.set_exit_mask(ExitMask::NONE);
+    // Pins 2 and 5 are `IP[4]` and `IP[7]`; both ready at once, the count goes
+    // to the higher line.
+    h.cpu.set_pc(BASE + 16);
+    let mut c = h.cpu.cp0();
+    c.status |= status::IEC | status::IM;
+    h.cpu.set_cp0(c);
+    h.cpu.set_interrupt(2, true);
+    h.cpu.set_interrupt(5, true);
+    h.steps(1);
+    assert_eq!(h.exc_code(), exc::INT);
+    let rows: Vec<_> = h
+        .cpu
+        .exceptions()
+        .expect("a MIPS core counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    if cfg!(feature = "trace") {
+        assert_eq!(
+            rows,
+            [
+                ("adel".into(), false, 1),
+                ("syscall".into(), false, 1),
+                ("break".into(), false, 1),
+                ("int.ip7".into(), true, 1),
+            ]
+        );
+    } else {
+        assert!(rows.is_empty(), "no counters compiled in");
+    }
+}
+
 #[test]
 fn the_exiting_core_trait_reaches_the_stack_pointer() {
     let h = Harness::r3000a(&[nop()]);
