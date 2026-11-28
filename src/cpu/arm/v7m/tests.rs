@@ -2047,6 +2047,47 @@ fn the_vtor_property_is_where_the_reset_sequence_reads_sp_and_pc() {
 }
 
 #[test]
+fn a_warm_reset_returns_the_scs_to_its_reset_values_but_not_the_debug_logic() {
+    // TakeReset's ResetSCSRegs() (DDI 0403 B1.5.5). The case that matters: a
+    // firmware enables an interrupt, moves VTOR to a table that serves it, and
+    // resets; the source is still asserted. After the reset the interrupt
+    // must be disabled, or it is taken against the boot table.
+    let (cpu, _ram) = booting_from_vtor();
+    cpu.step();
+    cpu.with_sys(|s| {
+        assert!(s.write_word(0xe000_e100, 1 << 20)); // NVIC_ISER0: IRQ 20
+        assert!(s.write_word(0xe000_e010, 0x7)); // SysTick on
+        assert!(s.write_word(0xe000_ed24, 0x7_0000)); // SHCSR: faults enabled
+        assert!(s.write_word(0xe000_edfc, 1 << 24)); // DEMCR.TRCENA
+    });
+    cpu.set_irq(20, true);
+    Device::reset(cpu.as_ref(), crate::core::device::ResetKind::Warm);
+    cpu.step();
+    cpu.with_sys(|s| {
+        assert_eq!(
+            s.read_word(0xe000_e100, true),
+            Some(0),
+            "NVIC enables cleared"
+        );
+        assert_eq!(
+            s.read_word(0xe000_e010, true).unwrap() & 1,
+            0,
+            "SysTick off"
+        );
+        assert_eq!(s.read_word(0xe000_ed24, true), Some(0), "SHCSR reset");
+        assert_eq!(
+            s.read_word(0xe000_edfc, true).unwrap() & (1 << 24),
+            1 << 24,
+            "DEMCR kept"
+        );
+    });
+    // The still-asserted line is not taken: the core runs its reset code.
+    assert_eq!(cpu.pc(), 0x2100);
+    cpu.step();
+    assert_eq!(cpu.current_exception(), Exception::THREAD);
+}
+
+#[test]
 fn every_reset_puts_vtor_back_to_its_reset_value() {
     let (cpu, _ram) = booting_from_vtor();
     cpu.step();

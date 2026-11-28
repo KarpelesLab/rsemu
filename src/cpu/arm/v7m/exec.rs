@@ -591,8 +591,22 @@ impl<'a> Exec<'a> {
             self.state.msplim = 0;
             self.state.psplim = 0;
         }
-        self.state.sys.active = [0; Exception::COUNT / 32];
-        self.state.sys.pending = [0; Exception::COUNT / 32];
+        // `ResetSCSRegs()` (DDI 0403 B1.5.5, `TakeReset`): every System
+        // Control Space register returns to its reset value -- the NVIC's
+        // enables, pending and active bits and priorities, the SCB's control
+        // and fault registers, SysTick, the MPU, CPACR/FPCCR. A firmware that
+        // enabled an interrupt and then reset must not have it taken against
+        // the vector table it boots from. The debug logic is outside a local
+        // reset -- only a power-on reset clears it (DDI 0403, the debug
+        // chapter's reset rules) -- so DEMCR and the DWT keep their state.
+        // VTOR has already been set to the reset value by the caller, and the
+        // SYSRESETREQ flag belongs to the machine that will act on it.
+        let old = core::mem::replace(&mut self.state.sys, State::new(self.cfg).sys);
+        self.state.sys.vtor = old.vtor;
+        self.state.sys.reset_requested = old.reset_requested;
+        self.state.sys.demcr = old.demcr;
+        self.state.sys.dwt_ctrl = old.dwt_ctrl;
+        self.state.sys.dwt_cyccnt = old.dwt_cyccnt;
         let base = self.state.sys.vtor;
         // The reset vector's stack pointer has its bottom two bits ignored;
         // an entry with `EPSR.T` clear is a HardFault on the first fetch, and
