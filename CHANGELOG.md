@@ -7,6 +7,277 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/KarpelesLab/rsemu/compare/v0.0.12...v0.0.13) - 2026-11-28
+
+### Added
+
+- *(space)* a per-master cache of the pages it reads directly
+- *(space)* resolve a span to its store once, for a master that rereads it
+- *(cpu-arm)* the Cortex-M35P
+
+### Fixed
+
+- *(cpu-arm-v7m)* record FPCCR's ready bits against the interrupted priority
+- *(cpu-arm-v7m)* take a failed exception return's UsageFault in place
+- *(cpu-m68k)* load only the 68030 MMU state PMOVE could have stored
+- *(cpu-m68k)* save the coprocessor of a 68000 that has one
+- *(cpu-riscv)* keep the software SEIP bit apart from the controller's line
+- *(cpu-riscv)* wrap split fetches and misaligned accesses at 2^XLEN on RV32
+- *(cpu-riscv)* make mstatus fields of an absent mode read-only zero
+- *(dev-riscv)* keep the CLINT's mtip line agreeing with mtime >= mtimecmp
+- *(cpu-riscv)* compare the TLB tag's fields instead of hashing them
+- *(cpu-arm-a64)* compare the TLB tag's fields instead of hashing them
+- *(cpu-arm-a64)* trap an EL0 WFI that SCTLR_EL1.nTWI does not allow
+- *(float)* a result ARM's FZ flushed raises underflow alone
+- *(cpu-x86)* let VERR and VERW verify a segment that is not present
+- *(cpu-x86)* refuse reserved bits of CR0[63:32], CR4 and IA32_EFER with #GP
+- *(cpu-x86)* wrap BT's bit-string byte offset at the address size
+- *(cpu-x86)* raise #UD for a store from segment register 6 or 7
+- *(cpu-x86)* wrap a page-crossing access at 4 GiB outside 64-bit mode
+- *(cpu-x86)* carry FS and GS bases across the IRET into virtual-8086 mode
+- *(cpu-x86)* derive SYSCALL's SS from the STAR field, not from the masked CS
+- *(cpu-x86)* check the return pointer of a far return and IRET before committing
+- *(cpu-x86)* a comparison with a NaN does not report a denormal operand
+- *(dev-linux-printk)* refuse a trampoline address that runs off the 32-bit space
+- *(dev-gb)* report the LCD controller's events on the machine-cycle grid
+- *(dev-gb)* paint a disabled background white, not BGP's colour 0
+- *(dev-snes-scpu)* raise EXTLATCH with WRIO's power-on value
+- *(dev-snes-scpu)* place beam events on the S-CPU's own clock
+- *(cpu-z80)* end a step inside a run of index prefixes
+- *(dev-snes-apu)* refuse a snapshot whose timer prescaler is outside its modulus
+- *(dev-gb)* refuse an LCD snapshot with the beam off the raster or too much DMA left
+- *(dev-ppu)* refuse a NES PPU snapshot whose beam is off the raster
+- *(dev-apu)* refuse a DMC snapshot whose bit counter is outside one to eight
+- *(bus-uart)* carry the bytes in flight on a UartLink through a snapshot
+- *(dev-wd33c93)* give back the DMA bytes a short data-out phase did not take
+- *(fw-pcbios)* VBE 4F03h returns bit 15 for a VGA mode set without clearing
+- *(fw-pcbios)* round an El Torito sector count up without wrapping it to zero
+- *(fw-pcbios)* refuse a CD-ROM extended read whose block number needs more than 32 bits
+- *(fw-pcbios)* INT 13h AH=42h/43h report how many blocks a short transfer moved
+- *(fw-pcbios)* report a disk write whose last sector the drive refused
+- *(dev-stm32-rtc)* refuse a snapshot whose wakeup prescaler is past its division
+- *(dev-stm32-tim)* refuse a snapshot whose prescaler phase or counter is out of range
+- *(dev-scsi)* refuse a disk snapshot whose data phase is outside its buffer or drive
+- *(dev-ata)* report a 28-bit address the way a drive past 2^28 sectors must
+- *(dev-virtio)* saturate virtio-blk's used-ring length instead of wrapping it
+- *(dev-virtio)* serve at most a ring's worth of chains per queue pass
+- *(cli)* make `--version` list every feature, grouped, from a list that cannot drift
+- *(cli)* put the terminal back before a second signal or a panic can strand it
+- *(window)* refuse a picture no window holds instead of mis-sizing its buffer
+- *(machine)* say which object refused a property, and where it is written
+- *(machine)* point a mistyped `-p` at the parameter that was meant
+- *(cli)* refuse arguments the listing commands have no use for
+- *(cli)* check `--console <name>` even when the run is headless
+- *(monitor)* let a long `step <n>` be interrupted
+- *(machine)* one list of the boards that boot on rsemu's own BIOS
+- *(clock)* report virtual time to the nearest nanosecond, not floored twice
+- *(registry)* suggest nothing for a name too short to mean anything
+- *(space)* give RamStore a fallible constructor and use it for every sized store
+- *(dev-amiga-sdmac)* hold the DMAC weakly from its data path
+- *(dev-st7272a)* keep the control sinks on the device, not in its state
+- *(dev-stm32-spi)* keep the input sinks on the device, not in its state
+- *(bus-spi)* keep the controller's MISO sink on the device, not in its state
+- *(dev-amiga-floppy)* hold Paula weakly, so a drive and Paula are freed
+- *(bus-spi)* a wired slave's pin holds its `SlavePins` weakly
+- *(bus-i2c)* a wired engine's pin holds the engine weakly
+- *(dev-amiga-agnus)* hold the custom bus weakly, so an Amiga is freed
+- *(dev-stm32-i2c)* hold the peripheral weakly from its slave face
+- *(accel)* a vCPU keeps its VM's memory slots alive, not only the VM
+- *(usermode)* a mapping the host cannot back is an error, not a panic or an abort
+- *(usermode)* a zero-length protect or unmap changes nothing, and a zero-length map_at is refused
+- *(usermode)* refuse a schedule snapshot whose quantum is zero
+- *(usermode)* a sleeper whose deadline passes wakes even while another thread is runnable
+- *(accel)* write a vCPU's x87 and SSE state through KVM_SET_XSAVE so the guest receives it
+- *(accel)* carry the x87 stack between engines in stack order
+- *(accel)* finish a port or MMIO access before a run returns on its allowance
+- *(float)* FPREM normalises a pseudo-denormal dividend it returns unchanged
+- *(float)* x87 picks the positive NaN when two have equal significands
+- *(float)* x87 precision control rounds a denormal result at the same bit as a normal one
+- *(float)* subtraction propagates its second operand's NaN with the sign it has
+- *(float)* MINSD/MAXSD raise invalid for a quiet NaN operand
+- *(float)* report x86's denormal operand only where the processor does
+- *(float)* detect tininess after rounding at full precision, not on the subnormal grid
+- *(gdb)* re-verify the 6502, 65C816 and SM83 register maps at their new chunk versions
+- *(dev-apu)* do not record a DMC stop when nothing was playing
+- *(dev-mos8520)* restore the serial bit counter as it was saved
+- *(dev-gb)* stop clocking the noise LFSR at clock shifts 14 and 15
+- *(dev-gb)* arm the window when WY equals LY, and keep it armed
+- *(dev-gb)* mix a channel whose DAC is off as analogue zero
+- *(dev-gb)* keep the DMG's length timers through an APU power-down
+- *(dev-snes)* never fire the H/V timer at a position the beam cannot reach
+- *(dev-snes)* release NMI and IRQ when the S-CPU is reset
+- *(dev-snes)* strip the low six bits of Mode 7's line products too
+- *(dev-snes)* load RDDIV with the multiplier on a WRMPYB write
+- *(dev-snes)* decode LoROM banks $FE and $FF, which are not work RAM
+- *(dev-nes)* stop a debug read of $4016 reloading the shift registers
+- *(cpu-6502)* keep an IRQ a page-crossing branch saw only at its first poll
+- *(cpu-6502)* let a wired NMI wake a 65C02 out of WAI
+- *(cpu-6502)* save the level the NMI edge detector last sampled
+- *(dev-sms)* hold a PSG tone output high when its period is 0 or 1
+- *(dev-sms)* clock the PSG's noise register from a flip-flop, not the counter
+- *(dev-sms)* draw the lower half of a 16x16 TMS9918 sprite
+- *(dev-sms)* select the 224-line display with M2 and M1, not M1 and M3
+- *(dev-gb)* let a cartridge with RAM and no controller reach its RAM
+- *(dev-gb)* move the joypad request line when the select bits change
+- *(dev-gb)* resolve object priority before the background test
+- *(cpu-sm83)* keep the cycle counter running across a warm reset
+- *(dev-ppu)* leave V and the vblank flag alone on a warm reset
+- *(dev-ppu)* stop a reset rewinding the PPU's lazy tick
+- *(cpu-sm83)* keep the request lines' levels in the snapshot
+- *(cpu-sm83)* return to a HALT that follows EI when an interrupt is pending
+- *(dev-apu)* carry the DMC's aborted-DMA window through a snapshot
+- *(sched)* free lazily-advanced devices when the scheduler is dropped
+- *(cpu-arm)* stop leaking the part-name list on every schema call
+- *(cpu-x86)* CMPXCHG8B checks write access before it reads, and always stores
+- *(cpu-x86)* a 32-bit page-directory entry's PS bit is ignored without CR4.PSE
+- *(cpu-x86)* address the FXSAVE image's register slots by wrapping
+- *(cpu-x86)* bound the iterations of a repeated string instruction per step
+- *(fw-pcbios)* a wire to a pin an 8259A does not have is not an ISA interrupt
+- *(fw-pcbios)* AX=4F03h answers with the mode AX=4F02h was given
+- *(fw-pcbios)* AX=4F00h fills 256 bytes unless the caller preset 'VBE2'
+- *(fw-pcbios)* report F1-F10 to INT 16h instead of dropping them
+- *(fw-pcbios)* an E0-prefixed key is no longer decoded as the keypad's
+- *(fw-pcbios)* INT 10h AH=13h moves the cursor only in the modes that ask
+- *(fw-pcbios)* INT 10h AH=0Ah writes the character and keeps the attribute
+- *(fw-pcbios)* clear the direction flag on entry to every service
+- *(fw-pcbios)* limit INT 13h AH=08h to cylinder 1023 instead of wrapping
+- *(fw-pcbios)* save all 32 bits of the caller's registers in every service
+- *(cpu-x86)* SYSCALL and SYSRET wrap their selector sums
+- *(cpu-x86)* IRET under EFER.LMA follows the manual's IA-32e branch
+- *(fw-pcbios)* refuse an extended transfer whose block number exceeds 28 bits
+- *(cpu-x86)* STR and SLDT zero-extend into a register destination
+- *(cpu-x86)* the protected-mode-only instructions are #UD in virtual-8086 mode
+- *(cpu-x86)* a selector load into FS or GS moves the base 64-bit mode uses
+- *(cpu-x86)* truncate a segmented linear address to 32 bits outside 64-bit mode
+- *(cpu-x86)* ENTER with a nesting level allocates below the display
+- *(cpu-x86)* a lifted bit scan of zero leaves the whole register alone
+- *(cpu-x86)* decode group 2 /6 as SHL from the 386 on
+- *(jit-wasm)* mask a result to the op's width when its destination is wider
+- *(cpu-arm-a64)* apply APTable[0] as a restriction, and check fetches as CheckPermission does
+- *(cpu-arm-a64)* honour SCTLR_EL1's EL0 enables for cache maintenance, CTR_EL0 and DAIF
+- *(cpu-arm-v7m)* store only the implemented priority bits in BASEPRI
+- *(cpu-arm-v7m)* wrap the SMMLA/SMMLS accumulate instead of panicking
+- *(cpu-arm-v7m)* let the sub-priority order pending exceptions within a group
+- *(cpu-arm-v7m)* restore the base register when a load or store multiple faults
+- *(cpu-arm-v7m)* refuse an exception return whose stacked IPSR contradicts the mode
+- *(cpu-arm-v7m)* execute BKPT inside an IT block whatever the condition
+- *(cpu-arm-v7m)* stack the ITSTATE that matches the return address
+- *(cpu-riscv)* mcounteren gates the hpmcounter shadows, and user mode where there is no supervisor
+- *(cpu-riscv)* taking an interrupt out of WFI ends the wait
+- *(dev-riscv)* the PLIC's lines follow its registers when two harts write at once
+- *(dev-riscv)* two harts writing one msip no longer lose the interrupt
+- *(dev-riscv)* a PLIC claim is not masked by the priority threshold
+- *(cpu-riscv)* mstatus.MPP and UXL stop naming privilege modes the hart does not have
+- *(cpu-riscv)* an AMO faults as a store, never as a load
+- *(cpu-riscv)* a write to mip or sip no longer erases a machine interrupt raised under it
+- *(dev-amiga-keyboard)* load a snapshot taken during a long start-up stream
+- *(dev-amiga-akiko)* a snapshot carries where the EEPROM is on its two-wire bus
+- *(dev-amiga-denise)* hold a loaded raster's first clock to the counter's eight bits
+- *(cpu-m68k)* loading a snapshot drops a reset the pin latched before it
+- *(cpu-m68k)* a traced TRAP is followed by its trace exception on a 68000 and 68010
+- *(cpu-m68k)* FMOVEM lays the registers out with FP0 at the lowest address
+- *(cpu-m68k)* the translated engine's store guard compares the address the bus sees
+- *(dev-amiga-paula)* a loaded audio channel that is running has at least one word left
+- *(dev-amiga-agnus)* Alice's scan-double enable is SPRxPOS bit 7, the SH10 Lisa drops
+- *(dev-amiga-floppy)* a track of nothing but sync words no longer hangs the decoder
+- *(dev-mac)* close the gap in the `image2` refusal a lost line continuation left
+- *(dev-mac)* refuse a clock `time` past February 2040 instead of overflowing
+- *(dev-wd33c93)* a register write through the mapped window delivers the queued interrupt
+- *(dev-amiga-agnus)* a blit made cheaper mid-word no longer underflows its countdown
+- *(sched)* count overlapping world stops instead of flagging one
+- *(props)* refuse a sign inside a compound duration
+- *(sched)* sweep the tombstones of events that have already fired
+- *(sched)* report an upper-level wheel entry that precedes a lower-level one
+- *(dev-stm32-i2c)* release a transactional bus when the controller is reset
+- *(bus-i2c)* [**breaking**] carry an open transaction across a snapshot
+- *(dev-watchdog-pin)* report a forgotten timeout as missing, not as zero
+- *(dev-at24c)* do not count a read that was clocked inside a write
+- *(dev-stm32-wdg)* keep the WWDG prescaler phase below a lowered WDGTB
+- *(dev-uart)* cross DTR and RTS onto DSR and CTS in 16550 loopback
+- *(cli)* answer `run --help`, and name the feature `debug` needs
+- *(cli)* offer rsemu's own BIOS to pc-at-smp, as its machine file says
+- *(cli)* refuse an output path that cannot be written before the run
+- *(cli)* ask the description which media slots it names before building
+- *(cli)* close the gaps a lost line continuation left in three messages
+- *(cli)* list the media flags `rsemu run` takes, not ones it does not
+- *(cli)* stop a console session at --for rather than at the next slice
+- *(machine)* put a caret under a device class this build does not have
+- *(machine)* bound the loops and templates that expand to nothing
+- *(machine)* skip a byte-order mark at the start of a machine file
+- *(machine)* refuse a ram too large to allocate instead of aborting
+- *(wasm)* write off the frames a backgrounded tab cannot catch up on
+- *(wasm)* keep a CR LF pair split across two console reads as one line break
+- *(window)* pass the function keys and Delete through to the guest
+- *(monitor)* cut a long device rendering on a character boundary
+- *(terminal)* treat a CR LF pair split across two writes as one line break
+- *(gdb)* stop taking requests from a client that is not reading its replies
+- *(gdb)* queue a Ctrl-C that arrives while the target is stopped
+- *(vnc)* bound what one turn reads from a client, and parse it in linear time
+- *(vnc)* send DesktopSize as the last rectangle of its update, not the first
+- *(vnc)* clip incremental rectangles to the framebuffer the client was told about
+- *(dev-ata-atapi)* never announce a DRQ block the byte count cannot describe
+- *(dev-virtio)* bound how much entropy one request is answered with
+- *(dev-ahci)* mask PxCLB and PxFB when a snapshot restores them
+- *(dev-sd)* refuse to change a drive-backed card instead of overwriting its file
+- *(dev-sd)* flush the medium behind a drive-backed card
+- *(dev-virtio)* report QueueNumMax as zero for a queue that does not exist
+- *(dev-virtio)* refuse a snapshot whose queue size no driver could set
+- *(dev-usb-xhci)* wrap context addresses instead of overflowing
+- *(dev-ahci)* wrap the PRD cursor instead of overflowing
+- *(dev-nvme)* wrap a queue entry's address instead of overflowing
+- *(dev-virtio)* wrap ring and buffer addresses instead of overflowing
+- *(dev-virtio)* bound a descriptor chain by the queue size in total
+- *(window)* say why minifb refused the window
+
+### Other
+
+- *(cli)* ask for a disk no host can reserve, not one macOS grants
+- name private items in plain code instead of linking to them
+- *(dev-nes)* stop re-driving /NMI and IRQ on every CPU cycle
+- *(dev-nes-io)* answer the DMA arbiter's idle cycle from one lock
+- *(sched)* skip an empty wheel level when the queue advances
+- *(fuzz)* load a doctored snapshot into a whole board and run it
+- *(dev-wd33c93)* stage a DMA transfer through one buffer, not one per burst
+- say what the firmware's keyboard does with E0-prefixed keys now
+- *(dev-ata)* move a DMA transfer 64 KiB per medium call, not one sector
+- *(jit)* read a guest state slot out of the host's array, not through a call
+- *(jit)* offer a refused block to the backend once, not on every execution
+- *(jit)* hand a host a whole range of deferred bookkeeping at once
+- *(space)* a fill that changes nothing stores nothing
+- *(cpu)* borrow the address space for a step instead of cloning its Arc
+- *(space)* keep the read cache's hit inline however many cores use it
+- *(cpu-arm-a64)* take only the output pins a step is about to drive
+- *(cpu-arm-a64)* serve the interpreter's fetches and loads from a read cache
+- *(cpu-riscv)* remember what an encoding decodes to
+- *(cpu-riscv)* serve the interpreter's fetches and loads from a read cache
+- *(cpu-x86)* serve operand loads and page-table reads from the read cache
+- *(cpu-x86)* give the interpreter's in-page fetch its own copy of the decoder
+- *(cpu-x86)* borrow on the step path instead of cloning
+- *(cpu-x86)* decode an instruction that lies in one page from that page
+- *(cpu-x86)* fetch the instruction stream through a resolved page
+- *(machine)* fuzz stm32f407, stm32wb55 and amiga-a500 by default
+- *(machine)* see a cycle closed beneath a device, without a sanitizer
+- *(accel)* read RIP only for an exit that is reported
+- *(float)* take the leading 64 bits of a square root from u128::isqrt
+- re-record the state hashes the 8-bit snapshot changes moved
+- *(fuzz)* state_migration drives every class that ships a step
+- *(fuzz)* machine_mmio, every MMIO window of a whole board
+- *(crosshost)* a 32-bit compile error is a failure, not a skipped leg
+- *(fuzz)* state_decoder must not assert that a literal path is absent
+- stop four gates reporting green when they ran nothing
+- *(long-run)* make the arm64/riscv budget knob live, and require the FreeDOS run
+- *(pc-at)* RSEMU_FREEDOS_REQUIRED turns the FreeDOS skip into a failure
+- *(deps)* check dev and build dependencies, and fail when the list cannot be read
+- *(jit-x86)* cut a bitfield with an immediate, and stop masking what is already canonical
+- *(jit-x86)* take a constant operand as an immediate, and give it no register
+- *(cpu-arm)* stop paying for locked operations on every interpreted instruction
+- *(dev-riscv)* the interrupt-race tests yield when they cannot spin
+- *(dev-amiga-paula)* ask whether there is anything to catch up before cloning the drive list
+- *(cli)* say what -q does in each kind of run
+- *(machine)* q35 needs --bios, so its first example must give one
+- *(vnc)* repack a frame from a table, a row at a time, into one buffer
+- *(gdb)* wake a halted session on the client's packet, not on a 1 ms tick
+
 ## [0.0.12](https://github.com/KarpelesLab/rsemu/compare/v0.0.11...v0.0.12) - 2026-11-27
 
 ### Added
