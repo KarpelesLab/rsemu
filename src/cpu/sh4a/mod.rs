@@ -209,6 +209,16 @@ pub struct Lines {
     /// Where a reset starts, when a board says; published as
     /// [`ExportId::RESET_ADDRESS`].
     reset_address: Arc<AtomicU64>,
+    /// Exceptions and interrupts taken, for the `exc` trace channel
+    /// ([`Lines::count_exception`], [`Lines::count_interrupt`]).
+    ///
+    /// Here rather than in the CPU state because this is the one piece of
+    /// wiring every execution borrow already holds — `Exec` is handed it for
+    /// the interrupt request — so counting needs no new argument threaded
+    /// through anything. Not guest state, like its neighbours: in no snapshot
+    /// and not in the state hash, and since a reset rebuilds the `State` but
+    /// never this struct, it survives a reset too.
+    exceptions: crate::core::trace::Exceptions,
 }
 
 impl Default for Lines {
@@ -219,11 +229,84 @@ impl Default for Lines {
             reset: AtomicBool::new(false),
             hold: AtomicBool::new(false),
             reset_address: Arc::new(AtomicU64::new(NO_RESET_ADDRESS)),
+            exceptions: crate::core::trace::Exceptions::new(Lines::EXC_CODES),
         }
     }
 }
 
 impl Lines {
+    /// The `exc` code space. Every exception code is a multiple of `H'20`
+    /// (SH-4A software manual, table 5.3), so dividing by `H'20` makes it
+    /// dense: an `EXPEVT` code (12 bits) at `code / H'20`, 0 to 127, and an
+    /// `INTEVT` code (14 bits) at `128 + code / H'20`, 128 to 639.
+    ///
+    /// Two halves rather than one because the two registers' code spaces
+    /// overlap: an interrupt controller is free to hand `INTEVT = H'800`,
+    /// which as an `EXPEVT` would be the FPU-disable exception.
+    const EXC_CODES: u32 = 128 + 512;
+
+    /// Where `INTEVT` codes start in the `exc` code space.
+    const EXC_INTEVT_BASE: u32 = 128;
+
+    /// An exception was taken into the guest with `EXPEVT = code`.
+    #[inline]
+    fn count_exception(&self, code: u32) {
+        self.exceptions.count((code & 0xfff) >> 5);
+    }
+
+    /// An interrupt was taken into the guest with `INTEVT = code`.
+    #[inline]
+    fn count_interrupt(&self, code: u32) {
+        self.exceptions
+            .count(Lines::EXC_INTEVT_BASE + ((code & 0x3fff) >> 5));
+    }
+
+    /// Every exception and interrupt taken so far, named after the SH-4A
+    /// software manual's exception table (table 5.3): `EXPEVT` codes by the
+    /// exception's name, `INTEVT` ones as `intevt-0xNNN` — the code is all
+    /// the CPU knows of an interrupt, and what it means belongs to the
+    /// interrupt controller — except the NMI, whose code the CPU defines.
+    fn exception_report(&self) -> Vec<crate::core::trace::ExceptionCount> {
+        use exec::exc;
+        self.exceptions.report(|index| {
+            if index >= Lines::EXC_INTEVT_BASE {
+                let code = (index - Lines::EXC_INTEVT_BASE) << 5;
+                let name = if code == exc::NMI {
+                    String::from("nmi")
+                } else {
+                    alloc::format!("intevt-{code:#05x}")
+                };
+                return (name, true);
+            }
+            let code = index << 5;
+            let name = match code {
+                exc::MANUAL_RESET => "manual-reset",
+                exc::TLB_MISS_READ => "tlb-miss-read",
+                exc::TLB_MISS_WRITE => "tlb-miss-write",
+                exc::INITIAL_WRITE => "initial-page-write",
+                exc::TLB_PROT_READ => "tlb-protection-read",
+                exc::TLB_PROT_WRITE => "tlb-protection-write",
+                exc::ADDR_READ => "address-error-read",
+                exc::ADDR_WRITE => "address-error-write",
+                exc::FPU => "fpu-exception",
+                exc::TLB_MULTI => "tlb-multiple-hit",
+                exc::TRAPA => "trapa",
+                exc::ILLEGAL => "illegal-instruction",
+                exc::SLOT_ILLEGAL => "slot-illegal",
+                0x1e0 => "user-break",
+                exc::FPU_DISABLE => "fpu-disable",
+                exc::SLOT_FPU_DISABLE => "slot-fpu-disable",
+                _ => "",
+            };
+            let name = if name.is_empty() {
+                alloc::format!("expevt-{code:#05x}")
+            } else {
+                String::from(name)
+            };
+            (name, false)
+        })
+    }
+
     /// The current request: `(level, INTEVT code)`.
     #[must_use]
     pub fn request(&self) -> (u32, u32) {
@@ -814,6 +897,10 @@ impl Device for Cpu {
 
     fn run(&self, budget: Budget) -> Consumed {
         Consumed::new(self.run_budget(budget.ticks))
+    }
+
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.lines.exception_report())
     }
 
     fn reset(&self, kind: ResetKind) {

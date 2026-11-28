@@ -1389,6 +1389,80 @@ fn trapa_can_leave_the_core_as_a_syscall_exit() {
     assert_eq!(h.cpu.ctl().tra, 5 << 2);
 }
 
+/// The `exc` trace channel counts each exception the guest took once, under
+/// the manual's name for its `EXPEVT` code; an interrupt under its `INTEVT`
+/// code; and a trap the exit mask handed to the host not at all.
+#[test]
+fn every_exception_taken_is_counted_once_for_the_exc_channel() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let h = Harness::new(&[
+        trapa(5),
+        0xfffd,
+        mov_i(1, 2),
+        movl_s(0, 1),
+        trapa(6),
+        0xfffd,
+        NOP,
+        NOP,
+    ]);
+    // Each handler vector holds nothing, so step each exception alone, then
+    // unblock and put the PC on the next one.
+    let next = |at: u32| {
+        h.cpu.set_sr(sr::MD);
+        h.cpu.set_pc(START + at);
+    };
+    h.steps(1);
+    assert_eq!(h.expevt(), exc::TRAPA);
+    next(2);
+    h.steps(1);
+    assert_eq!(h.expevt(), exc::ILLEGAL);
+    next(4);
+    h.steps(2);
+    assert_eq!(h.expevt(), exc::ADDR_WRITE);
+    next(8);
+    h.cpu
+        .set_exit_mask(ExitMask::NONE.with(ExitReason::SYSCALL));
+    let (_, exit) = h.cpu.step_to_exit();
+    assert!(exit.is_some(), "the armed TRAPA left for the host");
+    h.cpu.set_exit_mask(ExitMask::NONE);
+    // An exception with `SR.BL` set is the manual reset it turns into.
+    next(10);
+    h.cpu.set_sr(sr::MD | sr::BL);
+    h.steps(1);
+    assert_eq!(h.expevt(), exc::MANUAL_RESET);
+    next(12);
+    h.cpu.set_interrupt(6, 0x580);
+    h.steps(1);
+    assert_eq!(h.cpu.ctl().intevt, 0x580);
+    h.cpu.set_interrupt(0, 0);
+    next(14);
+    h.cpu.raise_nmi();
+    h.steps(1);
+    assert_eq!(h.cpu.ctl().intevt, exc::NMI);
+    let rows: Vec<_> = h
+        .cpu
+        .exceptions()
+        .expect("an SH-4A counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    if cfg!(feature = "trace") {
+        assert_eq!(
+            rows,
+            [
+                ("manual-reset".into(), false, 1),
+                ("address-error-write".into(), false, 1),
+                ("trapa".into(), false, 1),
+                ("illegal-instruction".into(), false, 1),
+                ("nmi".into(), true, 1),
+                ("intevt-0x580".into(), true, 1),
+            ]
+        );
+    } else {
+        assert!(rows.is_empty(), "no counters compiled in");
+    }
+}
+
 #[test]
 fn a_listing_of_a_program_reads_back() {
     let h = Harness::new(&[mov_i(1, 10), dt(1), bf(-3), RTS, NOP]);

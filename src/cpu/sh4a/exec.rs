@@ -578,6 +578,9 @@ impl<'a> Exec<'a> {
         if irq.nmi {
             self.lines.take_nmi();
         }
+        // Every accepted interrupt is delivered here, awake or asleep, and an
+        // interrupt is never an exit: one count per interrupt the guest took.
+        self.lines.count_interrupt(irq.code);
         self.st.ctl.intevt = irq.code & 0x3fff;
         let pc = self.st.pc;
         self.enter(pc, vector::INTERRUPT);
@@ -615,6 +618,19 @@ impl<'a> Exec<'a> {
             self.exit = Some(exit);
             return;
         }
+        // After the exit check, so a trap handed to the host is not counted
+        // (`core::trace::Exceptions`). Counted under the code the guest sees in
+        // `EXPEVT`: a TLB multiple hit's `H'140`, and an exception raised with
+        // `SR.BL` set as the manual reset it turns into (§5.5.3) — the
+        // double fault that is the first thing worth finding in a boot that
+        // keeps restarting. A reset from the pin or a power-on is not an
+        // exception the guest took and is not counted.
+        let blocked = trap.kind != Kind::Reset && self.st.sr & sr::BL != 0;
+        self.lines.count_exception(if blocked {
+            exc::MANUAL_RESET
+        } else {
+            trap.code
+        });
         if let Some(va) = trap.tea {
             self.st.ctl.tea = va;
             self.st.ctl.pteh = (va & 0xffff_fc00) | (self.st.ctl.pteh & 0xff);
