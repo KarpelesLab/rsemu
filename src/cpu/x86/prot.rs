@@ -1336,7 +1336,7 @@ pub const TSS_SEG_ORDER: [u8; 6] = [seg::ES, seg::CS, seg::SS, seg::DS, seg::FS,
 // The interpreter's half: everything that touches the bus
 // ---------------------------------------------------------------------------
 
-use super::exec::{Ex, Exec, Fault, VEC_GP, VEC_NP, VEC_SS, VEC_TS, VEC_UD};
+use super::exec::{Ex, Exec, Fault, Origin, VEC_GP, VEC_NP, VEC_SS, VEC_TS, VEC_UD};
 use super::flags;
 use super::isa::{Fields, Op};
 use crate::core::value::Width;
@@ -2557,15 +2557,30 @@ impl Exec<'_> {
     /// Three different sequences hide behind one name, and which one runs is
     /// the difference between a working machine and a mystery: the 8086's, a
     /// 386's in real mode, and a 386's in protected mode.
-    pub(super) fn take_interrupt(&mut self, vector: u8, error: Option<u32>) -> Ex<()> {
+    ///
+    /// Also the one place the `exc` trace channel counts: every event that
+    /// enters a guest handler — on every engine, since a translated block's
+    /// fault is handed to [`Exec::deliver`] and an interrupt is only ever
+    /// taken at the interpreter's instruction boundary — comes through here,
+    /// and an event the exit mask gives the host never does. Counted after
+    /// the sequence succeeds, so a delivery that faults part way and is
+    /// replaced by what it raised counts as what replaced it.
+    pub(super) fn take_interrupt(
+        &mut self,
+        vector: u8,
+        error: Option<u32>,
+        origin: Origin,
+    ) -> Ex<()> {
         self.state.halted = false;
         if self.legacy() {
-            return self.legacy_interrupt(vector);
+            self.legacy_interrupt(vector)?;
+        } else if self.protected() {
+            self.protected_interrupt(vector, error)?;
+        } else {
+            self.real_interrupt(vector)?;
         }
-        if self.protected() {
-            return self.protected_interrupt(vector, error);
-        }
-        self.real_interrupt(vector)
+        self.lines.count_event(vector, origin);
+        Ok(())
     }
 
     /// The 8086's interrupt sequence.

@@ -218,6 +218,31 @@ impl Fault {
 /// The result of anything that can fault.
 pub(super) type Ex<T> = Result<T, Fault>;
 
+/// Where an event being delivered came from — which the vector number alone
+/// does not say on x86, because one vector can be all three.
+///
+/// A real-mode PC's timer interrupt arrives on vector 8, the double fault's
+/// number; its BIOS is called with `INT 10h`, the x87 error's. The handler
+/// cannot tell them apart either, which is exactly why the `exc` trace
+/// channel must: "the guest took 18 double faults a second" is a very
+/// different finding from "the timer ran". Nothing but [`Lines::count_event`]
+/// reads this — delivery itself is identical for all four, bar `INT n`'s gate
+/// privilege check, which [`Exec::software_interrupt`] makes before it.
+///
+/// [`Lines::count_event`]: super::Lines::count_event
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The processor raised it: a fault, a trap, `INT3`, `INTO`, `ICEBP`, a
+    /// single step, a double fault.
+    Exception,
+    /// `INT n` — the two-byte `CD ib`, whatever `n` is.
+    Software,
+    /// Acknowledged off `INTR`, with the vector the controller supplied.
+    External,
+    /// The `NMI` pin.
+    Nmi,
+}
+
 // ---------------------------------------------------------------------------
 // The prefetch queue
 // ---------------------------------------------------------------------------
@@ -1197,7 +1222,7 @@ impl<'a> Exec<'a> {
                 self.state.halted = false;
                 self.charge(Op::INT.clocks());
                 self.entry = self.state.regs;
-                self.deliver(Fault::bare(VEC_NMI));
+                self.deliver_from(Fault::bare(VEC_NMI), Origin::Nmi);
                 return self.used;
             }
             if self.flag(flags::IF) && self.lines.intr_pending() {
@@ -1212,7 +1237,7 @@ impl<'a> Exec<'a> {
                 // the pin by hand sets.
                 let vector = self.lines.acknowledge();
                 self.entry = self.state.regs;
-                self.deliver(Fault::bare(vector));
+                self.deliver_from(Fault::bare(vector), Origin::External);
                 return self.used;
             }
         }
@@ -1275,12 +1300,28 @@ impl<'a> Exec<'a> {
     /// processor down — real silicon drives a `SHUTDOWN` bus cycle and waits
     /// for `RESET`, which the chipset is expected to notice.
     pub(super) fn deliver(&mut self, first: Fault) {
+        self.deliver_from(first, Origin::Exception);
+    }
+
+    /// [`Exec::deliver`] for an event that did not come from the instruction
+    /// stream: `origin` describes `first` alone, because anything raised while
+    /// delivering it — the `#GP` of a vector past the `IDT` limit, the `#DF`
+    /// that follows — is the processor's own exception.
+    ///
+    /// The `exc` trace channel counts inside [`Exec::take_interrupt`], once it
+    /// has succeeded, so this ladder counts **only the rung the guest actually
+    /// entered**: a `#PF` that escalates to `#DF` is one `double-fault` and no
+    /// `page-fault`, an interrupt whose gate is not present is one
+    /// `segment-not-present` and no interrupt, and a triple fault counts
+    /// nothing at all, because shutdown enters no handler.
+    pub(super) fn deliver_from(&mut self, first: Fault, origin: Origin) {
         let mut current = first;
+        let mut origin = origin;
         // Three attempts is the whole ladder: the event, the double fault, and
         // the shutdown that follows a fault during the double fault.
         for _ in 0..3 {
             self.nesting = self.nesting.saturating_add(1);
-            match self.take_interrupt(current.vector, current.error) {
+            match self.take_interrupt(current.vector, current.error, origin) {
                 Ok(()) => {
                     self.nesting = 0;
                     return;
@@ -1294,6 +1335,7 @@ impl<'a> Exec<'a> {
                     }
                     self.state.regs = self.entry;
                     self.state.queue.flush();
+                    origin = Origin::Exception;
                     current = if Self::escalates(current, second) {
                         Fault::coded(VEC_DF, 0)
                     } else {
@@ -3216,17 +3258,17 @@ impl<'a> Exec<'a> {
                     return Err(Fault::gp(0));
                 }
                 let vector = f.imm as u8;
-                self.software_interrupt(vector)?;
+                self.software_interrupt(vector, Origin::Software)?;
             }
             Op::INT3 | Op::ICEBP if self.exits(ExitReason::BREAKPOINT) => {
                 self.breakpoint_exit(f);
             }
-            Op::INT3 => self.software_interrupt(VEC_BREAKPOINT)?,
+            Op::INT3 => self.software_interrupt(VEC_BREAKPOINT, Origin::Exception)?,
             Op::ICEBP => {
                 // The undocumented one-byte `INT 1`. It is a *trap*, not a
                 // software interrupt: the IDT descriptor privilege check that
                 // `INT n` makes does not apply.
-                self.take_interrupt(VEC_DEBUG, None)?;
+                self.take_interrupt(VEC_DEBUG, None, Origin::Exception)?;
             }
             Op::INTO => {
                 // A taken `INTO` is `INT 4` as far as the host's vector set is
@@ -3237,7 +3279,7 @@ impl<'a> Exec<'a> {
                 {
                     self.syscall_exit(f);
                 } else if self.flag(flags::OF) {
-                    self.software_interrupt(VEC_OVERFLOW)?;
+                    self.software_interrupt(VEC_OVERFLOW, Origin::Exception)?;
                 }
             }
             Op::BOUND => self.bound(f)?,
@@ -4484,11 +4526,15 @@ impl<'a> Exec<'a> {
 
     /// `INT n`, which is not the same as an exception: in protected mode the
     /// gate's privilege level is checked against the caller's.
-    fn software_interrupt(&mut self, vector: u8) -> Ex<()> {
+    ///
+    /// `INT3` and `INTO` take the same check (*Intel SDM* Vol 3A §6.12.1.1)
+    /// but are counted as the `#BP` and `#OF` exceptions they raise, so
+    /// `origin` says which of the two this is.
+    fn software_interrupt(&mut self, vector: u8, origin: Origin) -> Ex<()> {
         if self.protected() {
             self.check_software_gate(vector)?;
         }
-        self.take_interrupt(vector, None)
+        self.take_interrupt(vector, None, origin)
     }
 
     /// `BSF` (`reverse` clear) and `BSR`: the index of the lowest or highest

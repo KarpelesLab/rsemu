@@ -2231,6 +2231,18 @@ pub(crate) struct Lines {
     /// The hot path's gate: one relaxed load per instruction on a machine with
     /// no local controller, rather than a lock acquisition per instruction.
     has_intc: AtomicBool,
+    /// Events delivered into the guest, for the `exc` trace channel
+    /// ([`Lines::count_event`]).
+    ///
+    /// Here rather than on [`X86`] or in [`State`] because `Lines` is the one
+    /// piece of wiring every execution borrow already holds — `Exec::lines`,
+    /// under the interpreter and under both translated engines alike — so
+    /// counting threads no new argument through any of them. And because it
+    /// is outside `State` it is outside the snapshot and the state hash by
+    /// construction, and survives a reset and a restore: it is a count of what
+    /// the run did, not part of the machine. [`Lines::snapshot`] and
+    /// [`Lines::restore`] name their fields and leave it alone.
+    exceptions: crate::core::trace::Exceptions,
 }
 
 /// [`Lines::startup`] when no Start-Up is waiting. Not a page: a Start-Up's
@@ -2254,11 +2266,92 @@ impl Default for Lines {
             startup: AtomicU32::new(NO_STARTUP),
             intc: sync::Mutex::new(None),
             has_intc: AtomicBool::new(false),
+            exceptions: crate::core::trace::Exceptions::new(Lines::EVENT_CODES),
         }
     }
 }
 
 impl Lines {
+    /// The `exc` code space: four ranges, because on x86 a vector number does
+    /// not say what kind of event it was ([`exec::Origin`]).
+    ///
+    /// | codes      | origin                | row name               |
+    /// |------------|-----------------------|------------------------|
+    /// | `0..256`   | processor exception   | `page-fault`, …        |
+    /// | `256..512` | `INT n`               | `int-0x80`             |
+    /// | `512..768` | `INTR`, by vector     | `intr-0x20`            |
+    /// | `768`      | the `NMI` pin         | `nmi`                  |
+    ///
+    /// The first two are `sync`, the last two `async`. A separate `INT n`
+    /// range is what keeps a real-mode `INT 10h` off the `x87-fp` row and a
+    /// PC's IRQ 0 — vector 8 under the BIOS's 8259A programming — off the
+    /// `double-fault` one.
+    const EVENT_CODES: u32 = 769;
+    /// Where `INT n`'s range starts.
+    const SOFTWARE_BASE: u32 = 256;
+    /// Where the `INTR` range starts.
+    const EXTERNAL_BASE: u32 = 512;
+    /// The `NMI` pin's one code.
+    const NMI_CODE: u32 = 768;
+
+    /// The guest entered the handler for `vector`, raised as `origin`.
+    #[inline]
+    pub(super) fn count_event(&self, vector: u8, origin: exec::Origin) {
+        let vector = u32::from(vector);
+        self.exceptions.count(match origin {
+            exec::Origin::Exception => vector,
+            exec::Origin::Software => Lines::SOFTWARE_BASE + vector,
+            exec::Origin::External => Lines::EXTERNAL_BASE + vector,
+            exec::Origin::Nmi => Lines::NMI_CODE,
+        });
+    }
+
+    /// Every event delivered so far. Exceptions take the names of *Intel SDM*
+    /// Vol 3A §6.3.1's Table 6-1 ("Protected-Mode Exceptions and
+    /// Interrupts"), spelled out in lower case; everything else is named by
+    /// its range and its vector in hex, the way x86 vectors are written.
+    fn event_report(&self) -> Vec<crate::core::trace::ExceptionCount> {
+        self.exceptions.report(|code| {
+            let vector = code & 0xff;
+            if code == Lines::NMI_CODE {
+                return (String::from("nmi"), true);
+            }
+            if code >= Lines::EXTERNAL_BASE {
+                return (alloc::format!("intr-{vector:#04x}"), true);
+            }
+            if code >= Lines::SOFTWARE_BASE {
+                return (alloc::format!("int-{vector:#04x}"), false);
+            }
+            let name = match vector {
+                0 => "divide-error",
+                1 => "debug",
+                3 => "breakpoint",
+                4 => "overflow",
+                5 => "bound-range",
+                6 => "invalid-opcode",
+                7 => "device-not-available",
+                8 => "double-fault",
+                9 => "coprocessor-segment-overrun",
+                10 => "invalid-tss",
+                11 => "segment-not-present",
+                12 => "stack-fault",
+                13 => "general-protection",
+                14 => "page-fault",
+                16 => "x87-fp",
+                17 => "alignment-check",
+                18 => "machine-check",
+                19 => "simd-fp",
+                20 => "virtualization",
+                21 => "control-protection",
+                // Vector 2 is the NMI's, which this range never holds — the pin
+                // has its own code — and the rest are reserved: either would
+                // be a bug worth seeing under its number.
+                _ => return (alloc::format!("vector-{vector:#04x}"), false),
+            };
+            (String::from(name), false)
+        })
+    }
+
     fn set_intr(&self, asserted: bool) {
         self.intr.store(asserted, Ordering::Release);
     }
@@ -4273,6 +4366,10 @@ pub fn migrations(migrations: &mut crate::core::state::Migrations) -> Result<()>
 impl Device for X86 {
     fn class(&self) -> &'static DeviceClass {
         self.class
+    }
+
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.lines.event_report())
     }
 
     /// The debug surface's route to the page unit: how a gdb `m` packet

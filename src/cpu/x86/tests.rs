@@ -257,6 +257,95 @@ fn an_interrupt_is_masked_by_the_interrupt_flag_but_an_nmi_is_not() {
     assert_eq!(m.regs().rip, 0x4000, "NMI is not maskable");
 }
 
+/// The `exc` trace channel's rows for `cpu`, as `(name, asynchronous, count)`.
+fn exc_rows(cpu: &X86) -> Vec<(alloc::string::String, bool, u64)> {
+    cpu.exceptions()
+        .expect("an x86 core counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect()
+}
+
+/// The `exc` trace channel counts every event the core delivers once, and
+/// tells the three things a vector number can mean apart: `INT 10h` is not
+/// the x87 error, and the timer on vector 8 is not a double fault.
+#[test]
+fn every_event_delivered_is_counted_once_for_the_exc_channel() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let m = machine();
+    // int 0x10 ; int3 ; div al (AL = 0) ; nop ; nop
+    m.load(0x0000, 0x0100, &[0xcd, 0x10, 0xcc, 0xf6, 0xf0, 0x90, 0x90]);
+    m.set_regs(|r| {
+        r.ss = 0x2000;
+        r.rsp = 0x0100;
+        r.rax = 0;
+    });
+    // Every vector used lands on an `IRET` at 0000:4000.
+    for vector in [0x00u64, 0x02, 0x03, 0x08, 0x10] {
+        m.poke(vector * 4, 0x00);
+        m.poke(vector * 4 + 1, 0x40);
+    }
+    m.poke(0x4000, 0xcf);
+    m.cpu.step(); // int 0x10
+    m.cpu.step(); // iret
+    m.cpu.step(); // int3
+    m.cpu.step(); // iret
+    m.cpu.step(); // div: #DE
+    assert_eq!(m.regs().rip, 0x4000, "the divide error was delivered");
+    m.cpu.step(); // iret, past the divide on an 8088
+    m.set_regs(|r| r.eflags |= flags::IF);
+    m.cpu.set_intr_vector(0x08);
+    m.cpu.set_intr(true);
+    m.cpu.step(); // the timer, on vector 8
+    m.cpu.set_intr(false);
+    m.cpu.step(); // iret
+    m.cpu.pulse_nmi();
+    m.cpu.step(); // NMI
+    assert_eq!(m.regs().rip, 0x4000);
+
+    let rows = exc_rows(&m.cpu);
+    if cfg!(feature = "trace") {
+        assert_eq!(
+            rows,
+            [
+                ("divide-error".into(), false, 1),
+                ("breakpoint".into(), false, 1),
+                ("int-0x10".into(), false, 1),
+                ("intr-0x08".into(), true, 1),
+                ("nmi".into(), true, 1),
+            ]
+        );
+    } else {
+        assert!(rows.is_empty(), "no counters compiled in");
+    }
+}
+
+/// A delivery that faults is counted as what the guest took instead: an
+/// `INT n` past a 386's real-mode `IDTR` limit is one `#GP` and no `INT n`.
+#[test]
+fn an_event_whose_delivery_faults_counts_as_the_fault_it_became() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let pc = pc386();
+    pc.start_real(0, 0x1000);
+    // Sixteen vectors' worth of table: 0x20 is past it, 13 is inside.
+    pc.write32(13 * 4, 0x0000_1800);
+    let mut sys = pc.cpu.sys();
+    sys.idtr.base = 0;
+    sys.idtr.limit = 0x3f;
+    pc.cpu.set_sys(sys);
+    pc.write(0x1000, &[0xcd, 0x20, 0xf4]); // int 0x20
+    pc.write(0x1800, &[0xf4]);
+    pc.cpu.step();
+    assert_eq!(pc.regs().rip, 0x1800, "the #GP handler was entered");
+
+    let rows = exc_rows(&pc.cpu);
+    if cfg!(feature = "trace") {
+        assert_eq!(rows, [("general-protection".into(), false, 1)]);
+    } else {
+        assert!(rows.is_empty());
+    }
+}
+
 #[test]
 fn writing_the_stack_segment_shadows_the_next_instruction() {
     let m = machine();
@@ -7131,6 +7220,64 @@ mod long_mode {
         }
 
         // ---- FAULT -------------------------------------------------------
+
+        /// Every engine counts a fault it delivers into the guest exactly as
+        /// the interpreter does, and none counts one the exit mask hands to
+        /// the host — nor an `INT n` the host selected — because the guest
+        /// never took it.
+        #[test]
+        fn every_engine_counts_delivered_events_and_not_host_exits() {
+            let _exc = crate::core::trace::counting_exceptions();
+            let expect = |pc: &Pc, rows: &[(&str, bool, u64)]| {
+                let got = exc_rows(&pc.cpu);
+                if cfg!(feature = "trace") {
+                    let want: Vec<_> = rows.iter().map(|&(n, a, c)| (n.into(), a, c)).collect();
+                    assert_eq!(got, want);
+                } else {
+                    assert!(got.is_empty());
+                }
+            };
+            for engine in engines() {
+                // mov ecx, 0 ; div ecx — taken by the guest's own handler.
+                let code = [0xb9, 0, 0, 0, 0, 0xf7, 0xf1, 0xf4];
+                let pc = Pc::flat32(engine, &code);
+                mark_handler(&pc, 0, at::CODE0 + 0x100);
+                assert!(pc.exit(1_000).is_none(), "{engine:?}");
+                assert_eq!(pc.ram.read_u8(at::MARK).unwrap(), 0xaa, "{engine:?}");
+                expect(&pc, &[("divide-error", false, 1)]);
+
+                // The same fault, given to the host instead.
+                let pc = Pc::flat32(engine, &code);
+                mark_handler(&pc, 0, at::CODE0 + 0x100);
+                pc.cpu.set_exit_mask(ExitMask::NONE.with(ExitReason::FAULT));
+                assert!(pc.exit(1_000).is_some(), "{engine:?}");
+                expect(&pc, &[]);
+
+                // A page fault raised inside a translated block, which the
+                // engine hands back through `Exec::deliver` rather than the
+                // interpreter's step: mov rbx, 0x800000 ; mov rax, [rbx] ; hlt
+                let code = [
+                    0x48, 0xc7, 0xc3, 0x00, 0x00, 0x80, 0x00, 0x48, 0x8b, 0x03, 0xf4,
+                ];
+                let pc = Pc::long64(engine, &code);
+                pc.idt64(14, 0x20, la::HANDLER);
+                pc.write(la::HANDLER, &[0xf4]);
+                pc.run(400);
+                assert_eq!(pc.cpu.regs().rip, la::HANDLER + 1, "{engine:?}");
+                expect(&pc, &[("page-fault", false, 1)]);
+
+                // int 0x80 to the host, int 0x81 through the guest's table.
+                let code = [0xcd, 0x80, 0xcd, 0x81, 0xf4];
+                let pc = Pc::flat32(engine, &code);
+                mark_handler(&pc, 0x80, at::CODE0 + 0x100);
+                mark_handler(&pc, 0x81, at::CODE0 + 0x200);
+                pc.cpu.set_exit_mask(ExitMask::USER);
+                pc.cpu.set_syscall_vectors(VectorSet::NONE.with(0x80));
+                assert!(pc.exit(1_000).is_some(), "{engine:?}");
+                assert!(pc.exit(1_000).is_none(), "{engine:?}");
+                expect(&pc, &[("int-0x81", false, 1)]);
+            }
+        }
 
         #[test]
         fn ud_exits_as_a_fault_at_the_instruction_when_masked_in() {
