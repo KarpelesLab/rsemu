@@ -1243,6 +1243,16 @@ pub(crate) struct Lines {
     /// the machine owns the devices, a wire merely refers to them (§4.3), and
     /// a controller answering is free to take its own locks.
     acks: IntAckHandlers,
+    /// Exceptions and interrupts taken, for the `exc` trace channel
+    /// ([`Lines::count_exception`]).
+    ///
+    /// Here rather than in `State` or on `M68k` because this is the one piece
+    /// of wiring every execution borrow already holds — `Exec::new` takes it,
+    /// so the interpreter, the lifted engine's fallback and every test helper
+    /// reach it without a new argument. And it is wiring, not guest state:
+    /// [`Lines::snapshot`] and [`Lines::restore`] leave it alone, so it is in
+    /// no snapshot and not in the state hash, and a reset does not clear it.
+    exceptions: crate::core::trace::Exceptions,
 }
 
 impl Default for Lines {
@@ -1256,11 +1266,85 @@ impl Default for Lines {
             resets: AtomicU32::new(0),
             reset: AtomicBool::new(false),
             acks: IntAckHandlers::new(),
+            exceptions: crate::core::trace::Exceptions::new(Lines::EXCEPTION_CODES),
         }
     }
 }
 
 impl Lines {
+    /// The `exc` code space: the 8-bit vector number, plus 256 when it was
+    /// reached through an interrupt-acknowledge cycle.
+    ///
+    /// Classified by *how* the vector was reached rather than by its number,
+    /// because the number does not say: vectors 64–255 are "user interrupt
+    /// vectors" by convention only (MC68000UM Table 6-2, M68000PM Table B-1),
+    /// a controller may answer the acknowledge with any vector at all — 2, or
+    /// 15 for "uninitialized" — and only the acknowledge path knows it was
+    /// asked by a device rather than by the instruction stream.
+    const EXCEPTION_CODES: u32 = 512;
+
+    /// An exception was taken into the guest at `vector`; `interrupt` when it
+    /// was an interrupt acknowledge that produced it.
+    #[inline]
+    pub(crate) fn count_exception(&self, vector: u8, interrupt: bool) {
+        let code = u32::from(vector);
+        self.exceptions
+            .count(if interrupt { code + 256 } else { code });
+    }
+
+    /// Every exception taken so far, named after the vector table
+    /// (M68000PM Table B-1; MC68030UM Table 8-1 and M68040UM Table 8-1 for the
+    /// coprocessor and MMU entries).
+    fn exception_report(&self) -> Vec<crate::core::trace::ExceptionCount> {
+        self.exceptions.report(|code| {
+            let interrupt = code >= 256;
+            let v = code & 0xff;
+            let fixed = match v {
+                0 => "reset-ssp",
+                1 => "reset-pc",
+                2 => "bus-error",
+                3 => "address-error",
+                4 => "illegal-instruction",
+                5 => "zero-divide",
+                6 => "chk",
+                7 => "trapv",
+                8 => "privilege-violation",
+                9 => "trace",
+                10 => "line-a",
+                11 => "line-f",
+                13 => "coprocessor-protocol-violation",
+                14 => "format-error",
+                15 => "uninitialized-interrupt",
+                24 => "spurious-interrupt",
+                48 => "fp-bsun",
+                49 => "fp-inexact",
+                50 => "fp-divide-by-zero",
+                51 => "fp-underflow",
+                52 => "fp-operand-error",
+                53 => "fp-overflow",
+                54 => "fp-signaling-nan",
+                55 => "fp-unimplemented-data-type",
+                56 => "mmu-configuration-error",
+                57 => "mmu-illegal-operation",
+                58 => "mmu-access-level-violation",
+                _ => "",
+            };
+            let name = if !fixed.is_empty() {
+                String::from(fixed)
+            } else if (25..=31).contains(&v) {
+                alloc::format!("autovector.{}", v - 24)
+            } else if (32..=47).contains(&v) {
+                alloc::format!("trap.{}", v - 32)
+            } else if v >= 64 {
+                alloc::format!("user.{v}")
+            } else {
+                // 12, 16–23 and 59–63 are reserved by Motorola.
+                alloc::format!("vector.{v}")
+            };
+            (name, interrupt)
+        })
+    }
+
     fn set_ipl(&self, level: u8) {
         let level = level.min(7);
         let previous = self.ipl.swap(level, Ordering::AcqRel);
@@ -2222,6 +2306,10 @@ pub fn register(reg: &mut Registry) -> Result<()> {
 impl Device for M68k {
     fn class(&self) -> &'static DeviceClass {
         &CLASS
+    }
+
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.lines.exception_report())
     }
 
     fn realize(&self, _ctx: &mut RealizeCtx<'_>) -> Result<()> {

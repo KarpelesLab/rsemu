@@ -1537,3 +1537,146 @@ fn resume_restarts_a_halted_core() {
     assert!(!board.cpu.is_halted());
     assert!(board.cpu.step() > 0);
 }
+
+/// Run the `exc` channel's test program on a core with `engine`, and return
+/// what it counted as `(name, asynchronous, count)` rows.
+///
+/// One of each thing worth telling apart: a `TRAP #0`, an `ILLEGAL`, a traced
+/// `TRAP #1` (two frames, so a trap *and* a trace), an autovectored level-3
+/// interrupt the moment the mask drops, and an address error from a word store
+/// to an odd address — which, on the translated engine, is a fault inside a
+/// lifted block handed back to the interpreter. The address-error handler
+/// stops, and level 3 is masked by then, so extra steps change nothing.
+fn exception_rows(engine: super::Engine) -> (Vec<(alloc::string::String, bool, u64)>, Arc<M68k>) {
+    let ram = Arc::new(RamStore::new(0x1_0000));
+    let space = AddressSpace::new("cpu", 24).with_endian(Endian::Big);
+    space
+        .topology()
+        .map(Region::ram("ram", ram.clone()).with_endian(Endian::Big), 0)
+        .expect("64 KiB fits in 24 bits");
+    let cpu = Arc::new(M68k::new(Config::default()).with_engine(engine));
+    cpu.attach_space(Arc::new(space));
+    let board = Board { cpu, ram };
+
+    let handlers: [(u8, u64, &[u16]); 6] = [
+        // TRAP #0 and #1: clear T in the stacked SR, so the traced program
+        // runs on untraced once it returns.
+        (vector::TRAP_BASE, 0x800, &[0x0257, 0x7fff, 0x4e73]),
+        (vector::TRAP_BASE + 1, 0x800, &[0x0257, 0x7fff, 0x4e73]),
+        // ILLEGAL: step over the offending word (ADDQ.L #2,2(A7); RTE).
+        (vector::ILLEGAL, 0x820, &[0x54af, 0x0002, 0x4e73]),
+        // Address error: STOP #$2700.
+        (vector::ADDRESS_ERROR, 0x840, &[0x4e72, 0x2700]),
+        (vector::TRACE, 0x860, &[0x4e73]),
+        // Level 3: raise the stacked mask to 7 (ORI.W #$0700,(A7); RTE), so
+        // the held level is taken once.
+        (
+            vector::AUTOVECTOR_BASE + 3,
+            0x880,
+            &[0x0057, 0x0700, 0x4e73],
+        ),
+    ];
+    for (vec, at, code) in handlers {
+        board.poke_long(u64::from(vec) * 4, at as u32);
+        for (i, w) in code.iter().enumerate() {
+            board.poke_word(at + 2 * i as u64, *w);
+        }
+    }
+    board.cpu.set_ipl(3);
+    board.boot(&[
+        0x4e71, // NOP
+        0x7001, // MOVEQ #1,D0
+        0x4e40, // TRAP #0
+        0x4afc, // ILLEGAL
+        0x007c, 0x8000, // ORI #$8000,SR — trace on
+        0x4e41, // TRAP #1, traced
+        0x46fc, 0x2000, // MOVE #$2000,SR — level 3 is taken after this
+        0x4e71, // NOP
+        0x41f8, 0x1001, // LEA $1001.W,A0
+        0x3080, // MOVE.W D0,(A0) — address error
+        0x4e71, // NOP, never reached
+    ]);
+    for _ in 0..64 {
+        board.cpu.step();
+    }
+    assert!(board.cpu.is_stopped(), "the address-error handler stopped");
+    let rows = board
+        .cpu
+        .exceptions()
+        .expect("an M68k counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    (rows, board.cpu)
+}
+
+/// What [`exception_rows`] should count, in code order.
+fn expected_exception_rows() -> Vec<(alloc::string::String, bool, u64)> {
+    if !cfg!(feature = "trace") {
+        return Vec::new();
+    }
+    [
+        ("address-error", false),
+        ("illegal-instruction", false),
+        ("trace", false),
+        ("trap.0", false),
+        ("trap.1", false),
+        ("autovector.3", true),
+    ]
+    .into_iter()
+    .map(|(name, asynchronous)| (name.into(), asynchronous, 1))
+    .collect()
+}
+
+/// The `exc` trace channel counts each frame stacked once, under the vector
+/// table's name, files the interrupt as asynchronous, and does not count the
+/// reset sequence's vectors 0 and 1.
+#[test]
+fn every_exception_taken_is_counted_once_for_the_exc_channel() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let (rows, _) = exception_rows(super::Engine::Interp);
+    assert_eq!(rows, expected_exception_rows());
+}
+
+/// The translated engine raises no exception of its own — a fault in a block
+/// is handed back to the interpreter, which takes it — so it counts exactly
+/// what the interpreter does, the fault included and not twice.
+#[cfg(all(feature = "cpu-m68k-lift", feature = "jit"))]
+#[test]
+fn the_translated_engine_counts_the_same_exceptions() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let (rows, cpu) = exception_rows(super::Engine::Jit);
+    assert_eq!(rows, expected_exception_rows());
+    let stats = cpu.jit_stats().expect("the translated engine ran");
+    assert!(
+        stats.executed > 0 && stats.faults > 0,
+        "the store faulted inside a lifted block, not only on the interpreter: {stats:?}"
+    );
+}
+
+/// A controller-supplied vector reached through the acknowledge is an
+/// interrupt whatever its number, and is named for it.
+#[test]
+fn a_vectored_interrupt_is_counted_as_asynchronous_under_its_number() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let board = Board::new();
+    board.boot(&[0x4e71]);
+    board.poke_long(64 * 4, 0x0e00);
+    board.poke_word(0xe00, 0x4e71);
+    board.cpu.set_interrupt_vector(Some(64));
+    board.cpu.set_ipl(7);
+    board.cpu.step();
+    assert_eq!(board.cpu.regs().pc, 0xe00);
+    let rows: Vec<_> = board
+        .cpu
+        .exceptions()
+        .expect("an M68k counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    if cfg!(feature = "trace") {
+        assert_eq!(rows, [("user.64".into(), true, 1)]);
+    } else {
+        assert!(rows.is_empty());
+    }
+}

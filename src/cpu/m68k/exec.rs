@@ -1588,6 +1588,21 @@ impl<'a> Exec<'a> {
         // exception a `STOP` executed with T set leaves behind.
         self.state.stopped = false;
         self.state.last_vector = Some(vector);
+        // Every exception the guest takes is delivered here — the interrupt
+        // acknowledge, `service`'s vectored traps and 68000 group-0 frames,
+        // and the 68010/020/030/040 bus- and address-error frames — and the
+        // lifted engine raises none of its own: a block that faults hands the
+        // instruction back to `Exec::step`, which reaches this once. So this
+        // is one count per exception processed: a traced `TRAP` is two
+        // exceptions and counts two (MC68000UM §6.3.8, MC68020UM §6.1.11),
+        // while a 68020 interrupt's throwaway frame is a second frame of the
+        // *same* exception and counts one (§6.1.9). Reset is not taken
+        // through here (`reset_sequence`), and a double bus fault counts the
+        // exception that halted, which is the one the guest was trying to
+        // take. `interrupting` is set only by `take_interrupt`, and a step
+        // that takes an interrupt does nothing else, so it says how this
+        // vector was reached.
+        self.lines.count_exception(vector, self.interrupting);
         if self.model.has_020()
             && let Frame::Format(image) = &frame
         {
