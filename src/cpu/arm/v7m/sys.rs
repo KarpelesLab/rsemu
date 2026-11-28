@@ -337,6 +337,11 @@ pub mod exc_return {
     /// `ARM_CM33_NTZ` port seeds every new task's frame with exactly this.
     pub const V8_THREAD_PSP: u32 = 0xffff_ffbc;
 
+    /// Armv8-M bit 6, `S`: the frame is on a Secure stack.
+    pub const S: u32 = 1 << 6;
+    /// Armv8-M bit 0, `ES`: the exception was taken to Secure state.
+    pub const ES: u32 = 1 << 0;
+
     /// How many bytes the basic exception frame occupies.
     pub const BASIC_FRAME: u32 = 0x20;
     /// How many bytes the extended frame occupies: eight words, then

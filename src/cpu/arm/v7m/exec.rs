@@ -1274,7 +1274,12 @@ impl<'a> Exec<'a> {
         let lr = if self.cfg.is_v8m() {
             #[cfg(feature = "cpu-arm-v8m")]
             {
-                super::v8m::encode_exc_return(self.state.in_handler(), from_psp, fp_frame)
+                super::v8m::encode_exc_return(
+                    self.state.in_handler(),
+                    from_psp,
+                    fp_frame,
+                    self.cfg.ext.security == super::Security::SecureOnly,
+                )
             }
             #[cfg(not(feature = "cpu-arm-v8m"))]
             {
@@ -2943,7 +2948,8 @@ impl<'a> Exec<'a> {
     fn decode_exc_return(&self, magic: u32) -> Ex<(bool, bool, bool)> {
         #[cfg(feature = "cpu-arm-v8m")]
         if self.cfg.is_v8m() {
-            return match super::v8m::decode_exc_return(magic) {
+            let secure = self.cfg.ext.security == super::Security::SecureOnly;
+            return match super::v8m::decode_exc_return(magic, secure) {
                 Some(r) => Ok((r.to_handler, r.use_psp, r.fp_frame)),
                 None => Err(Trap::INVPC),
             };

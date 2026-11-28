@@ -32,6 +32,21 @@
 //!   `FPCCR.S`/`SFRDY`/`TS`/`CLRONRET`/`CLRONRETS`/`LSPENS` and
 //!   `CONTROL.SFPA` read as zero and ignore writes.
 //!
+//! # The Secure-only option
+//!
+//! A part configured with
+//! [`Security::SecureOnly`](super::Security::SecureOnly) implements the
+//! extension and never leaves Secure state, where the PE resets: firmware that
+//! never configures the SAU nor branches to Non-secure code. The one thing
+//! that changes for it is `EXC_RETURN`: every exception is taken from and to
+//! Secure state, so entry generates `S` and `ES` set (`0xFFFFFFF1`,
+//! `0xFFFFFFF9`, `0xFFFFFFFD` — numerically the ARMv7-M values) and return
+//! requires them. A return to Non-secure state (`S` clear), a Non-secure
+//! exception (`ES` clear) or a frame carrying the callee-saved registers
+//! (`DCRS` clear) needs the Non-secure world, which is not modelled, and is
+//! `INVPC`. Everything listed above for the SAU, the `_NS` aliases and
+//! `TTA`/`BXNS`/`BLXNS` is as without the extension.
+//!
 //! # What is added
 //!
 //! | Mechanism | Where |
@@ -164,15 +179,24 @@ pub struct ExcReturn {
 /// Decode an Armv8-M `EXC_RETURN`, or `None` for a value this core may not
 /// return through (the caller raises `INVPC`).
 ///
-/// Bits `[31:7]` are the `0xFF` prefix and RES1; bit 6 `S` and bit 0 `ES`
-/// must be clear and bit 5 `DCRS` set, because a core with one security state
-/// has only one kind of frame; bit 1 is RES0. Handler mode on the process
-/// stack (`Mode` clear, `SPSEL` set) does not exist.
+/// Bits `[31:7]` are the `0xFF` prefix and RES1; bit 5 `DCRS` must be set,
+/// because no frame here carries the callee-saved registers; bit 1 is RES0.
+/// Bit 6 `S` and bit 0 `ES` must both be clear on a part without the
+/// Security Extension, which has only one security state, and both set on a
+/// [`Security::SecureOnly`](super::Security::SecureOnly) part, whose
+/// exceptions are all taken to, and return to, Secure state. Handler mode on
+/// the process stack (`Mode` clear, `SPSEL` set) does not exist.
 #[must_use]
-pub const fn decode_exc_return(value: u32) -> Option<ExcReturn> {
-    const FIXED_MASK: u32 = 0xffff_ff80 | (1 << 6) | (1 << 5) | (1 << 1) | 1;
-    const FIXED: u32 = 0xffff_ff80 | (1 << 5);
-    if value & FIXED_MASK != FIXED {
+pub const fn decode_exc_return(value: u32, secure: bool) -> Option<ExcReturn> {
+    const FIXED_MASK: u32 = 0xffff_ff80 | exc_return::S | (1 << 5) | (1 << 1) | exc_return::ES;
+    let fixed = 0xffff_ff80
+        | (1 << 5)
+        | if secure {
+            exc_return::S | exc_return::ES
+        } else {
+            0
+        };
+    if value & FIXED_MASK != fixed {
         return None;
     }
     let to_handler = value & (1 << 3) == 0;
@@ -187,15 +211,29 @@ pub const fn decode_exc_return(value: u32) -> Option<ExcReturn> {
     })
 }
 
-/// The `EXC_RETURN` an Armv8-M exception entry puts in `LR`.
+/// The `EXC_RETURN` an Armv8-M exception entry puts in `LR`. On a
+/// [`Security::SecureOnly`](super::Security::SecureOnly) part (`secure`) the
+/// exception is taken from and to Secure state, so `S` and `ES` are set —
+/// which gives `0xFFFFFFF1`, `0xFFFFFFF9` and `0xFFFFFFFD`, the ARMv7-M
+/// values.
 #[must_use]
-pub const fn encode_exc_return(from_handler: bool, from_psp: bool, fp_frame: bool) -> u32 {
+pub const fn encode_exc_return(
+    from_handler: bool,
+    from_psp: bool,
+    fp_frame: bool,
+    secure: bool,
+) -> u32 {
     let base = if from_handler {
         exc_return::V8_HANDLER_MSP
     } else if from_psp {
         exc_return::V8_THREAD_PSP
     } else {
         exc_return::V8_THREAD_MSP
+    };
+    let base = if secure {
+        base | exc_return::S | exc_return::ES
+    } else {
+        base
     };
     if fp_frame {
         base & !exc_return::FP_FRAME

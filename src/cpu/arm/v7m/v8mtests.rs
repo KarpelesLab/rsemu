@@ -17,7 +17,7 @@ use crate::core::state::{MachineShape, Migrations, StateReader, StateWriter};
 use super::isa::{decode, is_32bit};
 use super::sys::{Access, Exception, ccr, control, exc_return, fsr, shcsr};
 use super::v8m::{CPUID_CORTEX_M33, CPUID_CORTEX_M35P, decode_exc_return};
-use super::{ArmV7m, Config};
+use super::{ArmV7m, Config, Security};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -511,7 +511,7 @@ fn the_exc_return_decoder_takes_exactly_the_legal_values() {
         (0xffff_ffa8, false, false, true),
         (0xffff_ffac, false, true, true),
     ] {
-        let r = decode_exc_return(value).unwrap();
+        let r = decode_exc_return(value, false).unwrap();
         assert_eq!((r.to_handler, r.use_psp, r.fp_frame), (handler, psp, fp));
     }
     for bad in [
@@ -523,8 +523,134 @@ fn the_exc_return_decoder_takes_exactly_the_legal_values() {
         0xfeff_ffbc, // not the 0xFF prefix
         0xffff_7fbc, // a RES1 bit clear
     ] {
-        assert!(decode_exc_return(bad).is_none(), "{bad:#x}");
+        assert!(decode_exc_return(bad, false).is_none(), "{bad:#x}");
     }
+}
+
+// A part with the Security Extension that stays in Secure state (what the
+// ST33K1M5 secure element's Cortex-M35P runs its OS in): every exception is
+// taken from and to Secure state, so S and ES are set in EXC_RETURN.
+
+fn secure_m35p(code: &[u16]) -> Harness {
+    Harness::new(
+        Config::CORTEX_M35P.with_security(Security::SecureOnly),
+        code,
+    )
+}
+
+#[test]
+fn a_secure_exception_entry_sets_s_and_es() {
+    // Thread mode, main stack.
+    let h = secure_m35p(&[SVC]);
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(14), 0xffff_fff9);
+
+    // Thread mode, process stack: the value Secure-state firmware returns
+    // through, and seeds task frames with.
+    let h = secure_m35p(&[SVC]);
+    let mut regs = h.cpu.regs();
+    regs.control = control::SPSEL;
+    regs.psp = 0xc00;
+    h.cpu.set_regs(regs);
+    h.cpu.step();
+    assert_eq!(h.cpu.reg(14), 0xffff_fffd);
+
+    // Handler mode (SVC in the SVCall handler escalates to HardFault).
+    let h = secure_m35p(&[SVC]);
+    h.handler(&[SVC]);
+    h.steps(2);
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    assert_eq!(h.cpu.reg(14), 0xffff_fff1);
+}
+
+#[test]
+fn a_secure_exc_return_brings_the_process_stack_back() {
+    // `BX r0` with r0 = 0xFFFFFFFD from the handler: legal here.
+    let h = secure_m35p(&[SVC, 0x2009]);
+    h.handler(&[0x4700]);
+    h.enable_faults();
+    let mut regs = h.cpu.regs();
+    regs.control = control::SPSEL;
+    regs.psp = 0xc00;
+    regs.r[0] = 0xffff_fffd;
+    h.cpu.set_regs(regs);
+    h.steps(3);
+    assert_eq!(h.cfsr() & fsr::UF_INVPC, 0);
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    assert_eq!(h.cpu.psp(), 0xc00);
+    assert_eq!(h.cpu.reg(0), 9);
+}
+
+#[test]
+fn a_return_to_non_secure_state_is_invpc_on_a_secure_only_part() {
+    // 0xFFFFFFBC (S and ES clear) would return to Non-secure state, which
+    // is not modelled.
+    let h = secure_m35p(&[SVC]);
+    h.handler(&[0x4700]);
+    h.enable_faults();
+    h.cpu.set_reg(0, 0xffff_ffbc);
+    h.steps(2);
+    assert_ne!(h.cfsr() & fsr::UF_INVPC, 0);
+}
+
+#[test]
+fn the_secure_exc_return_decoder_takes_exactly_the_secure_values() {
+    for (value, handler, psp, fp) in [
+        (0xffff_fff1, true, false, false),
+        (0xffff_fff9, false, false, false),
+        (0xffff_fffd, false, true, false),
+        (0xffff_ffe1, true, false, true),
+        (0xffff_ffe9, false, false, true),
+        (0xffff_ffed, false, true, true),
+    ] {
+        let r = decode_exc_return(value, true).unwrap();
+        assert_eq!((r.to_handler, r.use_psp, r.fp_frame), (handler, psp, fp));
+    }
+    for bad in [
+        0xffff_ffbc, // S and ES clear: back to Non-secure state
+        0xffff_fffc, // ES clear: a Non-secure exception
+        0xffff_ffbd, // S clear
+        0xffff_ffdd, // DCRS clear: a frame with the callee-saved registers
+        0xffff_ffff, // bit 1
+        0xffff_fff5, // Handler mode on the process stack
+    ] {
+        assert!(decode_exc_return(bad, true).is_none(), "{bad:#x}");
+    }
+}
+
+#[test]
+fn only_an_armv8m_part_has_the_security_extension() {
+    let cpu = ArmV7m::new(Config::CORTEX_M4.with_security(Security::SecureOnly));
+    assert_eq!(cpu.config().ext.security, Security::Absent);
+    let cpu = ArmV7m::new(Config::CORTEX_M35P.with_security(Security::SecureOnly));
+    assert_eq!(cpu.config().ext.security, Security::SecureOnly);
+    assert_eq!(
+        Config::CORTEX_M35P.ext.security,
+        Security::Absent,
+        "the preset's default"
+    );
+}
+
+#[test]
+fn from_props_takes_the_security_extension() {
+    let props = Props::new()
+        .with("part", Value::from("cortex-m35p"))
+        .with("security", Value::from("secure-only"));
+    assert_eq!(
+        ArmV7m::from_props(&props).unwrap().config(),
+        Config::CORTEX_M35P.with_security(Security::SecureOnly)
+    );
+    let props = Props::new()
+        .with("part", Value::from("cortex-m35p"))
+        .with("security", Value::from("absent"));
+    assert_eq!(
+        ArmV7m::from_props(&props).unwrap().config(),
+        Config::CORTEX_M35P
+    );
+    let props = Props::new()
+        .with("part", Value::from("cortex-m35p"))
+        .with("security", Value::from("non-secure"));
+    assert!(ArmV7m::from_props(&props).is_err());
 }
 
 #[cfg(feature = "cpu-arm-v7m-fp")]

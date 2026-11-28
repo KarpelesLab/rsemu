@@ -28,15 +28,21 @@
 #   * the built corpus: 18 of 18 programs pass, one of them Armv8-M.
 # ---------------------------------------------------------------------------
 
-security-extension          # TrustZone for Armv8-M: Secure state, the SAU and
-                            # IDAU, the `_NS` register banks, secure
-                            # exception frames and FNC_RETURN. The core is a
-                            # v8-M Mainline part *without* the extension --
-                            # what an STM32U5 with TZEN=0 presents. The SAU
-                            # block and NVIC_ITNS read as zero; `_NS` MRS/MSR
-                            # aliases are RAZ/WI; TTA/TTAT, BXNS and BLXNS are
-                            # UNDEFINED; SG is a NOP; EXC_RETURN.S/ES set or
-                            # DCRS clear is INVPC. DDI 0553 B3, C2.4.
+security-extension          # TrustZone for Armv8-M beyond Secure state:
+                            # Non-secure state, the SAU and IDAU, the `_NS`
+                            # register banks, Non-secure exceptions, frames
+                            # with the callee-saved registers and
+                            # FNC_RETURN. A part is either without the
+                            # extension -- what an STM32U5 with TZEN=0
+                            # presents: EXC_RETURN.S/ES set or DCRS clear is
+                            # INVPC -- or `Security::SecureOnly`, the
+                            # extension present and the PE kept in Secure
+                            # state, where EXC_RETURN has S/ES set and S/ES
+                            # clear or DCRS clear is INVPC. Either way the
+                            # SAU block and NVIC_ITNS read as zero; `_NS`
+                            # MRS/MSR aliases are RAZ/WI; TTA/TTAT, BXNS and
+                            # BLXNS are UNDEFINED; SG is a NOP. DDI 0553 B3,
+                            # C2.4.
 
 id-registers                # ID_PFR0-1, ID_DFR0, ID_AFR0, ID_MMFR0-3 and
                             # ID_ISAR0-5 read as zero, as they do on this

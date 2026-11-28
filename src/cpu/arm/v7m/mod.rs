@@ -301,6 +301,40 @@ pub struct Extensions {
     /// without it. PMSAv6 requires it (DDI 0419E B3.5), because an MPU with
     /// nothing unprivileged to restrict would be a decoration.
     pub unpriv: bool,
+    /// The Armv8-M Security Extension (TrustZone), as far as it is modelled.
+    ///
+    /// Only an Armv8-M part can have it: [`ArmV7m::new`] holds every other
+    /// architecture to [`Security::Absent`].
+    pub security: Security,
+}
+
+/// Whether an Armv8-M part implements the Security Extension, and how much
+/// of it this model carries.
+///
+/// The extension is the IC designer's choice (*Arm Cortex-M35P r1p1 Lite
+/// Security Target*, §1.4, lists it beside the MPU, FPU and DSP options), and
+/// it is visible to software even when nothing uses the Non-secure world: a
+/// PE that implements it comes out of reset in **Secure** state, so every
+/// exception it takes is a Secure one and every `EXC_RETURN` it generates
+/// has `S` and `ES` set (DDI 0553, "EXC_RETURN"). Firmware written for such a
+/// part returns through `0xFFFFFFFD` and seeds task frames with it; on a part
+/// without the extension that value is an `INVPC` UsageFault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Security {
+    /// No Security Extension: one security state (DDI 0553 calls it
+    /// Non-secure), `EXC_RETURN.S` and `.ES` clear. What an STM32U5 with
+    /// `TZEN = 0` presents, and every preset's default.
+    Absent,
+    /// The extension is implemented and the PE stays in Secure state, which
+    /// is where it resets: firmware that never configures the SAU nor
+    /// branches to Non-secure code. Exception entry generates `EXC_RETURN`
+    /// with `S` and `ES` set; exception return takes those values. The
+    /// Non-secure world itself is not modelled — a return to Non-secure state
+    /// (`S` clear) or through a frame with the callee-saved registers
+    /// (`DCRS` clear) is `INVPC`, and the SAU, the `_NS` banks and
+    /// `BXNS`/`BLXNS` behave as on a part without the extension.
+    SecureOnly,
 }
 
 impl Extensions {
@@ -310,6 +344,7 @@ impl Extensions {
         fp: FpUnit::None,
         mpu: true,
         unpriv: true,
+        security: Security::Absent,
     };
     /// An SC300: the Cortex-M3's options — ARMv7-M, no DSP, no FPU — with
     /// its optional PMSAv7 MPU modelled present, as the Cortex-M3's is.
@@ -320,6 +355,7 @@ impl Extensions {
         fp: FpUnit::None,
         mpu: true,
         unpriv: true,
+        security: Security::Absent,
     };
     /// A Cortex-M4 or M7 without the floating-point option.
     pub const CORTEX_M4: Extensions = Extensions {
@@ -327,6 +363,7 @@ impl Extensions {
         fp: FpUnit::None,
         mpu: true,
         unpriv: true,
+        security: Security::Absent,
     };
     /// A Cortex-M4**F**: the same part with FPv4-SP-D16.
     pub const CORTEX_M4F: Extensions = Extensions {
@@ -361,6 +398,7 @@ impl Extensions {
         fp: FpUnit::None,
         mpu: true,
         unpriv: true,
+        security: Security::Absent,
     };
     /// A Cortex-M35P with its FPU: single-precision arithmetic with
     /// double-precision loads and stores, sixteen `D` registers — what this
@@ -380,6 +418,7 @@ impl Extensions {
         fp: FpUnit::None,
         mpu: false,
         unpriv: false,
+        security: Security::Absent,
     };
     /// A Cortex-M0+ with both of its protection options built in: the
     /// eight-region PMSAv6 MPU and the Unprivileged/Privileged Extension
@@ -652,6 +691,10 @@ impl Config {
     /// **without** the cache, as every other preset here is cacheless:
     /// `CLIDR` and `CTR` read zero and `CCR.IC` is RAZ/WI.
     /// `tests/conformance/ledgers/cpu-arm-v8m.txt` lists all three gaps.
+    ///
+    /// A part whose designer included the Security Extension, running
+    /// firmware that stays in Secure state, is this preset
+    /// [`with_security`](Config::with_security)`(`[`Security::SecureOnly`]`)`.
     #[cfg(feature = "cpu-arm-v8m")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cpu-arm-v8m")))]
     pub const CORTEX_M35P: Config = Config {
@@ -846,6 +889,15 @@ impl Config {
         self
     }
 
+    /// Same configuration, with the Security Extension modelled as
+    /// `security` (see [`Security`]). Only an Armv8-M part can have it;
+    /// [`ArmV7m::new`] holds any other architecture to [`Security::Absent`].
+    #[must_use]
+    pub const fn with_security(mut self, security: Security) -> Config {
+        self.ext.security = security;
+        self
+    }
+
     /// Same configuration, with a different number of implemented priority
     /// bits. Clamped to `1..=8`.
     #[must_use]
@@ -877,6 +929,9 @@ impl Default for Config {
 /// `cortex-m33` needs `cpu-arm-v8m` and a `cortex-m0` needs `cpu-arm-v6m`,
 /// and `cortex-m33f` needs both `cpu-arm-v8m` and the FPU — as do
 /// `cortex-m35p` and `cortex-m35pf`.
+/// The `security` property's values (see [`Security`]).
+const SECURITY: &[&str] = &["absent", "secure-only"];
+
 const PARTS: &[&str] = &[
     #[cfg(feature = "cpu-arm-v6m")]
     "cortex-m0",
@@ -1207,6 +1262,18 @@ impl ArmV7m {
             },
             ..cfg
         };
+        // The Security Extension is Armv8-M's; no other architecture has it.
+        let cfg = if cfg.is_v8m() {
+            cfg
+        } else {
+            Config {
+                ext: Extensions {
+                    security: Security::Absent,
+                    ..cfg.ext
+                },
+                ..cfg
+            }
+        };
         let cfg = if cfg.is_v6m() {
             Config {
                 ext: Extensions {
@@ -1268,6 +1335,14 @@ impl ArmV7m {
         };
         let syst_calib =
             r.or_range("syst-calib", u64::from(SYST_CALIB_UNKNOWN), 0..=0xffff_ffff)? as u32;
+        let security = if props.contains("security") {
+            match r.require_enum("security", SECURITY)? {
+                "secure-only" => Security::SecureOnly,
+                _ => Security::Absent,
+            }
+        } else {
+            Security::Absent
+        };
         r.finish()?;
         let base = match part {
             #[cfg(feature = "cpu-arm-v6m")]
@@ -1334,6 +1409,7 @@ impl ArmV7m {
                 },
                 mpu: base.ext.mpu && mpu_override,
                 unpriv: base.ext.unpriv,
+                security,
             },
             reset_vtor: vtor as u32,
             cpuid: cpuid.unwrap_or(base.cpuid),
@@ -1926,6 +2002,12 @@ pub static CLASS: DeviceClass = DeviceClass {
             summary: "the value CPUID reads, for silicon whose revision differs from the part's default",
         },
         PropertySpec {
+            name: "security",
+            kind: ValueKind::Str,
+            required: false,
+            summary: "the Armv8-M Security Extension: absent (default) or secure-only (implemented, the PE stays in Secure state); Armv8-M parts only",
+        },
+        PropertySpec {
             name: "syst-calib",
             kind: ValueKind::Uint,
             required: false,
@@ -2364,6 +2446,7 @@ pub fn schema() -> crate::machine::validate::ClassSchema {
         .prop(PropSchema::new("vtor", ValueKind::Uint).range(0, 0xffff_ff80))
         .prop(PropSchema::new("cpuid", ValueKind::Uint).range(0, 0xffff_ffff))
         .prop(PropSchema::new("syst-calib", ValueKind::Uint).range(0, 0xffff_ffff))
+        .prop(PropSchema::new("security", ValueKind::Str).values(SECURITY))
         // Inputs only. `irq0`…`irq239` are the NVIC's external lines.
         .port_bank("irq", PortDir::In, IRQ_LINES)
         .port("nmi", PortDir::In)

@@ -2023,7 +2023,11 @@ cpu-arm-v7m-fp = ["cpu-arm-v7m", "float"]
 # regions, the A1-A3 aliases, MAIR0/1, overlap faults) and the v8-M SCB bits.
 # Modelled *without* the Security Extension -- what an STM32U5 with TZEN=0
 # runs -- so there is no Secure state, no SAU and no _NS banking; TTA/TTAT,
-# BXNS and BLXNS are UNDEFINED. A v7-M-only build links none of it, and v7-M
+# BXNS and BLXNS are UNDEFINED. A part may instead be configured
+# `security = "secure-only"` (Config::with_security): the extension present
+# and the PE kept in Secure state, as firmware that never enters the
+# Non-secure world sees it, which changes EXC_RETURN to S/ES set. A v7-M-only
+# build links none of it, and v7-M
 # parts behave identically with or without it. `no_std + alloc`, no `unsafe`,
 # no dependencies. The Cortex-M35P (`part = "cortex-m35p"` / `"cortex-m35pf"`)
 # is the same architecture and options with its own CPUID; its instruction
