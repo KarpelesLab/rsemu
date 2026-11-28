@@ -2663,6 +2663,62 @@ mod tests {
         }
     }
 
+    /// The `exc` channel counts a trap a **block** raised exactly as it
+    /// counts the interpreter's: the store fault reaches the guest through
+    /// `deliver`, which funnels into `Exec::enter_exception` like
+    /// `Exec::step` does, and nothing on the translated path counts twice.
+    #[test]
+    fn a_fault_from_a_block_is_counted_like_an_interpreted_one() {
+        use crate::core::device::Device as _;
+        let _exc = crate::core::trace::counting_exceptions();
+        let program = [
+            0xd2a0_0407, // movz x7, #0x20, lsl #16   ; the read-only page
+            0xf940_00e5, // ldr  x5, [x7]
+            0xf900_00e5, // str  x5, [x7]             ; faults, from a block
+            0x1400_0000, // b    .
+        ];
+        let rows = |cpu: &Cpu| -> Vec<_> {
+            cpu.exceptions()
+                .expect("an AArch64 core counts")
+                .into_iter()
+                .map(|r| (r.name, r.asynchronous, r.count))
+                .collect()
+        };
+        for engine in [Engine::Interp, Engine::Jit, Engine::JitHost] {
+            let cpu = core(engine, &program);
+            enable_mmu(&cpu);
+            let mut sys = cpu.sysregs();
+            sys.vbar_el1 = VBAR;
+            cpu.set_sysregs(sys);
+            // "Current EL with SP_ELx, synchronous": a handler that stops,
+            // so the one fault is the only exception the run takes.
+            let space = cpu.space().expect("the core has its space");
+            space
+                .write(VBAR + 0x200, Width::U32, 0x1400_0000, MemAttrs::DEFAULT)
+                .expect("inside RAM");
+            for _ in 0..3 {
+                cpu.run_budget(8192);
+            }
+            assert_eq!(cpu.pc(), VBAR + 0x200, "parked in the handler, {engine:?}");
+            if engine != Engine::Interp {
+                assert!(
+                    cpu.jit_stats().expect("a jit core").blocks > 0,
+                    "nothing was translated, so the block path is untested"
+                );
+            }
+            let got = rows(&cpu);
+            if cfg!(feature = "trace") {
+                assert_eq!(
+                    got,
+                    [("data-abort-same".into(), false, 1)],
+                    "under {engine:?}"
+                );
+            } else {
+                assert!(got.is_empty(), "no counters compiled in");
+            }
+        }
+    }
+
     #[test]
     fn a_remapping_after_a_tlbi_is_seen_by_a_compiled_load() {
         // The shadow's stamp is `SysRegs::translation_gen`, which is what a

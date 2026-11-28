@@ -731,6 +731,67 @@ pub struct Lines {
     /// `Exec::new` an argument for the sake of one instruction. The roster
     /// holds `Weak<Lines>` back, so there is no cycle.
     cluster: Option<Arc<psci::Cluster>>,
+    /// Exceptions taken, for the `exc` trace channel ([`Lines::count_exception`]).
+    ///
+    /// Here for the reason `cluster` is: this is the one piece of wiring
+    /// every `Exec` already borrows — the interpreter's, the translated
+    /// engine's `deliver` and every test harness — so counting at
+    /// `Exec::enter_exception` needs no new argument threaded through any of
+    /// them. Not guest state, like everything else here that is not an
+    /// input pin: it survives a reset (warm or cold) and a snapshot restore,
+    /// and is in no chunk and not in the state hash.
+    exceptions: crate::core::trace::Exceptions,
+}
+
+/// The row name the `exc` channel gives exception class `ec`.
+///
+/// DDI 0487's `ESR_EL1` register description, the EC field, is the table; the names are
+/// short forms of its descriptions, with `-a64`/`-a32` where the table itself
+/// distinguishes the execution state and `-lower`/`-same` where it
+/// distinguishes the level the exception came from. A class the table has and
+/// this list does not reads `ec-0xNN`, so nothing is hidden behind a guess.
+fn exception_class_name(ec: u64) -> String {
+    let name = match ec {
+        0x00 => "unknown",
+        0x01 => "wfi-wfe",
+        0x03 => "mcr-mrc-cp15",
+        0x04 => "mcrr-mrrc-cp15",
+        0x05 => "mcr-mrc-cp14",
+        0x06 => "ldc-stc-cp14",
+        0x07 => "fp-access",
+        0x09 => "pauth",
+        0x0c => "mrrc-cp14",
+        0x0d => "branch-target",
+        0x0e => "illegal-state",
+        0x11 => "svc-a32",
+        0x12 => "hvc-a32",
+        0x13 => "smc-a32",
+        0x15 => "svc-a64",
+        0x16 => "hvc-a64",
+        0x17 => "smc-a64",
+        0x18 => "sysreg-trap",
+        0x19 => "sve-access",
+        0x20 => "instruction-abort-lower",
+        0x21 => "instruction-abort-same",
+        0x22 => "pc-alignment",
+        0x24 => "data-abort-lower",
+        0x25 => "data-abort-same",
+        0x26 => "sp-alignment",
+        0x28 => "fp-exception-a32",
+        0x2c => "fp-exception-a64",
+        0x2f => "serror-syndrome",
+        0x30 => "breakpoint-lower",
+        0x31 => "breakpoint-same",
+        0x32 => "software-step-lower",
+        0x33 => "software-step-same",
+        0x34 => "watchpoint-lower",
+        0x35 => "watchpoint-same",
+        0x38 => "bkpt-a32",
+        0x3a => "vector-catch-a32",
+        0x3c => "brk",
+        _ => return alloc::format!("ec-{ec:#04x}"),
+    };
+    String::from(name)
 }
 
 impl Default for Lines {
@@ -752,6 +813,7 @@ impl Default for Lines {
             start_context: AtomicU64::new(0),
             start_pending: AtomicBool::new(false),
             cluster: None,
+            exceptions: crate::core::trace::Exceptions::new(Lines::EXCEPTION_CODES),
         }
     }
 }
@@ -768,6 +830,54 @@ impl Lines {
     pub const TIMER_PHYS: u64 = 1 << 0;
     /// The EL1 virtual timer's output.
     pub const TIMER_VIRT: u64 = 1 << 1;
+
+    /// The `exc` code space: a synchronous exception as its `ESR_ELx.EC`
+    /// (six bits, `0..64`), then the three asynchronous kinds above it —
+    /// see [`Lines::EXC_IRQ`].
+    ///
+    /// No target exception level in the code, because there is only one:
+    /// this core implements EL0 and EL1 (`ID_AA64PFR0_EL1`), and every
+    /// exception it takes is taken to EL1. A core that grows EL2 would widen
+    /// this to one block per target level — `el2.hvc-a64` and `el1.svc-a64`
+    /// are different findings about a hypervisor — and until then a prefix
+    /// would be a constant on every row.
+    const EXCEPTION_CODES: u32 = 67;
+    /// `exc` code for an IRQ.
+    const EXC_IRQ: u32 = 64;
+    /// `exc` code for an FIQ.
+    const EXC_FIQ: u32 = 65;
+    /// `exc` code for an SError.
+    const EXC_SERROR: u32 = 66;
+
+    /// An exception of `kind` was delivered into the guest; `class` is its
+    /// `ESR_ELx.EC` when it is synchronous.
+    #[inline]
+    fn count_exception(&self, kind: sysreg::VectorKind, class: Option<u64>) {
+        use sysreg::VectorKind;
+        let code = match (kind, class) {
+            // EC is six bits; the mask keeps a malformed one on a real row
+            // rather than on an interrupt's.
+            (VectorKind::Synchronous, Some(ec)) => (ec & 0x3f) as u32,
+            // A synchronous exception with no syndrome is not one this core
+            // raises; `other` is the honest row for it.
+            (VectorKind::Synchronous, None) => u32::MAX,
+            (VectorKind::Irq, _) => Lines::EXC_IRQ,
+            (VectorKind::Fiq, _) => Lines::EXC_FIQ,
+            (VectorKind::SError, _) => Lines::EXC_SERROR,
+        };
+        self.exceptions.count(code);
+    }
+
+    /// Every exception taken so far, named from DDI 0487's exception class
+    /// table ([`exception_class_name`]).
+    fn exception_report(&self) -> Vec<crate::core::trace::ExceptionCount> {
+        self.exceptions.report(|code| match code {
+            Lines::EXC_IRQ => (String::from("irq"), true),
+            Lines::EXC_FIQ => (String::from("fiq"), true),
+            Lines::EXC_SERROR => (String::from("serror"), true),
+            ec => (exception_class_name(u64::from(ec)), false),
+        })
+    }
 
     /// Drive one input.
     pub fn set(&self, mask: u64, asserted: bool) {
@@ -2031,6 +2141,10 @@ impl Device for Cpu {
 
     fn is_runnable(&self) -> bool {
         true
+    }
+
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.lines.exception_report())
     }
 
     fn run(&self, budget: Budget) -> Consumed {

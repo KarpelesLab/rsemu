@@ -1742,6 +1742,88 @@ fn an_armed_svc_exits_instead_of_vectoring() {
     assert_eq!(h.cpu.el(), El::El1, "no exception was taken");
 }
 
+/// The `exc` trace channel counts each exception delivered into the guest
+/// once, synchronous ones under their `ESR_EL1.EC` name and interrupts apart —
+/// and not one the exit mask handed to the host, which the guest never saw.
+/// A reset is not a reason to forget them: the counters are wiring.
+#[test]
+fn every_exception_taken_is_counted_once_for_the_exc_channel() {
+    use crate::core::exec::{ExitMask, ExitingCore};
+    let _exc = crate::core::trace::counting_exceptions();
+    let h = Harness::a53(&[svc(1), brk(2), msr(key(SysReg::Vbar), 0), NOP, svc(3)]);
+    let mut regs = h.cpu.sysregs();
+    regs.vbar_el1 = 0x4000;
+    h.cpu.set_sysregs(regs);
+    // An SVC and a BRK at EL1, each stepped on its own: the handler slots
+    // are zeroed words, so letting the core run on would take an
+    // `UNDEFINED` per step and count those too.
+    h.steps(1);
+    h.cpu.set_pc(4);
+    h.steps(1);
+    // An EL0 write to an EL1 register: `UNDEFINED`, so EC 0 from below.
+    let mut regs = h.cpu.sysregs();
+    regs.el = El::El0;
+    regs.spsel = false;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_pc(8);
+    h.steps(1);
+    // Both interrupts at once, unmasked at EL1: FIQ wins, then IRQ.
+    let mut regs = h.cpu.sysregs();
+    regs.daif = 0;
+    h.cpu.set_sysregs(regs);
+    h.cpu.set_pc(12);
+    h.cpu.set_interrupt(super::Lines::IRQ, true);
+    h.cpu.set_interrupt(super::Lines::FIQ, true);
+    h.steps(1);
+    h.cpu.set_interrupt(super::Lines::FIQ, false);
+    let mut regs = h.cpu.sysregs();
+    regs.daif = 0;
+    h.cpu.set_sysregs(regs);
+    h.steps(1);
+    h.cpu.set_interrupt(super::Lines::IRQ, false);
+    // An SVC the exit mask takes out of the core: not the guest's.
+    h.cpu.set_exit_mask(ExitMask::USER);
+    h.cpu.set_pc(16);
+    let (_, exit) = h.cpu.step_to_exit();
+    assert!(exit.is_some(), "the SVC left the core");
+    h.cpu.reset(ResetKind::Cold);
+
+    let rows: Vec<_> = h
+        .cpu
+        .exceptions()
+        .expect("an AArch64 core counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    if cfg!(feature = "trace") {
+        assert_eq!(
+            rows,
+            [
+                ("unknown".into(), false, 1),
+                ("svc-a64".into(), false, 1),
+                ("brk".into(), false, 1),
+                ("irq".into(), true, 1),
+                ("fiq".into(), true, 1),
+            ]
+        );
+    } else {
+        assert!(rows.is_empty(), "no counters compiled in");
+    }
+}
+
+/// An exception class without a short name reads as its number, and the
+/// names that are spelled are the Arm ARM's classes.
+#[test]
+fn an_unnamed_exception_class_reads_as_its_number() {
+    assert_eq!(
+        super::exception_class_name(ec::DABT_LOWER),
+        "data-abort-lower"
+    );
+    assert_eq!(super::exception_class_name(ec::SYSREG), "sysreg-trap");
+    assert_eq!(super::exception_class_name(0x0a), "ec-0x0a");
+    assert_eq!(super::exception_class_name(0x3f), "ec-0x3f");
+}
+
 #[test]
 fn every_named_part_constructs_and_names_itself() {
     let mut seen: Vec<u64> = Vec::new();

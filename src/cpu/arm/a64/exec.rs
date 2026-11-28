@@ -662,6 +662,13 @@ impl<'a> Exec<'a> {
         far: Option<u64>,
         ret: u64,
     ) {
+        // Both engines deliver through here — the interpreter's step for an
+        // interrupt or a trap, the translated engine's `deliver` through
+        // `take_trap` — and a trap the exit mask hands to the host returns
+        // from `take_trap` before reaching it, so this is one count per
+        // exception the guest saw (`core::trace::Exceptions`).
+        self.lines
+            .count_exception(kind, syndrome.map(|(class, _)| class));
         let group = if self.st.sys.el == El::El0 {
             0x400
         } else if self.st.sys.spsel {
