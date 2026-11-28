@@ -286,6 +286,107 @@ fn the_mmio_channel_counts_device_apertures_and_nothing_else() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A firmware for `riscv-virt` that takes exactly one of each of four traps:
+/// `ECALL` from M-mode, `EBREAK`, an all-zero word (illegal), and one machine
+/// timer interrupt — `mtimecmp` set to zero, then pushed to the end of time by
+/// the handler — before spinning on `j .` forever.
+///
+/// Hand-assembled from this source (`llvm-mc -triple=riscv64 -mattr=-c`, then
+/// `objcopy -O binary`), which is the whole program:
+///
+/// ```text
+/// _start: la    t0, handler      handler: csrr t2, mcause
+///         csrw  mtvec, t0                 bltz t2, irq
+///         ecall                           csrr t2, mepc
+///         ebreak                          addi t2, t2, 4
+///         .word 0                         csrw mepc, t2
+///         li    t0, 0x2004000             mret
+///         sd    zero, 0(t0)      irq:     li   t2, -1
+///         li    t1, 0x80                  li   t3, 0x2004000
+///         csrs  mie, t1                   sd   t2, 0(t3)
+///         csrsi mstatus, 8                mret
+/// 1:      j     1b
+/// ```
+#[cfg(feature = "machine-riscv-virt")]
+const FOUR_TRAPS: [u8; 88] = [
+    0x97, 0x02, 0x00, 0x00, 0x93, 0x82, 0x02, 0x03, 0x73, 0x90, 0x52, 0x30, 0x73, 0x00, 0x00, 0x00,
+    0x73, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb7, 0x42, 0x00, 0x02, 0x23, 0xb0, 0x02, 0x00,
+    0x13, 0x03, 0x00, 0x08, 0x73, 0x20, 0x43, 0x30, 0x73, 0x60, 0x04, 0x30, 0x6f, 0x00, 0x00, 0x00,
+    0xf3, 0x23, 0x20, 0x34, 0x63, 0xca, 0x03, 0x00, 0xf3, 0x23, 0x10, 0x34, 0x93, 0x83, 0x43, 0x00,
+    0x73, 0x90, 0x13, 0x34, 0x73, 0x00, 0x20, 0x30, 0x93, 0x03, 0xf0, 0xff, 0x37, 0x4e, 0x00, 0x02,
+    0x23, 0x30, 0x7e, 0x00, 0x73, 0x00, 0x20, 0x30,
+];
+
+/// The `exc` channel counts each trap the guest took once, by name, filed as
+/// an interrupt or not — and on every engine this build has, because the
+/// translated engines deliver through the same `enter_trap` the interpreter
+/// does and a count that only one of them made would be a trace that changed
+/// with `-p engine=`.
+#[cfg(feature = "machine-riscv-virt")]
+#[test]
+fn the_exc_channel_counts_each_trap_once_by_name() {
+    let fw = scratch("four-traps.bin");
+    std::fs::write(&fw, FOUR_TRAPS).expect("scratch firmware");
+    let media = format!("firmware={}", fw.display());
+    let mut engines = vec!["interp"];
+    if cfg!(all(feature = "cpu-riscv-lift", feature = "jit")) {
+        engines.extend(["jit", "jit-host"]);
+    }
+    for engine in engines {
+        let engine = format!("engine={engine}");
+        let (ok, stdout, err) = run(&[
+            "run",
+            "riscv-virt",
+            "--media",
+            &media,
+            "-p",
+            &engine,
+            "--for",
+            "1ms",
+            "--headless",
+            "--trace",
+            "exc",
+        ]);
+        assert!(ok, "{engine}: {err}");
+        for (name, want) in [
+            ("exc.cpu0.sync.ecall-m", 1),
+            ("exc.cpu0.sync.breakpoint", 1),
+            ("exc.cpu0.sync.illegal-instruction", 1),
+            ("exc.cpu0.async.machine-timer", 1),
+            ("exc.cpu0.sync", 3),
+            ("exc.cpu0.async", 1),
+            ("exc.cpu0.total", 4),
+            ("exc.total", 4),
+        ] {
+            assert_eq!(row(&stdout, name), want, "{engine}: {name}\n{stdout}");
+        }
+    }
+    let _ = std::fs::remove_file(&fw);
+}
+
+/// A board none of whose processors counts exceptions says so in a sentence.
+///
+/// The apple1 is that board for as long as the 6502 is not taught to count;
+/// when it is, this test moves to whichever board is left, or goes.
+#[test]
+fn a_board_whose_processors_do_not_count_exceptions_says_so() {
+    let (ok, stdout, err) = run(&[
+        "run",
+        "apple1",
+        "--for",
+        "10ms",
+        "--headless",
+        "--trace",
+        "exc",
+    ]);
+    assert!(ok, "{err}");
+    assert!(
+        stdout.contains("no processor in this machine counts exceptions"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("exc.total"), "{stdout}");
+}
+
 /// Two columns, sorted, `#` for anything that is not a count.
 #[test]
 fn the_format_is_a_plain_two_column_table_a_script_can_read() {

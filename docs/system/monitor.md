@@ -117,7 +117,7 @@ state
   rewind <span>         go back <span>: restore the nearest keyframe and replay
 
 counters
-  trace [channel…]      what --trace reports, now, for sched/cpu/clock/mmio
+  trace [channel…]      what --trace reports, now, for any of its channels
 ```
 
 Addresses are hex with an optional `0x`; lengths are decimal and bounded at 1024

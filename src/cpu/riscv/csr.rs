@@ -26,6 +26,9 @@
 //! (`ROADMAP.md` §4.7). The 6502's interrupt pins are the same shape for the
 //! same reason.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::core::sync::{AtomicBool, AtomicU64, Ordering};
 
 use super::isa::Xlen;
@@ -443,7 +446,7 @@ pub struct MipWrite {
 /// inside an MMIO write the CPU itself issued must not have to take the lock
 /// the CPU is holding. `mip` is the whole of that state, because every
 /// interrupt this core can take is one of its bits.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Lines {
     /// Machine interrupt pending, driven by wires and by M-mode CSR writes —
     /// plus, at [`Lines::SEIP_LINE`], the external interrupt controller's
@@ -451,9 +454,89 @@ pub struct Lines {
     mip: AtomicU64,
     /// A reset assertion nobody has acted on yet.
     reset_req: AtomicBool,
+    /// Traps taken, for the `exc` trace channel ([`Lines::count_trap`]).
+    ///
+    /// Here rather than on the hart because this is the one piece of wiring
+    /// every execution borrow already holds — the interpreter's, each JIT
+    /// engine's and every test helper's — so counting needs no new argument
+    /// threaded through any of them. Not guest state, like the rest of this
+    /// struct's neighbours in `Hart`: it survives a reset and is in no
+    /// snapshot.
+    exceptions: crate::core::trace::Exceptions,
+}
+
+impl Default for Lines {
+    fn default() -> Lines {
+        Lines {
+            mip: AtomicU64::new(0),
+            reset_req: AtomicBool::new(false),
+            exceptions: crate::core::trace::Exceptions::new(Lines::TRAP_CODES),
+        }
+    }
 }
 
 impl Lines {
+    /// The `exc` code space: an exception's cause as itself, an interrupt's
+    /// at sixty-four above it — `mcause` with the interrupt bit moved down to
+    /// bit 6, so the encoding is the same for RV32 and RV64.
+    const TRAP_CODES: u32 = 128;
+
+    /// A trap was taken into the guest: `cause` is the code without the
+    /// interrupt bit.
+    #[inline]
+    pub(super) fn count_trap(&self, cause: u64, interrupt: bool) {
+        let code = u32::try_from(cause).unwrap_or(u32::MAX).min(63);
+        // A cause above 63 cannot be written into `mcause` on RV64 alongside
+        // the interrupt bit and is not one the hart raises; clamped to 63 it
+        // still lands on a row rather than vanishing.
+        self.exceptions
+            .count(if interrupt { code + 64 } else { code });
+    }
+
+    /// Every trap taken so far, named the way the privileged spec's `mcause`
+    /// table names it.
+    pub(super) fn trap_report(&self) -> Vec<crate::core::trace::ExceptionCount> {
+        self.exceptions.report(|code| {
+            let interrupt = code >= 64;
+            let cause = u64::from(code & 63);
+            let name = if interrupt {
+                match cause {
+                    cause::IRQ_S_SOFT => "supervisor-software",
+                    cause::IRQ_M_SOFT => "machine-software",
+                    cause::IRQ_S_TIMER => "supervisor-timer",
+                    cause::IRQ_M_TIMER => "machine-timer",
+                    cause::IRQ_S_EXT => "supervisor-external",
+                    cause::IRQ_M_EXT => "machine-external",
+                    _ => "",
+                }
+            } else {
+                match cause {
+                    cause::INSN_MISALIGNED => "fetch-misaligned",
+                    cause::INSN_ACCESS => "fetch-access",
+                    cause::ILLEGAL_INSN => "illegal-instruction",
+                    cause::BREAKPOINT => "breakpoint",
+                    cause::LOAD_MISALIGNED => "load-misaligned",
+                    cause::LOAD_ACCESS => "load-access",
+                    cause::STORE_MISALIGNED => "store-misaligned",
+                    cause::STORE_ACCESS => "store-access",
+                    cause::ECALL_U => "ecall-u",
+                    cause::ECALL_S => "ecall-s",
+                    cause::ECALL_M => "ecall-m",
+                    cause::INSN_PAGE_FAULT => "fetch-page-fault",
+                    cause::LOAD_PAGE_FAULT => "load-page-fault",
+                    cause::STORE_PAGE_FAULT => "store-page-fault",
+                    _ => "",
+                }
+            };
+            let name = if name.is_empty() {
+                alloc::format!("cause-{cause}")
+            } else {
+                String::from(name)
+            };
+            (name, interrupt)
+        })
+    }
+
     /// How far above `SEIP` the controller's supervisor line is kept.
     const SEIP_LINE_SHIFT: u32 = 16;
 

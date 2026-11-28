@@ -1250,6 +1250,11 @@ impl<'a> Exec<'a> {
         if let Some(watch) = self.spin.as_deref_mut() {
             watch.interrupt();
         }
+        // Every engine delivers through here — the interpreter's step and the
+        // translated engines' `deliver` both — and a trap the exit mask sends
+        // to the host never reaches it, so this is exactly one count per trap
+        // the guest saw (`core::trace::Exceptions`).
+        self.lines.count_trap(trap.cause, interrupt);
         let csrs = &mut self.st.csrs;
         let bit = 1u64 << trap.cause;
         let delegated = if interrupt {

@@ -350,3 +350,56 @@ fn interning_an_aperture_is_idempotent() {
         assert!(names.is_empty());
     }
 }
+
+/// `Exceptions` counts only while `exc` is on, names only the codes taken, and
+/// puts a code past its width on `other` rather than on a real vector.
+///
+/// Its counters are this object's own, so the only process-global thing it
+/// touches is the channel mask — which [`SERIAL`] covers like everything else
+/// here.
+#[test]
+fn an_exception_table_counts_by_code_and_overflows_onto_other() {
+    use super::Exceptions;
+    let _serial = SERIAL.lock();
+    super::reset();
+    let exc = Exceptions::new(4);
+    exc.count(1);
+    assert_eq!(exc.get(1), 0, "`exc` is off, so nothing counts");
+
+    super::enable(Channel::EXC);
+    exc.count(1);
+    exc.count(1);
+    exc.count(3);
+    exc.count(4);
+    exc.count(u32::MAX);
+    let report = exc.report(|code| (alloc::format!("v{code}"), code == 3));
+    super::reset();
+
+    #[cfg(feature = "trace")]
+    {
+        let row = |name: &str, asynchronous: bool, count: u64| super::ExceptionCount {
+            name: name.into(),
+            asynchronous,
+            count,
+        };
+        assert_eq!(
+            report,
+            [
+                row("v1", false, 2),
+                row("v3", true, 1),
+                row("other", false, 2)
+            ],
+            "code order, untaken codes absent, both out-of-range codes on `other`"
+        );
+        assert_eq!(
+            exc.get(4),
+            2,
+            "every code past the width reads the overflow slot"
+        );
+    }
+    #[cfg(not(feature = "trace"))]
+    assert!(
+        report.is_empty(),
+        "a build without the feature counts nothing"
+    );
+}

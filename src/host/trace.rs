@@ -222,6 +222,7 @@ pub fn collect(machine: &Machine, hosts: &HostObjects, channels: &[Channel]) -> 
             Channel::CLOCK => clocks(machine, &mut table),
             Channel::CPU => cpus(machine, hosts, &mut table),
             Channel::MMIO => mmio(&mut table),
+            Channel::EXC => exceptions(machine, &mut table),
             _ => {}
         }
     }
@@ -273,6 +274,64 @@ fn mmio(table: &mut Table) {
             &format!("{dropped} apertures past the counter array are not counted"),
         );
     }
+}
+
+/// Per-processor exceptions and interrupts, by vector, out of each core's own
+/// [`Exceptions`](crate::core::trace::Exceptions).
+///
+/// Rows are `exc.<path>.<sync|async>.<vector>`, then per core
+/// `exc.<path>.sync`, `exc.<path>.async` and `exc.<path>.total`, then the same
+/// three machine-wide. A core that counts gets its three totals even at zero —
+/// "this processor took no interrupts" is the answer to the question — while a
+/// vector it never took gets no row, because a 496-interrupt NVIC of zeroes
+/// would bury the four lines that matter.
+///
+/// No handle on a concrete core is needed, unlike `cpu`: the counters are
+/// reached through [`Device::exceptions`](crate::core::device::Device::exceptions),
+/// so this channel works without [`install`] and on every core that implements
+/// it.
+fn exceptions(machine: &Machine, table: &mut Table) {
+    let (mut sync, mut asynchronous) = (0u64, 0u64);
+    let mut counted = false;
+    for device in machine.devices() {
+        let Some(rows) = device.device().exceptions() else {
+            continue;
+        };
+        counted = true;
+        let path = device.path();
+        let (mut s, mut a) = (0u64, 0u64);
+        for row in rows {
+            let kind = if row.asynchronous { "async" } else { "sync" };
+            // The same defence `mmio` makes for a region name: a row is two
+            // whitespace-separated fields with no quoting.
+            let name: String = row
+                .name
+                .chars()
+                .map(|c| if c.is_whitespace() { '_' } else { c })
+                .collect();
+            // `add` rather than `set`, so two codes a core happens to name the
+            // same way are summed rather than one silently replacing the other.
+            table.add(&format!("exc.{path}.{kind}.{name}"), row.count);
+            if row.asynchronous {
+                a = a.saturating_add(row.count);
+            } else {
+                s = s.saturating_add(row.count);
+            }
+        }
+        table.set(&format!("exc.{path}.sync"), s);
+        table.set(&format!("exc.{path}.async"), a);
+        table.set(&format!("exc.{path}.total"), s.saturating_add(a));
+        sync = sync.saturating_add(s);
+        asynchronous = asynchronous.saturating_add(a);
+    }
+    if !counted {
+        // A sentence rather than three zeroes, for the reason `cpus` gives.
+        table.note("exc", "no processor in this machine counts exceptions");
+        return;
+    }
+    table.set("exc.sync", sync);
+    table.set("exc.async", asynchronous);
+    table.set("exc.total", sync.saturating_add(asynchronous));
 }
 
 /// Per-clock-domain tick totals.

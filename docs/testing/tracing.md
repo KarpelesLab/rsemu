@@ -149,6 +149,7 @@ the `cpu` channel costs the block-entry path nothing at all.
 | `cpu` | per processor: blocks entered, blocks run as host code, blocks reached by following a patched exit, distinct blocks lifted, translations thrown away, guest instructions retired inside a block against interpreted one at a time — and, on A64, inlined-TLB load and store counts | each core's own `jit_stats`, read once when the run ends |
 | `clock` | per-clock-domain tick totals | `ClockForest::ticks`, read once when the run ends |
 | `mmio` | per device aperture: how many reads and how many writes it answered | a hook in each of `core::space::flat`'s three `FlatTarget::Io` dispatch arms |
+| `exc` | per processor: exceptions and interrupts taken into the guest, by the architecture's own vector or cause | each core's own `core::trace::Exceptions`, counted at its exception-entry function and read through `Device::exceptions` when the run ends |
 | `all` | every channel above | |
 
 ### The rows
@@ -231,6 +232,38 @@ An aperture is counted **per device, not per mapping**: a mirrored window, an
 aperture that appears in two address spaces, and the same region re-flattened
 after a BAR moved all add to one row. That is a property of where the identity
 is interned rather than a convention — see *The identity is the device* below.
+
+`exc`, under `exc.<instance path>.` and again as a machine-wide total under
+`exc.`:
+
+| Row | Meaning |
+| --- | --- |
+| `sync.<vector>` | exceptions the instruction stream raised itself, by name: `illegal-instruction`, `ecall-m`, `load-page-fault` |
+| `async.<vector>` | interrupts something outside the instruction stream asked for: `machine-timer`, `machine-external` |
+| `sync` / `async` / `total` | the per-processor sums, written even at zero |
+
+A vector the processor never took gets no row — an NVIC's 496 interrupt lines
+would otherwise bury the four that fired — but a processor that counts always
+gets its three totals, because "this core took no interrupts" is the answer.
+A code past the end of the core's table lands on `sync.other` rather than being
+dropped or folded into a real vector. A board none of whose processors counts
+gets `# exc  no processor in this machine counts exceptions` and no rows, for
+the reason `cpu` does. An exception the exit mask sends to the host instead
+(`core::exec`) is not counted: the guest never took it.
+
+The counters live **in the core**, not in a static, which is the one way this
+channel differs from `sched` and `mmio`: exception entry is a method on a
+processor, and the processor is a `Device` with a path, so there is something to
+attribute the count to at the moment it happens. Two machines in one process
+never see each other's counts. A core keeps its `Exceptions` beside its wiring —
+the RISC-V hart's is in its interrupt `Lines`, which every engine's execution
+borrow already holds — so it is in no snapshot, is not in the state hash, and
+survives a reset. Counting costs one relaxed load of the channel mask per
+exception taken, plus a relaxed `fetch_add` when `exc` is on; without the
+`trace` feature `Exceptions` is zero-sized and the call is empty.
+
+The cores that count today: RISC-V (every engine: the translated ones deliver
+through the interpreter's `enter_trap`).
 
 ### What was considered and left out
 

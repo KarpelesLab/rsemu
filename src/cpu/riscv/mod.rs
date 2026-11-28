@@ -1501,6 +1501,10 @@ impl Device for Hart {
         }
     }
 
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.lines.trap_report())
+    }
+
     fn set_spin_detector(&self, cpu: u32, detector: Option<Arc<spin::Detector>>) -> bool {
         self.session.lock().spin.attach(cpu, detector);
         true

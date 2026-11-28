@@ -941,8 +941,9 @@ plain two-column table — `cpu.retired.permille 987`, `sched.quanta 24818`,
 `mmio.pia.read 1461001` — that `awk` reads with one pattern and `diff` compares
 between two runs. **Counters, not an event stream**: every measurement this
 project has improvised was a count, and a record per block entry would be
-hundreds of millions of records the hot path cannot carry. Four channels —
-`sched`, `cpu`, `clock`, and `mmio` per device aperture — and there is no
+hundreds of millions of records the hot path cannot carry. Five channels —
+`sched`, `cpu`, `clock`, `mmio` per device aperture, and `exc` per processor
+and vector — and there is no
 timestamp and no wall-clock figure anywhere in the output, deliberately, so two
 traces of one deterministic run are byte-identical and a diff between them is a
 real regression test. `tests/cli_trace.rs` asserts that, and asserts the

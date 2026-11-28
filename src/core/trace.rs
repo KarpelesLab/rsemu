@@ -130,9 +130,25 @@ impl Channel {
     /// that decided it was safe to place.
     pub const MMIO: Channel = Channel(3);
 
+    /// Per-processor exceptions and interrupts taken, by the architecture's
+    /// own vector or cause number.
+    ///
+    /// Counted by each core into its own [`Exceptions`] at the one function
+    /// every engine funnels a taken exception through, and read off the
+    /// machine through [`Device::exceptions`](crate::core::device::Device::exceptions)
+    /// when the run ends — so, like `cpu`, it is attributed to an instance
+    /// path, and unlike `cpu` it needs no constructor interception to reach
+    /// the core.
+    pub const EXC: Channel = Channel(4);
+
     /// Every channel this build knows, in the order `--trace all` reports them.
-    pub const ALL: &'static [Channel] =
-        &[Channel::SCHED, Channel::CPU, Channel::CLOCK, Channel::MMIO];
+    pub const ALL: &'static [Channel] = &[
+        Channel::SCHED,
+        Channel::CPU,
+        Channel::CLOCK,
+        Channel::MMIO,
+        Channel::EXC,
+    ];
 
     /// The name `--trace` spells this channel with.
     #[must_use]
@@ -142,6 +158,7 @@ impl Channel {
             Channel::CPU => "cpu",
             Channel::CLOCK => "clock",
             Channel::MMIO => "mmio",
+            Channel::EXC => "exc",
             _ => "unknown",
         }
     }
@@ -161,6 +178,7 @@ impl Channel {
             Channel::CPU => "per-processor: blocks, chaining, translations, retired vs interpreted",
             Channel::CLOCK => "per-clock-domain tick totals",
             Channel::MMIO => "per-region MMIO: reads and writes each device aperture answered",
+            Channel::EXC => "per-processor exceptions and interrupts taken, by vector",
             _ => "",
         }
     }
@@ -600,6 +618,178 @@ pub fn mmio_get(id: u16, write: bool) -> u64 {
     {
         let _ = (id, write);
         0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-processor exceptions
+// ---------------------------------------------------------------------------
+
+/// One processor's exception counters: how many times each vector was taken.
+///
+/// # Why per processor, when every other live counter is process-global
+///
+/// The module docs give the reason the counters above are statics: a hook
+/// inside the dispatcher has no machine in hand to attribute a count to. An
+/// exception entry is the opposite case — it is a method on the core, the core
+/// is a `Device` with an instance path, and "which processor took the page
+/// faults" is most of what anyone asks of this channel. So the counters live in
+/// the core, and the collector reads them off the machine through
+/// [`Device::exceptions`](crate::core::device::Device::exceptions) exactly as
+/// it reads tick totals off the clock tree. Two machines in one process, or
+/// two tests in one test binary, therefore never see each other's counts.
+///
+/// # The code space
+///
+/// A *code* is whatever number the architecture already gives the exception —
+/// an x86 vector, an M-profile exception number, a RISC-V cause with the
+/// interrupt bit folded in above it. The core chooses the encoding and the
+/// width, and names the codes when the trace is rendered
+/// ([`Exceptions::report`]). A code at or past the width is counted in one
+/// overflow slot rather than dropped or folded into a real vector: the
+/// encoding outgrowing its table is exactly the thing worth seeing, and a
+/// count on the wrong row is worse than one on a row that says "other".
+///
+/// # What it is not
+///
+/// Not guest state. It is in no snapshot chunk and not in the state hash,
+/// survives a reset and a snapshot restore, and is never read by anything the
+/// guest can reach — the same three rules the module docs give for every other
+/// counter here. A core keeps it beside its wiring rather than inside its
+/// architectural state, which is what makes the first two true by
+/// construction.
+///
+/// # Cost
+///
+/// Without the `trace` feature this is a zero-sized type and [`count`] is an
+/// empty body. With it, [`count`] is one relaxed load of the channel mask and,
+/// when `exc` is on, one relaxed `fetch_add` — on a path that is already
+/// stacking a frame or rewriting a status register, and that a guest takes
+/// thousands of times a second rather than billions.
+///
+/// [`count`]: Exceptions::count
+#[derive(Debug)]
+pub struct Exceptions {
+    /// `width` vector slots, then one overflow slot.
+    #[cfg(feature = "trace")]
+    slots: alloc::boxed::Box<[AtomicU64]>,
+}
+
+/// One row of an [`Exceptions::report`]: a vector a processor took, what it is
+/// called, and how often.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionCount {
+    /// The row name, as the core spells the vector: `page-fault`, `irq.37`,
+    /// `machine-timer`. Lower case, no whitespace and no dots other than the
+    /// ones the core put there on purpose; the collector defends the
+    /// whitespace rule anyway.
+    pub name: String,
+    /// Whether this is an *interrupt* — something outside the instruction
+    /// stream asked for it — rather than an exception the instruction stream
+    /// raised itself. The collector files the row under `async` or `sync`
+    /// accordingly, because "the guest took 40 000 interrupts" and "the guest
+    /// took 40 000 faults" are different findings about the same total.
+    pub asynchronous: bool,
+    /// How many times it was taken.
+    pub count: u64,
+}
+
+impl Exceptions {
+    /// Counters for codes `0..width`, plus the overflow slot.
+    ///
+    /// Allocates `width + 1` counters with the `trace` feature and nothing
+    /// without it, so a core may hold one unconditionally.
+    #[must_use]
+    pub fn new(width: u32) -> Exceptions {
+        #[cfg(feature = "trace")]
+        {
+            let slots = (0..=width).map(|_| AtomicU64::new(0)).collect();
+            Exceptions { slots }
+        }
+        #[cfg(not(feature = "trace"))]
+        {
+            let _ = width;
+            Exceptions {}
+        }
+    }
+
+    /// The processor took exception `code`.
+    ///
+    /// Call it once per exception *delivered into the guest* — where the
+    /// frame is stacked or the cause register written — and not for one that
+    /// leaves the processor for the host instead (`core::exec`'s exit mask),
+    /// which the guest never saw.
+    #[inline]
+    pub fn count(&self, code: u32) {
+        #[cfg(feature = "trace")]
+        {
+            if on(Channel::EXC) {
+                let last = self.slots.len() - 1;
+                let at = usize::try_from(code).map_or(last, |c| c.min(last));
+                self.slots[at].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        #[cfg(not(feature = "trace"))]
+        {
+            let _ = code;
+        }
+    }
+
+    /// How many times `code` was taken. Codes at or past the width all read
+    /// the overflow slot; zero without the `trace` feature.
+    #[must_use]
+    pub fn get(&self, code: u32) -> u64 {
+        #[cfg(feature = "trace")]
+        {
+            let last = self.slots.len() - 1;
+            let at = usize::try_from(code).map_or(last, |c| c.min(last));
+            self.slots[at].load(Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "trace"))]
+        {
+            let _ = code;
+            0
+        }
+    }
+
+    /// Every vector taken at least once, named by `name`, in code order; the
+    /// overflow slot last, as `other`, filed under `sync` because nothing can
+    /// be said about it.
+    ///
+    /// `name(code)` returns the row name and whether the code is an interrupt.
+    /// Only codes that were taken are named, so a core with a 512-entry table
+    /// formats a handful of strings, not five hundred.
+    ///
+    /// Empty without the `trace` feature.
+    #[must_use]
+    pub fn report(&self, name: impl Fn(u32) -> (String, bool)) -> Vec<ExceptionCount> {
+        #[cfg(feature = "trace")]
+        {
+            let last = self.slots.len() - 1;
+            let mut out = Vec::new();
+            for (at, slot) in self.slots.iter().enumerate() {
+                let count = slot.load(Ordering::Relaxed);
+                if count == 0 {
+                    continue;
+                }
+                let (name, asynchronous) = if at == last {
+                    (String::from("other"), false)
+                } else {
+                    name(u32::try_from(at).unwrap_or(u32::MAX))
+                };
+                out.push(ExceptionCount {
+                    name,
+                    asynchronous,
+                    count,
+                });
+            }
+            out
+        }
+        #[cfg(not(feature = "trace"))]
+        {
+            let _ = name;
+            Vec::new()
+        }
     }
 }
 

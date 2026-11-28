@@ -1294,7 +1294,7 @@ state
   rewind <span>         go back <span>: restore the nearest keyframe and replay
 
 counters
-  trace [channel...]    what --trace reports, now, for sched/cpu/clock/mmio
+  trace [channel...]    what --trace reports, now, for any of its channels
 
 Every read here sets MemAttrs::debug, so looking at a device never changes it.
 ";
@@ -1354,7 +1354,7 @@ translation standing behind it.
 trace renders the counters as `rsemu run --trace` would, but now rather than at
 the end of a run: two whitespace-separated columns sorted by name, under a #
 header, with no wall clock in it. Name channels to narrow it: sched, cpu, clock,
-mmio.
+mmio, exc.
 "
         }
         "media" | "insert" | "eject" => {

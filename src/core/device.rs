@@ -687,6 +687,25 @@ pub trait Device: Send + Sync + fmt::Debug {
         false
     }
 
+    /// The exceptions and interrupts this device has taken, by vector, for
+    /// the `exc` trace channel ([`crate::core::trace::Exceptions`]).
+    ///
+    /// `None` — the default — means *this device does not count exceptions*,
+    /// which is everything that is not a processor and any processor that has
+    /// not been taught to. `Some(empty)` is a different answer: a core that
+    /// counts and took nothing, or one whose build has the counters compiled
+    /// out. The collector keeps the two apart for the reason the `cpu` channel
+    /// does: "zero page faults" and "nothing here counts page faults" are
+    /// different facts.
+    ///
+    /// Read once, after the run, by `host::trace`. Like
+    /// [`set_spin_detector`](Device::set_spin_detector) it is about wiring
+    /// rather than guest state: never serialized, and not reset by
+    /// [`reset`](Device::reset).
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        None
+    }
+
     /// The sink for input pin `port`, and the line the device knows it by.
     ///
     /// `sources` is every id a `wire` statement points at **this pin**. §4.3
