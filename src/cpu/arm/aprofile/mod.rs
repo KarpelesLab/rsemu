@@ -721,7 +721,7 @@ impl Default for Config {
 /// critical section, which is a deadlock under `native-std` and a panic under
 /// `single`. Both ARM interrupt inputs are level-sensitive, so there is no
 /// edge latch to keep either (`ROADMAP.md` §4.7).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Lines {
     irq: AtomicBool,
     fiq: AtomicBool,
@@ -741,9 +741,61 @@ pub(crate) struct Lines {
     /// Held in reset by the `hold` input: the core executes nothing until it
     /// is released, and the release is a reset.
     hold: AtomicBool,
+    /// Exceptions taken, for the `exc` trace channel (read by
+    /// [`Lines::exception_report`]).
+    ///
+    /// Here because this is the wiring the core already keeps outside its
+    /// execution lock and outside its architectural state: not serialized,
+    /// not in the state hash, and untouched by a reset or a snapshot restore,
+    /// which is what the channel's counters must be. `Exec` is lent a
+    /// reference at its one construction site and counts in
+    /// `Exec::take_exception`, the entry every exception goes through.
+    exceptions: crate::core::trace::Exceptions,
+}
+
+impl Default for Lines {
+    fn default() -> Lines {
+        Lines {
+            irq: AtomicBool::new(false),
+            fiq: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
+            event: AtomicBool::new(false),
+            hold: AtomicBool::new(false),
+            exceptions: crate::core::trace::Exceptions::new(Lines::EXCEPTION_CODES),
+        }
+    }
 }
 
 impl Lines {
+    /// The `exc` code space: the exception's vector offset divided by four
+    /// (ARM ARM A2.6, "Exception vectors"; DDI 0406C B1.8.1), which is the
+    /// number the architecture already gives each one. Eight slots cover the
+    /// table; reset (0) is never counted — it is not something the guest
+    /// took — and 5, the reserved slot (Hyp trap on a part with the
+    /// Virtualization Extensions, which this core does not model), is never
+    /// raised.
+    const EXCEPTION_CODES: u32 = 8;
+
+    /// Every exception taken so far, named by its vector. `BKPT` is counted
+    /// under `prefetch-abort`, because that is the exception it takes (ARM ARM
+    /// A2.6.5): the row says what the guest's handler saw.
+    fn exception_report(&self) -> Vec<crate::core::trace::ExceptionCount> {
+        self.exceptions.report(|code| {
+            let (name, asynchronous) = match code {
+                0 => ("reset", false),
+                1 => ("undefined", false),
+                2 => ("svc", false),
+                3 => ("prefetch-abort", false),
+                4 => ("data-abort", false),
+                5 => ("hyp-trap", false),
+                6 => ("irq", true),
+                7 => ("fiq", true),
+                _ => return (alloc::format!("vector-{code}"), false),
+            };
+            (String::from(name), asynchronous)
+        })
+    }
+
     fn snapshot(&self) -> (bool, bool) {
         (
             self.irq.load(Ordering::Acquire),
@@ -1571,6 +1623,7 @@ impl Arm {
             coprocessors,
             &cfg,
             global_monitor.as_deref(),
+            &self.lines.exceptions,
         )
         .step(irq, fiq);
         if resetting {
@@ -2188,6 +2241,10 @@ impl Device for Arm {
             _ => return None,
         };
         Some(SinkPin { sink, line: 0 })
+    }
+
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.lines.exception_report())
     }
 
     fn is_runnable(&self) -> bool {

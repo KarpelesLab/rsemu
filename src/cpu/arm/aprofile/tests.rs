@@ -1203,6 +1203,67 @@ fn fiq_outranks_irq_and_masks_both() {
     assert!(h.cpu.cpsr() & psr::F != 0);
 }
 
+/// The `exc` trace channel counts each exception the core took once, under
+/// its vector's name, files the interrupts apart — and does not count reset,
+/// either the one out of power-on or a later one, which is the core coming
+/// up rather than something the guest took.
+#[test]
+fn every_exception_taken_is_counted_once_for_the_exc_channel() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let h = running(&[
+        0xef00_0001, // SWI #1
+        0xe7f0_00f0, // UNDEFINED
+        0xe591_0000, // LDR r0, [r1] into the hole: a data abort
+        0xe120_0070, // BKPT #0: a prefetch abort
+        0xe3a0_0001, // MOV r0, #1, which the interrupts preempt
+    ]);
+    h.cpu.set_reg(1, 0x8000_0000);
+    // Each one stepped from System mode at its own address: the vectors hold
+    // nothing, so running on would take an `UNDEFINED` per step and count
+    // that too.
+    for at in [0x1000, 0x1004, 0x1008, 0x100c] {
+        h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0));
+        h.cpu.set_pc(at);
+        h.step();
+    }
+    h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0));
+    h.cpu.set_pc(0x1010);
+    h.cpu.set_irq(true);
+    h.cpu.set_fiq(true);
+    h.step();
+    assert_eq!(h.cpu.mode(), Mode::FIQ);
+    h.cpu.set_fiq(false);
+    h.cpu.set_cpsr(u32::from(Mode::SYSTEM.0));
+    h.step();
+    assert_eq!(h.cpu.mode(), Mode::IRQ);
+    h.cpu.set_irq(false);
+    h.cpu.reset(ResetKind::Cold);
+    h.step();
+
+    let rows: Vec<_> = h
+        .cpu
+        .exceptions()
+        .expect("an A-profile core counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    if cfg!(feature = "trace") {
+        assert_eq!(
+            rows,
+            [
+                ("undefined".into(), false, 1),
+                ("svc".into(), false, 1),
+                ("prefetch-abort".into(), false, 1),
+                ("data-abort".into(), false, 1),
+                ("irq".into(), true, 1),
+                ("fiq".into(), true, 1),
+            ]
+        );
+    } else {
+        assert!(rows.is_empty(), "no counters compiled in");
+    }
+}
+
 #[test]
 fn an_exception_return_restores_the_whole_cpsr() {
     // SWI #0 at 0x1000, then SUBS pc, lr, #4 at the SWI vector.

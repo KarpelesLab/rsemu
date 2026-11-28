@@ -379,6 +379,8 @@ pub(super) struct Exec<'a> {
     it_done: bool,
     /// Cycles this step has charged.
     used: u64,
+    /// The core's `exc` trace counters: wiring lent from `Lines`, not state.
+    exceptions: &'a crate::core::trace::Exceptions,
 }
 
 impl<'a> Exec<'a> {
@@ -387,6 +389,11 @@ impl<'a> Exec<'a> {
     /// This is where the MMU is asked what it is doing — once, for the whole
     /// instruction. See [`Regime`] for why that is both cheaper and closer to
     /// the architecture than asking per access.
+    ///
+    /// One borrow per piece of the session and the wiring it needs, from a
+    /// single call site in `Arm::step`; bundling them into a struct would be
+    /// a second name for that call site's destructuring, not a simplification.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         state: &'a mut State,
         space: &'a AddressSpace,
@@ -395,6 +402,7 @@ impl<'a> Exec<'a> {
         coprocessors: &'a [Option<Arc<dyn Coprocessor>>; 16],
         cfg: &'a Config,
         global: Option<&'a dyn GlobalMonitor>,
+        exceptions: &'a crate::core::trace::Exceptions,
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         let regime = mmu.regime();
@@ -413,6 +421,7 @@ impl<'a> Exec<'a> {
             branched: false,
             it_done: false,
             used: 0,
+            exceptions,
         }
     }
 
@@ -737,6 +746,15 @@ impl<'a> Exec<'a> {
 
     /// Enter an exception: bank `CPSR`, set `R14`, mask, and vector.
     fn take_exception(&mut self, kind: Exception, return_address: u32) {
+        // Every exception the guest takes enters here — the interrupts at the
+        // top of `step`, `take_abort`'s two, `SVC`, `BKPT` and `UNDEFINED` —
+        // and this core has no exit mask to hand one to the host instead, so
+        // this is one count per exception taken (`core::trace::Exceptions`).
+        // The code is the vector offset over four; reset is the core coming
+        // up rather than an exception the guest took, and is left out.
+        if kind != Exception::Reset {
+            self.exceptions.count(kind.vector() / 4);
+        }
         // The SPSR keeps the IT state this instruction ran under, so the
         // handler's return restarts it in the right place of its block.
         self.it_done = true;
