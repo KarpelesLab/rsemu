@@ -949,9 +949,9 @@ traces of one deterministic run are byte-identical and a diff between them is a
 real regression test. `tests/cli_trace.rs` asserts that, and asserts the
 property the whole facility stands on: a traced run reaches the **same state
 hash** as an untraced one. A flag that cannot be honoured is refused rather than
-ignored — `--trace cpu` with `--accel` says why an accelerated processor keeps
-none of those counters, while `--trace all` drops `cpu` from the wildcard and
-says so on stderr, because `all` means "every channel this run can report".
+ignored — `--trace cpu` and `--trace exc` with `--accel` say why an
+accelerated processor keeps none of those counters, while `--trace all` drops
+both from the wildcard and says so on stderr, because `all` means "every channel this run can report".
 Without the `trace` feature every hook has an empty body and the whole thing
 costs zero; with it compiled in, the numbers — including the callgrind and
 wall-clock pair that decided the MMIO hook was safe to put on a guest access

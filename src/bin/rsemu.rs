@@ -2614,7 +2614,8 @@ impl Traces {
         if args.mon && rsemu::host::trace::available() {
             out.channels = Channel::ALL.to_vec();
             if args.accel.is_some() {
-                out.channels.retain(|ch| *ch != Channel::CPU);
+                out.channels
+                    .retain(|ch| !Self::NOT_UNDER_ACCEL.contains(ch));
             }
         }
         if args.trace.is_empty() {
@@ -2659,6 +2660,24 @@ impl Traces {
                 );
                 named.retain(|ch| *ch != Channel::CPU);
             }
+            // The same refusal for the same reason: the host's silicon delivers
+            // an accelerated guest's exceptions through the guest's own tables,
+            // and no core of ours sees one go by. A count of zero would read as
+            // "the guest took no interrupts", which is a lie rather than a gap.
+            if args.accel.is_some() && named.contains(&Channel::EXC) {
+                if !wildcard {
+                    return Err(String::from(
+                        "--trace exc with --accel: an accelerated guest's exceptions are \
+                         delivered by the host's own silicon, so nothing here sees them to \
+                         count; trace `sched` or `clock`, or drop --accel",
+                    ));
+                }
+                eprintln!(
+                    "rsemu: --trace all with --accel: leaving out `exc`, because an accelerated \
+                     guest's exceptions are delivered by the host's silicon and never seen here"
+                );
+                named.retain(|ch| *ch != Channel::EXC);
+            }
             for ch in &named {
                 if !out.channels.contains(ch) {
                     out.channels.push(*ch);
@@ -2675,6 +2694,13 @@ impl Traces {
         out.channels.sort_unstable();
         Ok(out)
     }
+
+    /// The channels an accelerated run cannot answer: `cpu` because nothing is
+    /// translated, `exc` because nothing here sees an exception delivered.
+    const NOT_UNDER_ACCEL: [rsemu::core::trace::Channel; 2] = [
+        rsemu::core::trace::Channel::CPU,
+        rsemu::core::trace::Channel::EXC,
+    ];
 
     /// Whether the per-processor counters were asked for, which is the only
     /// channel that needs its constructors intercepted before the build.

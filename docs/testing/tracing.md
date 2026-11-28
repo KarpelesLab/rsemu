@@ -371,8 +371,10 @@ says `state-hash  not reproducible under this threading mode` rather than
 printing a number, exactly as `rsemu run`'s summary does. `--trace cpu` with
 `--accel` is **refused**: an accelerated processor runs on the host's own
 silicon and translates nothing, so it keeps none of these counters, and a table
-of zeroes would be a wrong answer rather than no answer. `--trace all` with
-`--accel` leaves `cpu` out and says so on stderr — `all` is a wildcard and means
+of zeroes would be a wrong answer rather than no answer. `--trace exc` is
+refused for the same reason: the host's silicon delivers an accelerated guest's
+exceptions through the guest's own tables, and no core here sees one go by.
+`--trace all` with `--accel` leaves both out and says so on stderr — `all` is a wildcard and means
 "every channel this run can report", while a channel somebody *named* is a flag
 that cannot be honoured.
 
