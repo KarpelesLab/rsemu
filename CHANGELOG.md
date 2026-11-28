@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/KarpelesLab/rsemu/compare/v0.0.13...v0.0.14) - 2026-11-28
+
+### Added
+
+- *(cpu-arm)* count exceptions taken for the `exc` trace channel
+- *(cpu-arm-a64)* count exceptions taken for the `exc` trace channel
+- *(cpu-m68k)* count exceptions and interrupts for the `exc` trace channel
+- *(cpu-x86)* count exceptions and interrupts for the exc trace channel
+- *(cpu-sh4a)* count exceptions and interrupts for the `exc` trace channel
+- *(cpu-mips)* count exceptions and interrupts for the `exc` trace channel
+- *(cpu-arm-v7m)* count exceptions taken for the `exc` trace channel
+- *(cli)* refuse `--trace exc` under `--accel`, as `cpu` is refused
+- *(trace)* an `exc` channel counting exceptions per processor and vector
+- *(cpu-arm-v8m)* model a Secure-only Security Extension option
+
+### Fixed
+
+- *(cpu-arm-v7m)* reset the System Control Space on every reset
+
+### Other
+
+- *(trace)* a shared switch for tests that assert exception counts
+
 ## [0.0.13](https://github.com/KarpelesLab/rsemu/compare/v0.0.12...v0.0.13) - 2026-11-28
 
 ### Added
