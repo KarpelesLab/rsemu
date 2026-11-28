@@ -340,11 +340,16 @@ fn a_disk_larger_than_the_host_is_refused_not_aborted() {
         "--for",
         "1ms",
         "-p",
-        "hd0size=1024G",
+        // Not the `1024G` of the report. Whether a terabyte can be reserved
+        // is the host's overcommit policy, and macOS grants it — the run then
+        // dies touching it, which is a different failure and not this test's.
+        // 2^50 bytes is past the user address space of every 64-bit target
+        // this is built for, so no policy can say yes.
+        "hd0size=1048576G",
     ]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(
-        stderr.contains("cannot allocate 1099511627776 bytes"),
+        stderr.contains("cannot allocate 1125899906842624 bytes"),
         "{stderr}"
     );
     assert!(!stderr.contains("memory allocation of"), "{stderr}");
