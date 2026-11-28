@@ -1175,6 +1175,53 @@ struct Pins {
 // The core
 // ---------------------------------------------------------------------------
 
+/// The `exc` code space: the exception number itself, as `IPSR` holds it.
+///
+/// Nine bits of `IPSR` (DDI 0403E.b B1.4.2, DDI 0553 "IPSR"), so 512 numbers
+/// whatever the NVIC implements; a number no core here can take simply never
+/// shows up in the report.
+const EXCEPTION_CODES: u32 = 512;
+
+/// The `exc` row for exception number `n`: its name, and whether it is an
+/// interrupt.
+///
+/// Classified by number alone. NMI, PendSV, SysTick and the external
+/// interrupts come from outside the instruction stream; the faults and
+/// `SVCall` are raised by it. DebugMonitor is filed as synchronous: its
+/// causes are overwhelmingly instruction-stream events — a `BKPT`, a DWT or
+/// FPB match, a step — and the one external one (`DEMCR.MON_PEND`, an
+/// external debug request) cannot be told apart by number (DDI 0403E.b C1.7).
+///
+/// No `s.`/`ns.` prefix for the Security Extension: the one option modelled
+/// ([`Security::SecureOnly`]) never leaves Secure state, so every exception
+/// is Secure and a prefix would only lengthen every row. A model of the
+/// Non-secure world, where the banked exceptions (SVCall, PendSV, SysTick,
+/// the configurable faults) can each be taken in either state, should add
+/// one then.
+fn exception_row(n: u32) -> (alloc::string::String, bool) {
+    let fixed = match n {
+        1 => Some(("reset", false)),
+        2 => Some(("nmi", true)),
+        3 => Some(("hardfault", false)),
+        4 => Some(("memmanage", false)),
+        5 => Some(("busfault", false)),
+        6 => Some(("usagefault", false)),
+        7 => Some(("securefault", false)),
+        11 => Some(("svcall", false)),
+        12 => Some(("debugmonitor", false)),
+        14 => Some(("pendsv", true)),
+        15 => Some(("systick", true)),
+        _ => None,
+    };
+    match fixed {
+        Some((name, interrupt)) => (name.to_string(), interrupt),
+        None if n >= 16 => (alloc::format!("irq.{}", n - 16), true),
+        // A reserved number: nothing pends one, but if something ever did,
+        // the row still says which.
+        None => (alloc::format!("exception.{n}"), false),
+    }
+}
+
 /// Everything the interpreter mutates, behind one lock.
 struct Session {
     state: State,
@@ -1187,6 +1234,17 @@ struct Session {
     /// machine attached would be a diagnostic that quietly stops working after
     /// the first snapshot.
     spin: spin::Watch,
+    /// Exceptions taken, for the `exc` trace channel
+    /// ([`core::trace::Exceptions`](crate::core::trace::Exceptions)), indexed
+    /// by exception number.
+    ///
+    /// Here, beside `spin`, for the reason `spin` is: [`Exec`] already borrows
+    /// the session, so the interpreter and every test helper reach it with no
+    /// new argument, and [`Device::load`] and a reset replace only [`State`],
+    /// so the count survives both and is in no snapshot and not in the state
+    /// hash. Not in [`Lines`], which is shared with the wire sinks and would
+    /// need its `Arc` threaded into [`Exec`] instead.
+    exc: crate::core::trace::Exceptions,
     /// Where every reset reads the vector table from: [`Config::reset_vtor`]
     /// until [`ArmV7m::set_vtor`] says otherwise. Configuration rather than
     /// architectural state, so beside [`State`] and not in the snapshot.
@@ -1300,6 +1358,7 @@ impl ArmV7m {
                     state: State::new(&cfg),
                     space: None,
                     spin: spin::Watch::new(cfg.requester),
+                    exc: crate::core::trace::Exceptions::new(EXCEPTION_CODES),
                     reset_vtor: cfg.reset_vtor,
                     cursor: None,
                     live_offset: None,
@@ -1786,6 +1845,7 @@ impl ArmV7m {
             state,
             space,
             spin,
+            exc,
             reset_vtor,
             cursor,
             live_offset,
@@ -1806,7 +1866,7 @@ impl ArmV7m {
             return 0;
         };
         let live = cursor.as_ref().zip(*live_offset);
-        Exec::new(state, space, &self.cfg, spin)
+        Exec::new(state, space, &self.cfg, spin, exc)
             .with_live(live)
             .step(&external, nmi)
     }
@@ -2073,6 +2133,10 @@ impl Device for ArmV7m {
     fn set_spin_detector(&self, cpu: u32, detector: Option<Arc<spin::Detector>>) -> bool {
         self.session.lock().spin.attach(cpu, detector);
         true
+    }
+
+    fn exceptions(&self) -> Option<Vec<crate::core::trace::ExceptionCount>> {
+        Some(self.session.lock().exc.report(exception_row))
     }
 
     fn attach_cursor(&self, cursor: TickCursor) {

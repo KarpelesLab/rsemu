@@ -45,6 +45,7 @@
 use crate::core::sched::TickCursor;
 use crate::core::space::{AccessPurpose, AddressSpace, MemAttrs};
 use crate::core::spin::Watch;
+use crate::core::trace::Exceptions;
 use crate::core::value::{Endian, Width};
 
 use super::isa::{
@@ -369,6 +370,11 @@ pub(super) struct Exec<'a> {
     /// and not architectural state: a snapshot restore replaces the whole
     /// `State` and must not take the detector with it.
     spin: &'a mut Watch,
+    /// The `exc` trace channel's counters (`core::trace::Exceptions`),
+    /// borrowed from the session beside `spin` and for the same reason: they
+    /// are wiring, not guest state, so they must outlive a reset and a
+    /// snapshot restore that replace [`State`].
+    exc: &'a Exceptions,
     /// The scheduler's cursor and the offset that turns [`State::cycles`]
     /// into this core's live position, while a scheduled `run` is under way.
     live: Option<(&'a TickCursor, u64)>,
@@ -406,6 +412,7 @@ impl<'a> Exec<'a> {
         space: &'a AddressSpace,
         cfg: &'a Config,
         spin: &'a mut Watch,
+        exc: &'a Exceptions,
     ) -> Exec<'a> {
         let attrs = MemAttrs::DEFAULT.with_requester(cfg.requester);
         Exec {
@@ -413,6 +420,7 @@ impl<'a> Exec<'a> {
             space,
             cfg,
             spin,
+            exc,
             live: None,
             levels: &[],
             attrs,
@@ -1179,6 +1187,16 @@ impl<'a> Exec<'a> {
 
     /// Push the exception frame and vector to a handler (DDI 0403 B1.5.6).
     fn exception_entry(&mut self, exc: Exception, return_address: u32) {
+        // Every entry that pushes a frame comes through here — priority
+        // arbitration in `step` (and so every interrupt, and a late arrival,
+        // which that arbitration already resolved to the winner), a fault
+        // after `take_trap` has escalated it, `SVC`, `BKPT`, and the NMI
+        // that ends a lockup — always with the exception the guest is about
+        // to run. A lockup returns before reaching here and is not counted;
+        // a vector read that fails *after* the frame is pushed and `IPSR`
+        // written still is, because the entry happened (`ExceptionTaken`,
+        // DDI 0403E.b B1.5.6) and only the handler fetch did not.
+        self.exc.count(u32::from(exc.0));
         // Taking an exception ends a `WFI` or `WFE` whether or not the
         // instruction stream ever gets back to it.
         self.state.asleep = false;
@@ -1617,6 +1635,10 @@ impl<'a> Exec<'a> {
     ///
     /// The caller has marked `exc` active.
     fn exception_taken_on_frame(&mut self, exc: Exception, magic: u32) {
+        // The other half of the `exc` count (see `exception_entry`): a
+        // tail-chained exception is taken — it gets `IPSR`, its vector and
+        // its handler run — it only skips the stacking.
+        self.exc.count(u32::from(exc.0));
         self.state.sys.set_pending(exc, false);
         // The handler that just returned consumed its `EXC_RETURN` (`BX LR`,
         // `POP {PC}`), and `LR` now holds whatever it last left there.

@@ -1464,6 +1464,116 @@ fn a_tail_chained_handler_gets_exc_return_in_lr_even_after_the_last_one_clobbere
     assert_eq!(h.cpu.reg(14), exc_return::THREAD_MSP);
 }
 
+/// The `exc` trace channel counts each exception the guest entered once,
+/// under its own number: an `SVC`, an IRQ, the IRQ tail-chained after it, and
+/// a disabled UsageFault as the HardFault it escalated to — and not the reset
+/// before them nor the lockup after.
+#[test]
+fn every_exception_taken_is_counted_once_for_the_exc_channel() {
+    let _exc = crate::core::trace::counting_exceptions();
+    // `SVC #0` ; `NOP` ; `UDF #0`. SVCall and both IRQs return through a
+    // `BX lr` at 0x300; HardFault's handler is another `UDF`, which faults at
+    // HardFault priority and so locks up.
+    let h = Harness::m4(&[0xdf00, 0xbf00, 0xde00]);
+    h.set_word(0x300, 0x4770); // `BX lr`
+    h.set_word(0x500, 0xde00); // `UDF #0`
+    for n in [11, 16, 17] {
+        h.set_word(n * 4, 0x301);
+    }
+    h.set_word(3 * 4, 0x501);
+    h.cpu.with_sys(|s| {
+        s.set_enable(Exception::IRQ0, true);
+        s.set_enable(Exception(17), true);
+    });
+
+    h.cpu.step(); // SVC: SVCall entry
+    h.cpu.step(); // `BX lr`: back to Thread
+    assert_eq!(h.cpu.current_exception(), Exception::THREAD);
+    h.cpu.pend_irq(0);
+    h.cpu.pend_irq(1);
+    h.cpu.step(); // IRQ0 entry: equal priority, lower number wins
+    assert_eq!(h.cpu.current_exception(), Exception::IRQ0);
+    h.cpu.step(); // `BX lr`: tail-chained into IRQ1
+    assert_eq!(h.cpu.current_exception(), Exception(17));
+    h.cpu.step(); // `BX lr`: back to Thread
+    assert_eq!(h.cpu.pc(), ENTRY + 2);
+    h.cpu.step(); // NOP
+    h.cpu.step(); // UDF: a disabled UsageFault, so a HardFault
+    assert_eq!(h.cpu.current_exception(), Exception::HARD_FAULT);
+    h.cpu.step(); // UDF inside HardFault: lockup, no entry
+    assert!(h.cpu.is_locked_up());
+    h.cpu.step(); // and a locked-up core enters nothing
+
+    let rows: Vec<_> = h
+        .cpu
+        .exceptions()
+        .expect("an M-profile core counts")
+        .into_iter()
+        .map(|r| (r.name, r.asynchronous, r.count))
+        .collect();
+    if cfg!(feature = "trace") {
+        assert_eq!(
+            rows,
+            [
+                ("hardfault".into(), false, 1),
+                ("svcall".into(), false, 1),
+                ("irq.0".into(), true, 1),
+                ("irq.1".into(), true, 1),
+            ]
+        );
+    } else {
+        assert!(rows.is_empty(), "no counters compiled in");
+    }
+}
+
+/// The counters are wiring, not guest state: a snapshot restore and a reset
+/// leave them alone, and the saved bytes do not depend on them.
+#[test]
+fn the_exc_counters_survive_restore_and_reset_and_stay_out_of_the_snapshot() {
+    let _exc = crate::core::trace::counting_exceptions();
+    let save = |cpu: &ArmV7m| {
+        let mut shape = MachineShape::new();
+        shape.add_device("cpu", CLASS.name).unwrap();
+        let mut writer = StateWriter::new(shape);
+        {
+            let mut chunk = writer.chunk("cpu", CLASS.name, CLASS.version).unwrap();
+            Device::save(cpu, &mut chunk).unwrap();
+        }
+        writer.to_vec().unwrap()
+    };
+    let load = |cpu: &ArmV7m, bytes: &[u8]| {
+        let reader = StateReader::new(bytes).unwrap();
+        let migrations = Migrations::new();
+        let chunk = reader
+            .load("cpu", CLASS.name, CLASS.version, &migrations)
+            .unwrap();
+        Device::load(cpu, &mut chunk.reader()).unwrap();
+    };
+    let taken = |cpu: &ArmV7m| {
+        cpu.exceptions()
+            .expect("an M-profile core counts")
+            .iter()
+            .map(|r| r.count)
+            .sum::<u64>()
+    };
+
+    let h = Harness::m4(&[0xdf00, 0xbf00]);
+    h.set_word(11 * 4, 0x301);
+    h.set_word(0x300, 0x4770); // `BX lr`
+    let before = save(&h.cpu);
+    h.cpu.step(); // SVCall entry
+    load(&h.cpu, &before);
+    assert_eq!(
+        save(&h.cpu),
+        before,
+        "a core that has counted an entry saves the bytes it saved before"
+    );
+    Device::reset(h.cpu.as_ref(), crate::core::device::ResetKind::Cold);
+    h.cpu.step(); // the reset sequence, which is not an entry
+    let expected = if cfg!(feature = "trace") { 1 } else { 0 };
+    assert_eq!(taken(&h.cpu), expected, "restore and reset kept the count");
+}
+
 #[test]
 fn a_level_input_does_not_pend_while_its_handler_is_active() {
     // The line is high on entry and the handler releases it before
